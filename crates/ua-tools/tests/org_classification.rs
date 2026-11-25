@@ -160,6 +160,7 @@ const TENANT: &[&str] = &[
     // shared graph store (`ua-graph`): org_id from birth, triggers from `organization.v1.graph`
     "graph_nodes",
     "graph_edges",
+    "graph_org_counts",
 ];
 
 /// Tenant tables that do not yet pass the tenant check. May only shrink.

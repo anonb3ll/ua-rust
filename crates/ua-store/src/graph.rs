@@ -21,16 +21,90 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ua_core::time::{format_ts, now, parse_ts};
 use ua_core::{DEFAULT_ORG, UaError, UaResult};
 
-use crate::db::WriteTx;
+use crate::db::{WriteTx, instant_to_deadline_nanos};
 use crate::ledger::{self, EventInput};
+
+/// Reason code returned when a SQLite progress handler interrupts a graph query
+/// at its wall-clock deadline.
+pub const DEADLINE_REASON_CODE: &str = "query_deadline_exceeded";
+
+/// True when `err` represents a graph query aborted at its wall-clock deadline.
+pub fn is_deadline_error(err: &UaError) -> bool {
+    err.reason_code() == Some(DEADLINE_REASON_CODE)
+}
+
+fn deadline_error() -> UaError {
+    UaError::invalid_code(DEADLINE_REASON_CODE, "graph query exceeded wall-clock deadline")
+}
+
+/// Clamp a `usize` SQL `LIMIT` to `i64::MAX` so large values (such as
+/// `usize::MAX`) never wrap to `-1` (unlimited) in SQLite.
+fn sql_limit(n: usize) -> i64 {
+    n.min(i64::MAX as usize) as i64
+}
+
+fn map_sql_err(err: rusqlite::Error) -> UaError {
+    if let rusqlite::Error::SqliteFailure(ffi_err, _) = &err
+        && ffi_err.code == ErrorCode::OperationInterrupted
+    {
+        return deadline_error();
+    }
+    UaError::from(err)
+}
+
+/// Run `f` with a SQLite `progress_handler` wired to `deadline`, always
+/// clearing the handler on normal return, error, or panic so pooled
+/// connections never retain a stale hook.
+fn run_with_conn_deadline<R, F, T>(
+    repo: &mut R,
+    get_conn: impl Fn(&mut R) -> &mut Connection,
+    deadline: Instant,
+    f: F,
+) -> UaResult<T>
+where
+    F: FnOnce(&mut R) -> UaResult<T>,
+{
+    if Instant::now() >= deadline {
+        return Err(deadline_error());
+    }
+    get_conn(repo).progress_handler(2_000, Some(move || Instant::now() >= deadline)).map_err(map_sql_err)?;
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(repo)));
+    let _ = get_conn(repo).progress_handler(0, None::<fn() -> bool>);
+    match res {
+        Ok(r) => r,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Run `f` while arming an atomic deadline slot checked by the writer
+/// connection's SQLite progress handler, always disarming on return or panic.
+fn run_with_atomic_deadline<F, T>(slot: Option<&AtomicU64>, deadline: Instant, f: F) -> UaResult<T>
+where
+    F: FnOnce() -> UaResult<T>,
+{
+    if Instant::now() >= deadline {
+        return Err(deadline_error());
+    }
+    let prev = slot.map(|s| s.swap(instant_to_deadline_nanos(deadline), Ordering::Relaxed));
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    if let (Some(s), Some(p)) = (slot, prev) {
+        s.store(p, Ordering::Relaxed);
+    }
+    match res {
+        Ok(r) => r,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
 
 /// One row of `graph_nodes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,11 +337,22 @@ pub trait GraphRead {
     /// discovered via covering-index [`compact_adjacent`] scans).
     fn get_edges_by_rowids(&mut self, org_id: &str, rowids: &[i64]) -> UaResult<Vec<(i64, GraphEdgeRow)>>;
 
-    /// Count rows in `graph_nodes` for `org_id`.
+    /// Count rows in `graph_nodes` for `org_id` (O(1) via `graph_org_counts`).
     fn count_org_nodes(&mut self, org_id: &str) -> UaResult<u64>;
 
-    /// Count rows in `graph_edges` for `org_id`.
+    /// Count rows in `graph_edges` for `org_id` (O(1) via `graph_org_counts`).
     fn count_org_edges(&mut self, org_id: &str) -> UaResult<u64>;
+
+    /// Bounded count of live (`valid_to IS NULL`) incident edges (out + in) for
+    /// `node_id` in `org_id`, stopping once `cap` is reached.
+    fn count_node_live_edges_capped(&mut self, org_id: &str, node_id: &str, cap: usize) -> UaResult<usize>;
+
+    /// Execute `f` with a SQLite progress-handler wall-clock deadline installed
+    /// on the underlying connection, clearing it unconditionally on return.
+    fn with_deadline<F, T>(&mut self, deadline: Instant, f: F) -> UaResult<T>
+    where
+        Self: Sized,
+        F: FnOnce(&mut Self) -> UaResult<T>;
 
     /// Bounded 1-hop adjacency with full edge and neighbor node rows.
     fn adjacent_edges(&mut self, query: &AdjacencyQuery) -> UaResult<Vec<AdjacencyEntry>>;
@@ -304,7 +389,9 @@ pub trait GraphRead {
 
     /// Bounded covering-index reachability probe from `dst_id` toward `src_id`
     /// over live (`state = 'active'`, `valid_to IS NULL`) edges of `kind` in
-    /// `org_id`, capped at `max_nodes` visited nodes and `max_edges` visited edges.
+    /// `org_id`, capped at `max_nodes` visited nodes, `max_edges` visited edges,
+    /// and a SQLite `progress_handler` wall-clock `deadline`.
+    #[allow(clippy::too_many_arguments)]
     fn bounded_acyclic_reach(
         &mut self,
         org_id: &str,
@@ -313,6 +400,7 @@ pub trait GraphRead {
         kind: &str,
         max_nodes: usize,
         max_edges: usize,
+        deadline: Instant,
     ) -> UaResult<AcyclicReachOutcome>;
 
     /// Bounded count of caller-eligible incident edges for `node_id` up to `cap_plus_one`.
@@ -367,7 +455,19 @@ pub trait GraphRead {
     ) -> UaResult<Option<ExactPprSlice>>;
 }
 
-/// Write graph primitives, running inside the caller's write transaction.
+/// Low-level write graph primitives, running inside the caller's write transaction.
+///
+/// # Low-level storage primitives
+///
+/// Methods on [`GraphRepo`] enforce only storage-level defense-in-depth checks
+/// (tenant existence, pre-#2790 non-default-org provenance, and temporal
+/// `valid_to <= now` / `valid_from` invariants). They intentionally skip domain
+/// rules — endpoint-kind matrix, domain-owned edge fence, generic empty-scope
+/// enforcement, write-time acyclicity checks, quotas, and ledger appends.
+/// Production callers MUST go through `ua-graph` (`graph_node_ensure`,
+/// `assert_edge`, `retract_edge`) rather than calling these methods directly,
+/// except for controlled bulk import/backfill paths that uphold those
+/// invariants themselves.
 pub trait GraphRepo: GraphRead {
     /// Look up an existing node by `(org_id, kind, external_id)` without
     /// visibility filtering, for domain-internal [`ensure_node`] idempotency.
@@ -378,20 +478,28 @@ pub trait GraphRepo: GraphRead {
         external_id: &str,
     ) -> UaResult<Option<GraphNodeRow>>;
 
-    /// Create a node row if `(org_id, kind, external_id)` is absent, touching
-    /// nothing if it already exists. Returns `(row, created)`.
+    /// **Low-level unchecked storage primitive.** Create a node row if
+    /// `(org_id, kind, external_id)` is absent, touching nothing if it already
+    /// exists. Skips quotas, kind/visibility validation, and ledger appends;
+    /// callers should use `ua_graph::graph_node_ensure`.
     fn ensure_node(&mut self, node: &NewGraphNode) -> UaResult<(GraphNodeRow, bool)>;
 
-    /// Insert a single edge row. Enforces non-default-org provenance and
-    /// `valid_to <= now` / `valid_from` invariants before executing SQL.
+    /// **Low-level unchecked storage primitive.** Insert a single edge row.
+    /// Enforces non-default-org provenance and temporal invariants only; skips
+    /// endpoint-kind validation, domain-owned edge fence, acyclicity checks,
+    /// quotas, and ledger appends. Callers must use `ua_graph::assert_edge`.
     fn insert_edge(&mut self, edge: &NewGraphEdge) -> UaResult<GraphEdgeRow>;
 
-    /// Batch-insert nodes inside the caller's open transaction using a cached
-    /// prepared statement (enforcing the same provenance checks).
+    /// **Low-level unchecked storage primitive.** Batch-insert nodes inside the
+    /// caller's open transaction using a cached prepared statement (provenance
+    /// checks only; skips quotas and ledger appends). Intended for controlled
+    /// bulk backfill/import only.
     fn insert_nodes_batch(&mut self, nodes: &[NewGraphNode]) -> UaResult<usize>;
 
-    /// Batch-insert edges inside the caller's open transaction using a cached
-    /// prepared statement (enforcing the same provenance and temporal checks).
+    /// **Low-level unchecked storage primitive.** Batch-insert edges inside the
+    /// caller's open transaction using a cached prepared statement (provenance
+    /// and temporal checks only; skips endpoint-kind, domain-owned, acyclicity,
+    /// quota, and ledger checks). Intended for controlled bulk backfill/import only.
     fn insert_edges_batch(&mut self, edges: &[NewGraphEdge]) -> UaResult<usize>;
 
     /// Close a currently live (`valid_to IS NULL`) edge by stamping `valid_to`.
@@ -405,11 +513,11 @@ pub trait GraphRepo: GraphRead {
 
 /// Borrowed SQLite reader implementing [`GraphRead`].
 pub struct SqliteGraph<'a> {
-    conn: &'a Connection,
+    conn: &'a mut Connection,
 }
 
 impl<'a> SqliteGraph<'a> {
-    pub fn new(conn: &'a Connection) -> Self {
+    pub fn new(conn: &'a mut Connection) -> Self {
         Self { conn }
     }
 }
@@ -744,8 +852,8 @@ fn get_node_by_id_sql(
     let mut sql = format!("SELECT {NODE_COLS} FROM graph_nodes WHERE org_id = ?1 AND id = ?2");
     let mut bind = vec![SqlValue::Text(org_id.to_string()), SqlValue::Text(id.to_string())];
     push_visibility_sql(&mut sql, &mut bind, "", scope);
-    let mut stmt = conn.prepare_cached(&sql)?;
-    Ok(stmt.query_row(params_from_iter(bind.iter()), |r| decode_node(r, 0)).optional()?)
+    let mut stmt = conn.prepare_cached(&sql).map_err(map_sql_err)?;
+    stmt.query_row(params_from_iter(bind.iter()), |r| decode_node(r, 0)).optional().map_err(map_sql_err)
 }
 
 fn get_node_by_external_sql(
@@ -763,8 +871,8 @@ fn get_node_by_external_sql(
         SqlValue::Text(external_id.to_string()),
     ];
     push_visibility_sql(&mut sql, &mut bind, "", scope);
-    let mut stmt = conn.prepare_cached(&sql)?;
-    Ok(stmt.query_row(params_from_iter(bind.iter()), |r| decode_node(r, 0)).optional()?)
+    let mut stmt = conn.prepare_cached(&sql).map_err(map_sql_err)?;
+    stmt.query_row(params_from_iter(bind.iter()), |r| decode_node(r, 0)).optional().map_err(map_sql_err)
 }
 
 fn get_nodes_by_ids_sql(
@@ -789,19 +897,22 @@ fn get_nodes_by_ids_sql(
         sql.push_str(&ph.join(","));
         sql.push(')');
         push_visibility_sql(&mut sql, &mut bind, "", scope);
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare(&sql).map_err(map_sql_err)?;
         let rows = stmt
-            .query_map(params_from_iter(bind.iter()), |r| decode_node(r, 0))?
-            .collect::<Result<Vec<_>, _>>()?;
+            .query_map(params_from_iter(bind.iter()), |r| decode_node(r, 0))
+            .map_err(map_sql_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql_err)?;
         out.extend(rows);
     }
     Ok(out)
 }
 
 fn get_edge_by_id_sql(conn: &Connection, org_id: &str, id: &str) -> UaResult<Option<GraphEdgeRow>> {
-    let mut stmt =
-        conn.prepare_cached(&format!("SELECT {EDGE_COLS} FROM graph_edges WHERE org_id = ?1 AND id = ?2"))?;
-    Ok(stmt.query_row(params![org_id, id], |r| decode_edge(r, 0)).optional()?)
+    let mut stmt = conn
+        .prepare_cached(&format!("SELECT {EDGE_COLS} FROM graph_edges WHERE org_id = ?1 AND id = ?2"))
+        .map_err(map_sql_err)?;
+    stmt.query_row(params![org_id, id], |r| decode_edge(r, 0)).optional().map_err(map_sql_err)
 }
 
 fn get_edges_by_ids_sql(conn: &Connection, org_id: &str, ids: &[String]) -> UaResult<Vec<GraphEdgeRow>> {
@@ -819,10 +930,12 @@ fn get_edges_by_ids_sql(conn: &Connection, org_id: &str, ids: &[String]) -> UaRe
         }
         sql.push_str(&ph.join(","));
         sql.push(')');
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare(&sql).map_err(map_sql_err)?;
         let rows = stmt
-            .query_map(params_from_iter(bind.iter()), |r| decode_edge(r, 0))?
-            .collect::<Result<Vec<_>, _>>()?;
+            .query_map(params_from_iter(bind.iter()), |r| decode_edge(r, 0))
+            .map_err(map_sql_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql_err)?;
         out.extend(rows);
     }
     Ok(out)
@@ -847,25 +960,70 @@ fn get_edges_by_rowids_sql(
         }
         sql.push_str(&ph.join(","));
         sql.push(')');
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare(&sql).map_err(map_sql_err)?;
         let rows = stmt
-            .query_map(params_from_iter(bind.iter()), |r| Ok((r.get::<_, i64>(0)?, decode_edge(r, 1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
+            .query_map(params_from_iter(bind.iter()), |r| Ok((r.get::<_, i64>(0)?, decode_edge(r, 1)?)))
+            .map_err(map_sql_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql_err)?;
         out.extend(rows);
     }
     Ok(out)
 }
 
 fn count_org_nodes_sql(conn: &Connection, org_id: &str) -> UaResult<u64> {
-    let n: i64 =
-        conn.query_row("SELECT COUNT(*) FROM graph_nodes WHERE org_id = ?1", [org_id], |r| r.get(0))?;
+    let mut stmt = conn
+        .prepare_cached("SELECT COALESCE((SELECT node_count FROM graph_org_counts WHERE org_id = ?1), 0)")
+        .map_err(map_sql_err)?;
+    let n: i64 = stmt.query_row([org_id], |r| r.get(0)).map_err(map_sql_err)?;
     Ok(n.max(0) as u64)
 }
 
 fn count_org_edges_sql(conn: &Connection, org_id: &str) -> UaResult<u64> {
-    let n: i64 =
-        conn.query_row("SELECT COUNT(*) FROM graph_edges WHERE org_id = ?1", [org_id], |r| r.get(0))?;
+    let mut stmt = conn
+        .prepare_cached("SELECT COALESCE((SELECT edge_count FROM graph_org_counts WHERE org_id = ?1), 0)")
+        .map_err(map_sql_err)?;
+    let n: i64 = stmt.query_row([org_id], |r| r.get(0)).map_err(map_sql_err)?;
     Ok(n.max(0) as u64)
+}
+
+fn count_node_live_edges_capped_sql(
+    conn: &Connection,
+    org_id: &str,
+    node_id: &str,
+    cap: usize,
+) -> UaResult<usize> {
+    if cap == 0 {
+        return Ok(0);
+    }
+    let mut out_stmt = conn
+        .prepare_cached(
+            "SELECT COUNT(*) FROM ( \
+                 SELECT 1 FROM graph_edges INDEXED BY idx_graph_edges_out \
+                 WHERE org_id = ?1 AND src_id = ?2 AND valid_to IS NULL \
+                 LIMIT ?3 \
+             )",
+        )
+        .map_err(map_sql_err)?;
+    let out_n: i64 =
+        out_stmt.query_row(params![org_id, node_id, sql_limit(cap)], |r| r.get(0)).map_err(map_sql_err)?;
+    let out = out_n.max(0) as usize;
+    if out >= cap {
+        return Ok(cap);
+    }
+    let rem = cap - out;
+    let mut in_stmt = conn
+        .prepare_cached(
+            "SELECT COUNT(*) FROM ( \
+                 SELECT 1 FROM graph_edges INDEXED BY idx_graph_edges_in \
+                 WHERE org_id = ?1 AND dst_id = ?2 AND valid_to IS NULL \
+                 LIMIT ?3 \
+             )",
+        )
+        .map_err(map_sql_err)?;
+    let in_n: i64 =
+        in_stmt.query_row(params![org_id, node_id, sql_limit(rem)], |r| r.get(0)).map_err(map_sql_err)?;
+    Ok((out + in_n.max(0) as usize).min(cap))
 }
 
 fn query_directed_full(
@@ -888,18 +1046,20 @@ fn query_directed_full(
     push_visibility_sql(&mut sql, &mut bind, "n", &q.scope);
     push_edge_and_node_filter_sql(&mut sql, &mut bind, &q.filter);
     push_cursor_sql(&mut sql, &mut bind, q.cursor.as_ref());
-    bind.push(SqlValue::Integer(q.limit as i64));
+    bind.push(SqlValue::Integer(sql_limit(q.limit)));
     let lim = bind.len();
     sql.push_str(&format!(" ORDER BY e.weight DESC, e.asserted_at DESC, e.id ASC LIMIT ?{lim}"));
 
-    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql).map_err(map_sql_err)?;
     let rows = stmt
         .query_map(params_from_iter(bind.iter()), |r| {
             let edge = decode_edge(r, 0)?;
             let neighbor = decode_node(r, 16)?;
             Ok(AdjacencyEntry { edge, neighbor, direction: dir })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+        })
+        .map_err(map_sql_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sql_err)?;
     Ok(rows)
 }
 
@@ -971,14 +1131,14 @@ fn step_compact_stmt(
     dir: EdgeDirection,
     out: &mut Vec<CompactAdjEdge>,
 ) -> UaResult<()> {
-    stmt.raw_bind_parameter(2, node_id)?;
-    stmt.raw_bind_parameter(lim_idx, limit as i64)?;
+    stmt.raw_bind_parameter(2, node_id).map_err(map_sql_err)?;
+    stmt.raw_bind_parameter(lim_idx, sql_limit(limit)).map_err(map_sql_err)?;
     let mut rows = stmt.raw_query();
-    while let Some(r) = rows.next()? {
+    while let Some(r) = rows.next().map_err(map_sql_err)? {
         out.push(CompactAdjEdge {
-            rowid: r.get(0)?,
-            neighbor_id: r.get(1)?,
-            weight: r.get(2)?,
+            rowid: r.get(0).map_err(map_sql_err)?,
+            neighbor_id: r.get(1).map_err(map_sql_err)?,
+            weight: r.get(2).map_err(map_sql_err)?,
             direction: dir,
         });
     }
@@ -995,9 +1155,9 @@ fn query_directed_compact(
     limit: usize,
 ) -> UaResult<Vec<CompactAdjEdge>> {
     let (sql, bind, lim_idx) = build_compact_sql(org_id, dir, filter, scope);
-    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql).map_err(map_sql_err)?;
     for (i, v) in bind.iter().enumerate() {
-        stmt.raw_bind_parameter(i + 1, v)?;
+        stmt.raw_bind_parameter(i + 1, v).map_err(map_sql_err)?;
     }
     let mut out = Vec::with_capacity(limit.min(256));
     step_compact_stmt(&mut stmt, node_id, lim_idx, limit, dir, &mut out)?;
@@ -1049,9 +1209,9 @@ where
 {
     let mut out_stmt = if matches!(directions, EdgeDirection::Out | EdgeDirection::Both) {
         let (sql, bind, lim_idx) = build_compact_sql(org_id, EdgeDirection::Out, filter, scope);
-        let mut s = conn.prepare_cached(&sql)?;
+        let mut s = conn.prepare_cached(&sql).map_err(map_sql_err)?;
         for (i, v) in bind.iter().enumerate() {
-            s.raw_bind_parameter(i + 1, v)?;
+            s.raw_bind_parameter(i + 1, v).map_err(map_sql_err)?;
         }
         Some((s, lim_idx))
     } else {
@@ -1059,9 +1219,9 @@ where
     };
     let mut in_stmt = if matches!(directions, EdgeDirection::In | EdgeDirection::Both) {
         let (sql, bind, lim_idx) = build_compact_sql(org_id, EdgeDirection::In, filter, scope);
-        let mut s = conn.prepare_cached(&sql)?;
+        let mut s = conn.prepare_cached(&sql).map_err(map_sql_err)?;
         for (i, v) in bind.iter().enumerate() {
-            s.raw_bind_parameter(i + 1, v)?;
+            s.raw_bind_parameter(i + 1, v).map_err(map_sql_err)?;
         }
         Some((s, lim_idx))
     } else {
@@ -1101,7 +1261,10 @@ where
     f(&mut step)
 }
 
-fn bounded_acyclic_reach_sql(
+/// Runs the bounded reachability SQL assuming the caller has already installed
+/// a SQLite progress-handler deadline (`run_with_conn_deadline` or
+/// `run_with_atomic_deadline`).
+fn bounded_acyclic_reach_sql_inner(
     conn: &Connection,
     org_id: &str,
     src_id: &str,
@@ -1112,23 +1275,33 @@ fn bounded_acyclic_reach_sql(
 ) -> UaResult<AcyclicReachOutcome> {
     // Single covering-index bounded reachability CTE (`CROSS JOIN` forces
     // `r` -> covering index `idx_graph_edges_out(org_id, src_id, kind, state, valid_to)`).
-    let mut node_stmt = conn.prepare_cached(
-        "WITH RECURSIVE r(id) AS ( \
-             SELECT ?2 \
-             UNION \
-             SELECT e.dst_id \
-             FROM r CROSS JOIN graph_edges e INDEXED BY idx_graph_edges_out \
-             WHERE e.org_id = ?1 AND e.src_id = r.id AND e.kind = ?3 \
-               AND e.state = 'active' AND e.valid_to IS NULL \
-         ) \
-         SELECT COUNT(*) AS n_nodes, \
-                COALESCE(MAX(CASE WHEN id = ?4 THEN 1 ELSE 0 END), 0) AS hit_src \
-         FROM (SELECT id FROM r LIMIT ?5)",
-    )?;
-    let (n_nodes, hit_src): (i64, i64) = node_stmt
-        .query_row(params![org_id, dst_id, kind, src_id, (max_nodes + 1) as i64], |r| {
+    let mut node_stmt = conn
+        .prepare_cached(
+            "WITH RECURSIVE r(id) AS ( \
+                 SELECT ?2 \
+                 UNION \
+                 SELECT e.dst_id \
+                 FROM r CROSS JOIN graph_edges e INDEXED BY idx_graph_edges_out \
+                 WHERE e.org_id = ?1 AND e.src_id = r.id AND e.kind = ?3 \
+                   AND e.state = 'active' AND e.valid_to IS NULL \
+             ) \
+             SELECT COUNT(*) AS n_nodes, \
+                    COALESCE(MAX(CASE WHEN id = ?4 THEN 1 ELSE 0 END), 0) AS hit_src \
+             FROM (SELECT id FROM r LIMIT ?5)",
+        )
+        .map_err(map_sql_err)?;
+    let (n_nodes, hit_src): (i64, i64) = match node_stmt
+        .query_row(params![org_id, dst_id, kind, src_id, sql_limit(max_nodes.saturating_add(1))], |r| {
             Ok((r.get(0)?, r.get(1)?))
-        })?;
+        })
+        .map_err(map_sql_err)
+    {
+        Ok(pair) => pair,
+        Err(err) if is_deadline_error(&err) => {
+            return Ok(AcyclicReachOutcome::BoundExceeded("deadline"));
+        }
+        Err(err) => return Err(err),
+    };
     if hit_src != 0 {
         return Ok(AcyclicReachOutcome::CycleDetected);
     }
@@ -1141,28 +1314,39 @@ fn bounded_acyclic_reach_sql(
     // or whenever n_nodes >= 2 and total possible edges > max_edges).
     let n_u = n_nodes.max(0) as usize;
     if n_u > 1 && (n_u > max_edges || n_u.saturating_mul(n_u) > max_edges) {
-        let mut edge_stmt = conn.prepare_cached(
-            "WITH RECURSIVE r(id) AS ( \
-                 SELECT ?2 \
-                 UNION \
-                 SELECT e.dst_id \
-                 FROM r CROSS JOIN graph_edges e INDEXED BY idx_graph_edges_out \
-                 WHERE e.org_id = ?1 AND e.src_id = r.id AND e.kind = ?3 \
-                   AND e.state = 'active' AND e.valid_to IS NULL \
-             ) \
-             SELECT COUNT(*) FROM ( \
-                 SELECT 1 \
-                 FROM (SELECT id FROM r LIMIT ?4) rn \
-                 CROSS JOIN graph_edges e INDEXED BY idx_graph_edges_out \
-                 WHERE e.org_id = ?1 AND e.src_id = rn.id AND e.kind = ?3 \
-                   AND e.state = 'active' AND e.valid_to IS NULL \
-                 LIMIT ?5 \
-             )",
-        )?;
-        let n_edges: i64 = edge_stmt
-            .query_row(params![org_id, dst_id, kind, max_nodes as i64, (max_edges + 1) as i64], |r| {
-                r.get(0)
-            })?;
+        let mut edge_stmt = conn
+            .prepare_cached(
+                "WITH RECURSIVE r(id) AS ( \
+                     SELECT ?2 \
+                     UNION \
+                     SELECT e.dst_id \
+                     FROM r CROSS JOIN graph_edges e INDEXED BY idx_graph_edges_out \
+                     WHERE e.org_id = ?1 AND e.src_id = r.id AND e.kind = ?3 \
+                       AND e.state = 'active' AND e.valid_to IS NULL \
+                 ) \
+                 SELECT COUNT(*) FROM ( \
+                     SELECT 1 \
+                     FROM (SELECT id FROM r LIMIT ?4) rn \
+                     CROSS JOIN graph_edges e INDEXED BY idx_graph_edges_out \
+                     WHERE e.org_id = ?1 AND e.src_id = rn.id AND e.kind = ?3 \
+                       AND e.state = 'active' AND e.valid_to IS NULL \
+                     LIMIT ?5 \
+                 )",
+            )
+            .map_err(map_sql_err)?;
+        let n_edges: i64 = match edge_stmt
+            .query_row(
+                params![org_id, dst_id, kind, sql_limit(max_nodes), sql_limit(max_edges.saturating_add(1))],
+                |r| r.get(0),
+            )
+            .map_err(map_sql_err)
+        {
+            Ok(n) => n,
+            Err(err) if is_deadline_error(&err) => {
+                return Ok(AcyclicReachOutcome::BoundExceeded("deadline"));
+            }
+            Err(err) => return Err(err),
+        };
         if n_edges as usize > max_edges {
             return Ok(AcyclicReachOutcome::BoundExceeded("visited_edges"));
         }
@@ -1193,12 +1377,12 @@ fn eligible_degree_dir(
     let mut bind = vec![SqlValue::Text(org_id.to_string()), SqlValue::Text(node_id.to_string())];
     push_visibility_sql(&mut sql, &mut bind, "n", scope);
     push_edge_and_node_filter_sql(&mut sql, &mut bind, filter);
-    bind.push(SqlValue::Integer(cap_plus_one as i64));
+    bind.push(SqlValue::Integer(sql_limit(cap_plus_one)));
     let lim = bind.len();
     sql.push_str(&format!(" LIMIT ?{lim})"));
 
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let n: i64 = stmt.query_row(params_from_iter(bind.iter()), |r| r.get(0))?;
+    let mut stmt = conn.prepare_cached(&sql).map_err(map_sql_err)?;
+    let n: i64 = stmt.query_row(params_from_iter(bind.iter()), |r| r.get(0)).map_err(map_sql_err)?;
     Ok(n.max(0) as usize)
 }
 
@@ -1242,14 +1426,16 @@ fn outgoing_live_targets_of_kind_into_sql(
 ) -> UaResult<()> {
     out.clear();
     // Covered by idx_graph_edges_out(org_id, src_id, kind, state, valid_to, valid_from, dst_id, weight).
-    let mut stmt = conn.prepare_cached(
-        "SELECT dst_id FROM graph_edges \
-         WHERE org_id = ?1 AND src_id = ?2 AND kind = ?3 AND state = 'active' AND valid_to IS NULL \
-         LIMIT ?4",
-    )?;
-    let mut rows = stmt.query(params![org_id, src_id, kind, limit as i64])?;
-    while let Some(r) = rows.next()? {
-        out.push(r.get::<_, String>(0)?);
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT dst_id FROM graph_edges \
+             WHERE org_id = ?1 AND src_id = ?2 AND kind = ?3 AND state = 'active' AND valid_to IS NULL \
+             LIMIT ?4",
+        )
+        .map_err(map_sql_err)?;
+    let mut rows = stmt.query(params![org_id, src_id, kind, sql_limit(limit)]).map_err(map_sql_err)?;
+    while let Some(r) = rows.next().map_err(map_sql_err)? {
+        out.push(r.get::<_, String>(0).map_err(map_sql_err)?);
     }
     Ok(())
 }
@@ -1274,25 +1460,32 @@ fn exact_ppr_slice_sql(
         }
         nsql.push_str(&format!(" AND kind IN ({})", ph.join(",")));
     }
-    nbind.push(SqlValue::Integer((max_nodes + 1) as i64));
+    nbind.push(SqlValue::Integer(sql_limit(max_nodes.saturating_add(1))));
     let nlim = nbind.len();
     nsql.push_str(&format!(" LIMIT ?{nlim}"));
 
     let node_ids: Vec<String> = {
-        let mut stmt = conn.prepare_cached(&nsql)?;
-        stmt.query_map(params_from_iter(nbind.iter()), |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
+        let mut stmt = conn.prepare_cached(&nsql).map_err(map_sql_err)?;
+        stmt.query_map(params_from_iter(nbind.iter()), |r| r.get::<_, String>(0))
+            .map_err(map_sql_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql_err)?
     };
     if node_ids.len() > max_nodes {
         return Ok(None);
     }
     let visible: HashSet<&str> = node_ids.iter().map(String::as_str).collect();
 
-    // Covering-index scan over `idx_graph_edges_out` filtered in-memory against
-    // the exact visible node set (`visible`, <= 5,000 entries), stopping as soon
-    // as `max_edges + 1` eligible edges are found. Hidden edges never count
-    // against `max_edges` and avoid 2x per-edge SQLite PK joins on `graph_nodes`.
-    let mut esql = String::from("SELECT src_id, dst_id, weight FROM graph_edges WHERE org_id = ?1");
+    // Bounded covering-index scan over `idx_graph_edges_out` filtered in-memory
+    // against the exact visible node set (`visible`, <= max_nodes). Caps BOTH
+    // matched edges (`max_edges`) and total scanned edges (`scan_cap = 2 * max_edges`)
+    // so selective node-kind/visibility filters cannot trigger an unbounded org scan.
+    // Callers also install `with_deadline` so SQLite's `progress_handler` enforces
+    // the wall-clock deadline mid-scan.
+    let scan_cap = max_edges.saturating_mul(2).max(max_edges);
+    let mut esql = String::from(
+        "SELECT src_id, dst_id, weight FROM graph_edges INDEXED BY idx_graph_edges_out WHERE org_id = ?1",
+    );
     let mut ebind = vec![SqlValue::Text(org_id.to_string())];
     if filter.include_proposed {
         esql.push_str(" AND state IN ('active','proposed')");
@@ -1312,24 +1505,32 @@ fn exact_ppr_slice_sql(
         }
         esql.push_str(&format!(" AND kind IN ({})", ph.join(",")));
     }
+    ebind.push(SqlValue::Integer(sql_limit(scan_cap.saturating_add(1))));
+    let elim = ebind.len();
+    esql.push_str(&format!(" LIMIT ?{elim}"));
 
     let mut edges: Vec<(String, String, f64)> = Vec::new();
+    let mut scanned = 0usize;
     {
-        let mut stmt = conn.prepare_cached(&esql)?;
-        let mut rows = stmt.query(params_from_iter(ebind.iter()))?;
-        while let Some(r) = rows.next()? {
-            let s: String = r.get(0)?;
+        let mut stmt = conn.prepare_cached(&esql).map_err(map_sql_err)?;
+        let mut rows = stmt.query(params_from_iter(ebind.iter())).map_err(map_sql_err)?;
+        while let Some(r) = rows.next().map_err(map_sql_err)? {
+            scanned += 1;
+            if scanned > scan_cap {
+                return Ok(None);
+            }
+            let s: String = r.get(0).map_err(map_sql_err)?;
             if !visible.contains(s.as_str()) {
                 continue;
             }
-            let d: String = r.get(1)?;
+            let d: String = r.get(1).map_err(map_sql_err)?;
             if !visible.contains(d.as_str()) {
                 continue;
             }
             if edges.len() >= max_edges {
                 return Ok(None);
             }
-            let w: f64 = r.get(2)?;
+            let w: f64 = r.get(2).map_err(map_sql_err)?;
             edges.push((s, d, w));
         }
     }
@@ -1384,6 +1585,16 @@ impl GraphRead for SqliteGraph<'_> {
     fn count_org_edges(&mut self, org_id: &str) -> UaResult<u64> {
         count_org_edges_sql(self.conn, org_id)
     }
+    fn count_node_live_edges_capped(&mut self, org_id: &str, node_id: &str, cap: usize) -> UaResult<usize> {
+        count_node_live_edges_capped_sql(self.conn, org_id, node_id, cap)
+    }
+    fn with_deadline<F, T>(&mut self, deadline: Instant, f: F) -> UaResult<T>
+    where
+        Self: Sized,
+        F: FnOnce(&mut Self) -> UaResult<T>,
+    {
+        run_with_conn_deadline(self, |g| g.conn, deadline, f)
+    }
     fn adjacent_edges(&mut self, query: &AdjacencyQuery) -> UaResult<Vec<AdjacencyEntry>> {
         adjacent_edges_sql(self.conn, query)
     }
@@ -1422,8 +1633,18 @@ impl GraphRead for SqliteGraph<'_> {
         kind: &str,
         max_nodes: usize,
         max_edges: usize,
+        deadline: Instant,
     ) -> UaResult<AcyclicReachOutcome> {
-        bounded_acyclic_reach_sql(self.conn, org_id, src_id, dst_id, kind, max_nodes, max_edges)
+        match run_with_conn_deadline(
+            self,
+            |g| g.conn,
+            deadline,
+            |g| bounded_acyclic_reach_sql_inner(g.conn, org_id, src_id, dst_id, kind, max_nodes, max_edges),
+        ) {
+            Ok(o) => Ok(o),
+            Err(err) if is_deadline_error(&err) => Ok(AcyclicReachOutcome::BoundExceeded("deadline")),
+            Err(err) => Err(err),
+        }
     }
     fn eligible_degree(
         &mut self,
@@ -1502,6 +1723,17 @@ impl GraphRead for WriteTx<'_> {
     fn count_org_edges(&mut self, org_id: &str) -> UaResult<u64> {
         count_org_edges_sql(self, org_id)
     }
+    fn count_node_live_edges_capped(&mut self, org_id: &str, node_id: &str, cap: usize) -> UaResult<usize> {
+        count_node_live_edges_capped_sql(self, org_id, node_id, cap)
+    }
+    fn with_deadline<F, T>(&mut self, deadline: Instant, f: F) -> UaResult<T>
+    where
+        Self: Sized,
+        F: FnOnce(&mut Self) -> UaResult<T>,
+    {
+        let slot = self.deadline_slot();
+        run_with_atomic_deadline(slot.as_deref(), deadline, || f(self))
+    }
     fn adjacent_edges(&mut self, query: &AdjacencyQuery) -> UaResult<Vec<AdjacencyEntry>> {
         adjacent_edges_sql(self, query)
     }
@@ -1540,8 +1772,16 @@ impl GraphRead for WriteTx<'_> {
         kind: &str,
         max_nodes: usize,
         max_edges: usize,
+        deadline: Instant,
     ) -> UaResult<AcyclicReachOutcome> {
-        bounded_acyclic_reach_sql(self, org_id, src_id, dst_id, kind, max_nodes, max_edges)
+        let slot = self.deadline_slot();
+        match run_with_atomic_deadline(slot.as_deref(), deadline, || {
+            bounded_acyclic_reach_sql_inner(self, org_id, src_id, dst_id, kind, max_nodes, max_edges)
+        }) {
+            Ok(o) => Ok(o),
+            Err(err) if is_deadline_error(&err) => Ok(AcyclicReachOutcome::BoundExceeded("deadline")),
+            Err(err) => Err(err),
+        }
     }
     fn eligible_degree(
         &mut self,

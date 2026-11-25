@@ -13,8 +13,9 @@
 
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use tokio::sync::broadcast;
@@ -42,6 +43,9 @@ pub struct Db {
 struct Inner {
     path: Option<PathBuf>,
     writer: Mutex<Connection>,
+    /// Optional nanosecond deadline (since process-local epoch; `0` = disabled)
+    /// checked by the writer connection's SQLite progress handler.
+    writer_deadline: Arc<AtomicU64>,
     readers: Mutex<Pool>,
     reader_free: Condvar,
     /// How long a read waits for a reader ([`READER_WAIT`]; tests shorten it).
@@ -50,6 +54,29 @@ struct Inner {
     /// Recorded parts this build does not know, opened anyway because the
     /// caller allowed it ([`Fence::allow_newer`]). Empty otherwise.
     ignored_newer: Vec<String>,
+}
+
+static DEADLINE_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+pub(crate) fn now_deadline_nanos() -> u64 {
+    let epoch = *DEADLINE_EPOCH.get_or_init(Instant::now);
+    Instant::now().saturating_duration_since(epoch).as_nanos().min(u64::MAX as u128).max(1) as u64
+}
+
+pub(crate) fn instant_to_deadline_nanos(deadline: Instant) -> u64 {
+    let epoch = *DEADLINE_EPOCH.get_or_init(Instant::now);
+    deadline.saturating_duration_since(epoch).as_nanos().min(u64::MAX as u128).max(1) as u64
+}
+
+fn install_writer_progress_handler(conn: &mut Connection, slot: &Arc<AtomicU64>) -> rusqlite::Result<()> {
+    let slot = Arc::clone(slot);
+    conn.progress_handler(
+        2_000,
+        Some(move || {
+            let d = slot.load(Ordering::Relaxed);
+            d != 0 && now_deadline_nanos() >= d
+        }),
+    )
 }
 
 /// What [`Db::open_with`] does about parts recorded in the database that this
@@ -114,6 +141,15 @@ impl Deref for ReaderGuard<'_> {
     }
 }
 
+impl DerefMut for ReaderGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        match self.lease.as_mut() {
+            Some(Lease::Pooled(c) | Lease::Overflow(c)) => c,
+            None => unreachable!("a reader guard holds its connection until dropped"),
+        }
+    }
+}
+
 impl Drop for ReaderGuard<'_> {
     fn drop(&mut self) {
         let Some(lease) = self.lease.take() else { return };
@@ -153,11 +189,7 @@ fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
     )?;
     r.busy_timeout(std::time::Duration::from_secs(10))?;
-    r.execute_batch(
-        "PRAGMA temp_store = MEMORY;
-         PRAGMA cache_size = -64000;
-         PRAGMA mmap_size = 268435456;",
-    )?;
+    r.execute_batch("PRAGMA temp_store = MEMORY;")?;
     Ok(r)
 }
 
@@ -190,14 +222,17 @@ fn check_fence<P: Into<Part> + Copy>(
 
 fn configure(conn: &Connection) -> rusqlite::Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    // Writer-only page cache budget: 16 MiB on the single writer connection
+    // (readers keep SQLite's 2 MiB default; no mmap), plus a 16 MiB WAL
+    // autocheckpoint threshold (4,000 x 4 KiB pages) so multi-index batched
+    // writes do not thrash the cache or checkpoint mid-burst.
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
          PRAGMA temp_store = MEMORY;
-         PRAGMA cache_size = -64000;
-         PRAGMA mmap_size = 268435456;
-         PRAGMA wal_autocheckpoint = 10000;",
+         PRAGMA cache_size = -16384;
+         PRAGMA wal_autocheckpoint = 4000;",
     )
 }
 
@@ -249,15 +284,18 @@ impl Db {
 
     fn from_parts(
         path: Option<PathBuf>,
-        writer: Connection,
+        mut writer: Connection,
         readers: Vec<Connection>,
         ignored_newer: Vec<String>,
     ) -> Self {
+        let writer_deadline = Arc::new(AtomicU64::new(0));
+        let _ = install_writer_progress_handler(&mut writer, &writer_deadline);
         let (events, _) = broadcast::channel(1024);
         Self {
             inner: Arc::new(Inner {
                 path,
                 writer: Mutex::new(writer),
+                writer_deadline,
                 readers: Mutex::new(Pool { idle: readers, overflow: 0, vacant: 0 }),
                 reader_free: Condvar::new(),
                 reader_wait: READER_WAIT,
@@ -288,7 +326,7 @@ impl Db {
     pub fn write<T>(&self, f: impl FnOnce(&mut WriteTx<'_>) -> UaResult<T>) -> UaResult<T> {
         let (out, pending) = {
             let mut conn = self.inner.writer.lock().map_err(|_| UaError::internal("writer lock poisoned"))?;
-            run_write(&mut conn, f)
+            run_write(&mut conn, Some(&self.inner.writer_deadline), f)
         };
         for ev in pending {
             let _ = self.inner.events.send(ev);
@@ -306,6 +344,23 @@ impl Db {
         }
         let guard = self.reader()?;
         f(&guard)
+    }
+
+    /// Run `f` with exclusive `&mut Connection` access to a read connection
+    /// (for example to install a temporary SQLite `progress_handler` deadline).
+    /// Blocking: from async code use [`Db::read_mut_async`].
+    pub fn read_mut<T>(&self, f: impl FnOnce(&mut Connection) -> UaResult<T>) -> UaResult<T> {
+        if self.inner.path.is_none() {
+            let mut conn = self.inner.writer.lock().map_err(|_| UaError::internal("writer lock poisoned"))?;
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut conn)));
+            let _ = install_writer_progress_handler(&mut conn, &self.inner.writer_deadline);
+            return match res {
+                Ok(r) => r,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+        }
+        let mut guard = self.reader()?;
+        f(&mut guard)
     }
 
     /// Take a read connection of a file database: an idle pooled reader;
@@ -395,16 +450,34 @@ impl Db {
             .await
             .map_err(|e| UaError::internal(format!("blocking task failed: {e}")))?
     }
+
+    /// Async wrapper around [`Db::read_mut`].
+    pub async fn read_mut_async<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> UaResult<T> + Send + 'static,
+    ) -> UaResult<T> {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || db.read_mut(f))
+            .await
+            .map_err(|e| UaError::internal(format!("blocking task failed: {e}")))?
+    }
 }
 
 /// A write transaction plus the ledger events it will publish on commit.
 pub struct WriteTx<'c> {
     tx: Transaction<'c>,
+    deadline: Option<Arc<AtomicU64>>,
     pub(crate) pending: Vec<Event>,
     /// Copies of the events appended with
     /// [`crate::ledger::append_surviving`], recorded again if this
     /// transaction rolls back.
     pub(crate) surviving: Vec<EventInput>,
+}
+
+impl WriteTx<'_> {
+    pub(crate) fn deadline_slot(&self) -> Option<Arc<AtomicU64>> {
+        self.deadline.as_ref().map(Arc::clone)
+    }
 }
 
 /// Run `f` inside a `BEGIN IMMEDIATE` transaction on an already-opened writer
@@ -414,7 +487,7 @@ pub(crate) fn write_on_connection<T>(
     conn: &mut Connection,
     f: impl FnOnce(&mut WriteTx<'_>) -> UaResult<T>,
 ) -> UaResult<T> {
-    run_write(conn, f).0
+    run_write(conn, None, f).0
 }
 
 /// One write transaction on `conn`: the result of `f` (or of the commit)
@@ -422,6 +495,7 @@ pub(crate) fn write_on_connection<T>(
 /// surviving events are recorded in a transaction of their own.
 fn run_write<T>(
     conn: &mut Connection,
+    deadline: Option<&Arc<AtomicU64>>,
     f: impl FnOnce(&mut WriteTx<'_>) -> UaResult<T>,
 ) -> (UaResult<T>, Vec<Event>) {
     let (failure, surviving) = {
@@ -429,9 +503,10 @@ fn run_write<T>(
             Ok(tx) => tx,
             Err(e) => return (Err(e.into()), Vec::new()),
         };
-        let mut wtx = WriteTx { tx, pending: Vec::new(), surviving: Vec::new() };
+        let mut wtx =
+            WriteTx { tx, deadline: deadline.map(Arc::clone), pending: Vec::new(), surviving: Vec::new() };
         let out = f(&mut wtx);
-        let WriteTx { tx, pending, surviving } = wtx;
+        let WriteTx { tx, pending, surviving, .. } = wtx;
         match out {
             Ok(v) => match tx.commit() {
                 Ok(()) => return (Ok(v), pending),
@@ -454,7 +529,7 @@ fn record_surviving(conn: &mut Connection, events: Vec<EventInput>) -> Vec<Event
     let n = events.len();
     let recorded = (|| -> UaResult<Vec<Event>> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut wtx = WriteTx { tx, pending: Vec::new(), surviving: Vec::new() };
+        let mut wtx = WriteTx { tx, deadline: None, pending: Vec::new(), surviving: Vec::new() };
         for ev in events {
             crate::ledger::append(&mut wtx, ev)?;
         }

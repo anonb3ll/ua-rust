@@ -19,11 +19,11 @@ pub mod types;
 pub mod write;
 
 pub use query::{
-    KHopRequest, KHopResult, NeighborItem, NeighborsRequest, NeighborsResult, SeedExpandGraphStats,
-    SeedExpandItem, SeedExpandRequest, SeedExpandResult, SeedInput, ShortestPathRequest, ShortestPathResult,
-    k_hop, neighbors, node_get, seed_expand, shortest_path,
+    KHopRequest, KHopResult, MAX_SKIP_HUBS_OVER, NeighborItem, NeighborsRequest, NeighborsResult,
+    SeedExpandGraphStats, SeedExpandItem, SeedExpandRequest, SeedExpandResult, SeedInput,
+    ShortestPathRequest, ShortestPathResult, k_hop, neighbors, node_get, seed_expand, shortest_path,
 };
-pub use schema::{SCHEMA, TENANT_PART, schema_parts};
+pub use schema::{COUNTERS_SCHEMA, COUNTERS_TENANT_PART, SCHEMA, TENANT_PART, schema_parts};
 pub use types::{
     AssertedByKind, EdgeKind, EdgeState, NodeKind, OwnerType, PrincipalId, Provenance, SourceKind,
     Visibility, WalkDirection, normalize_timestamp,

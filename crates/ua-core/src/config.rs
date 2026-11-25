@@ -129,6 +129,9 @@ pub struct Config {
     /// Maximum graph edges one organization may hold in `graph_edges`.
     /// Asserting a new edge past it is refused (`graph_quota_exceeded`).
     pub graph_max_edges_per_org: u64,
+    /// Maximum live (`valid_to IS NULL`) incident edges a single graph node
+    /// may carry. Prevents unbounded parallel-edge fanout DoS on a single node.
+    pub graph_max_live_edges_per_node: u64,
     /// Client evidence events (`evidence_append`) one identity may append per
     /// rolling hour. Past it the call is refused (`rate_limited`). Counted
     /// from the ledger, so it holds across restarts.
@@ -733,6 +736,7 @@ impl Default for Config {
             graph_canvas_history_max_bytes: 10_000_000,
             graph_max_nodes_per_org: 500_000,
             graph_max_edges_per_org: 2_000_000,
+            graph_max_live_edges_per_node: 5_000,
             evidence_append_max_per_hour: 120,
             evidence_append_max_bytes_per_hour: 2 * 1024 * 1024,
             shell_allowlist: Vec::new(),

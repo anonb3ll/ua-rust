@@ -90,6 +90,8 @@ pub struct AssertEdgeRequest {
     pub generic: bool,
     /// Per-organization edge quota (`0` disables the quota check).
     pub max_edges_per_org: u64,
+    /// Per-node live (`valid_to IS NULL`) incident edge cap (`0` disables the check).
+    pub max_live_edges_per_node: u64,
     /// Write-time acyclicity bounds (defaults to `1,000` nodes / `5,000` edges / `50 ms`).
     pub cycle_bounds: CycleCheckBounds,
 }
@@ -163,6 +165,7 @@ pub fn check_acyclic<R: GraphRead>(
         kind.as_str(),
         bounds.max_nodes,
         bounds.max_edges,
+        started + deadline,
     )?;
     if started.elapsed() >= deadline {
         return Err(UaError::invalid_code(
@@ -271,6 +274,9 @@ pub fn graph_node_ensure<R: GraphRepo>(
     let seq = repo.record_event(EVENT_NODE_CREATED, payload, originator)?;
     let (source_kind, source_ref) = match (req.provenance.source_kind, seq) {
         (SourceKind::Event, Some(s)) => (SourceKind::Event.as_str().to_string(), format!("event:{s}")),
+        (SourceKind::Event, None) => {
+            (SourceKind::Tool.as_str().to_string(), req.provenance.source_ref.trim().to_string())
+        }
         (k, _) => (k.as_str().to_string(), req.provenance.source_ref.trim().to_string()),
     };
 
@@ -317,6 +323,12 @@ pub fn assert_edge<R: GraphRepo>(repo: &mut R, req: AssertEdgeRequest) -> UaResu
 
     if !req.weight.is_finite() || req.weight <= 0.0 || req.weight > 1000.0 {
         return Err(UaError::invalid("weight must be finite and in (0.0, 1000.0]"));
+    }
+    if req.generic && !req.assertion_scope.is_empty() {
+        return Err(UaError::denied(
+            "reserved_assertion_scope",
+            "generic graph edge assertions must use an empty assertion_scope; scoped assertions are reserved for domain code",
+        ));
     }
     if req.assertion_scope.len() > ASSERTION_SCOPE_MAX_BYTES {
         return Err(UaError::invalid(format!(
@@ -396,6 +408,22 @@ pub fn assert_edge<R: GraphRepo>(repo: &mut R, req: AssertEdgeRequest) -> UaResu
         }
     }
 
+    if req.max_live_edges_per_node > 0 && req.valid_to.is_none() {
+        let cap = req.max_live_edges_per_node.min(usize::MAX as u64) as usize;
+        for endpoint_id in [&src.id, &dst.id] {
+            let live_count = repo.count_node_live_edges_capped(&req.org_id, endpoint_id, cap)?;
+            if live_count >= cap {
+                return Err(UaError::denied(
+                    "node_edge_limit_exceeded",
+                    format!(
+                        "graph node {endpoint_id} has reached graph_max_live_edges_per_node ({})",
+                        req.max_live_edges_per_node
+                    ),
+                ));
+            }
+        }
+    }
+
     // Write-time bounded acyclicity check (fail-closed).
     if req.kind.is_acyclic() && req.valid_to.is_none() {
         check_acyclic(repo, &req.org_id, &src.id, &dst.id, req.kind, req.cycle_bounds)?;
@@ -461,6 +489,9 @@ pub fn assert_edge<R: GraphRepo>(repo: &mut R, req: AssertEdgeRequest) -> UaResu
             (SourceKind::Event.as_str().to_string(), format!("event:{s}"))
         }
         (SourceKind::Event, Some(s)) => (SourceKind::Event.as_str().to_string(), format!("event:{s}")),
+        (SourceKind::Event, None) => {
+            (SourceKind::Tool.as_str().to_string(), req.provenance.source_ref.trim().to_string())
+        }
         (k, _) => (k.as_str().to_string(), req.provenance.source_ref.trim().to_string()),
     };
 

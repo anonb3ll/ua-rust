@@ -100,6 +100,7 @@ fn ddl_immutability_triggers_and_system_check_constraints() {
                     scope: VisibilityScope::org_only(),
                     generic: false,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )
@@ -419,6 +420,7 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
                     scope: VisibilityScope::org_only(),
                     generic: false,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )?;
@@ -447,6 +449,7 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
                     scope: VisibilityScope::org_only(),
                     generic: false,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )
@@ -476,6 +479,7 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
                     scope: VisibilityScope::org_only(),
                     generic: false,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds { max_nodes: 5, max_edges: 5_000, deadline_ms: 50 },
                 },
             )
@@ -486,7 +490,7 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
 
     // 3. Edge-cap bound hit => cycle_check_bound_exceeded
     let edge_bound_err = db
-        .read(|conn| {
+        .read_mut(|conn| {
             let mut repo = SqliteGraph::new(conn);
             check_acyclic(
                 &mut repo,
@@ -503,7 +507,7 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
 
     // 4. Deadline bound hit (0 ms) => cycle_check_bound_exceeded
     let deadline_err = db
-        .read(|conn| {
+        .read_mut(|conn| {
             let mut repo = SqliteGraph::new(conn);
             check_acyclic(
                 &mut repo,
@@ -528,7 +532,7 @@ fn assert_never_creates_nodes_and_validates_endpoint_kinds() {
     let foreign_note = ensure_org_node(&db, "org-b", NodeKind::MemoryNote, "mn-foreign");
 
     // Missing endpoint -> not_found, node count unchanged.
-    let before_count = db.read(|c| SqliteGraph::new(c).count_org_nodes(DEFAULT_ORG)).unwrap();
+    let before_count = db.read_mut(|c| SqliteGraph::new(c).count_org_nodes(DEFAULT_ORG)).unwrap();
     let miss_err = db
         .write(|tx| {
             assert_edge(
@@ -548,6 +552,7 @@ fn assert_never_creates_nodes_and_validates_endpoint_kinds() {
                     scope: VisibilityScope::org_only(),
                     generic: true,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )
@@ -572,6 +577,7 @@ fn assert_never_creates_nodes_and_validates_endpoint_kinds() {
                     scope: VisibilityScope::org_only(),
                     generic: true,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )
@@ -580,7 +586,7 @@ fn assert_never_creates_nodes_and_validates_endpoint_kinds() {
     assert_eq!(miss_err.code(), "not_found");
     assert_eq!(foreign_err.code(), "not_found");
     assert_eq!(miss_err.to_string(), foreign_err.to_string(), "zero existence oracle");
-    let after_count = db.read(|c| SqliteGraph::new(c).count_org_nodes(DEFAULT_ORG)).unwrap();
+    let after_count = db.read_mut(|c| SqliteGraph::new(c).count_org_nodes(DEFAULT_ORG)).unwrap();
     assert_eq!(before_count, after_count, "assert_edge must never create nodes");
 
     // Endpoint-kind mismatch: `depends_on` between `goal` nodes -> invalid_endpoint_kind.
@@ -603,6 +609,7 @@ fn assert_never_creates_nodes_and_validates_endpoint_kinds() {
                     scope: VisibilityScope::org_only(),
                     generic: false,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )
@@ -631,6 +638,7 @@ fn assert_never_creates_nodes_and_validates_endpoint_kinds() {
                     scope: VisibilityScope::org_only(),
                     generic: true,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )
@@ -667,6 +675,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
                     scope: VisibilityScope::org_only(),
                     generic: true,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )?;
@@ -687,6 +696,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
                     scope: VisibilityScope::org_only(),
                     generic: true,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )?;
@@ -698,7 +708,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
     let owner = VisibilityScope::for_principal("agent", "owner-1", vec![]);
 
     let snapshot = |scope: &VisibilityScope| {
-        db.read(|conn| {
+        db.read_mut(|conn| {
             let mut repo = SqliteGraph::new(conn);
             let nbrs = neighbors(
                 &mut repo,
@@ -817,6 +827,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
                     scope: owner.clone(),
                     generic: true,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )?;
@@ -856,6 +867,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
                     scope: VisibilityScope::org_only(),
                     generic: false,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )
@@ -863,7 +875,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
         .expect("import historical edge");
 
     let at_mid = db
-        .read(|conn| {
+        .read_mut(|conn| {
             let mut repo = SqliteGraph::new(conn);
             neighbors(
                 &mut repo,
@@ -889,7 +901,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
     assert_eq!(at_mid.neighbors[0].edge.id, hist_edge.id);
 
     let at_end = db
-        .read(|conn| {
+        .read_mut(|conn| {
             let mut repo = SqliteGraph::new(conn);
             neighbors(
                 &mut repo,
@@ -930,7 +942,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
     .expect("retract e_ab");
 
     let missing_node_err = db
-        .read(|c| node_get(&mut SqliteGraph::new(c), DEFAULT_ORG, Some("no-such"), None, None, &outsider))
+        .read_mut(|c| node_get(&mut SqliteGraph::new(c), DEFAULT_ORG, Some("no-such"), None, None, &outsider))
         .unwrap_err();
     assert!(matches!(missing_node_err, UaError::NotFound(_)));
 }
@@ -1008,6 +1020,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
                     scope: VisibilityScope::org_only(),
                     generic: false,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )
@@ -1032,6 +1045,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
                 scope: VisibilityScope::org_only(),
                 generic: false,
                 max_edges_per_org: 0,
+                max_live_edges_per_node: 0,
                 cycle_bounds: CycleCheckBounds::default(),
             },
         )
@@ -1068,6 +1082,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
                 scope: VisibilityScope::org_only(),
                 generic: false,
                 max_edges_per_org: 0,
+                max_live_edges_per_node: 0,
                 cycle_bounds: CycleCheckBounds::default(),
             },
         )
@@ -1097,6 +1112,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
                     scope: VisibilityScope::org_only(),
                     generic: true,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )?;
@@ -1107,7 +1123,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
 
     let scope = VisibilityScope::org_only();
     let page1 = db
-        .read(|c| {
+        .read_mut(|c| {
             neighbors(
                 &mut SqliteGraph::new(c),
                 NeighborsRequest {
@@ -1133,7 +1149,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
     assert_eq!(page1.neighbors[0].node.id, v2.id);
 
     let page2 = db
-        .read(|c| {
+        .read_mut(|c| {
             neighbors(
                 &mut SqliteGraph::new(c),
                 NeighborsRequest {
@@ -1160,7 +1176,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
 
     // Cycle immunity on v1 <-> v2 and hard-cap refusals (> 4 hops, > 6 depth).
     let cyc_khop = db
-        .read(|c| {
+        .read_mut(|c| {
             k_hop(
                 &mut SqliteGraph::new(c),
                 KHopRequest {
@@ -1186,7 +1202,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
     assert_eq!(cyc_khop.nodes.len(), 3);
 
     let bad_hops = db
-        .read(|c| {
+        .read_mut(|c| {
             k_hop(
                 &mut SqliteGraph::new(c),
                 KHopRequest {
@@ -1212,7 +1228,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
     assert_eq!(bad_hops.code(), "invalid_argument");
 
     let bad_depth = db
-        .read(|c| {
+        .read_mut(|c| {
             shortest_path(
                 &mut SqliteGraph::new(c),
                 ShortestPathRequest {
@@ -1232,4 +1248,988 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
         })
         .unwrap_err();
     assert_eq!(bad_depth.code(), "invalid_argument");
+}
+
+#[test]
+fn org_quota_counters_are_trigger_maintained_transactional_and_enforced() {
+    let db = open_graph_db();
+
+    assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_nodes(DEFAULT_ORG)).unwrap(), 0);
+    assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_edges(DEFAULT_ORG)).unwrap(), 0);
+
+    // Insert 2 nodes in default org and 1 in org-b; verify O(1) counter table matches exact row counts.
+    let n1 = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "q-1");
+    let n2 = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "q-2");
+    let _b1 = ensure_org_node(&db, "org-b", NodeKind::MemoryNote, "qb-1");
+
+    assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_nodes(DEFAULT_ORG)).unwrap(), 2);
+    assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_nodes("org-b")).unwrap(), 1);
+
+    // Rolled-back transaction must NOT leave stale increments in graph_org_counts.
+    let rollback: Result<(), UaError> = db.write(|tx| {
+        graph_node_ensure(
+            tx,
+            EnsureNodeRequest {
+                org_id: DEFAULT_ORG.into(),
+                kind: NodeKind::MemoryNote,
+                external_id: "q-rolled-back".into(),
+                display_label: None,
+                visibility: Visibility::Org,
+                team_id: None,
+                owner_type: None,
+                owner_id: None,
+                provenance: prov_agent("builder-1"),
+                meta_json: None,
+                max_nodes_per_org: 0,
+            },
+        )?;
+        Err(UaError::invalid("force rollback"))
+    });
+    assert!(rollback.is_err());
+    assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_nodes(DEFAULT_ORG)).unwrap(), 2);
+
+    // Node quota enforced at max_nodes_per_org = 2.
+    let node_quota_err = db
+        .write(|tx| {
+            graph_node_ensure(
+                tx,
+                EnsureNodeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    kind: NodeKind::MemoryNote,
+                    external_id: "q-3".into(),
+                    display_label: None,
+                    visibility: Visibility::Org,
+                    team_id: None,
+                    owner_type: None,
+                    owner_id: None,
+                    provenance: prov_agent("builder-1"),
+                    meta_json: None,
+                    max_nodes_per_org: 2,
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(node_quota_err.code(), "denied");
+    assert_eq!(node_quota_err.reason_code(), Some("graph_quota_exceeded"));
+
+    // Assert 1 edge -> counter becomes 1; second edge with max_edges_per_org = 1 is refused.
+    db.write(|tx| {
+        assert_edge(
+            tx,
+            AssertEdgeRequest {
+                org_id: DEFAULT_ORG.into(),
+                src_id: n1.id.clone(),
+                dst_id: n2.id.clone(),
+                kind: EdgeKind::Extends,
+                assertion_scope: String::new(),
+                state: EdgeState::Active,
+                weight: 1.0,
+                provenance: prov_agent("builder-1"),
+                valid_from: None,
+                valid_to: None,
+                meta_json: None,
+                scope: VisibilityScope::org_only(),
+                generic: true,
+                max_edges_per_org: 2,
+                max_live_edges_per_node: 0,
+                cycle_bounds: CycleCheckBounds::default(),
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_edges(DEFAULT_ORG)).unwrap(), 1);
+    assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_edges("org-b")).unwrap(), 0);
+
+    let edge_quota_err = db
+        .write(|tx| {
+            assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: n2.id.clone(),
+                    dst_id: n1.id.clone(),
+                    kind: EdgeKind::Extends,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_agent("builder-1"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: true,
+                    max_edges_per_org: 1,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: CycleCheckBounds::default(),
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(edge_quota_err.code(), "denied");
+    assert_eq!(edge_quota_err.reason_code(), Some("graph_quota_exceeded"));
+}
+
+/// Wrapper that delegates `GraphRepo` to `WriteTx` except `record_event` returns `None`,
+/// exercising the no-ledger-seq `source_kind` fallback cleanly.
+struct NoLedgerRepo<'a, 'b>(&'a mut ua_store::db::WriteTx<'b>);
+
+impl GraphRead for NoLedgerRepo<'_, '_> {
+    fn require_org_exists(&mut self, org_id: &str) -> ua_core::UaResult<()> {
+        self.0.require_org_exists(org_id)
+    }
+    fn get_node_by_id(
+        &mut self,
+        org_id: &str,
+        id: &str,
+        scope: &VisibilityScope,
+    ) -> ua_core::UaResult<Option<ua_store::graph::GraphNodeRow>> {
+        self.0.get_node_by_id(org_id, id, scope)
+    }
+    fn get_node_by_external(
+        &mut self,
+        org_id: &str,
+        kind: &str,
+        external_id: &str,
+        scope: &VisibilityScope,
+    ) -> ua_core::UaResult<Option<ua_store::graph::GraphNodeRow>> {
+        self.0.get_node_by_external(org_id, kind, external_id, scope)
+    }
+    fn get_nodes_by_ids(
+        &mut self,
+        org_id: &str,
+        ids: &[String],
+        scope: &VisibilityScope,
+    ) -> ua_core::UaResult<Vec<ua_store::graph::GraphNodeRow>> {
+        self.0.get_nodes_by_ids(org_id, ids, scope)
+    }
+    fn get_edge_by_id(
+        &mut self,
+        org_id: &str,
+        id: &str,
+    ) -> ua_core::UaResult<Option<ua_store::graph::GraphEdgeRow>> {
+        self.0.get_edge_by_id(org_id, id)
+    }
+    fn get_edges_by_ids(
+        &mut self,
+        org_id: &str,
+        ids: &[String],
+    ) -> ua_core::UaResult<Vec<ua_store::graph::GraphEdgeRow>> {
+        self.0.get_edges_by_ids(org_id, ids)
+    }
+    fn get_edges_by_rowids(
+        &mut self,
+        org_id: &str,
+        rowids: &[i64],
+    ) -> ua_core::UaResult<Vec<(i64, ua_store::graph::GraphEdgeRow)>> {
+        self.0.get_edges_by_rowids(org_id, rowids)
+    }
+    fn count_org_nodes(&mut self, org_id: &str) -> ua_core::UaResult<u64> {
+        self.0.count_org_nodes(org_id)
+    }
+    fn count_org_edges(&mut self, org_id: &str) -> ua_core::UaResult<u64> {
+        self.0.count_org_edges(org_id)
+    }
+    fn count_node_live_edges_capped(
+        &mut self,
+        org_id: &str,
+        node_id: &str,
+        cap: usize,
+    ) -> ua_core::UaResult<usize> {
+        self.0.count_node_live_edges_capped(org_id, node_id, cap)
+    }
+    fn with_deadline<F, T>(&mut self, deadline: std::time::Instant, f: F) -> ua_core::UaResult<T>
+    where
+        Self: Sized,
+        F: FnOnce(&mut Self) -> ua_core::UaResult<T>,
+    {
+        if std::time::Instant::now() >= deadline {
+            return Err(UaError::invalid_code(ua_store::graph::DEADLINE_REASON_CODE, "deadline"));
+        }
+        f(self)
+    }
+    fn adjacent_edges(
+        &mut self,
+        query: &ua_store::graph::AdjacencyQuery,
+    ) -> ua_core::UaResult<Vec<ua_store::graph::AdjacencyEntry>> {
+        self.0.adjacent_edges(query)
+    }
+    fn compact_adjacent(
+        &mut self,
+        org_id: &str,
+        node_id: &str,
+        direction: EdgeDirection,
+        filter: &ua_store::graph::EdgeFilter,
+        scope: &VisibilityScope,
+        limit: usize,
+    ) -> ua_core::UaResult<Vec<ua_store::graph::CompactAdjEdge>> {
+        self.0.compact_adjacent(org_id, node_id, direction, filter, scope, limit)
+    }
+    fn with_compact_adjacent<F, T>(
+        &mut self,
+        org_id: &str,
+        directions: EdgeDirection,
+        filter: &ua_store::graph::EdgeFilter,
+        scope: &VisibilityScope,
+        f: F,
+    ) -> ua_core::UaResult<T>
+    where
+        F: FnOnce(
+            &mut dyn FnMut(
+                &str,
+                EdgeDirection,
+                usize,
+                &mut Vec<ua_store::graph::CompactAdjEdge>,
+            ) -> ua_core::UaResult<()>,
+        ) -> ua_core::UaResult<T>,
+    {
+        self.0.with_compact_adjacent(org_id, directions, filter, scope, f)
+    }
+    fn bounded_acyclic_reach(
+        &mut self,
+        org_id: &str,
+        src_id: &str,
+        dst_id: &str,
+        kind: &str,
+        max_nodes: usize,
+        max_edges: usize,
+        deadline: std::time::Instant,
+    ) -> ua_core::UaResult<ua_store::graph::AcyclicReachOutcome> {
+        self.0.bounded_acyclic_reach(org_id, src_id, dst_id, kind, max_nodes, max_edges, deadline)
+    }
+    fn eligible_degree(
+        &mut self,
+        org_id: &str,
+        node_id: &str,
+        direction: EdgeDirection,
+        filter: &ua_store::graph::EdgeFilter,
+        scope: &VisibilityScope,
+        cap_plus_one: usize,
+    ) -> ua_core::UaResult<usize> {
+        self.0.eligible_degree(org_id, node_id, direction, filter, scope, cap_plus_one)
+    }
+    fn outgoing_live_targets_of_kind_into(
+        &mut self,
+        org_id: &str,
+        src_id: &str,
+        kind: &str,
+        limit: usize,
+        out: &mut Vec<String>,
+    ) -> ua_core::UaResult<()> {
+        self.0.outgoing_live_targets_of_kind_into(org_id, src_id, kind, limit, out)
+    }
+    fn exact_ppr_slice(
+        &mut self,
+        org_id: &str,
+        filter: &ua_store::graph::EdgeFilter,
+        scope: &VisibilityScope,
+        max_nodes: usize,
+        max_edges: usize,
+    ) -> ua_core::UaResult<Option<ua_store::graph::ExactPprSlice>> {
+        self.0.exact_ppr_slice(org_id, filter, scope, max_nodes, max_edges)
+    }
+}
+
+impl GraphRepo for NoLedgerRepo<'_, '_> {
+    fn find_node_by_external_internal(
+        &mut self,
+        org_id: &str,
+        kind: &str,
+        external_id: &str,
+    ) -> ua_core::UaResult<Option<ua_store::graph::GraphNodeRow>> {
+        self.0.find_node_by_external_internal(org_id, kind, external_id)
+    }
+    fn ensure_node(
+        &mut self,
+        node: &NewGraphNode,
+    ) -> ua_core::UaResult<(ua_store::graph::GraphNodeRow, bool)> {
+        self.0.ensure_node(node)
+    }
+    fn insert_edge(&mut self, edge: &NewGraphEdge) -> ua_core::UaResult<ua_store::graph::GraphEdgeRow> {
+        self.0.insert_edge(edge)
+    }
+    fn insert_nodes_batch(&mut self, nodes: &[NewGraphNode]) -> ua_core::UaResult<usize> {
+        self.0.insert_nodes_batch(nodes)
+    }
+    fn insert_edges_batch(&mut self, edges: &[NewGraphEdge]) -> ua_core::UaResult<usize> {
+        self.0.insert_edges_batch(edges)
+    }
+    fn close_edge(
+        &mut self,
+        org_id: &str,
+        edge_id: &str,
+        valid_to: &str,
+    ) -> ua_core::UaResult<Option<ua_store::graph::GraphEdgeRow>> {
+        self.0.close_edge(org_id, edge_id, valid_to)
+    }
+    fn record_event(
+        &mut self,
+        _channel: &str,
+        _payload: serde_json::Value,
+        _originator: &str,
+    ) -> ua_core::UaResult<Option<i64>> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn generic_assertion_scope_refused_per_node_live_cap_and_source_kind_fallback() {
+    let db = open_graph_db();
+    let n1 = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "s1");
+    let n2 = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "s2");
+    let n3 = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "s3");
+    let n4 = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "s4");
+
+    // 1. Generic assert with non-empty assertion_scope is refused (`reserved_assertion_scope`).
+    let scope_err = db
+        .write(|tx| {
+            assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: n1.id.clone(),
+                    dst_id: n2.id.clone(),
+                    kind: EdgeKind::Extends,
+                    assertion_scope: "note:42".into(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_agent("builder-1"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: true,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: CycleCheckBounds::default(),
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(scope_err.code(), "denied");
+    assert_eq!(scope_err.reason_code(), Some("reserved_assertion_scope"));
+
+    // Domain-internal assert (generic = false) MAY use `note:` scopes.
+    let scoped = db
+        .write(|tx| {
+            assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: n1.id.clone(),
+                    dst_id: n2.id.clone(),
+                    kind: EdgeKind::Evidence,
+                    assertion_scope: "note:42".into(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_agent("builder-1"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: false,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: CycleCheckBounds::default(),
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(scoped.assertion_scope, "note:42");
+
+    // 2. Per-node live-edge cap counts out + in live edges on both endpoints and releases on retract.
+    // n1 currently has 1 live outgoing edge (n1 -> n2). Add 1 incoming (n3 -> n1) with cap = 2 -> succeeds.
+    let e_in = db
+        .write(|tx| {
+            assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: n3.id.clone(),
+                    dst_id: n1.id.clone(),
+                    kind: EdgeKind::Extends,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_agent("builder-1"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: true,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 2,
+                    cycle_bounds: CycleCheckBounds::default(),
+                },
+            )
+        })
+        .unwrap();
+
+    // Now n1 has 2 live incident edges (1 out + 1 in); a 3rd edge touching n1 (as src or dst) is refused.
+    for (src, dst) in [(&n1.id, &n4.id), (&n4.id, &n1.id)] {
+        let cap_err = db
+            .write(|tx| {
+                assert_edge(
+                    tx,
+                    AssertEdgeRequest {
+                        org_id: DEFAULT_ORG.into(),
+                        src_id: src.clone(),
+                        dst_id: dst.clone(),
+                        kind: EdgeKind::Extends,
+                        assertion_scope: String::new(),
+                        state: EdgeState::Active,
+                        weight: 1.0,
+                        provenance: prov_agent("builder-1"),
+                        valid_from: None,
+                        valid_to: None,
+                        meta_json: None,
+                        scope: VisibilityScope::org_only(),
+                        generic: true,
+                        max_edges_per_org: 0,
+                        max_live_edges_per_node: 2,
+                        cycle_bounds: CycleCheckBounds::default(),
+                    },
+                )
+            })
+            .unwrap_err();
+        assert_eq!(cap_err.code(), "denied");
+        assert_eq!(cap_err.reason_code(), Some("node_edge_limit_exceeded"));
+    }
+
+    // Retracting e_in frees a live-edge slot on n1 so n1 -> n4 succeeds under cap = 2.
+    db.write(|tx| {
+        retract_edge(
+            tx,
+            RetractEdgeRequest {
+                org_id: DEFAULT_ORG.into(),
+                edge_id: e_in.id.clone(),
+                retractor: PrincipalId::new("builder-1").unwrap(),
+                retractor_kind: AssertedByKind::Agent,
+                valid_to: None,
+                generic: true,
+            },
+        )?;
+        assert_edge(
+            tx,
+            AssertEdgeRequest {
+                org_id: DEFAULT_ORG.into(),
+                src_id: n1.id.clone(),
+                dst_id: n4.id.clone(),
+                kind: EdgeKind::Extends,
+                assertion_scope: String::new(),
+                state: EdgeState::Active,
+                weight: 1.0,
+                provenance: prov_agent("builder-1"),
+                valid_from: None,
+                valid_to: None,
+                meta_json: None,
+                scope: VisibilityScope::org_only(),
+                generic: true,
+                max_edges_per_org: 0,
+                max_live_edges_per_node: 2,
+                cycle_bounds: CycleCheckBounds::default(),
+            },
+        )
+    })
+    .expect("retracting frees per-node live-edge capacity");
+
+    // 3. No-ledger-seq fallback: when record_event returns None, SourceKind::Event falls back to `tool`.
+    let (nl_node, nl_edge) = db
+        .write(|tx| {
+            let mut repo = NoLedgerRepo(tx);
+            let (node, _) = graph_node_ensure(
+                &mut repo,
+                EnsureNodeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    kind: NodeKind::MemoryNote,
+                    external_id: "no-ledger-node".into(),
+                    display_label: None,
+                    visibility: Visibility::Org,
+                    team_id: None,
+                    owner_type: None,
+                    owner_id: None,
+                    provenance: prov_agent("builder-1"),
+                    meta_json: None,
+                    max_nodes_per_org: 0,
+                },
+            )?;
+            let edge = assert_edge(
+                &mut repo,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: node.id.clone(),
+                    dst_id: n2.id.clone(),
+                    kind: EdgeKind::Extends,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_agent("builder-1"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: true,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: CycleCheckBounds::default(),
+                },
+            )?;
+            Ok((node, edge))
+        })
+        .unwrap();
+    assert_eq!(nl_node.source_kind, "tool");
+    assert_eq!(nl_node.source_ref, "tool:test");
+    assert_eq!(nl_edge.source_kind, "tool");
+    assert_eq!(nl_edge.source_ref, "tool:test");
+}
+
+#[test]
+fn sql_deadline_enforcement_exact_ppr_scan_cap_skip_hubs_clamp_and_endpoint_node_kinds() {
+    let db = open_graph_db();
+    let n_a = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "dn-a");
+    let n_b = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "dn-b");
+    let t_a = ensure_org_node(&db, DEFAULT_ORG, NodeKind::Task, "dt-a");
+
+    // 1. Live SQLite progress_handler interrupts an already-expired deadline and cleans up cleanly.
+    db.read_mut(|conn| {
+        {
+            let mut repo = SqliteGraph::new(conn);
+            let past = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(10))
+                .unwrap_or_else(std::time::Instant::now);
+            let err = repo
+                .with_deadline(past, |r| r.get_node_by_id(DEFAULT_ORG, &n_a.id, &VisibilityScope::org_only()))
+                .unwrap_err();
+            assert!(ua_store::graph::is_deadline_error(&err));
+        }
+
+        // Verify progress_handler actually interrupts a heavy recursive SQL query mid-execution
+        // and leaves the connection clean for subsequent reads.
+        let soon = std::time::Instant::now() + std::time::Duration::from_millis(5);
+        conn.progress_handler(1_000, Some(move || std::time::Instant::now() >= soon))?;
+        let sql_res: rusqlite::Result<i64> = conn.query_row(
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 100000000) \
+             SELECT MAX(x) FROM cnt",
+            [],
+            |r| r.get(0),
+        );
+        conn.progress_handler(0, None::<fn() -> bool>)?;
+        assert!(sql_res.is_err(), "progress_handler must interrupt long-running SQL");
+        assert!(
+            SqliteGraph::new(conn)
+                .get_node_by_id(DEFAULT_ORG, &n_a.id, &VisibilityScope::org_only())?
+                .is_some()
+        );
+        Ok(())
+    })
+    .unwrap();
+
+    // 2. bounded_acyclic_reach respects SQL deadline and returns BoundExceeded("deadline").
+    let past = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(10))
+        .unwrap_or_else(std::time::Instant::now);
+    let reach = db
+        .read_mut(|conn| {
+            SqliteGraph::new(conn).bounded_acyclic_reach(
+                DEFAULT_ORG,
+                &n_a.id,
+                &n_b.id,
+                "depends_on",
+                1_000,
+                5_000,
+                past,
+            )
+        })
+        .unwrap();
+    assert_eq!(reach, ua_store::graph::AcyclicReachOutcome::BoundExceeded("deadline"));
+
+    // 3. exact_ppr_slice scan cap: seed 25 private edges (invisible to outsider) + 1 visible edge;
+    //    with max_edges = 10 (scan_cap = 20), exact_ppr_slice stops scanning and returns Ok(None).
+    let owner = VisibilityScope::for_principal("agent", "owner-scan", vec![]);
+    let outsider = VisibilityScope::for_principal("agent", "outsider-scan", vec![]);
+    db.write(|tx| {
+        assert_edge(
+            tx,
+            AssertEdgeRequest {
+                org_id: DEFAULT_ORG.into(),
+                src_id: n_a.id.clone(),
+                dst_id: n_b.id.clone(),
+                kind: EdgeKind::Extends,
+                assertion_scope: String::new(),
+                state: EdgeState::Active,
+                weight: 1.0,
+                provenance: prov_agent("owner-scan"),
+                valid_from: None,
+                valid_to: None,
+                meta_json: None,
+                scope: owner.clone(),
+                generic: true,
+                max_edges_per_org: 0,
+                max_live_edges_per_node: 0,
+                cycle_bounds: CycleCheckBounds::default(),
+            },
+        )?;
+        let mut priv_nodes = Vec::new();
+        for i in 0..26 {
+            let (pn, _) = graph_node_ensure(
+                tx,
+                EnsureNodeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    kind: NodeKind::MemoryNote,
+                    external_id: format!("scan-priv-{i}"),
+                    display_label: None,
+                    visibility: Visibility::Private,
+                    team_id: None,
+                    owner_type: Some(OwnerType::Agent),
+                    owner_id: Some("owner-scan".into()),
+                    provenance: prov_agent("owner-scan"),
+                    meta_json: None,
+                    max_nodes_per_org: 0,
+                },
+            )?;
+            priv_nodes.push(pn);
+        }
+        for w in priv_nodes.windows(2) {
+            assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: w[0].id.clone(),
+                    dst_id: w[1].id.clone(),
+                    kind: EdgeKind::Extends,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_agent("owner-scan"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: owner.clone(),
+                    generic: true,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: CycleCheckBounds::default(),
+                },
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    let slice = db
+        .read_mut(|conn| {
+            let filter = ua_store::graph::EdgeFilter {
+                as_of: ua_core::time::now(),
+                edge_kinds: vec![],
+                node_kinds: vec![],
+                include_proposed: false,
+            };
+            SqliteGraph::new(conn).exact_ppr_slice(DEFAULT_ORG, &filter, &outsider, 5_000, 10)
+        })
+        .unwrap();
+    assert!(slice.is_none(), "exact_ppr_slice must bail out once scanned edges exceed scan cap");
+
+    // 4. skip_hubs_over = usize::MAX is clamped safely (never wraps to SQL LIMIT -1).
+    let kh = db
+        .read_mut(|conn| {
+            k_hop(
+                &mut SqliteGraph::new(conn),
+                KHopRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    seed_ids: vec![n_a.id.clone()],
+                    max_hops: Some(2),
+                    direction: EdgeDirection::Out,
+                    edge_kinds: vec![],
+                    node_kinds: vec![],
+                    as_of: None,
+                    include_proposed: false,
+                    max_nodes: Some(50),
+                    max_edges: Some(50),
+                    max_degree_per_node: Some(50),
+                    max_visited_edges: Some(500),
+                    skip_hubs_over: Some(usize::MAX),
+                    deadline_ms: Some(500),
+                    scope: outsider.clone(),
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(kh.nodes.len(), 2);
+
+    let ppr = db
+        .read_mut(|conn| {
+            seed_expand(
+                &mut SqliteGraph::new(conn),
+                SeedExpandRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    seeds: vec![SeedInput { node_id: n_a.id.clone(), weight: 1.0 }],
+                    edge_kinds: vec![],
+                    node_kinds: vec![],
+                    as_of: None,
+                    include_proposed: false,
+                    walk_direction: WalkDirection::Undirected,
+                    damping: None,
+                    max_iters: None,
+                    eps: None,
+                    max_results: Some(10),
+                    skip_hubs_over: Some(usize::MAX),
+                    deadline_ms: Some(500),
+                    scope: outsider.clone(),
+                },
+            )
+        })
+        .unwrap();
+    assert!(!ppr.results.is_empty());
+
+    // 5. shortest_path checks node_kinds on both endpoints (including self-path and direct edge).
+    db.write(|tx| {
+        assert_edge(
+            tx,
+            AssertEdgeRequest {
+                org_id: DEFAULT_ORG.into(),
+                src_id: n_a.id.clone(),
+                dst_id: t_a.id.clone(),
+                kind: EdgeKind::Evidence,
+                assertion_scope: String::new(),
+                state: EdgeState::Active,
+                weight: 1.0,
+                provenance: prov_agent("builder-1"),
+                valid_from: None,
+                valid_to: None,
+                meta_json: None,
+                scope: VisibilityScope::org_only(),
+                generic: false,
+                max_edges_per_org: 0,
+                max_live_edges_per_node: 0,
+                cycle_bounds: CycleCheckBounds::default(),
+            },
+        )
+    })
+    .unwrap();
+
+    // Direct edge n_a (memory_note) -> t_a (task): filtering node_kinds = [Task] must exclude n_a!
+    let sp_endpoint_filtered = db
+        .read_mut(|conn| {
+            shortest_path(
+                &mut SqliteGraph::new(conn),
+                ShortestPathRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    from_id: n_a.id.clone(),
+                    to_id: t_a.id.clone(),
+                    direction: EdgeDirection::Out,
+                    edge_kinds: vec![],
+                    node_kinds: vec![NodeKind::Task],
+                    as_of: None,
+                    include_proposed: false,
+                    max_depth: Some(4),
+                    deadline_ms: Some(500),
+                    scope: outsider.clone(),
+                },
+            )
+        })
+        .unwrap();
+    assert!(!sp_endpoint_filtered.found, "shortest_path must check node_kinds on from_id");
+
+    // Self-path on n_a (memory_note) with node_kinds = [Task] must also return found = false.
+    let sp_self_filtered = db
+        .read_mut(|conn| {
+            shortest_path(
+                &mut SqliteGraph::new(conn),
+                ShortestPathRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    from_id: n_a.id.clone(),
+                    to_id: n_a.id.clone(),
+                    direction: EdgeDirection::Out,
+                    edge_kinds: vec![],
+                    node_kinds: vec![NodeKind::Task],
+                    as_of: None,
+                    include_proposed: false,
+                    max_depth: Some(4),
+                    deadline_ms: Some(500),
+                    scope: outsider.clone(),
+                },
+            )
+        })
+        .unwrap();
+    assert!(!sp_self_filtered.found, "shortest_path self-path must respect node_kinds");
+
+    // 6. neighbors returns truncated = true when SQL hits its deadline.
+    struct DeadlineHitRead<'a>(SqliteGraph<'a>);
+    impl GraphRead for DeadlineHitRead<'_> {
+        fn require_org_exists(&mut self, org_id: &str) -> ua_core::UaResult<()> {
+            self.0.require_org_exists(org_id)
+        }
+        fn get_node_by_id(
+            &mut self,
+            org_id: &str,
+            id: &str,
+            scope: &VisibilityScope,
+        ) -> ua_core::UaResult<Option<ua_store::graph::GraphNodeRow>> {
+            self.0.get_node_by_id(org_id, id, scope)
+        }
+        fn get_node_by_external(
+            &mut self,
+            org_id: &str,
+            kind: &str,
+            external_id: &str,
+            scope: &VisibilityScope,
+        ) -> ua_core::UaResult<Option<ua_store::graph::GraphNodeRow>> {
+            self.0.get_node_by_external(org_id, kind, external_id, scope)
+        }
+        fn get_nodes_by_ids(
+            &mut self,
+            org_id: &str,
+            ids: &[String],
+            scope: &VisibilityScope,
+        ) -> ua_core::UaResult<Vec<ua_store::graph::GraphNodeRow>> {
+            self.0.get_nodes_by_ids(org_id, ids, scope)
+        }
+        fn get_edge_by_id(
+            &mut self,
+            org_id: &str,
+            id: &str,
+        ) -> ua_core::UaResult<Option<ua_store::graph::GraphEdgeRow>> {
+            self.0.get_edge_by_id(org_id, id)
+        }
+        fn get_edges_by_ids(
+            &mut self,
+            org_id: &str,
+            ids: &[String],
+        ) -> ua_core::UaResult<Vec<ua_store::graph::GraphEdgeRow>> {
+            self.0.get_edges_by_ids(org_id, ids)
+        }
+        fn get_edges_by_rowids(
+            &mut self,
+            org_id: &str,
+            rowids: &[i64],
+        ) -> ua_core::UaResult<Vec<(i64, ua_store::graph::GraphEdgeRow)>> {
+            self.0.get_edges_by_rowids(org_id, rowids)
+        }
+        fn count_org_nodes(&mut self, org_id: &str) -> ua_core::UaResult<u64> {
+            self.0.count_org_nodes(org_id)
+        }
+        fn count_org_edges(&mut self, org_id: &str) -> ua_core::UaResult<u64> {
+            self.0.count_org_edges(org_id)
+        }
+        fn count_node_live_edges_capped(
+            &mut self,
+            org_id: &str,
+            node_id: &str,
+            cap: usize,
+        ) -> ua_core::UaResult<usize> {
+            self.0.count_node_live_edges_capped(org_id, node_id, cap)
+        }
+        fn with_deadline<F, T>(&mut self, _deadline: std::time::Instant, _f: F) -> ua_core::UaResult<T>
+        where
+            Self: Sized,
+            F: FnOnce(&mut Self) -> ua_core::UaResult<T>,
+        {
+            Err(UaError::invalid_code(ua_store::graph::DEADLINE_REASON_CODE, "simulated deadline"))
+        }
+        fn adjacent_edges(
+            &mut self,
+            query: &ua_store::graph::AdjacencyQuery,
+        ) -> ua_core::UaResult<Vec<ua_store::graph::AdjacencyEntry>> {
+            self.0.adjacent_edges(query)
+        }
+        fn compact_adjacent(
+            &mut self,
+            org_id: &str,
+            node_id: &str,
+            direction: EdgeDirection,
+            filter: &ua_store::graph::EdgeFilter,
+            scope: &VisibilityScope,
+            limit: usize,
+        ) -> ua_core::UaResult<Vec<ua_store::graph::CompactAdjEdge>> {
+            self.0.compact_adjacent(org_id, node_id, direction, filter, scope, limit)
+        }
+        fn with_compact_adjacent<F, T>(
+            &mut self,
+            org_id: &str,
+            directions: EdgeDirection,
+            filter: &ua_store::graph::EdgeFilter,
+            scope: &VisibilityScope,
+            f: F,
+        ) -> ua_core::UaResult<T>
+        where
+            F: FnOnce(
+                &mut dyn FnMut(
+                    &str,
+                    EdgeDirection,
+                    usize,
+                    &mut Vec<ua_store::graph::CompactAdjEdge>,
+                ) -> ua_core::UaResult<()>,
+            ) -> ua_core::UaResult<T>,
+        {
+            self.0.with_compact_adjacent(org_id, directions, filter, scope, f)
+        }
+        fn bounded_acyclic_reach(
+            &mut self,
+            org_id: &str,
+            src_id: &str,
+            dst_id: &str,
+            kind: &str,
+            max_nodes: usize,
+            max_edges: usize,
+            deadline: std::time::Instant,
+        ) -> ua_core::UaResult<ua_store::graph::AcyclicReachOutcome> {
+            self.0.bounded_acyclic_reach(org_id, src_id, dst_id, kind, max_nodes, max_edges, deadline)
+        }
+        fn eligible_degree(
+            &mut self,
+            org_id: &str,
+            node_id: &str,
+            direction: EdgeDirection,
+            filter: &ua_store::graph::EdgeFilter,
+            scope: &VisibilityScope,
+            cap_plus_one: usize,
+        ) -> ua_core::UaResult<usize> {
+            self.0.eligible_degree(org_id, node_id, direction, filter, scope, cap_plus_one)
+        }
+        fn outgoing_live_targets_of_kind_into(
+            &mut self,
+            org_id: &str,
+            src_id: &str,
+            kind: &str,
+            limit: usize,
+            out: &mut Vec<String>,
+        ) -> ua_core::UaResult<()> {
+            self.0.outgoing_live_targets_of_kind_into(org_id, src_id, kind, limit, out)
+        }
+        fn exact_ppr_slice(
+            &mut self,
+            org_id: &str,
+            filter: &ua_store::graph::EdgeFilter,
+            scope: &VisibilityScope,
+            max_nodes: usize,
+            max_edges: usize,
+        ) -> ua_core::UaResult<Option<ua_store::graph::ExactPprSlice>> {
+            self.0.exact_ppr_slice(org_id, filter, scope, max_nodes, max_edges)
+        }
+    }
+
+    let nbr_deadline = db
+        .read_mut(|conn| {
+            let mut r = DeadlineHitRead(SqliteGraph::new(conn));
+            neighbors(
+                &mut r,
+                NeighborsRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    node_id: Some(n_a.id.clone()),
+                    kind: None,
+                    external_id: None,
+                    direction: EdgeDirection::Out,
+                    edge_kinds: vec![],
+                    node_kinds: vec![],
+                    as_of: None,
+                    include_proposed: false,
+                    limit: Some(10),
+                    cursor: None,
+                    deadline_ms: Some(1),
+                    scope: outsider.clone(),
+                },
+            )
+        })
+        .unwrap();
+    assert!(nbr_deadline.truncated, "neighbors must return truncated = true on deadline");
+    assert!(nbr_deadline.next_cursor.is_none());
 }

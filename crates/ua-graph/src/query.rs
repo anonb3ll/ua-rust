@@ -14,13 +14,16 @@ use serde::{Deserialize, Serialize};
 use ua_core::{UaError, UaResult};
 use ua_store::graph::{
     AdjacencyCursor, AdjacencyQuery, EdgeDirection, EdgeFilter, GraphEdgeRow, GraphNodeRow, GraphRead,
-    VisibilityScope,
+    VisibilityScope, is_deadline_error,
 };
 
 use crate::types::{EdgeKind, NodeKind, WalkDirection, normalize_timestamp};
 
 pub const DEFAULT_DEADLINE_MS: u64 = 500;
 pub const MAX_DEADLINE_MS: u64 = 2_000;
+/// Hard upper bound on `skip_hubs_over` so huge caller values never produce
+/// unbounded degree scans or SQL `LIMIT` overflow.
+pub const MAX_SKIP_HUBS_OVER: usize = 100_000;
 
 pub const NEIGHBORS_DEFAULT_LIMIT: usize = 50;
 pub const NEIGHBORS_MAX_LIMIT: usize = 200;
@@ -155,6 +158,9 @@ pub struct NeighborsResult {
 }
 
 pub fn neighbors<R: GraphRead>(repo: &mut R, req: NeighborsRequest) -> UaResult<NeighborsResult> {
+    let started = Instant::now();
+    let deadline = clamp_deadline(req.deadline_ms);
+    let deadline_at = started + deadline;
     let seed = node_get(
         repo,
         &req.org_id,
@@ -165,17 +171,29 @@ pub fn neighbors<R: GraphRead>(repo: &mut R, req: NeighborsRequest) -> UaResult<
     )?;
     let filter = build_filter(req.as_of.as_deref(), &req.edge_kinds, &req.node_kinds, req.include_proposed)?;
     let limit = req.limit.unwrap_or(NEIGHBORS_DEFAULT_LIMIT).clamp(1, NEIGHBORS_MAX_LIMIT);
-    let _deadline = clamp_deadline(req.deadline_ms);
 
-    let mut entries = repo.adjacent_edges(&AdjacencyQuery {
-        org_id: req.org_id,
-        node_id: seed.id.clone(),
-        direction: req.direction,
-        filter,
-        scope: req.scope,
-        limit: limit + 1,
-        cursor: req.cursor,
-    })?;
+    let mut entries = match repo.with_deadline(deadline_at, |repo| {
+        repo.adjacent_edges(&AdjacencyQuery {
+            org_id: req.org_id,
+            node_id: seed.id.clone(),
+            direction: req.direction,
+            filter,
+            scope: req.scope,
+            limit: limit + 1,
+            cursor: req.cursor,
+        })
+    }) {
+        Ok(entries) => entries,
+        Err(err) if is_deadline_error(&err) => {
+            return Ok(NeighborsResult {
+                node: seed,
+                neighbors: Vec::new(),
+                truncated: true,
+                next_cursor: None,
+            });
+        }
+        Err(err) => return Err(err),
+    };
 
     let truncated = entries.len() > limit;
     if truncated {
@@ -248,8 +266,10 @@ pub fn k_hop<R: GraphRead>(repo: &mut R, req: KHopRequest) -> UaResult<KHopResul
     let max_degree = req.max_degree_per_node.unwrap_or(KHOP_DEFAULT_DEGREE).clamp(1, KHOP_MAX_DEGREE);
     let max_visited_edges =
         req.max_visited_edges.unwrap_or(KHOP_DEFAULT_VISITED_EDGES).clamp(1, KHOP_MAX_VISITED_EDGES);
+    let skip_hubs_over = req.skip_hubs_over.map(|v| v.min(MAX_SKIP_HUBS_OVER));
     let deadline = clamp_deadline(req.deadline_ms);
     let started = Instant::now();
+    let deadline_at = started + deadline;
     let filter = build_filter(req.as_of.as_deref(), &req.edge_kinds, &req.node_kinds, req.include_proposed)?;
 
     // Resolve visible seeds (missing/foreign/hidden seeds are silently dropped: zero existence oracle).
@@ -284,81 +304,108 @@ pub fn k_hop<R: GraphRead>(repo: &mut R, req: KHopRequest) -> UaResult<KHopResul
         truncation_reason = Some("node_cap".to_string());
     }
 
-    'hops: for _hop in 0..max_hops {
-        if frontier.is_empty() {
-            break;
-        }
-        let mut next_frontier: Vec<String> = Vec::new();
-        for pivot in &frontier {
-            if started.elapsed() >= deadline {
-                truncated = true;
-                truncation_reason = Some("deadline".to_string());
-                break 'hops;
+    let bfs_res = repo.with_deadline(deadline_at, |repo| {
+        'hops: for _hop in 0..max_hops {
+            if frontier.is_empty() {
+                break;
             }
-            if let Some(hub_cap) = req.skip_hubs_over {
-                let deg = repo.eligible_degree(
+            let mut next_frontier: Vec<String> = Vec::new();
+            for pivot in &frontier {
+                if started.elapsed() >= deadline {
+                    truncated = true;
+                    truncation_reason = Some("deadline".to_string());
+                    break 'hops;
+                }
+                if let Some(hub_cap) = skip_hubs_over {
+                    let deg = match repo.eligible_degree(
+                        &req.org_id,
+                        pivot,
+                        req.direction,
+                        &filter,
+                        &req.scope,
+                        hub_cap.saturating_add(1),
+                    ) {
+                        Ok(d) => d,
+                        Err(e) if is_deadline_error(&e) => {
+                            truncated = true;
+                            truncation_reason = Some("deadline".to_string());
+                            break 'hops;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if deg > hub_cap {
+                        continue;
+                    }
+                }
+                let adj = match repo.compact_adjacent(
                     &req.org_id,
                     pivot,
                     req.direction,
                     &filter,
                     &req.scope,
-                    hub_cap.saturating_add(1),
-                )?;
-                if deg > hub_cap {
-                    continue;
+                    max_degree + 1,
+                ) {
+                    Ok(a) => a,
+                    Err(e) if is_deadline_error(&e) => {
+                        truncated = true;
+                        truncation_reason = Some("deadline".to_string());
+                        break 'hops;
+                    }
+                    Err(e) => return Err(e),
+                };
+                let mut degree_truncated = false;
+                let iter_len = if adj.len() > max_degree {
+                    degree_truncated = true;
+                    max_degree
+                } else {
+                    adj.len()
+                };
+                if degree_truncated && !truncated {
+                    truncated = true;
+                    truncation_reason = Some("degree_cap".to_string());
+                }
+                for e in adj.into_iter().take(iter_len) {
+                    visited_edges += 1;
+                    if visited_edges > max_visited_edges {
+                        truncated = true;
+                        truncation_reason = Some("scan_budget".to_string());
+                        break 'hops;
+                    }
+                    if seen_edges.contains(&e.rowid) {
+                        continue;
+                    }
+                    let is_new_node = !visited_nodes.contains(&e.neighbor_id);
+                    if is_new_node && ordered_node_ids.len() >= max_nodes {
+                        truncated = true;
+                        truncation_reason = Some("node_cap".to_string());
+                        break 'hops;
+                    }
+                    if ordered_edge_rowids.len() >= max_edges {
+                        truncated = true;
+                        truncation_reason = Some("edge_cap".to_string());
+                        break 'hops;
+                    }
+                    seen_edges.insert(e.rowid);
+                    ordered_edge_rowids.push(e.rowid);
+                    if is_new_node {
+                        visited_nodes.insert(e.neighbor_id.clone());
+                        ordered_node_ids.push(e.neighbor_id.clone());
+                        next_frontier.push(e.neighbor_id);
+                    }
                 }
             }
-            let adj = repo.compact_adjacent(
-                &req.org_id,
-                pivot,
-                req.direction,
-                &filter,
-                &req.scope,
-                max_degree + 1,
-            )?;
-            let mut degree_truncated = false;
-            let iter_len = if adj.len() > max_degree {
-                degree_truncated = true;
-                max_degree
-            } else {
-                adj.len()
-            };
-            if degree_truncated && !truncated {
-                truncated = true;
-                truncation_reason = Some("degree_cap".to_string());
-            }
-            for e in adj.into_iter().take(iter_len) {
-                visited_edges += 1;
-                if visited_edges > max_visited_edges {
-                    truncated = true;
-                    truncation_reason = Some("scan_budget".to_string());
-                    break 'hops;
-                }
-                if seen_edges.contains(&e.rowid) {
-                    continue;
-                }
-                let is_new_node = !visited_nodes.contains(&e.neighbor_id);
-                if is_new_node && ordered_node_ids.len() >= max_nodes {
-                    truncated = true;
-                    truncation_reason = Some("node_cap".to_string());
-                    break 'hops;
-                }
-                if ordered_edge_rowids.len() >= max_edges {
-                    truncated = true;
-                    truncation_reason = Some("edge_cap".to_string());
-                    break 'hops;
-                }
-                seen_edges.insert(e.rowid);
-                ordered_edge_rowids.push(e.rowid);
-                if is_new_node {
-                    visited_nodes.insert(e.neighbor_id.clone());
-                    ordered_node_ids.push(e.neighbor_id.clone());
-                    next_frontier.push(e.neighbor_id);
-                }
-            }
+            hops_completed += 1;
+            frontier = next_frontier;
         }
-        hops_completed += 1;
-        frontier = next_frontier;
+        Ok(())
+    });
+    match bfs_res {
+        Ok(()) => {}
+        Err(e) if is_deadline_error(&e) => {
+            truncated = true;
+            truncation_reason = Some("deadline".to_string());
+        }
+        Err(e) => return Err(e),
     }
 
     // Hydrate full node and edge rows preserving deterministic discovery order.
@@ -420,6 +467,7 @@ pub fn shortest_path<R: GraphRead>(repo: &mut R, req: ShortestPathRequest) -> Ua
     }
     let deadline = clamp_deadline(req.deadline_ms);
     let started = Instant::now();
+    let deadline_at = started + deadline;
     let filter = build_filter(req.as_of.as_deref(), &req.edge_kinds, &req.node_kinds, req.include_proposed)?;
 
     // Zero existence oracle: both endpoints must exist in org_id and be visible.
@@ -429,6 +477,22 @@ pub fn shortest_path<R: GraphRead>(repo: &mut R, req: ShortestPathRequest) -> Ua
     let to = repo
         .get_node_by_id(&req.org_id, &req.to_id, &req.scope)?
         .ok_or_else(|| UaError::not_found("graph node not found"))?;
+
+    // Enforce node_kinds on both endpoints as well as intermediate nodes.
+    if !req.node_kinds.is_empty() {
+        let from_ok = NodeKind::parse(&from.kind).is_ok_and(|k| req.node_kinds.contains(&k));
+        let to_ok = NodeKind::parse(&to.kind).is_ok_and(|k| req.node_kinds.contains(&k));
+        if !from_ok || !to_ok {
+            return Ok(ShortestPathResult {
+                found: false,
+                hops: 0,
+                node_ids: Vec::new(),
+                edge_ids: Vec::new(),
+                truncated: false,
+                truncation_reason: None,
+            });
+        }
+    }
 
     if from.id == to.id {
         return Ok(ShortestPathResult {
@@ -496,138 +560,163 @@ pub fn shortest_path<R: GraphRead>(repo: &mut R, req: ShortestPathRequest) -> Ua
         (left_nodes, left_edges)
     };
 
-    while !fwd_frontier.is_empty() && !bwd_frontier.is_empty() && (fwd_depth + bwd_depth) < max_depth {
-        if started.elapsed() >= deadline {
-            truncated = true;
-            truncation_reason = Some("deadline".to_string());
-            break;
-        }
-        let expand_fwd = fwd_frontier.len() <= bwd_frontier.len();
-        let (curr_frontier, dir) = if expand_fwd {
-            (std::mem::take(&mut fwd_frontier), fwd_dir)
-        } else {
-            (std::mem::take(&mut bwd_frontier), bwd_dir)
-        };
-
-        let mut next_frontier_set: BTreeSet<String> = BTreeSet::new();
-        let mut candidate_meetings: Vec<(Vec<String>, Vec<i64>)> = Vec::new();
-
-        // Track best deterministic parent (by rowid ASC) for each newly discovered node at this level.
-        let mut level_new: HashMap<String, (String, i64)> = HashMap::new();
-
-        for u in curr_frontier {
+    let mut found_result: Option<ShortestPathResult> = None;
+    let search_res = repo.with_deadline(deadline_at, |repo| {
+        while !fwd_frontier.is_empty() && !bwd_frontier.is_empty() && (fwd_depth + bwd_depth) < max_depth {
             if started.elapsed() >= deadline {
                 truncated = true;
                 truncation_reason = Some("deadline".to_string());
                 break;
             }
-            let rem_edges = SHORTEST_PATH_MAX_EDGES.saturating_sub(expanded_edges);
-            if rem_edges == 0 {
-                truncated = true;
-                truncation_reason = Some("edge_cap".to_string());
-                break;
-            }
-            let adj = repo.compact_adjacent(
-                &req.org_id,
-                &u,
-                dir,
-                &filter,
-                &req.scope,
-                rem_edges.min(SHORTEST_PATH_MAX_EDGES) + 1,
-            )?;
-            for e in adj {
-                expanded_edges += 1;
-                if expanded_edges > SHORTEST_PATH_MAX_EDGES {
+            let expand_fwd = fwd_frontier.len() <= bwd_frontier.len();
+            let (curr_frontier, dir) = if expand_fwd {
+                (std::mem::take(&mut fwd_frontier), fwd_dir)
+            } else {
+                (std::mem::take(&mut bwd_frontier), bwd_dir)
+            };
+
+            let mut next_frontier_set: BTreeSet<String> = BTreeSet::new();
+            let mut candidate_meetings: Vec<(Vec<String>, Vec<i64>)> = Vec::new();
+
+            // Track best deterministic parent (by rowid ASC) for each newly discovered node at this level.
+            let mut level_new: HashMap<String, (String, i64)> = HashMap::new();
+
+            for u in curr_frontier {
+                if started.elapsed() >= deadline {
+                    truncated = true;
+                    truncation_reason = Some("deadline".to_string());
+                    break;
+                }
+                let rem_edges = SHORTEST_PATH_MAX_EDGES.saturating_sub(expanded_edges);
+                if rem_edges == 0 {
                     truncated = true;
                     truncation_reason = Some("edge_cap".to_string());
                     break;
                 }
-                let v = e.neighbor_id;
-                let already_mine =
-                    if expand_fwd { fwd_parent.contains_key(&v) } else { bwd_parent.contains_key(&v) };
-                if already_mine {
-                    continue;
-                }
-                let entry = level_new.entry(v.clone());
-                match entry {
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert((u.clone(), e.rowid));
-                        next_frontier_set.insert(v.clone());
+                let adj = match repo.compact_adjacent(
+                    &req.org_id,
+                    &u,
+                    dir,
+                    &filter,
+                    &req.scope,
+                    rem_edges.min(SHORTEST_PATH_MAX_EDGES) + 1,
+                ) {
+                    Ok(a) => a,
+                    Err(e) if is_deadline_error(&e) => {
+                        truncated = true;
+                        truncation_reason = Some("deadline".to_string());
+                        break;
                     }
-                    std::collections::hash_map::Entry::Occupied(mut slot) => {
-                        if e.rowid < slot.get().1 {
-                            *slot.get_mut() = (u.clone(), e.rowid);
+                    Err(e) => return Err(e),
+                };
+                for e in adj {
+                    expanded_edges += 1;
+                    if expanded_edges > SHORTEST_PATH_MAX_EDGES {
+                        truncated = true;
+                        truncation_reason = Some("edge_cap".to_string());
+                        break;
+                    }
+                    let v = e.neighbor_id;
+                    let already_mine =
+                        if expand_fwd { fwd_parent.contains_key(&v) } else { bwd_parent.contains_key(&v) };
+                    if already_mine {
+                        continue;
+                    }
+                    let entry = level_new.entry(v.clone());
+                    match entry {
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert((u.clone(), e.rowid));
+                            next_frontier_set.insert(v.clone());
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut slot) => {
+                            if e.rowid < slot.get().1 {
+                                *slot.get_mut() = (u.clone(), e.rowid);
+                            }
                         }
                     }
                 }
+                if truncated {
+                    break;
+                }
             }
+
+            for (v, (parent, rid)) in level_new {
+                expanded_nodes += 1;
+                if expanded_nodes > SHORTEST_PATH_MAX_NODES {
+                    truncated = true;
+                    truncation_reason = Some("node_cap".to_string());
+                    break;
+                }
+                if expand_fwd {
+                    fwd_parent.insert(v.clone(), Some((parent, rid)));
+                    if bwd_parent.contains_key(&v) {
+                        candidate_meetings.push(reconstruct(&v, &fwd_parent, &bwd_parent));
+                    }
+                } else {
+                    bwd_parent.insert(v.clone(), Some((parent, rid)));
+                    if fwd_parent.contains_key(&v) {
+                        candidate_meetings.push(reconstruct(&v, &fwd_parent, &bwd_parent));
+                    }
+                }
+            }
+
+            if !candidate_meetings.is_empty() {
+                // Hydrate only the winning depth's candidate edge rowids and tie-break by edge_id ASC.
+                let mut needed_rowids: Vec<i64> =
+                    candidate_meetings.iter().flat_map(|(_, rids)| rids.iter().copied()).collect();
+                needed_rowids.sort_unstable();
+                needed_rowids.dedup();
+                let resolved: HashMap<i64, String> = repo
+                    .get_edges_by_rowids(&req.org_id, &needed_rowids)?
+                    .into_iter()
+                    .map(|(rid, e)| (rid, e.id))
+                    .collect();
+                let mut best: Option<(Vec<String>, Vec<String>)> = None;
+                for (nodes, rids) in candidate_meetings {
+                    let eids: Vec<String> =
+                        rids.iter().filter_map(|rid| resolved.get(rid).cloned()).collect();
+                    if eids.len() == rids.len() && best.as_ref().is_none_or(|b| eids < b.1) {
+                        best = Some((nodes, eids));
+                    }
+                }
+                if let Some((node_ids, edge_ids)) = best {
+                    let hops = edge_ids.len();
+                    found_result = Some(ShortestPathResult {
+                        found: true,
+                        hops,
+                        node_ids,
+                        edge_ids,
+                        truncated: false,
+                        truncation_reason: None,
+                    });
+                    break;
+                }
+            }
+
             if truncated {
                 break;
             }
-        }
-
-        for (v, (parent, rid)) in level_new {
-            expanded_nodes += 1;
-            if expanded_nodes > SHORTEST_PATH_MAX_NODES {
-                truncated = true;
-                truncation_reason = Some("node_cap".to_string());
-                break;
-            }
+            let next_vec: Vec<String> = next_frontier_set.into_iter().collect();
             if expand_fwd {
-                fwd_parent.insert(v.clone(), Some((parent, rid)));
-                if bwd_parent.contains_key(&v) {
-                    candidate_meetings.push(reconstruct(&v, &fwd_parent, &bwd_parent));
-                }
+                fwd_depth += 1;
+                fwd_frontier = next_vec;
             } else {
-                bwd_parent.insert(v.clone(), Some((parent, rid)));
-                if fwd_parent.contains_key(&v) {
-                    candidate_meetings.push(reconstruct(&v, &fwd_parent, &bwd_parent));
-                }
+                bwd_depth += 1;
+                bwd_frontier = next_vec;
             }
         }
-
-        if !candidate_meetings.is_empty() {
-            // Hydrate only the winning depth's candidate edge rowids and tie-break by edge_id ASC.
-            let mut needed_rowids: Vec<i64> =
-                candidate_meetings.iter().flat_map(|(_, rids)| rids.iter().copied()).collect();
-            needed_rowids.sort_unstable();
-            needed_rowids.dedup();
-            let resolved: HashMap<i64, String> = repo
-                .get_edges_by_rowids(&req.org_id, &needed_rowids)?
-                .into_iter()
-                .map(|(rid, e)| (rid, e.id))
-                .collect();
-            let mut best: Option<(Vec<String>, Vec<String>)> = None;
-            for (nodes, rids) in candidate_meetings {
-                let eids: Vec<String> = rids.iter().filter_map(|rid| resolved.get(rid).cloned()).collect();
-                if eids.len() == rids.len() && best.as_ref().is_none_or(|b| eids < b.1) {
-                    best = Some((nodes, eids));
-                }
-            }
-            if let Some((node_ids, edge_ids)) = best {
-                let hops = edge_ids.len();
-                return Ok(ShortestPathResult {
-                    found: true,
-                    hops,
-                    node_ids,
-                    edge_ids,
-                    truncated: false,
-                    truncation_reason: None,
-                });
-            }
+        Ok(())
+    });
+    match search_res {
+        Ok(()) => {}
+        Err(e) if is_deadline_error(&e) => {
+            truncated = true;
+            truncation_reason = Some("deadline".to_string());
         }
-
-        if truncated {
-            break;
-        }
-        let next_vec: Vec<String> = next_frontier_set.into_iter().collect();
-        if expand_fwd {
-            fwd_depth += 1;
-            fwd_frontier = next_vec;
-        } else {
-            bwd_depth += 1;
-            bwd_frontier = next_vec;
-        }
+        Err(e) => return Err(e),
+    }
+    if let Some(res) = found_result {
+        return Ok(res);
     }
 
     Ok(ShortestPathResult {
@@ -714,8 +803,10 @@ pub fn seed_expand<R: GraphRead>(repo: &mut R, req: SeedExpandRequest) -> UaResu
     let max_iters = req.max_iters.unwrap_or(PPR_DEFAULT_ITERS).clamp(1, PPR_MAX_ITERS);
     let eps = req.eps.unwrap_or(PPR_DEFAULT_EPS).clamp(PPR_MIN_EPS, PPR_MAX_EPS);
     let max_results = req.max_results.unwrap_or(PPR_DEFAULT_RESULTS).clamp(1, PPR_MAX_RESULTS);
+    let skip_hubs_over = req.skip_hubs_over.map(|v| v.min(MAX_SKIP_HUBS_OVER));
     let deadline = clamp_deadline(req.deadline_ms);
     let started = Instant::now();
+    let deadline_at = started + deadline;
 
     let filter = build_filter(req.as_of.as_deref(), &req.edge_kinds, &req.node_kinds, req.include_proposed)?;
 
@@ -744,23 +835,45 @@ pub fn seed_expand<R: GraphRead>(repo: &mut R, req: SeedExpandRequest) -> UaResu
     }
 
     // Attempt exact slice first; fall back to bounded 2-hop ego subgraph if org exceeds caps.
-    let EgoSubgraph { node_ids, edges: directed_edges, exact, mut truncated } = if let Some(slice) =
-        repo.exact_ppr_slice(&req.org_id, &filter, &req.scope, PPR_EXACT_NODE_CAP, PPR_EXACT_EDGE_CAP)?
-    {
-        EgoSubgraph { node_ids: slice.node_ids, edges: slice.edges, exact: true, truncated: false }
-    } else {
-        extract_bounded_ego(
-            repo,
-            &req.org_id,
-            &seed_weights,
-            req.walk_direction,
-            &filter,
-            &req.scope,
-            req.skip_hubs_over,
-            started,
-            deadline,
-        )?
-    };
+    // Both paths run under SQLite's progress_handler wall-clock deadline.
+    let EgoSubgraph { node_ids, edges: directed_edges, exact, mut truncated } =
+        match repo.with_deadline(deadline_at, |repo| {
+            if let Some(slice) = repo.exact_ppr_slice(
+                &req.org_id,
+                &filter,
+                &req.scope,
+                PPR_EXACT_NODE_CAP,
+                PPR_EXACT_EDGE_CAP,
+            )? {
+                Ok(EgoSubgraph {
+                    node_ids: slice.node_ids,
+                    edges: slice.edges,
+                    exact: true,
+                    truncated: false,
+                })
+            } else {
+                extract_bounded_ego(
+                    repo,
+                    &req.org_id,
+                    &seed_weights,
+                    req.walk_direction,
+                    &filter,
+                    &req.scope,
+                    skip_hubs_over,
+                    started,
+                    deadline,
+                )
+            }
+        }) {
+            Ok(sub) => sub,
+            Err(e) if is_deadline_error(&e) => EgoSubgraph {
+                node_ids: seed_weights.keys().cloned().collect(),
+                edges: Vec::new(),
+                exact: false,
+                truncated: true,
+            },
+            Err(e) => return Err(e),
+        };
 
     // Index nodes densely 0..n
     let mut id_to_idx: HashMap<String, usize> = HashMap::with_capacity(node_ids.len());
@@ -789,7 +902,7 @@ pub fn seed_expand<R: GraphRead>(repo: &mut R, req: SeedExpandRequest) -> UaResu
 
     // First compute raw degrees if hub-skipping is active in exact mode.
     let hub_blocked: Vec<bool> = if exact {
-        if let Some(hub_cap) = req.skip_hubs_over {
+        if let Some(hub_cap) = skip_hubs_over {
             let mut deg = vec![0usize; n];
             for (s, d, _) in &directed_edges {
                 if let (Some(&si), Some(&di)) = (id_to_idx.get(s), id_to_idx.get(d))
@@ -1052,7 +1165,14 @@ fn extract_bounded_ego<R: GraphRead>(
                         truncated = true;
                         break;
                     }
-                    step(&u, dir, cap + 1, &mut adj_buf)?;
+                    match step(&u, dir, cap + 1, &mut adj_buf) {
+                        Ok(()) => {}
+                        Err(e) if is_deadline_error(&e) => {
+                            truncated = true;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
                     push_batch(
                         &u,
                         depth,
@@ -1084,7 +1204,15 @@ fn extract_bounded_ego<R: GraphRead>(
                 }
                 if depth > 0 {
                     let deg =
-                        repo.eligible_degree(org_id, &u, dir, filter, scope, hub_cap.saturating_add(1))?;
+                        match repo.eligible_degree(org_id, &u, dir, filter, scope, hub_cap.saturating_add(1))
+                        {
+                            Ok(d) => d,
+                            Err(e) if is_deadline_error(&e) => {
+                                truncated = true;
+                                break;
+                            }
+                            Err(e) => return Err(e),
+                        };
                     if deg > hub_cap {
                         continue;
                     }
@@ -1095,7 +1223,14 @@ fn extract_bounded_ego<R: GraphRead>(
                     truncated = true;
                     break;
                 }
-                let mut adj = repo.compact_adjacent(org_id, &u, dir, filter, scope, cap + 1)?;
+                let mut adj = match repo.compact_adjacent(org_id, &u, dir, filter, scope, cap + 1) {
+                    Ok(a) => a,
+                    Err(e) if is_deadline_error(&e) => {
+                        truncated = true;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
                 push_batch(
                     &u,
                     depth,

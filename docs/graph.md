@@ -745,6 +745,12 @@ the C1 PR):
 | `shortest_path` (100k edges) | Bidirectional BFS, `max_depth = 4`, `max_expanded_edges = 10,000` | **≤ 15 ms p95** |
 | Super-hub DoS probe | `k_hop` (`max_hops = 3`) and `seed_expand` seeded directly on a 2,000-edge super-hub | **≤ 50 ms p95**, bounded memory, `truncated = true` |
 
+**SQLite writer memory budget:** `ua-store` sets `PRAGMA cache_size = -16384`
+(16 MiB) and `PRAGMA wal_autocheckpoint = 4000` (16 MiB WAL threshold) on the
+**single writer connection only** (+14 MiB over SQLite's 2 MiB default, total
+across the hub). Read pool connections keep SQLite's default 2 MiB page cache
+and `mmap_size` is left unset.
+
 ## Security model
 
 ### Cross-org probing and same-org visibility

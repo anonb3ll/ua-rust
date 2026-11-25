@@ -178,6 +178,7 @@ async fn generic_tools_refuse_evidence_mentions_and_other_domain_owned_edges() {
                     scope: VisibilityScope::org_only(),
                     generic: false,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )?;
@@ -203,6 +204,7 @@ async fn generic_tools_refuse_evidence_mentions_and_other_domain_owned_edges() {
                     scope: VisibilityScope::org_only(),
                     generic: false,
                     max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )?;
@@ -429,4 +431,159 @@ async fn cross_org_zero_oracle_and_non_default_org_write_refusal() {
         .unwrap_err();
     assert_eq!(kind_err.code(), "invalid_argument");
     assert_eq!(kind_err.reason_code(), Some("invalid_endpoint_kind"));
+}
+
+#[tokio::test]
+async fn retract_checks_asserted_by_kind_and_tool_layer_refusals_are_not_masked() {
+    let cfg = Config { graph_max_live_edges_per_node: 2, ..Config::default() };
+    let (hub, _dir) = hub_with_config(cfg);
+    let reg = builtin_registry();
+
+    let human_same_label = caller("shared-principal", ActorKind::Human, Profile::Developer, DEFAULT_ORG);
+    let agent_same_label = caller("shared-principal", ActorKind::Agent, Profile::Developer, DEFAULT_ORG);
+    let other_agent = caller("builder-2", ActorKind::Agent, Profile::Developer, DEFAULT_ORG);
+    let org_b_dev = caller("builder-b", ActorKind::Agent, Profile::Developer, "org-b");
+
+    let n1 = seed_node(&hub, DEFAULT_ORG, NodeKind::MemoryNote, "r1", Visibility::Org, None);
+    let n2 = seed_node(&hub, DEFAULT_ORG, NodeKind::MemoryNote, "r2", Visibility::Org, None);
+    let n3 = seed_node(&hub, DEFAULT_ORG, NodeKind::MemoryNote, "r3", Visibility::Org, None);
+    let n4 = seed_node(&hub, DEFAULT_ORG, NodeKind::MemoryNote, "r4", Visibility::Org, None);
+
+    // 1. Generic graph_edge_assert rejects assertion_scope (unknown field via deny_unknown_fields).
+    let scope_err = reg
+        .call(
+            &hub,
+            &agent_same_label,
+            "graph_edge_assert",
+            json!({ "src_id": n1, "dst_id": n2, "kind": "extends", "assertion_scope": "note:1" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(scope_err.code(), "invalid_argument");
+
+    // 2. Retract compares BOTH asserted_by AND asserted_by_kind:
+    //    Human "shared-principal" asserts edge -> Agent with identical label CANNOT retract it.
+    let human_edge = reg
+        .call(
+            &hub,
+            &human_same_label,
+            "graph_edge_assert",
+            json!({ "src_id": n1, "dst_id": n2, "kind": "extends" }),
+        )
+        .await
+        .unwrap();
+    let human_edge_id = human_edge["edge"]["id"].as_str().unwrap().to_string();
+    assert_eq!(human_edge["edge"]["asserted_by"], "shared-principal");
+    assert_eq!(human_edge["edge"]["asserted_by_kind"], "person");
+
+    let spoof_err = reg
+        .call(&hub, &agent_same_label, "graph_edge_retract", json!({ "edge_id": human_edge_id }))
+        .await
+        .unwrap_err();
+    assert_eq!(spoof_err.code(), "denied");
+    assert_eq!(spoof_err.reason_code(), Some("authority_required"));
+
+    // The originating Human CAN retract their own edge.
+    let retracted = reg
+        .call(&hub, &human_same_label, "graph_edge_retract", json!({ "edge_id": human_edge_id }))
+        .await
+        .unwrap();
+    assert!(retracted["edge"]["valid_to"].is_string());
+
+    // 3. Tool-layer refusal tests that CANNOT be masked by ua-graph:
+    //    Passing an invalid `state: "bogus"` forces `parse_edge_state` to return `invalid_argument`
+    //    if either the `ua-tools` non-default-org check or the `ua-tools` domain-owned check is removed.
+    let tool_org_err = reg
+        .call(
+            &hub,
+            &org_b_dev,
+            "graph_edge_assert",
+            json!({ "src_id": n1, "dst_id": n2, "kind": "extends", "state": "bogus" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(tool_org_err.code(), "denied");
+    assert_eq!(tool_org_err.reason_code(), Some("principal_id_required"));
+
+    let tool_domain_err = reg
+        .call(
+            &hub,
+            &agent_same_label,
+            "graph_edge_assert",
+            json!({ "src_id": n1, "dst_id": n2, "kind": "evidence", "state": "bogus" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(tool_domain_err.code(), "denied");
+    assert_eq!(tool_domain_err.reason_code(), Some("domain_owned_edge"));
+
+    // Retract tool-layer non-default-org refusal runs before empty edge_id validation.
+    let retract_org_err =
+        reg.call(&hub, &org_b_dev, "graph_edge_retract", json!({ "edge_id": "" })).await.unwrap_err();
+    assert_eq!(retract_org_err.code(), "denied");
+    assert_eq!(retract_org_err.reason_code(), Some("principal_id_required"));
+
+    // Retract tool-layer domain-owned refusal runs before Authz::require (`authority_required`):
+    // a different non-operator agent gets `domain_owned_edge`, not `authority_required`.
+    let dom_edge_id = hub
+        .db()
+        .write(|tx| {
+            let e = assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: n1.clone(),
+                    dst_id: n2.clone(),
+                    kind: EdgeKind::Evidence,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: Provenance {
+                        asserted_by: PrincipalId::new("builder-1").unwrap(),
+                        asserted_by_kind: AssertedByKind::Agent,
+                        source_kind: SourceKind::Mirror,
+                        source_ref: "mirror:memory:99".into(),
+                    },
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: false,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: CycleCheckBounds::default(),
+                },
+            )?;
+            Ok(e.id)
+        })
+        .unwrap();
+    let retract_dom_err = reg
+        .call(&hub, &other_agent, "graph_edge_retract", json!({ "edge_id": dom_edge_id }))
+        .await
+        .unwrap_err();
+    assert_eq!(retract_dom_err.code(), "denied");
+    assert_eq!(retract_dom_err.reason_code(), Some("domain_owned_edge"));
+
+    // 4. Per-node live-edge cap wired from Config (`graph_max_live_edges_per_node = 2`):
+    //    n1 already has 1 live edge (`dom_edge_id` above; `human_edge_id` was retracted).
+    //    Adding n1 -> n3 reaches 2 live edges; adding n1 -> n4 is refused with `node_edge_limit_exceeded`.
+    reg.call(
+        &hub,
+        &agent_same_label,
+        "graph_edge_assert",
+        json!({ "src_id": n1, "dst_id": n3, "kind": "extends" }),
+    )
+    .await
+    .unwrap();
+    let cap_err = reg
+        .call(
+            &hub,
+            &agent_same_label,
+            "graph_edge_assert",
+            json!({ "src_id": n1, "dst_id": n4, "kind": "extends" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(cap_err.code(), "denied");
+    assert_eq!(cap_err.reason_code(), Some("node_edge_limit_exceeded"));
 }

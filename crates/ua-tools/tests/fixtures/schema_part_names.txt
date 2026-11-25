@@ -141,3 +141,5 @@ organization.v1.tools.skill_sources
 skill_registry.v4.source_id
 graph.v1
 organization.v1.graph
+graph.v2.counters
+organization.v1.graph_counters

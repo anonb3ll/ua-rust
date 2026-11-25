@@ -414,7 +414,7 @@ fn main() {
                             source_ref: "import:chain500".into(),
                         },
                         meta_json: None,
-                        max_nodes_per_org: 0,
+                        max_nodes_per_org: 500_000,
                     },
                 )?;
                 ids.push(n.id);
@@ -468,7 +468,7 @@ fn main() {
                             source_ref: "import:chain1100".into(),
                         },
                         meta_json: None,
-                        max_nodes_per_org: 0,
+                        max_nodes_per_org: 500_000,
                     },
                 )?;
                 ids.push(n.id);
@@ -523,7 +523,7 @@ fn main() {
                             source_ref: "import:w2".into(),
                         },
                         meta_json: None,
-                        max_nodes_per_org: 0,
+                        max_nodes_per_org: 500_000,
                     },
                 )?;
                 ids.push(n.id);
@@ -573,7 +573,8 @@ fn main() {
                     meta_json: None,
                     scope: VisibilityScope::org_only(),
                     generic: false,
-                    max_edges_per_org: 0,
+                    max_edges_per_org: 2_000_000,
+                    max_live_edges_per_node: 5_000,
                     cycle_bounds: CycleCheckBounds::default(),
                 },
             )?;
@@ -584,7 +585,7 @@ fn main() {
     }
     w2_ms.sort_by(f64::total_cmp);
     println!(
-        "[2] Single governed edge write + 500-hop cycle check: p50={:.2}ms p95={:.2}ms p99={:.2}ms (floor <= 3.00ms p95)",
+        "[2] Single governed edge write + 500-hop cycle check (quotas ON): p50={:.2}ms p95={:.2}ms p99={:.2}ms (floor <= 3.00ms p95)",
         percentile(&w2_ms, 0.50),
         percentile(&w2_ms, 0.95),
         percentile(&w2_ms, 0.99),
@@ -619,7 +620,8 @@ fn main() {
                         meta_json: None,
                         scope: VisibilityScope::org_only(),
                         generic: false,
-                        max_edges_per_org: 0,
+                        max_edges_per_org: 2_000_000,
+                        max_live_edges_per_node: 5_000,
                         cycle_bounds: CycleCheckBounds::default(),
                     },
                 )
@@ -651,7 +653,7 @@ fn main() {
             org_a_ids[rng.gen_range(ORG_A_NODES)].clone(),
         ];
         let t0 = Instant::now();
-        db.read(|conn| {
+        db.read_mut(|conn| {
             let mut repo = SqliteGraph::new(conn);
             k_hop(
                 &mut repo,
@@ -679,7 +681,7 @@ fn main() {
         w4_org_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
 
         let t1 = Instant::now();
-        db.read(|conn| {
+        db.read_mut(|conn| {
             let mut repo = SqliteGraph::new(conn);
             k_hop(
                 &mut repo,
@@ -732,7 +734,7 @@ fn main() {
             .map(|_| SeedInput { node_id: org_a_ids[rng.gen_range(ORG_A_NODES)].clone(), weight: 1.0 })
             .collect();
         let t0 = Instant::now();
-        db.read(|conn| {
+        db.read_mut(|conn| {
             let mut repo = SqliteGraph::new(conn);
             seed_expand(
                 &mut repo,
@@ -763,7 +765,7 @@ fn main() {
             .collect();
         let t1 = Instant::now();
         let res = db
-            .read(|conn| {
+            .read_mut(|conn| {
                 let mut repo = SqliteGraph::new(conn);
                 seed_expand(
                     &mut repo,
@@ -812,7 +814,7 @@ fn main() {
         let from = org_a_org_vis_ids[rng.gen_range(org_a_org_vis_ids.len())].clone();
         let to = org_a_org_vis_ids[rng.gen_range(org_a_org_vis_ids.len())].clone();
         let t0 = Instant::now();
-        db.read(|conn| {
+        db.read_mut(|conn| {
             let mut repo = SqliteGraph::new(conn);
             shortest_path(
                 &mut repo,
@@ -851,7 +853,7 @@ fn main() {
     for _ in 0..QUERIES_PER_WORKLOAD {
         let t0 = Instant::now();
         let kh = db
-            .read(|conn| {
+            .read_mut(|conn| {
                 let mut repo = SqliteGraph::new(conn);
                 k_hop(
                     &mut repo,
@@ -880,7 +882,7 @@ fn main() {
 
         let t1 = Instant::now();
         let ppr = db
-            .read(|conn| {
+            .read_mut(|conn| {
                 let mut repo = SqliteGraph::new(conn);
                 seed_expand(
                     &mut repo,

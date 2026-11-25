@@ -204,9 +204,6 @@ pub struct EdgeAssertArgs {
     pub dst_id: String,
     /// Generic-assertable edge kind: `extends`, `contradicts`, `links_to`, or `plan_tracks`.
     pub kind: String,
-    /// Optional assertion scope (<= 128 bytes), e.g. `note:<id>`. Defaults to empty string.
-    #[serde(default)]
-    pub assertion_scope: String,
     /// Optional edge state (`proposed` required for `contradicts`, `active` for other generic kinds).
     pub state: Option<String>,
     /// Edge weight in `(0.0, 1000.0]` (default `1.0`).
@@ -296,7 +293,7 @@ async fn handle_node_get(ctx: ToolCtx, a: NodeGetArgs) -> UaResult<Value> {
     let kind = a.kind.as_deref().map(NodeKind::parse).transpose()?;
     ctx.hub
         .db()
-        .read_async(move |conn| {
+        .read_mut_async(move |conn| {
             let mut repo = SqliteGraph::new(conn);
             let node = ua_graph::node_get(
                 &mut repo,
@@ -340,7 +337,7 @@ async fn handle_neighbors(ctx: ToolCtx, a: NeighborsArgs) -> UaResult<Value> {
     };
     ctx.hub
         .db()
-        .read_async(move |conn| {
+        .read_mut_async(move |conn| {
             let mut repo = SqliteGraph::new(conn);
             let res = ua_graph::neighbors(&mut repo, req)?;
             Ok(serde_json::to_value(res)?)
@@ -373,7 +370,7 @@ async fn handle_traverse(ctx: ToolCtx, a: TraverseArgs) -> UaResult<Value> {
     };
     ctx.hub
         .db()
-        .read_async(move |conn| {
+        .read_mut_async(move |conn| {
             let mut repo = SqliteGraph::new(conn);
             let res = ua_graph::k_hop(&mut repo, req)?;
             Ok(serde_json::to_value(res)?)
@@ -402,7 +399,7 @@ async fn handle_shortest_path(ctx: ToolCtx, a: ShortestPathArgs) -> UaResult<Val
     };
     ctx.hub
         .db()
-        .read_async(move |conn| {
+        .read_mut_async(move |conn| {
             let mut repo = SqliteGraph::new(conn);
             let res = ua_graph::shortest_path(&mut repo, req)?;
             Ok(serde_json::to_value(res)?)
@@ -435,7 +432,7 @@ async fn handle_expand(ctx: ToolCtx, a: ExpandArgs) -> UaResult<Value> {
     };
     ctx.hub
         .db()
-        .read_async(move |conn| {
+        .read_mut_async(move |conn| {
             let mut repo = SqliteGraph::new(conn);
             let res = ua_graph::seed_expand(&mut repo, req)?;
             Ok(serde_json::to_value(res)?)
@@ -468,6 +465,7 @@ async fn handle_edge_assert(ctx: ToolCtx, a: EdgeAssertArgs) -> UaResult<Value> 
     let state = parse_edge_state(a.state.as_deref(), kind)?;
     let scope = caller_scope(&ctx);
     let max_edges_per_org = ctx.hub.cfg().graph_max_edges_per_org;
+    let max_live_edges_per_node = ctx.hub.cfg().graph_max_live_edges_per_node;
     let provenance = Provenance {
         asserted_by: principal,
         asserted_by_kind,
@@ -479,7 +477,7 @@ async fn handle_edge_assert(ctx: ToolCtx, a: EdgeAssertArgs) -> UaResult<Value> 
         src_id: a.src_id,
         dst_id: a.dst_id,
         kind,
-        assertion_scope: a.assertion_scope,
+        assertion_scope: String::new(),
         state,
         weight: a.weight.unwrap_or(1.0),
         provenance,
@@ -489,6 +487,7 @@ async fn handle_edge_assert(ctx: ToolCtx, a: EdgeAssertArgs) -> UaResult<Value> 
         scope,
         generic: true,
         max_edges_per_org,
+        max_live_edges_per_node,
         cycle_bounds: CycleCheckBounds::default(),
     };
     ctx.hub
@@ -533,7 +532,7 @@ async fn handle_edge_retract(ctx: ToolCtx, a: EdgeRetractArgs) -> UaResult<Value
                     ),
                 ));
             }
-            if edge.asserted_by != retractor.as_str() {
+            if edge.asserted_by != retractor.as_str() || edge.asserted_by_kind != retractor_kind.as_str() {
                 Authz::new(ctx2.hub.cfg()).require(
                     &ctx2.caller,
                     &[Authority::Operator, Authority::LifecycleOperator],

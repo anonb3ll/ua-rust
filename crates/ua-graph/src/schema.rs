@@ -169,8 +169,58 @@ END;
 pub const TENANT_PART: Procedure =
     ua_store::org::tenant_part("organization.v1.graph", &["graph_nodes", "graph_edges"]);
 
+/// `graph.v2.counters`: trigger-maintained per-organization node and edge
+/// counters (`graph_org_counts`) so quota checks run in O(1) inside the write
+/// transaction without scanning `graph_nodes` / `graph_edges`.
+pub const COUNTERS_SCHEMA: SchemaPart = SchemaPart {
+    name: "graph.v2.counters",
+    sql: "
+CREATE TABLE IF NOT EXISTS graph_org_counts (
+    org_id     TEXT PRIMARY KEY NOT NULL,
+    node_count INTEGER NOT NULL DEFAULT 0 CHECK (node_count >= 0),
+    edge_count INTEGER NOT NULL DEFAULT 0 CHECK (edge_count >= 0)
+);
+
+INSERT INTO graph_org_counts (org_id, node_count, edge_count)
+SELECT o.org_id,
+       COALESCE(n.cnt, 0),
+       COALESCE(e.cnt, 0)
+FROM (
+    SELECT org_id FROM graph_nodes
+    UNION
+    SELECT org_id FROM graph_edges
+) o
+LEFT JOIN (SELECT org_id, COUNT(*) AS cnt FROM graph_nodes GROUP BY org_id) n ON n.org_id = o.org_id
+LEFT JOIN (SELECT org_id, COUNT(*) AS cnt FROM graph_edges GROUP BY org_id) e ON e.org_id = o.org_id
+ON CONFLICT(org_id) DO UPDATE SET
+    node_count = excluded.node_count,
+    edge_count = excluded.edge_count;
+
+CREATE TRIGGER IF NOT EXISTS graph_nodes_count_ai
+AFTER INSERT ON graph_nodes
+BEGIN
+    INSERT INTO graph_org_counts (org_id, node_count, edge_count)
+    VALUES (NEW.org_id, 1, 0)
+    ON CONFLICT(org_id) DO UPDATE SET node_count = node_count + 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS graph_edges_count_ai
+AFTER INSERT ON graph_edges
+BEGIN
+    INSERT INTO graph_org_counts (org_id, node_count, edge_count)
+    VALUES (NEW.org_id, 0, 1)
+    ON CONFLICT(org_id) DO UPDATE SET edge_count = edge_count + 1;
+END;
+",
+};
+
+/// `organization.v1.graph_counters`: generated `*_org_exists` and
+/// `*_org_immutable` triggers for `graph_org_counts`.
+pub const COUNTERS_TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.graph_counters", &["graph_org_counts"]);
+
 /// Schema parts for the shared graph store, in application order. Requires
 /// `organization.v1.store` applied first.
 pub fn schema_parts() -> Vec<Part> {
-    vec![SCHEMA.into(), TENANT_PART.into()]
+    vec![SCHEMA.into(), TENANT_PART.into(), COUNTERS_SCHEMA.into(), COUNTERS_TENANT_PART.into()]
 }
