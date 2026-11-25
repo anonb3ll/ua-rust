@@ -555,12 +555,12 @@ async fn doctor_tells_another_organization_nothing_about_the_hub_filesystem() {
 }
 
 #[tokio::test]
-async fn doctor_hides_the_hub_listener_approval_gating_and_zulip_from_other_organizations() {
+async fn doctor_hides_hub_configuration_from_other_organizations() {
     let dir = tempfile::tempdir().unwrap();
     let reg = builtin_registry();
     let own = agent("reviewer-1", Profile::Lead);
     let other = Caller { org_id: "org-b".into(), ..own.clone() };
-    let caps = ["http_bind", "approval_gating", "zulip"];
+    let caps = ["http_bind", "approval_gating", "zulip", "slack", "search_provider"];
     let lines = |report: &Value| {
         caps.map(|cap| {
             report["checks"].as_array().unwrap().iter().find(|row| row["capability"] == cap).unwrap().clone()
@@ -578,6 +578,8 @@ async fn doctor_hides_the_hub_listener_approval_gating_and_zulip_from_other_orga
             cfg.zulip_site = Some("https://chat.example.com".into());
             cfg.zulip_email = Some("bridge@example.com".into());
             cfg.zulip_api_key = Some(SecretString::from("doctor-fixture-key".to_string()));
+            cfg.slack_enabled = true;
+            cfg.slack_signing_secret = Some(SecretString::from("doctor-slack-fixture".to_string()));
         }
         let hub = Hub::in_memory(cfg).unwrap();
         exec(
@@ -597,13 +599,16 @@ async fn doctor_hides_the_hub_listener_approval_gating_and_zulip_from_other_orga
     }
     assert_eq!(org_b[0], org_b[1]);
 
-    let [bind, approval, zulip] = &default_org[1];
+    let [bind, approval, zulip, slack, search] = &default_org[1];
     assert_eq!(bind["detail"], "listening beyond loopback on port 18765 with auth enforced");
     assert!(approval["detail"].as_str().unwrap().starts_with("2 configured gated tool(s)"));
     assert!(zulip["detail"].as_str().unwrap().starts_with("chat.example.com;"));
+    assert!(slack["detail"].as_str().unwrap().starts_with("HTTP routes mounted;"));
+    assert_ne!(search["detail"], "not available to this organization");
     assert_eq!(default_org[0][0]["status"], "MISCONFIGURED");
     assert!(default_org[0][1]["detail"].as_str().unwrap().starts_with("0 configured gated tool(s)"));
     assert_eq!(default_org[0][2]["status"], "DORMANT");
+    assert_eq!(default_org[0][3]["status"], "DORMANT");
 }
 
 /// The hub's host, its shared database file and the policy file are the

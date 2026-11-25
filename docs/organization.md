@@ -1349,10 +1349,11 @@ here for memory columns, owners and defaults.
     count). Neutral hub lines, `DORMANT` "not available to this
     organization" whatever the hub holds, for `hub_auth`, `http_bind`,
     `approval_gating`, `vault`, `workspace_root`, `database`, `schema`,
-    `notify_webhook`, `zulip` and `policy_file`. The hub skips these
+    `notify_webhook`, `zulip`, `slack`, `search_provider` and `policy_file`. The hub skips these
     checks for other organizations. The neutral lines conceal the
-    listener port and auth state, approval counts, Zulip host, static
-    token and human counts, paths, database and WAL sizes, page counts,
+    listener port and auth state, approval counts, Zulip host, Slack
+    configuration, search provider and key presence, static token and
+    human counts, paths, database and WAL sizes, page counts,
     deep `quick_check`, schema drift, webhook configuration and latest
     delivery, and the policy file state. `ledger_chain`: `LIVE` "the hub's ledger
     verifies" or `DEGRADED` "the hub's ledger is broken", with no entry
@@ -1361,8 +1362,7 @@ here for memory columns, owners and defaults.
     while that is at most five minutes old, else runs one and keeps it, so
     other organizations cause at most one full ledger read per five
     minutes and the answer may be that old. The build-wide lines are the
-    same for every caller: `search_provider`, `build_features`, `slack`,
-    `edition` and the `build` block. The top-level `host` and `database`
+    same for every caller: `build_features`, `edition` and the `build` block. The top-level `host` and `database`
     are null, and `deep_checks` is false. `check_anomalies` likewise gives it the
     neutral `ledger_chain` anomaly ("the hub's ledger is broken") and
     never runs `host_low_memory` (the hub's RAM) for it. A local

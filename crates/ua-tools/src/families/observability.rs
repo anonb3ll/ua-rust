@@ -1258,8 +1258,10 @@ fn workspace_check(cfg: &Config) -> Value {
     finding("workspace_root", status, format!("workspace root present and {w}; {bindings}"), gate)
 }
 
+const SEARCH_GATE: &str = "UA_SEARCH_PROVIDER, BRAVE_API_KEY, TAVILY_API_KEY";
+
 fn search_check(reg: &Registry) -> Value {
-    let gate = "UA_SEARCH_PROVIDER, BRAVE_API_KEY, TAVILY_API_KEY";
+    let gate = SEARCH_GATE;
     if reg.get("web_search").is_none() {
         return finding("search_provider", DORMANT, "web search tools are not part of this build", gate);
     }
@@ -1655,13 +1657,15 @@ fn github_credentials_check(
     Ok(finding("github_credentials", status, detail, gate))
 }
 
+const SLACK_GATE: &str = "slack_enabled, UA_SLACK_SIGNING_SECRET, slack_socket_mode, UA_SLACK_APP_TOKEN, slack_identities, \
+     cargo feature slack-socket";
+
 /// Slack: the HTTP routes (mounted or why not) and the Socket Mode
 /// transport (off, not compiled, connecting, connected, auth failed). The
 /// signing secret and the app token are only checked for presence.
 fn slack_check(cfg: &Config) -> Value {
     use crate::families::slack;
-    let gate = "slack_enabled, UA_SLACK_SIGNING_SECRET, slack_socket_mode, UA_SLACK_APP_TOKEN, slack_identities, \
-                cargo feature slack-socket";
+    let gate = SLACK_GATE;
     if !cfg.slack_enabled && !cfg.slack_socket_mode {
         return finding(
             "slack",
@@ -1931,7 +1935,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         hub_resource_check(&ctx.caller, "workspace_root", "UA_WORKSPACE, UA_AGENT_WORKSPACES", || {
             workspace_check(cfg)
         }),
-        search_check(reg),
+        hub_resource_check(&ctx.caller, "search_provider", SEARCH_GATE, || search_check(reg)),
         build_features_check(),
         embeddings_check(&facts),
         ledger_row,
@@ -1952,7 +1956,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
             "UA_ZULIP_SITE, UA_ZULIP_EMAIL, UA_ZULIP_API_KEY, UA_ZULIP_RETIRED, zulip_channels",
             || zulip_check(cfg),
         ),
-        slack_check(cfg),
+        hub_resource_check(&ctx.caller, "slack", SLACK_GATE, || slack_check(cfg)),
         github,
         hub_resource_check(&ctx.caller, "policy_file", "UA_POLICY_FILE", || policy_check(cfg)),
         fleet_nodes_check(&facts, cfg.node_require_acceptance, hub_reader),
