@@ -390,8 +390,7 @@ pub fn key_add(
     note: Option<&str>,
 ) -> UaResult<()> {
     let normalized = public_key_hex.trim().to_ascii_lowercase();
-    let bytes =
-        hex::decode(&normalized).map_err(|_| UaError::invalid("public key must be hex-encoded"))?;
+    let bytes = hex::decode(&normalized).map_err(|_| UaError::invalid("public key must be hex-encoded"))?;
     if bytes.len() != 32 {
         return Err(UaError::invalid(format!("an Ed25519 public key is 32 bytes, got {}", bytes.len())));
     }
@@ -582,8 +581,9 @@ pub fn checkpoint_attach(tx: &mut WriteTx<'_>, checkpoint_id: &str, signature_he
     }
     let checkpoint = checkpoint_get(tx, checkpoint_id)?
         .ok_or_else(|| UaError::not_found(format!("no checkpoint {checkpoint_id:?}")))?;
-    let key = key_get(tx, &checkpoint.key_id)?
-        .ok_or_else(|| UaError::not_found(format!("evidence key {:?} is not in the store", checkpoint.key_id)))?;
+    let key = key_get(tx, &checkpoint.key_id)?.ok_or_else(|| {
+        UaError::not_found(format!("evidence key {:?} is not in the store", checkpoint.key_id))
+    })?;
     if key.retired_at.is_some() {
         return Err(UaError::conflict(format!(
             "evidence key {:?} is retired; its checkpoint cannot be signed",
@@ -726,9 +726,7 @@ fn ledger_mismatch(conn: &Connection, checkpoint: &Checkpoint) -> UaResult<Optio
         return Ok(Some(format!("event_log has no row at seq {seq}")));
     };
     if !entry.eq_ignore_ascii_case(hash) {
-        return Ok(Some(format!(
-            "event_log[{seq}].entry_hash does not match the checkpoint hash"
-        )));
+        return Ok(Some(format!("event_log[{seq}].entry_hash does not match the checkpoint hash")));
     }
     let report = crate::ledger::verify_through(conn, seq)?;
     if !report.ok {
@@ -770,11 +768,7 @@ mod tests {
 
     fn open() -> (tempfile::TempDir, Db) {
         let dir = tempdir().unwrap();
-        let db = Db::open(
-            &dir.path().join("hub.db"),
-            &[KEY_STORE_PART, crate::ledger::SCHEMA],
-        )
-        .unwrap();
+        let db = Db::open(&dir.path().join("hub.db"), &[KEY_STORE_PART, crate::ledger::SCHEMA]).unwrap();
         (dir, db)
     }
 
@@ -789,11 +783,7 @@ mod tests {
         db.write(|tx| {
             let event = crate::ledger::append(
                 tx,
-                crate::EventInput::new(
-                    ua_core::DEFAULT_ORG,
-                    "test.event",
-                    serde_json::json!({"n": 1}),
-                ),
+                crate::EventInput::new(ua_core::DEFAULT_ORG, "test.event", serde_json::json!({"n": 1})),
             )?
             .expect("event appended");
             Ok((event.seq, event.entry_hash.expect("hashed")))
@@ -851,10 +841,7 @@ mod tests {
             org_id: Some("acme".into()),
             seq: None,
             hash: None,
-            window: Some(Window {
-                start: "2026-11-01T00:00:00Z".into(),
-                end: "2026-11-02T00:00:00Z".into(),
-            }),
+            window: Some(Window { start: "2026-11-01T00:00:00Z".into(), end: "2026-11-02T00:00:00Z".into() }),
             global_from_hash: Some("g0".into()),
             global_head_hash: Some("g1".into()),
             org_row_count: Some(9),
@@ -865,7 +852,8 @@ mod tests {
         let input = cp.digest_input();
         assert!(input.contains("\"format\":\"ua.evidence.checkpoint.v1\""), "{input}");
         assert!(
-            input.contains("\"window\":{\"end\":\"2026-11-02T00:00:00Z\",\"start\":\"2026-11-01T00:00:00Z\"}"),
+            input
+                .contains("\"window\":{\"end\":\"2026-11-02T00:00:00Z\",\"start\":\"2026-11-01T00:00:00Z\"}"),
             "{input}"
         );
         assert!(input.contains("\"org_row_count\":9"), "{input}");
@@ -978,8 +966,7 @@ mod tests {
         let (_sk, pk) = keypair();
         db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
         let (seq, hash) = ledger_row(&db);
-        let digest =
-            db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1", seq, &hash), "now")).unwrap();
+        let digest = db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1", seq, &hash), "now")).unwrap();
         let other = SigningKey::from_bytes(&[9u8; 32]);
         let sig = hex::encode(other.sign(&hex::decode(&digest).unwrap()).to_bytes());
         db.write(|tx| checkpoint_attach(tx, "cp-1", &sig)).unwrap();
@@ -995,8 +982,7 @@ mod tests {
         let (sk, pk) = keypair();
         db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
         let (seq, hash) = ledger_row(&db);
-        let digest =
-            db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1", seq, &hash), "now")).unwrap();
+        let digest = db.write(|tx| checkpoint_write(tx, &hub_checkpoint("k1", seq, &hash), "now")).unwrap();
         let sig = hex::encode(sk.sign(&hex::decode(&digest).unwrap()).to_bytes());
         db.write(|tx| checkpoint_attach(tx, "cp-1", &sig)).unwrap();
         let err = db.write(|tx| checkpoint_attach(tx, "cp-1", &sig)).unwrap_err();
