@@ -510,12 +510,15 @@ fn caller(label: &str) -> Caller {
         enforce_profile: false,
         session_key: None,
         transport: Transport::Cli,
+        org_id: ua_core::DEFAULT_ORG.to_string(),
     }
 }
 
-fn schema() -> Vec<ua_store::SchemaPart> {
-    let mut parts = vec![ledger::SCHEMA, ledger::META_SCHEMA];
-    parts.extend(crate::schema_parts());
+fn schema() -> Vec<ua_store::Part> {
+    let mut parts: Vec<ua_store::Part> = ua_store::schema::parts(&[ledger::SCHEMA, ledger::META_SCHEMA]);
+    parts.push(ua_store::org::STORE_PART.into());
+    parts.extend(crate::schema_parts().into_iter().map(ua_store::Part::from));
+    parts.extend(crate::org_parts());
     parts
 }
 
@@ -606,6 +609,7 @@ async fn search_keys(
     let hits = search::search(
         db,
         cfg,
+        ua_core::DEFAULT_ORG,
         SearchRequest { query: query.to_string(), as_of, limit: Some(SEARCH_LIMIT), ..Default::default() },
     )
     .await?;
@@ -822,6 +826,7 @@ async fn score_question(q: &LmeQuestion, scratch: &Scratch, cfg: &Config) -> UaR
     let hits = search::search(
         &db,
         cfg,
+        ua_core::DEFAULT_ORG,
         SearchRequest { query: q.question.clone(), limit: Some(SEARCH_LIMIT), ..Default::default() },
     )
     .await
@@ -839,6 +844,7 @@ async fn score_question(q: &LmeQuestion, scratch: &Scratch, cfg: &Config) -> UaR
         let again = search::search(
             &db,
             cfg,
+            ua_core::DEFAULT_ORG,
             SearchRequest {
                 query: q.question.clone(),
                 as_of: Some(as_of),
