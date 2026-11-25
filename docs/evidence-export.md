@@ -160,10 +160,12 @@ On top of that:
   manifest is what the checkpoint signature covers. Authorship of a receipt is
   therefore "the holder of key `K` attested this checkpoint and the manifest it
   signs", not a per-receipt signature.
-- A checkpoint's signature covers `{class, org_id, seq, hash, key_id,
-  signed_at}` for class `hub` and `{class, org_id, window, global_from_hash,
-  global_head_hash, org_row_count, org_chain_hash, key_id, signed_at}` for
-  class `org`.
+- A checkpoint's signature covers `{class, format, org_id, seq, hash, key_id,
+  signed_at}` for class `hub` and `{class, format, org_id, window,
+  global_from_hash, global_head_hash, org_row_count, org_chain_hash, key_id,
+  signed_at}` for class `org`. `format` is the domain tag
+  `ua.evidence.checkpoint.v1`, so a signature over a checkpoint cannot be
+  replayed as a signature over a different object type.
 
 ## The approval receipt
 
@@ -208,8 +210,9 @@ unsupported version). A refusal is never downgraded to a warning.
 1. **Format.** Version known; every file in the manifest present; no extra files
    counted as evidence.
 2. **Manifest digest and per-file digests.**
-3. **Checkpoint signature** against a trusted key id. An unknown key id is `2`,
-   never a pass.
+3. **Checkpoint signature** against the pinned anchor. An unknown key id is `2`,
+   never a pass; a key read from the same database is reported as
+   `valid_in_store_only` and is not authorship.
 4. **Row hashes and chain continuity.** Every row's `entry_hash` is recomputed
    under its `hash_v`. For class `hub`, continuity is checked from the
    checkpoint back to the pinned point or genesis. For class `org`, continuity
@@ -252,10 +255,20 @@ match" for "the hub is honest".
   the bundle.
 - Rotation: old public keys stay in the verifier's trust file so old bundles
   still verify; a bundle signed by a key the verifier does not have is `2`.
+- Revocation: a retired key stays in the store so older bundles verify, but a
+  revoked key is refused outright and every checkpoint naming it no longer
+  verifies. Revocation is set once and cannot be undone.
+- Trust anchor: the key row sits in the same database as the checkpoint, so a
+  verifier that trusts it is trusting the database it protects. `ua evidence
+  verify` therefore takes `--anchor-key` and `--anchor-key-id` from the key the
+  operator obtained out of band. Without a pinned anchor the verdict is
+  `valid_in_store_only`, which is not authorship and exits non-zero.
 - Custody is operator-held (decided 2026-11-22): the hub never holds the signing
   key. It writes the checkpoint digest and the operator signs it offline, so a
   compromised hub cannot mint a bundle. A hub-owned key would protect only against
   database editors, which the hash chain already covers.
+- The offline commands (`key-generate`, `sign`) do not open or create a hub
+  database. They read and write key files only.
 
 ## What must never be in a bundle
 
@@ -317,3 +330,48 @@ shipping it would invite the wrong reading.
    operator-only. Receipts carry no signature of their own — the manifest
    carries their digests and the checkpoint signature covers it. This replaces
    the earlier single whole-hub assumption (review, 2026-11-22).
+
+
+## S2: the key store and checkpoint signing
+
+Implemented in `crates/ua-store/src/evidence.rs` and the `ua evidence` CLI.
+The hub never holds a private key: it writes a checkpoint row and its digest,
+and the operator signs that digest offline.
+
+- **Key store.** `evidence_key` holds public keys only — `key_id`, the
+  algorithm (`ed25519`), the 32-byte public key as hex, when it was added, and
+  optional retirement and revocation times. A retired key still verifies old
+  bundles; it only stops new checkpoints naming it. A revoked key is refused
+  outright and every checkpoint naming it stops verifying. There is no
+  private-key column and no path that would add one.
+- **Checkpoint rows.** `evidence_checkpoint` holds one row per checkpoint:
+  its class, the class's signed fields, the digest, the key id, and the
+  operator's signature once attached. A row is signed once; a second
+  signature is refused, so the row cannot hide which key attested it.
+- **The digest.** The signed value is the raw 32-byte SHA-256 of one canonical
+  JSON object holding exactly the class's fields with sorted keys and explicit
+  `null`s, plus the domain tag `format: "ua.evidence.checkpoint.v1"` so a
+  signature cannot be replayed over a different object type. The canonical
+  encoding is the ledger's: `,`/`:` separators and non-ASCII escaped as
+  `\uXXXX`. The signature is Ed25519 over the raw digest bytes, not over the
+  hex text. A row whose stored fields no longer hash to the stored digest is
+  reported as a digest mismatch, never as a pass.
+- **The ledger anchor.** A `hub` checkpoint is checked against `event_log`:
+  its `seq` must exist, its `hash` must equal that row's `entry_hash`, and the
+  chain must verify through that `seq`. A made-up sequence or hash is a ledger
+  mismatch, never a pass.
+- **The trust anchor.** The key row is in the same database as the checkpoint,
+  so a verifier that trusts it is trusting the database it protects. `verify`
+  takes a pinned key (`--anchor-key`, `--anchor-key-id`); without one the
+  verdict is `valid_in_store_only`, which is not authorship.
+- **The commands.** `ua evidence key-generate` writes a 0600 seed file on the
+  operator's machine and prints the public key; `key-add`, `key-retire` and
+  `key-revoke` maintain the store; `checkpoint` writes a row and prints its
+  digest; `sign` signs a digest offline with the seed file; `attach` stores the
+  signature; `verify` recomputes the digest, checks the ledger anchor and the
+  signature against the pinned key. `verify` exits non-zero unless the verdict
+  is a valid signature. `key-generate` and `sign` are offline: they do not
+  open or create a hub database. Key and checkpoint changes are appended to
+  `event_log` (`evidence.key.added`, `evidence.key.retired`,
+  `evidence.key.revoked`, `evidence.checkpoint.written`,
+  `evidence.checkpoint.signed`).

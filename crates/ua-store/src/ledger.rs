@@ -234,7 +234,7 @@ fn from_row(r: &Row<'_>) -> rusqlite::Result<Event> {
 }
 
 /// Encode a string the way Python's `json.dumps` does with `ensure_ascii=True`.
-fn py_json_str(out: &mut String, s: &str) {
+pub(crate) fn py_json_str(out: &mut String, s: &str) {
     out.push('"');
     for ch in s.chars() {
         match ch {
@@ -542,6 +542,13 @@ pub struct VerifyReport {
 /// `organization.v1.store`) must be [`HASH_V`]; any other value fails, so a
 /// row cannot claim a hash form this build does not check.
 pub fn verify(conn: &Connection) -> UaResult<VerifyReport> {
+    verify_through(conn, i64::MAX)
+}
+
+/// Recompute the chain from genesis through `through_seq` (inclusive). A
+/// checkpoint uses this to prove the rows it covers without walking entries
+/// written after it. The report is the same as [`verify`].
+pub fn verify_through(conn: &Connection, through_seq: i64) -> UaResult<VerifyReport> {
     let expected_prefix = recorded_legacy_prefix(conn)?;
     let has_hash_v: bool = conn
         .query_row("SELECT 1 FROM pragma_table_info('event_log') WHERE name = 'hash_v'", [], |_| Ok(true))
@@ -550,9 +557,9 @@ pub fn verify(conn: &Connection) -> UaResult<VerifyReport> {
     let hash_v = if has_hash_v { "hash_v" } else { "1" };
     let mut stmt = conn.prepare(&format!(
         "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, dedupe_key, \
-         prev_hash, entry_hash, {hash_v} FROM event_log ORDER BY seq ASC"
+         prev_hash, entry_hash, {hash_v} FROM event_log WHERE seq <= ?1 ORDER BY seq ASC"
     ))?;
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query([through_seq])?;
     let mut expected_prev = GENESIS_HASH.to_string();
     let mut report =
         VerifyReport { ok: true, checked: 0, unhashed_legacy_prefix: 0, first_bad_seq: None, reason: None };
@@ -618,6 +625,15 @@ pub fn verify(conn: &Connection) -> UaResult<VerifyReport> {
         ));
     }
     Ok(report)
+}
+
+/// The entry hash stored at `seq`, or `None` when the row is absent or has no
+/// hash. A checkpoint names this value; the caller compares it.
+pub fn entry_hash_at(conn: &Connection, seq: i64) -> UaResult<Option<String>> {
+    let row: Option<Option<String>> = conn
+        .query_row("SELECT entry_hash FROM event_log WHERE seq = ?1", [seq], |r| r.get(0))
+        .optional()?;
+    Ok(row.flatten())
 }
 
 #[cfg(test)]

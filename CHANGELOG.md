@@ -12,6 +12,17 @@ from its commit history.
 
 ### Added
 
+- Evidence checkpoint signing and the public-key store (S2 of
+  `docs/evidence-export.md`): `evidence_key` holds Ed25519 public keys only,
+  `evidence_checkpoint` holds one row per checkpoint with its canonical digest
+  and the operator's signature. `ua evidence key-generate|key-add|key-retire|
+  key-revoke|checkpoint|sign|attach|verify` runs the offline signing step. The
+  hub never holds a private key: it writes the digest, the operator signs it
+  offline, and `verify` recomputes the digest, checks the ledger anchor and
+  checks the signature against a pinned key, exiting non-zero unless the
+  signature is valid. The signed digest carries the domain tag
+  `ua.evidence.checkpoint.v1`; key and checkpoint changes are ledgered; the
+  offline commands do not open a hub database. Red tier — ledger semantics.
 - GitHub webhooks per organization: `POST /api/github/webhook/{org}` (the
   organization's id) checks a delivery against that organization's own
   webhook secret only, and handles it for that organization only. The bare
