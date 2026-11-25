@@ -393,9 +393,18 @@ pub struct Config {
     /// Most GitHub webhook deliveries handled at once, across both
     /// unauthenticated routes (`POST /api/github/webhook` and
     /// `POST /api/github/webhook/{org}`), body read included. A delivery
-    /// over the cap is answered 429 before its body is read. 0 is taken
-    /// as 1. Default 4.
+    /// over the cap waits up to `github_webhook_busy_wait_ms` for a slot,
+    /// then is answered 429 before its body is read. 0 is taken as 1.
+    /// Default 16.
     pub github_webhook_max_in_flight: usize,
+    /// Milliseconds a delivery may take to send its whole body once it holds
+    /// a slot; a slower one is answered 408 and its slot freed. Clamped to
+    /// 50-60000. Default 10000 (GitHub's own delivery timeout).
+    pub github_webhook_read_timeout_ms: u64,
+    /// Milliseconds a delivery waits for a slot when
+    /// `github_webhook_max_in_flight` are taken, before it is answered 429.
+    /// Clamped to 0-10000. Default 2000.
+    pub github_webhook_busy_wait_ms: u64,
     /// The branch a merged pull request must target to close its task, by
     /// project. Unlisted projects use the repository's default branch.
     pub github_merge_branches: BTreeMap<String, String>,
@@ -789,7 +798,9 @@ impl Default for Config {
             github_require_default_branch_workflow: false,
             github_ci_latest_attempt_only: false,
             github_webhook_max_age_hours: 24,
-            github_webhook_max_in_flight: 4,
+            github_webhook_max_in_flight: 16,
+            github_webhook_read_timeout_ms: 10_000,
+            github_webhook_busy_wait_ms: 2_000,
             github_merge_branches: BTreeMap::new(),
             github_web_host: None,
             source_host: None,
@@ -1518,7 +1529,9 @@ provider_fallback = true
         assert_eq!(d.github_web_host(), "github.com");
         assert_eq!(d.github_ci_apps, vec!["github-actions".to_string()]);
         assert_eq!(d.github_webhook_max_age_hours, 24);
-        assert_eq!(d.github_webhook_max_in_flight, 4);
+        assert_eq!(d.github_webhook_max_in_flight, 16);
+        assert_eq!(d.github_webhook_read_timeout_ms, 10_000);
+        assert_eq!(d.github_webhook_busy_wait_ms, 2_000);
         assert!(!d.github_require_default_branch_workflow && !d.github_ci_latest_attempt_only);
     }
 

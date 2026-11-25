@@ -1,11 +1,12 @@
 //! Shared hub state handed to every tool.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use ua_core::Config;
 use ua_store::Db;
 
 use crate::ci::{CiVerifier, GitHubCiVerifier};
+use crate::families::github::credentials::{self, SharedWebhookRoutes};
 
 /// Configuration, the database and the pluggable outside lookups. Cheap to clone.
 #[derive(Clone)]
@@ -17,6 +18,10 @@ struct HubInner {
     cfg: Config,
     db: Db,
     ci: Arc<dyn CiVerifier>,
+    /// GitHub webhook routes refused because their secret is shared
+    /// ([`credentials::scan_shared_webhook_secrets`]); `None` when the last
+    /// check failed, which refuses every route (fail closed).
+    shared_webhook_routes: Arc<RwLock<Option<SharedWebhookRoutes>>>,
 }
 
 /// The environment variable that, set to `1`, opens a database written by a
@@ -96,15 +101,50 @@ impl Hub {
         Ok(Self::new(cfg, db))
     }
 
+    /// A hub over `db`. Checks the GitHub webhook secrets for sharing first
+    /// ([`Hub::shared_webhook_routes`]).
     pub fn new(cfg: Config, db: Db) -> Self {
         let ci = Arc::new(GitHubCiVerifier::new(cfg.clone(), db.clone()));
-        Self { inner: Arc::new(HubInner { cfg, db, ci }) }
+        let scan = db.read(|c| credentials::scan_shared_webhook_secrets(c, &cfg)).ok();
+        credentials::log_shared_webhook_secrets(scan.as_ref());
+        let shared_webhook_routes = Arc::new(RwLock::new(scan));
+        Self { inner: Arc::new(HubInner { cfg, db, ci, shared_webhook_routes }) }
     }
 
     /// The same hub with another CI verifier (tests, or a forge client).
     pub fn with_ci_verifier(self, ci: Arc<dyn CiVerifier>) -> Self {
         let (cfg, db) = (self.inner.cfg.clone(), self.inner.db.clone());
-        Self { inner: Arc::new(HubInner { cfg, db, ci }) }
+        let shared_webhook_routes = self.inner.shared_webhook_routes.clone();
+        Self { inner: Arc::new(HubInner { cfg, db, ci, shared_webhook_routes }) }
+    }
+
+    /// The GitHub webhook routes refused because another route shares
+    /// their secret, by organization id (the default organization's stands
+    /// for the bare route); `None` when the last check failed, and then
+    /// every route is refused.
+    pub fn shared_webhook_routes(&self) -> Option<SharedWebhookRoutes> {
+        self.inner.shared_webhook_routes.read().map(|g| g.clone()).unwrap_or(None)
+    }
+
+    /// Whether organization `org`'s webhook route is refused for a shared
+    /// secret (or because the last check failed).
+    pub fn webhook_route_shared(&self, org: &str) -> bool {
+        match self.inner.shared_webhook_routes.read() {
+            Ok(g) => g.as_ref().is_none_or(|shared| shared.contains(org)),
+            Err(_) => true,
+        }
+    }
+
+    /// Check the GitHub webhook secrets for sharing again (after one is set
+    /// or cleared, or by a test), log the outcome and keep it.
+    pub async fn rescan_shared_webhook_secrets(&self) {
+        let cfg = self.inner.cfg.clone();
+        let scan =
+            self.db().read_async(move |c| credentials::scan_shared_webhook_secrets(c, &cfg)).await.ok();
+        credentials::log_shared_webhook_secrets(scan.as_ref());
+        if let Ok(mut g) = self.inner.shared_webhook_routes.write() {
+            *g = scan;
+        }
     }
 
     /// The CI verifier task checks are graded with.

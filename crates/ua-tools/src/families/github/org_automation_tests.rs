@@ -556,6 +556,121 @@ mod cases {
         assert_eq!(h.count("SELECT count(*) FROM event_log WHERE channel GLOB 'agent.github.*'"), 0);
     }
 
+    /// Every webhook check takes the same steps whatever the organization
+    /// id names: one database read, one decryption (a dummy one when there
+    /// is nothing real to decrypt) and one MAC. Unknown, malformed, empty
+    /// (an id that is not UTF-8), suspended, secretless, unusable, shared,
+    /// the default organization's (whose secret is configuration) and a
+    /// valid delivery alike.
+    #[tokio::test]
+    async fn every_webhook_check_takes_the_same_steps() {
+        let h = H::new(ALL).await;
+        h.sql(
+            "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES
+                ('org-d', 'org-d', 'org-d', '[\"developer\"]', '2026-01-01T00:00:00+00:00'),
+                ('org-e', 'org-e', 'org-e', '[\"developer\"]', '2026-01-01T00:00:00+00:00');",
+        );
+        h.move_sealed(ORG_B, "org-e", CredentialKind::WebhookSecret);
+        let cases: [(&str, &str, Option<&str>); 10] = [
+            ("unknown", "org-nope", Some(B_HOOK)),
+            ("malformed id", "org b/../x", Some(B_HOOK)),
+            ("empty id", "", Some(B_HOOK)),
+            ("no secret", "org-d", Some(B_HOOK)),
+            ("unusable secret", "org-e", Some(B_HOOK)),
+            ("bad signature", ORG_B, Some(WRONG_HOOK)),
+            ("default, bad signature", DEFAULT_ORG, Some(WRONG_HOOK)),
+            ("default", DEFAULT_ORG, Some(HUB_HOOK)),
+            ("valid", ORG_B, Some(B_HOOK)),
+            ("suspended", ORG_C, Some(C_HOOK)),
+        ];
+        for (i, (what, to, secret)) in cases.into_iter().enumerate() {
+            if what == "suspended" {
+                h.sql(&format!("UPDATE orgs SET status = 'suspended' WHERE id = '{ORG_C}'"));
+            }
+            managed_secrets::work_trace::take();
+            let body = format!("{{\"zen\": \"steps {i}\"}}");
+            let _ = h.deliver(to, secret, "ping", &format!("steps-{i}"), body.as_bytes()).await;
+            assert_eq!(managed_secrets::work_trace::take(), ["read", "decrypt", "mac"], "{what}");
+        }
+    }
+
+    /// A route whose secret another route shares (a row from before the
+    /// uniqueness rule, or a hub configuration changed after the rows were
+    /// stored) refuses every delivery once the hub has checked, with the
+    /// same answer as a bad signature, and the doctor counts it. Fixing the
+    /// row and checking again serves the routes again.
+    #[tokio::test]
+    async fn a_route_whose_secret_another_route_shares_refuses_every_delivery() {
+        let h = H::new(Creds { hub: true, b_token: false, b_hook: Some(B_HOOK), c_hook: None }).await;
+        let store_unchecked = |org: &str, value: &str| {
+            let kind = CredentialKind::WebhookSecret;
+            let cfg = h.hub.cfg().clone();
+            let sealed =
+                managed_secrets::seal_value(&cfg, org, kind.secret_name(), kind.consumer(), value).unwrap();
+            let org = org.to_string();
+            h.hub
+                .db()
+                .write(move |tx| {
+                    managed_secrets::put_unchecked(tx, &org, kind.secret_name(), kind.consumer(), &sealed)
+                })
+                .unwrap();
+        };
+        store_unchecked(ORG_C, B_HOOK);
+        // Not yet checked: served as before.
+        h.deliver(ORG_B, Some(B_HOOK), "ping", "shared-0", b"{\"n\": 0}").await.unwrap();
+        h.hub.rescan_shared_webhook_secrets().await;
+        let shared: Vec<String> = h.hub.shared_webhook_routes().unwrap().into_iter().collect();
+        assert_eq!(shared, [ORG_B, ORG_C]);
+        for (i, to) in [ORG_B, ORG_C].into_iter().enumerate() {
+            let body = format!("{{\"n\": {}}}", i + 1);
+            let e = h.deliver(to, Some(B_HOOK), "ping", &format!("shared-{}", i + 1), body.as_bytes()).await;
+            assert_eq!(e.unwrap_err(), WebhookError::BadSignature, "{to}");
+        }
+        h.deliver(DEFAULT_ORG, Some(HUB_HOOK), "ping", "shared-3", b"{\"n\": 3}").await.unwrap();
+        let line = h.doctor_line().await;
+        assert!(
+            line.contains("2 webhook route(s) refused because another route shares their secret"),
+            "{line}"
+        );
+        assert!(!line.contains(B_HOOK));
+
+        // C now holds the hub configuration's value: the bare route and C's
+        // are refused, B's is served again.
+        h.sql(&format!("DELETE FROM managed_secrets WHERE org_id = '{ORG_C}'"));
+        store_unchecked(ORG_C, HUB_HOOK);
+        h.hub.rescan_shared_webhook_secrets().await;
+        assert_eq!(
+            h.deliver(DEFAULT_ORG, Some(HUB_HOOK), "ping", "shared-4", b"{\"n\": 4}").await.unwrap_err(),
+            WebhookError::BadSignature
+        );
+        h.deliver(ORG_B, Some(B_HOOK), "ping", "shared-5", b"{\"n\": 5}").await.unwrap();
+
+        h.sql(&format!("DELETE FROM managed_secrets WHERE org_id = '{ORG_C}'"));
+        h.hub.rescan_shared_webhook_secrets().await;
+        assert!(h.hub.shared_webhook_routes().unwrap().is_empty());
+        h.deliver(DEFAULT_ORG, Some(HUB_HOOK), "ping", "shared-6", b"{\"n\": 6}").await.unwrap();
+        assert!(h.doctor_line().await.contains("0 webhook route(s) refused"));
+    }
+
+    /// An internal failure on the default organization's route answers 500
+    /// with the same fixed message as any other route, never the error's
+    /// text.
+    #[tokio::test]
+    async fn an_internal_failure_on_the_default_route_answers_neutrally() {
+        let h = H::new(ALL).await;
+        h.sql(
+            "CREATE TRIGGER fail_default_received BEFORE INSERT ON event_log
+             WHEN NEW.channel = 'agent.github.webhook.received'
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        );
+        let e = h.deliver(DEFAULT_ORG, Some(HUB_HOOK), "ping", "neutral-1", b"{}").await.unwrap_err();
+        assert!(matches!(e, WebhookError::Internal(_)), "{e:?}");
+        assert_eq!(e.http_status(), 500);
+        assert!(!e.message().contains("injected"), "{}", e.message());
+        let other = h.deliver(ORG_B, Some(B_HOOK), "ping", "neutral-2", b"{}").await.unwrap_err();
+        assert_eq!(e.message(), other.message());
+    }
+
     // --- CI re-verification ---------------------------------------------------------------
 
     /// A push signed by organization B re-verifies B's check with B's token; one

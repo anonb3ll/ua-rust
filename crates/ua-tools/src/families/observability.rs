@@ -1440,9 +1440,18 @@ const GITHUB_ORGS_SHOWN: usize = 50;
 /// automation runs per organization, so the line also counts, over the same
 /// organizations, repositories whose last poll failed (no values, no
 /// names): only those still bound, in an organization whose token is still
-/// usable. LIVE when one is configured, DEGRADED when a stored one is
-/// unusable or a poll is failing, DORMANT when all are off.
-fn github_credentials_check(c: &Connection, cfg: &Config, caller: &ua_core::Caller) -> UaResult<Value> {
+/// usable. It also counts, over the same organizations, webhook routes
+/// refused because another route shares their secret (`shared`, from
+/// [`crate::Hub::shared_webhook_routes`]; `None` when that check failed and
+/// every route is refused). LIVE when one is configured, DEGRADED when a
+/// stored one is unusable, a poll is failing or a webhook route is refused
+/// for a shared secret, DORMANT when all are off.
+fn github_credentials_check(
+    c: &Connection,
+    cfg: &Config,
+    caller: &ua_core::Caller,
+    shared: Option<&crate::families::github::credentials::SharedWebhookRoutes>,
+) -> UaResult<Value> {
     use crate::families::github::credentials::{self, CredentialKind, CredentialSource, CredentialState};
     let gate = "github_token_env, github_webhook_secret_env (default organization); github_credential_set \
                 (another organization)";
@@ -1513,13 +1522,18 @@ fn github_credentials_check(c: &Connection, cfg: &Config, caller: &ua_core::Call
             |r| r.get::<_, i64>(0),
         )?;
     }
+    // Counted over the organizations this caller sees; never which value.
+    let refused = match shared {
+        Some(shared) => orgs.iter().filter(|o| shared.contains(o.as_str())).count().to_string(),
+        None => "every".to_string(),
+    };
     let detail = format!(
         "{}; automation runs per organization under its own credentials; {failing} bound repositor{} whose \
-         last poll failed",
+         last poll failed; {refused} webhook route(s) refused because another route shares their secret",
         lines.join("; "),
         if failing == 1 { "y" } else { "ies" }
     );
-    let status = if unusable || failing > 0 {
+    let status = if unusable || failing > 0 || refused != "0" {
         DEGRADED
     } else if configured {
         LIVE
@@ -1761,7 +1775,8 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let facts = ctx.hub.db().read_async(move |c| db_facts(c, &org, deep)).await?;
     let github = {
         let (cfg, caller) = (ctx.hub.cfg().clone(), ctx.caller.clone());
-        ctx.hub.db().read_async(move |c| github_credentials_check(c, &cfg, &caller)).await?
+        let shared = ctx.hub.shared_webhook_routes();
+        ctx.hub.db().read_async(move |c| github_credentials_check(c, &cfg, &caller, shared.as_ref())).await?
     };
     let cfg = ctx.hub.cfg();
     let reg = crate::builtin_registry_shared();

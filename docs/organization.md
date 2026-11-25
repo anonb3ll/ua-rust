@@ -666,7 +666,9 @@ here for memory columns, owners and defaults.
   byte-identical refusal for an unknown, suspended or secretless
   organization and a bad signature; every organization's webhook secret
   must be distinct (`webhook_secret_in_use`, checked by keyed fingerprint
-  at `github_credential_set`), and the former multi-match rule is gone
+  at `github_credential_set` after the approval gate, each refusal ledgered
+  by fingerprint; a shared secret found at startup refuses every route that
+  shares it, fail closed), and the former multi-match rule is gone
   (see [github.md](github.md#automation-per-organization)),
   the poller polls each organization with its own token and skips one
   without, CI lookups and `queue_close_merged` use the task's or caller's

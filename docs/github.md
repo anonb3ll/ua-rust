@@ -33,7 +33,9 @@ github_ci_latest_attempt_only = false           # judge a job on its latest atte
 
 # Webhooks and close-on-merge.
 github_webhook_max_age_hours = 24               # refuse payloads whose own timestamp is older; 0 = off
-github_webhook_max_in_flight = 4                # deliveries read or handled at once; over it: 429
+github_webhook_max_in_flight = 16               # deliveries read or handled at once
+github_webhook_busy_wait_ms = 2000              # wait this long for a slot, then 429
+github_webhook_read_timeout_ms = 10000          # a body slower than this is answered 408
 # github_web_host = "github.com"                # host PR links must name (default: from github_api_url)
 # project -> branch a merged PR must target; unlisted: the repository's default branch
 # github_merge_branches = { default = "main" }
@@ -117,12 +119,32 @@ reconciliation all do (see [Automation per organization](#automation-per-organiz
   without saying which organization holds it. The comparison is by keyed
   fingerprint, under the key each stored row was sealed with (a row sealed
   under a key the hub no longer has cannot verify anything and is not
-  compared); no plaintext is compared or kept. Since set and clear refuse
-  every caller until memberships exist, this rule is enforced code that
-  waits for that path; it is tested through the shared write path. The hub
-  configuration itself is not checked against stored secrets when it
-  changes: routing (below) already keeps one organization's secret off
-  another's route.
+  compared); no plaintext is compared or kept. The check runs after the
+  approval gate, so replacing a stored secret answers nothing about the new
+  value until a human approved it, and every refusal is ledgered
+  (`github.credential.refused`: the attempted value's keyed fingerprint,
+  originator `system` for another organization, never the organization it
+  collides with), so probing for another organization's value leaves a
+  trail. Since set and clear refuse every caller until memberships exist,
+  this rule is enforced code that waits for that path; it is tested through
+  the shared write path.
+- **Shared secrets found later are refused (fail closed).** A shared value
+  can still arise outside `github_credential_set`: the hub configuration's
+  `github_webhook_secret_env` changed to a value an organization stores, or
+  rows stored before the rule. At startup, and after every webhook secret
+  is set or cleared, the hub compares the configuration's secret, by keyed
+  fingerprint under each stored row's own key, with every organization's
+  stored webhook secret, and the stored secrets with each other (each
+  decrypted in-process and fingerprinted under the write key, so rows
+  sealed under different keys compare). Every route in a match refuses
+  every delivery, with the usual 401 `bad_signature`: the bare route when
+  the configuration's secret is shared, and each organization's route
+  whose secret is shared. The hub logs an error naming the organizations
+  (never a value or a fingerprint), and the `system_doctor`
+  `github_credentials` line counts the refused routes and reads DEGRADED.
+  If the check itself fails, every webhook route is refused until one
+  succeeds (restart the hub, or set or clear a webhook secret). Fix it by
+  giving each route its own secret, then restart the hub.
 
 ## Security model
 
@@ -164,18 +186,32 @@ computed. The bare route never tries another organization's secret, and
 the payload's repository never decides. Set content type
 `application/json` on the GitHub side.
 
+**Moving an organization's webhook to its own route.** A webhook that
+pointed at the bare route for another organization is refused there (401).
+Repoint it on GitHub to `/api/github/webhook/<org id>`, give the
+organization its own secret, then redeliver by hand, from the hook's
+"Recent Deliveries" page, every delivery refused in between: GitHub does not
+redeliver on its own, and a delivery whose payload is older than
+`github_webhook_max_age_hours` is refused as `stale`, so do it within that
+window (or let the poller catch merged pull requests up).
+
 **Webhook authentication.** Neither route takes a bearer token (GitHub
 cannot send one). Before anything is parsed or stored:
 
 1. `X-Hub-Signature-256` must be `sha256=` + the HMAC-SHA256 of the raw body
    under the routed organization's webhook secret, compared in constant
    time. Otherwise 401 `bad_signature`. That one answer, byte for byte,
-   also covers an unknown or malformed organization id, a suspended
-   organization, an organization with no secret and a stored secret that
-   cannot be used, after the same one MAC (over a fixed dummy key when
-   there is no secret): an unauthenticated caller cannot tell which
-   organizations exist or have a secret. There is no `not_configured`
-   (503) answer any more.
+   also covers an unknown or malformed organization id (one that is not
+   even UTF-8 too), a suspended organization, an organization with no
+   secret, a stored secret that cannot be used and a secret another route
+   shares, after the same steps: one database read with the same query for
+   every id (a malformed id is looked up as one no organization has), one
+   AES-GCM decryption (a dummy one when there is nothing real to decrypt)
+   and one MAC (over a fixed dummy key when there is no secret). The answer
+   never tells which organizations exist or have a secret. The work is
+   equal, not constant-time: whether the read finds a row is not timed
+   out, so a caller with many samples may still see a small difference.
+   There is no `not_configured` (503) answer any more.
 2. When the payload carries its own timestamp (`pull_request.merged_at`,
    `updated_at` or `closed_at`; `check_run.completed_at`;
    `check_suite.updated_at`; `workflow_run.updated_at`;
@@ -190,19 +226,35 @@ cannot send one). Before anything is parsed or stored:
    are recorded in `inbound_deliveries` ([ingress.md](ingress.md#inbound-deliveries)),
    kept 30 days, at most 20 000 of each.
 4. The body must be `application/json` (the API guard refuses a form body
-   with 415) and at most 5 MiB.
+   with 415) and at most 5 MiB (413; a declared length over that is refused
+   before it takes a slot).
 5. Both routes share one in-flight cap, `github_webhook_max_in_flight`
-   (default 4, at least 1, at most 256): a delivery that arrives while that
-   many are being read or handled is answered 429 `busy` with
-   `Retry-After: 1` before its body is read, with nothing recorded or
-   ledgered, so a redelivery is processed normally. The permit is held from
-   before the body is read until the answer, so slow senders count too.
+   (default 16, at least 1, at most 256). A delivery holds a slot from
+   before its body is read until the answer. When all are taken it waits
+   up to `github_webhook_busy_wait_ms` (default 2000, at most 10 000) for
+   one, then is answered 429 `busy` with `Retry-After: 1`, with nothing
+   recorded or ledgered. Once it holds a slot it has
+   `github_webhook_read_timeout_ms` (default 10 000, GitHub's own delivery
+   timeout; 50 to 60 000) to send its whole body; a slower one is answered
+   408 `timeout` and its slot is freed. A sender that declares a body and
+   never sends it therefore holds a slot for that long at most; enough of
+   them at once can still fill the cap, which is what the wait and the
+   larger default absorb.
+
+**A delivery answered 429, 408 or 500 is lost unless something brings it
+back.** GitHub does not redeliver a failed delivery on its own. Enable the
+poller (`github_poll_interval_s`) as a backstop: it reconciles merged pull
+requests and re-verifies checks that a missed delivery would have. To
+replay one delivery, redeliver it by hand from the hook's "Recent
+Deliveries" page on GitHub (within `github_webhook_max_age_hours`, or it is
+refused as `stale`).
 
 The delivery id, the body hash (both `accepted` by this process) and an
 `agent.github.webhook.received` event are written in one transaction before
 any effect. After the effects both records are marked `finished`, and a later
 copy is a replay. If an effect fails with an internal error, the id and hash
-are released instead, so GitHub's redelivery is processed again. If the hub
+are released instead, so a redelivery (by hand, or the poller's pass) is
+processed again. If the hub
 stops between recording a delivery and finishing it, or the delivery has been
 in flight for 15 minutes, a redelivery is processed again rather than
 refused, and its ledger event says `"redelivered": true`. Every effect is
@@ -369,8 +421,9 @@ another's:
   answered organization-neutrally, `{"ok": true}`, with no organization id,
   repository, task id or title; what it did is in its own ledger. Its
   refusals (`bad_signature`, `replayed`, `stale`, `bad_request`) are as on
-  the default route; an internal failure answers 500 with a fixed message,
-  never the error's text, and releases its replay records so GitHub's
+  the default route. An internal failure, on any route, the default one
+  included, answers 500 with a fixed message, never the error's text (the
+  hub's log has it), and releases its replay records so a manual
   redelivery is processed.
 - **Poller.** Each pass polls every organization that has a token, its bound
   repositories with its token; an organization without one is skipped and

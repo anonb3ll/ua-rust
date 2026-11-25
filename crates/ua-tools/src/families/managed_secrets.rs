@@ -292,7 +292,33 @@ struct Bound<'a> {
     aad_v: i64,
 }
 
+/// Test hook: the steps an unauthenticated webhook check takes (`read`,
+/// `decrypt`, `mac`), on this thread, so a test can assert every refusal
+/// takes the same ones. Nothing outside tests.
+#[cfg(test)]
+pub(crate) mod work_trace {
+    use std::cell::RefCell;
+    thread_local! {
+        static STEPS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    }
+    pub(crate) fn record(step: &'static str) {
+        STEPS.with(|s| s.borrow_mut().push(step));
+    }
+    /// The steps recorded since the last call.
+    pub(crate) fn take() -> Vec<&'static str> {
+        STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+}
+
+/// Record one step of a webhook check (tests only; nothing otherwise).
+#[inline]
+pub(crate) fn trace_step(_step: &'static str) {
+    #[cfg(test)]
+    work_trace::record(_step);
+}
+
 fn unseal(key: &Key, at: &Bound<'_>, nonce: &[u8], ct: &[u8]) -> UaResult<SecretString> {
+    trace_step("decrypt");
     let name = at.name;
     if nonce.len() != 12 {
         return Err(UaError::internal(format!("managed secret {name:?} is corrupt")));
@@ -355,6 +381,92 @@ pub(crate) fn load_for_consumer(
     })?;
     let at = Bound { org, name, consumer, aad_v };
     Ok((unseal(key, &at, &nonce, &ct)?, fp))
+}
+
+/// One stored row as read for a webhook route: how it was sealed and the
+/// sealed bytes. Holds no plaintext.
+pub(crate) struct SealedRow {
+    pub(crate) consumer: String,
+    pub(crate) key_id: String,
+    pub(crate) nonce: Vec<u8>,
+    pub(crate) ciphertext: Vec<u8>,
+    pub(crate) aad_v: i64,
+}
+
+/// Length of the dummy value [`open_once`] decrypts when there is nothing
+/// real to decrypt: about a webhook secret's.
+const DUMMY_VALUE_BYTES: usize = 40;
+
+/// Decrypt a fixed dummy value under a fixed key: the same one AES-GCM
+/// decryption a real row costs, with nothing usable at the end.
+fn dummy_unseal() {
+    /// The dummy key, nonce and ciphertext.
+    type Dummy = (Key, Vec<u8>, Vec<u8>);
+    static DUMMY: std::sync::OnceLock<Option<Dummy>> = std::sync::OnceLock::new();
+    let dummy = DUMMY.get_or_init(|| {
+        let key = Key { id: String::new(), bytes: [0x5a; 32] };
+        let (nonce, ct) = seal(&key, "dummy", "dummy", "dummy", &"x".repeat(DUMMY_VALUE_BYTES)).ok()?;
+        Some((key, nonce, ct))
+    });
+    if let Some((key, nonce, ct)) = dummy {
+        let at = Bound { org: "dummy", name: "dummy", consumer: "dummy", aad_v: AAD_V };
+        let _ = unseal(key, &at, nonce, ct);
+    }
+}
+
+/// Open `row` as secret `name` of organization `org` for `consumer`, with
+/// exactly one AES-GCM decryption whatever `row` is: the real one when the
+/// row is bound to `consumer`, sealed with a configured key and in a form
+/// `org` opens; otherwise a dummy one, so no row, a row for another
+/// consumer, a missing key and a refused form cost what a real row costs.
+/// `Ok(None)` when there is no row for `consumer`; `Err` when there is one
+/// that cannot be used (no key, its key gone, a refused form, or it does
+/// not decrypt).
+pub(crate) fn open_once(
+    cfg: &Config,
+    org: &str,
+    name: &str,
+    consumer: &str,
+    row: Option<&SealedRow>,
+) -> UaResult<Option<SecretString>> {
+    let keys = keyring(cfg);
+    let usable = match row {
+        None => Err(Ok(None)),
+        Some(r) if r.consumer != consumer => Err(Ok(None)),
+        Some(r) => match &keys {
+            Ok(Some(keys)) => match keys.iter().find(|k| k.id == r.key_id) {
+                Some(_) if !form_accepted(r.aad_v, org) => Err(Err(UaError::denied(
+                    "secret_form_refused",
+                    format!("managed secret {name:?} was sealed in a form this organization refuses"),
+                ))),
+                Some(key) => Ok((key, r)),
+                None => Err(Err(UaError::denied(
+                    "secret_key_missing",
+                    format!("managed secret {name:?} was sealed with a key that is no longer configured"),
+                ))),
+            },
+            _ => Err(Err(UaError::denied(
+                "secret_key_unset",
+                "managed_secret_key is not set; stored secrets cannot be decrypted",
+            ))),
+        },
+    };
+    match usable {
+        Ok((key, r)) => {
+            let at = Bound { org, name, consumer, aad_v: r.aad_v };
+            unseal(key, &at, &r.nonce, &r.ciphertext).map(Some)
+        }
+        Err(outcome) => {
+            dummy_unseal();
+            outcome
+        }
+    }
+}
+
+/// `value`'s keyed fingerprint under the configured key `key_id`, or `None`
+/// when that key is not configured. Compared, never shown.
+pub(crate) fn fingerprint_under_key(cfg: &Config, key_id: &str, value: &str) -> Option<String> {
+    keyring(cfg).ok().flatten()?.iter().find(|k| k.id == key_id).map(|k| fingerprint(k, value))
 }
 
 /// Whether `name` is stored in organization `org` and bound to `consumer`
@@ -495,15 +607,42 @@ pub(crate) struct Stored {
     pub(crate) updated_at: String,
 }
 
+/// Why [`put`] stored nothing, though its transaction may commit.
+pub(crate) enum NotStored {
+    /// A one-time human approval is pending, with this id.
+    Pending(i64),
+    /// Refused after the approval gate; the refusal is already in the
+    /// ledger, so the caller commits its transaction and then returns this.
+    Refused(UaError),
+}
+
+impl NotStored {
+    /// The error `tool`'s caller sees.
+    pub(crate) fn into_error(self, tool: &str) -> UaError {
+        match self {
+            NotStored::Pending(approval_id) => UaError::ApprovalRequired { tool: tool.into(), approval_id },
+            NotStored::Refused(e) => e,
+        }
+    }
+}
+
 /// Store `sealed` as secret `name` of organization `org`, inside the
 /// caller's write transaction. A name already bound to another consumer is
 /// refused. Replacing a value is as consequential as deleting it: unless
 /// the registry already consumed a pass for this call (`registry_gated`),
 /// it needs a one-time human approval of `tool`, bound to the new value's
-/// fingerprint. `Ok(Err(id))` is a pending approval. Writes no event: the
-/// tool records its own. An organization's GitHub webhook secret must be its
-/// own: a value another organization or the hub configuration already uses
-/// is refused ([`gh_credentials::refuse_shared_webhook_secret`]).
+/// fingerprint (`Err(NotStored::Pending)`). Writes no event when it
+/// stores: the tool records its own.
+///
+/// An organization's GitHub webhook secret must be its own: a value another
+/// organization or the hub configuration already uses is refused
+/// ([`gh_credentials::refuse_shared_webhook_secret`]). That check runs
+/// after the approval gate, so a replacement answers nothing about the
+/// value before a human approved it, and every such refusal is ledgered
+/// (`github.credential.refused`, the attempted value's keyed fingerprint
+/// only, never an organization it collides with) and returned as
+/// `Err(NotStored::Refused)` for the caller to commit: repeated probing of
+/// a first value, which no approval gates, leaves a trail.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn put(
     tx: &mut WriteTx<'_>,
@@ -515,10 +654,7 @@ pub(crate) fn put(
     consumer: &str,
     sealed: &Sealed,
     registry_gated: bool,
-) -> UaResult<Result<Stored, i64>> {
-    if name == gh_credentials::WEBHOOK_SECRET && consumer == gh_credentials::WEBHOOK_CONSUMER {
-        gh_credentials::refuse_shared_webhook_secret(tx, cfg, org, sealed)?;
-    }
+) -> UaResult<Result<Stored, NotStored>> {
     let prior: Option<String> = tx
         .query_row("SELECT consumer FROM managed_secrets WHERE org_id = ?1 AND name = ?2", [org, name], |r| {
             r.get(0)
@@ -539,7 +675,7 @@ pub(crate) fn put(
         let payload = set_payload(name, consumer, Some(&sealed.fingerprint), sealed.value_bytes);
         match approvals::gate(tx, cfg, caller, tool, &payload)? {
             GateOutcome::Pass { approval_id: id } => approval_id = Some(id),
-            GateOutcome::Pending { approval_id } => return Ok(Err(approval_id)),
+            GateOutcome::Pending { approval_id } => return Ok(Err(NotStored::Pending(approval_id))),
             GateOutcome::Denied { approval_id, reason } => {
                 return Err(UaError::denied(
                     "approval_denied",
@@ -547,6 +683,32 @@ pub(crate) fn put(
                 ));
             }
         }
+    }
+    if name == gh_credentials::WEBHOOK_SECRET
+        && consumer == gh_credentials::WEBHOOK_CONSUMER
+        && let Err(refusal) = gh_credentials::refuse_shared_webhook_secret(tx, cfg, org, sealed)
+    {
+        if refusal.reason_code() != Some(gh_credentials::SECRET_IN_USE) {
+            return Err(refusal);
+        }
+        // ORG-EVENT-DEFAULT: as the credential tools' own events. The
+        // attempted value's keyed fingerprint only. The transaction commits,
+        // so a pass the gate consumed stays consumed: each probe of a
+        // replacement costs a fresh human approval.
+        ledger::append(
+            tx,
+            EventInput::new(
+                ua_core::DEFAULT_ORG,
+                "github.credential.refused",
+                json!({
+                    "kind": "webhook_secret", "reason": gh_credentials::SECRET_IN_USE,
+                    "fingerprint": sealed.fingerprint, "value_bytes": sealed.value_bytes,
+                    "approval_id": approval_id,
+                }),
+            )
+            .by(approvals::ledger_originator(org, &caller.label)),
+        )?;
+        return Ok(Err(NotStored::Refused(refusal)));
     }
     let now = ua_core::time::now();
     tx.execute(
@@ -570,6 +732,37 @@ pub(crate) fn put(
         ],
     )?;
     Ok(Ok(Stored { replaced: prior.is_some(), approval_id, updated_at: now }))
+}
+
+/// Store `sealed` with none of [`put`]'s checks: a row as an older build,
+/// or a direct database edit, could have left it. Tests only.
+#[cfg(test)]
+pub(crate) fn put_unchecked(
+    tx: &mut WriteTx<'_>,
+    org: &str,
+    name: &str,
+    consumer: &str,
+    sealed: &Sealed,
+) -> UaResult<()> {
+    let now = ua_core::time::now();
+    tx.execute(
+        "INSERT INTO managed_secrets (org_id, name, consumer, key_id, nonce, ciphertext, fingerprint, value_bytes, \
+         created_by, created_at, updated_by, updated_at, aad_v) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'test', ?9, 'test', ?9, ?10)",
+        params![
+            org,
+            name,
+            consumer,
+            sealed.key_id,
+            sealed.nonce,
+            sealed.ciphertext,
+            sealed.fingerprint,
+            sealed.value_bytes as i64,
+            now,
+            AAD_V
+        ],
+    )?;
+    Ok(())
 }
 
 /// Delete secret `name` of organization `org`, inside the caller's write
@@ -721,7 +914,7 @@ async fn managed_secret_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
                 registry_gated,
             )? {
                 Ok(s) => s,
-                Err(pending) => return Ok(Err(pending)),
+                Err(not_stored) => return Ok(Err(not_stored)),
             };
             // ORG-EVENT-DEFAULT: use the secret's organization once callers
             // can resolve to other organizations and org_guard allows it.
@@ -744,7 +937,7 @@ async fn managed_secret_set(ctx: ToolCtx, a: SetArgs) -> UaResult<Value> {
             })))
         })
         .await?;
-    out.map_err(|approval_id| UaError::ApprovalRequired { tool: "managed_secret_set".into(), approval_id })
+    out.map_err(|not_stored| not_stored.into_error("managed_secret_set"))
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]

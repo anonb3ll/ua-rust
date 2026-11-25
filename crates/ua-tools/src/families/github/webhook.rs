@@ -8,35 +8,44 @@
 //! organization's. Each delivery costs one secret check: only the routed
 //! organization's secret is loaded and only one MAC is computed, so an
 //! unauthenticated caller cannot make the hub decrypt or hash once per
-//! organization. Every organization's webhook secret is distinct
-//! (`github_credential_set` refuses a value another organization or the hub
-//! configuration already uses), so one signed delivery never verifies for
-//! two organizations.
+//! organization. Every organization's webhook secret should be distinct:
+//! `github_credential_set` refuses a value another organization or the hub
+//! configuration already uses, and the hub checks again at startup and
+//! after every webhook-secret change, refusing every route whose secret
+//! another route shares (fail closed; see [`Hub::webhook_route_shared`]).
 //!
 //! In order, before anything is parsed or stored:
 //!
 //! 1. `X-Hub-Signature-256` must be `sha256=` and 64 hex digits, checked
 //!    before the database is touched.
-//! 2. The routed organization's secret is loaded: the default
-//!    organization's from the variable `github_webhook_secret_env` names,
-//!    another active organization's from its own managed secret
-//!    `github:webhook-secret` ([`credentials::webhook_secret_for_route`]).
+//! 2. One database read, the same query for every organization id
+//!    ([`credentials::webhook_route_lookup`]; a malformed id is looked up
+//!    as one no organization has), then exactly one AES-GCM decryption, a
+//!    dummy one when there is nothing real to decrypt
+//!    ([`credentials::webhook_route_secret`]): the default organization's
+//!    secret is the variable `github_webhook_secret_env` names, another
+//!    active organization's its own managed secret `github:webhook-secret`.
 //!    The signature must be HMAC-SHA256(that secret, raw body), compared in
 //!    constant time, outside the database read.
 //!
 //! A malformed or wrong signature, an organization id that is unknown or
-//! malformed, a suspended organization, an organization with no secret and
-//! one whose stored secret cannot be used are all one refusal: 401
-//! `bad_signature`, the same body byte for byte, after the same one MAC
-//! (over a fixed dummy key when there is no secret). Nothing in the answer
-//! says which it was. The hub's log says, rate-limited, when the default
-//! organization has no secret or a stored secret is unusable.
+//! malformed (or not even UTF-8), a suspended organization, an organization
+//! with no secret, one whose stored secret cannot be used and one whose
+//! secret another route shares are all one refusal: 401 `bad_signature`,
+//! the same body byte for byte, after the same steps (one read, one
+//! decryption, one MAC, over a fixed dummy key when there is no secret).
+//! Nothing in the answer says which it was. That is equal work, not
+//! constant time: the database read finds a row or does not, and SQLite's
+//! time for that is not equalised. The hub's log says, rate-limited, when
+//! the default organization has no secret or a stored secret is unusable.
 //!
 //! **The response.** A delivery to the default organization is answered
 //! with its result. Any other organization's is answered
 //! organization-neutrally, `{"ok": true}`, with no organization id,
-//! repository or task: those stay in its own ledger. An internal failure
-//! there answers 500 with a fixed message, never the error's text.
+//! repository or task: those stay in its own ledger. An internal failure,
+//! on any route (a database error while checking the signature included),
+//! answers 500 with a fixed message, never the error's text, which the
+//! hub's log carries.
 //!
 //! Then, for a verified delivery, in order:
 //!
@@ -58,8 +67,8 @@
 //! transaction, and handled only when its repository is bound to a project
 //! of that organization.
 //! Afterwards both records are marked `finished`; when handling failed with
-//! an internal error they are released instead, so GitHub's redelivery is
-//! processed. A delivery that was accepted but never finished (the hub
+//! an internal error they are released instead, so a redelivery (by hand
+//! from GitHub, which does not redeliver on its own) is processed. A delivery that was accepted but never finished (the hub
 //! stopped while handling it, or it has been in flight for 15 minutes) is
 //! processed again when it is redelivered, not refused: every effect is
 //! idempotent. The ledger event of such a redelivery says
@@ -85,7 +94,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use hmac::{Hmac, KeyInit, Mac};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::UaError;
@@ -96,6 +105,7 @@ use super::credentials;
 use super::{GITHUB_ACTOR, github_caller_for, reverify_head};
 use crate::Hub;
 use crate::families::continuity::merged::{MergedPr, close_merged};
+use crate::families::managed_secrets;
 use crate::families::tasks::{emit, ledger_text};
 
 /// Delivery ids and body hashes are kept this many days for replay
@@ -236,6 +246,7 @@ pub(crate) fn parse_signature(signature: Option<&str>) -> Option<[u8; 32]> {
 
 /// Whether `mac` is HMAC-SHA256(`secret`, `body`), compared in constant time.
 fn mac_valid(secret: &[u8], body: &[u8], mac: &[u8; 32]) -> bool {
+    managed_secrets::trace_step("mac");
     let Ok(mut h) = Hmac::<Sha256>::new_from_slice(secret) else { return false };
     h.update(body);
     h.verify_slice(mac).is_ok()
@@ -273,17 +284,22 @@ fn route_org_shape(org: &str) -> bool {
 }
 
 /// Verify `body` against organization `org`'s own webhook secret, and only
-/// that one: one secret loaded, one MAC computed, in constant time, outside
-/// the database read. Every refusal is [`WebhookError::BadSignature`]
-/// (see the module documentation); a database failure is `Internal`.
+/// that one, with the same steps for every organization id: one database
+/// read (the same query), one AES-GCM decryption (a dummy one when there is
+/// nothing real to decrypt), one MAC in constant time, outside the database
+/// read. Every refusal is [`WebhookError::BadSignature`] (see the module
+/// documentation); a database failure is `Internal`.
 async fn verify_for(hub: &Hub, org: &str, body: &[u8], signature: Option<&str>) -> Result<(), WebhookError> {
     let mac = parse_signature(signature).ok_or(WebhookError::BadSignature)?;
-    let secret: Option<SecretString> = if route_org_shape(org) {
-        let (cfg, og) = (hub.cfg().clone(), org.to_string());
-        hub.db().read_async(move |c| credentials::webhook_secret_for_route(c, &cfg, &og)).await?
-    } else {
-        None
-    };
+    // A malformed id is looked up as "", which no organization has: the
+    // same read as any other id, never the sender's text in a query.
+    let routed = if route_org_shape(org) { org } else { "" };
+    let id = routed.to_string();
+    let found = hub.db().read_async(move |c| credentials::webhook_route_lookup(c, &id)).await;
+    managed_secrets::trace_step("read");
+    let secret = credentials::webhook_route_secret(hub.cfg(), routed, found?);
+    // A route whose secret another route shares verifies nothing.
+    let secret = secret.filter(|_| !hub.webhook_route_shared(routed));
     // The same one MAC whether or not a secret was found.
     let key = secret.as_ref().map_or(NO_SECRET_KEY, |s| s.expose_secret().as_bytes());
     let valid = mac_valid(key, body, &mac);
@@ -316,19 +332,19 @@ pub async fn receive(hub: &Hub, d: WebhookDelivery<'_>) -> Result<Value, Webhook
 /// default is answered organization-neutrally.
 pub async fn receive_org(hub: &Hub, org: &str, d: WebhookDelivery<'_>) -> Result<Value, WebhookError> {
     let result = receive_checked(hub, org, d).await;
-    if org == ua_core::DEFAULT_ORG {
-        return result;
-    }
     match result {
-        Ok(_) => Ok(json!({ "ok": true })),
         Err(WebhookError::Internal(m)) => {
-            // Only an organization id that could exist is logged.
+            // Only an organization id that could exist is logged; the
+            // sender is told nothing of the error's text, on any route.
             if route_org_shape(org) {
                 tracing::warn!(org = %org, "GitHub webhook handling failed: {m}");
+            } else {
+                tracing::warn!("GitHub webhook handling failed: {m}");
             }
             Err(neutral_internal())
         }
-        Err(e) => Err(e),
+        Ok(_) if org != ua_core::DEFAULT_ORG => Ok(json!({ "ok": true })),
+        other => other,
     }
 }
 
@@ -367,9 +383,9 @@ async fn receive_checked(hub: &Hub, org: &str, d: WebhookDelivery<'_>) -> Result
     receive_for(hub, org, &p).await
 }
 
-/// An internal failure as the sender sees it on another organization's
-/// route than the default: no error text, which could name that
-/// organization's rows. The text is in the hub's log and that ledger.
+/// An internal failure as the sender sees it, on every route: no error
+/// text, which could name an organization's rows or the hub's internals.
+/// The text is in the hub's log.
 fn neutral_internal() -> WebhookError {
     WebhookError::Internal("processing failed; a redelivery is processed".into())
 }
@@ -440,7 +456,7 @@ async fn receive_for(hub: &Hub, org: &str, p: &Parsed) -> Result<Value, WebhookE
         })?;
     let Some((bound, id_claim, body_claim)) = bound else { return Err(WebhookError::Replayed) };
     let result = handle(hub, org, p, bound).await;
-    // An internal failure releases both records so GitHub's redelivery of
+    // An internal failure releases both records so a redelivery of
     // this event is processed (every effect is idempotent); any other
     // outcome finishes them, so a later copy is a replay. Only records still
     // under this delivery's claims are settled: one a redelivery took over
