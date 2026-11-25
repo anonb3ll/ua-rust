@@ -63,6 +63,7 @@
 pub mod policy;
 pub mod render;
 mod tenant_keys;
+pub(crate) use tenant_keys::upgrade_expired_approvals;
 
 pub use tenant_keys::{TENANT_KEYS, TENANT_PART};
 

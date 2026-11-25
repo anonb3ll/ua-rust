@@ -150,6 +150,30 @@ UPDATE approvals
    AND status IN ('pending', 'approved')
    AND (NOT json_valid(payload) OR json_type(payload, '$.org_id') IS NULL)";
 
+/// The reason [`EXPIRE_UNSCOPED_APPROVALS`] writes on an approval it
+/// expires (when the approval had none). Kept apart from that statement,
+/// which belongs to a merged, checksum-locked part and must not change; a
+/// unit test pins that the statement still carries this text.
+const UPGRADE_EXPIRY_REASON: &str = "superseded: harness config approvals now bind org_id";
+
+/// Harness config approvals the upgrade expired: `harness_config_publish` and
+/// `harness_config_apply` approvals in the expired state with the reason
+/// [`EXPIRE_UNSCOPED_APPROVALS`] wrote. The upgrade is a schema part that
+/// runs before the hub can append to its hash-chained ledger, so it left no
+/// ledger event; `system_doctor` reports this count instead (the approvals
+/// themselves are kept, never dropped). An approval that already carried a
+/// reason kept it (`COALESCE`), so it is not counted here. A hub-wide count:
+/// every such approval predates organizations and is the default
+/// organization's.
+pub(crate) fn upgrade_expired_approvals(c: &Connection) -> rusqlite::Result<i64> {
+    c.query_row(
+        "SELECT COUNT(*) FROM approvals WHERE org_id = 'default' \
+         AND tool IN ('harness_config_apply', 'harness_config_publish') AND status = 'expired' AND reason = ?1",
+        [UPGRADE_EXPIRY_REASON],
+        |r| r.get(0),
+    )
+}
+
 fn rebuild_tenant_keys(conn: &Connection, _args: &'static [&'static str]) -> anyhow::Result<String> {
     anyhow::ensure!(conn.is_autocommit(), "harness_config.v3.tenant_keys must run outside a transaction");
     let mut log = Vec::new();
@@ -317,4 +341,15 @@ fn rebuild_body(conn: &Connection, log: &mut Vec<String>) -> anyhow::Result<()> 
          {views_after:?})"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The doctor's count reads the reason the merged part writes.
+    #[test]
+    fn the_upgrade_expiry_reason_matches_the_merged_statement() {
+        assert!(EXPIRE_UNSCOPED_APPROVALS.contains(&format!("'{UPGRADE_EXPIRY_REASON}'")));
+    }
 }

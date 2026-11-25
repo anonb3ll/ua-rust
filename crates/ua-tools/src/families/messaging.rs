@@ -1812,8 +1812,10 @@ fn mailbox_event(
 /// caller's transaction: to one session of `to_agent` when `to_session` is
 /// given, else label mail. `message_id` is the service's client id: a retry
 /// under it returns the first result. The result's `message_id` is the hub's.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn send_system(
     tx: &mut WriteTx<'_>,
+    org: &str,
     from: &str,
     to_agent: &str,
     to_session: Option<&str>,
@@ -1821,15 +1823,17 @@ pub(crate) fn send_system(
     body: &str,
     task_id: Option<i64>,
 ) -> UaResult<Value> {
-    // The hub's own senders (node notices) serve the default organization,
-    // as every session they notify is its.
+    // The hub's own senders (node notices) send within the organization of
+    // the row they are about (`org`): the message lands in that
+    // organization's mailbox, a session is looked up there, and another
+    // organization's message event keeps no content in the default ledger.
     let v = Viewer {
         identity: Some(from.to_string()),
         unrestricted: true,
         own_local: None,
         local_label: from.to_string(),
         humans: Vec::new(),
-        org: ua_core::DEFAULT_ORG.into(),
+        org: org.into(),
     };
     send(
         tx,

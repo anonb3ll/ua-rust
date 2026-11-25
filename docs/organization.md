@@ -177,7 +177,15 @@ here for memory columns, owners and defaults.
   assign and unassign approval payloads bind `org_id`, so a pass is never
   consumed across organizations; approvals parked in the earlier payload
   shape no longer match and should be denied at upgrade (no migration
-  expires them: they can never be consumed). The importer writes legacy
+  expires them: they can never be consumed). The `skill.published`,
+  `skill.assigned` and `skill.unassigned` events are `ORG-EVENT-DEFAULT`
+  sites through `skill_registry::emit`: for another organization the skill
+  name, target, source path and content hash (an unsalted digest of the
+  skill text) are `null` and the originator is `system`; the version,
+  target type, staging id and timestamps remain. Another organization's
+  operators are refused by `authz` today, so the unit test
+  `organization_b_writes_and_approvals_bind_its_organization` drives B's
+  publish, assign and unassign below the operator check. The importer writes legacy
   skill versions and assignments to `default`.
 - The governance family applies the standalone procedure
   `governance.v2.project_bindings_tenant_keys` to rebuild
@@ -224,7 +232,18 @@ here for memory columns, owners and defaults.
   the same transaction as `task_workflow`, so it converts with
   `task_workflow` (the continuity tables below). The
   queued, settled and Zulip events are `ORG-EVENT-DEFAULT` sites; their
-  payloads carry ids, counts, hashes and categories, never message text.
+  payloads carry ids, counts, hashes and categories, never message text. For
+  another organization the notification category (a caller-chosen name) is
+  `null` and the originator is `system` (`notify::emit`); the Zulip events
+  are default-only, as every Zulip tool is. Another organization's
+  `not_configured` outbox row keeps no message text (`message` is NULL): it
+  has no destination, so the text could never be sent and would otherwise
+  stay forever; the default organization's `not_configured` row keeps its
+  text for an operator's resend once the hub's webhook is set. A
+  `zulip_fetch_messages` call is refused like a send (unknown organization,
+  then `zulip_not_configured`) before any request, cursor or event, so
+  `zulip_fetch_cursors`, keyed by agent label, channel and topic, holds only
+  the default organization's cursors and needs no `org_id` (no schema part).
   `crates/ua-tools/tests/notify_tenant.rs` holds the upgrade and the
   isolation tests.
 - The harness config family applies the standalone procedure
@@ -252,8 +271,14 @@ here for memory columns, owners and defaults.
   organization (`nodes.org_id`, the nodes family below; it no longer spans
   every organization), and a node's
   `node_config` calls reach only a node of the caller's organization.
-  The `agent.harness_config` events are `ORG-EVENT-DEFAULT` sites. The
-  importer writes legacy bundles to `default`.
+  The `agent.harness_config` events are `ORG-EVENT-DEFAULT` sites; the
+  `harness_config_closed` count is the node's organization's proposals only.
+  The upgrade's approval expiry runs inside a schema part, which cannot
+  append to the hash-chained ledger, so it left no event; `system_doctor`
+  reports to a default-organization reader how many approvals it expired
+  (`harness_config_approvals_expired_at_upgrade`, matched by the reason it
+  wrote; an approval that already had a reason kept it and is not counted).
+  The importer writes legacy bundles to `default`.
 - The routine and workflow-run tables: `organization.v1.tools.routines`
   gives `routines` and `routine_runs` their `org_id` and triggers, and
   `routines.v2.org_indexes` adds indexes led by `org_id` and the
@@ -281,8 +306,12 @@ here for memory columns, owners and defaults.
   `routine_runs` and `workflow_runs` point at tasks (`task_id`), but neither
   is keyed by a task id nor part of the task workflow, so they convert here,
   not with `tasks`. The routine and workflow events are `ORG-EVENT-DEFAULT`
-  sites; another organization's client-chosen fire key reaches the ledger
-  only as a SHA-256 digest. The importer copies none of these tables.
+  sites; another organization's fire key (client text for an api or event
+  fire) never reaches the ledger, not even as a digest (an unsalted digest
+  would let a guess be confirmed): `agent.routine.fired` names its receipt
+  row instead (`run:<routine_runs.id>`, also in the dedupe key), with the
+  originator `system`. (An earlier build recorded `sha256:<digest>`; those
+  events stay in the chain.) The importer copies none of these tables.
   `crates/ua-tools/tests/routines_tenant.rs` holds the upgrade and the
   isolation tests.
 - The plans tables: `organization.v1.tools.plans` gives `plans`,
@@ -625,9 +654,27 @@ here for memory columns, owners and defaults.
   default-only for now. The `agent.goal.*` and `agent.work_proposal.*`
   events are `ORG-EVENT-DEFAULT` sites: for another organization the close
   and reopen reason, the proposer and the withdrawal reason are `null` and
-  the originator is `system`; ids, indexes, statuses, the reporting mode
-  and contract digests remain (goal and item titles and notes never reach
-  an event). The importer writes legacy goals, links, proposals and items
+  the originator is `system`; ids, indexes, statuses and the reporting mode
+  remain (goal and item titles and notes never reach an event). Contract
+  digests remain for the default organization only: another
+  organization's are `null` in every `agent.work_proposal.*` event
+  (`filed`, `item_approved`, `item_rejected`, `item_recovered`,
+  `item_rolled_back`), because a digest is an unsalted SHA-256 of the item
+  text and a guess could be confirmed against it. (Events an earlier build
+  wrote keep their digests.)
+  **Known gap: dropped cross-organization goal links.** `goals.v2.org_scope`
+  deletes a `task_goal_links` row whose goal is in another organization
+  than its task, and records nothing: no ledger event, no count, no archive
+  row. The part is merged and checksum-locked, so it cannot be changed, and
+  on an upgraded database those rows are already gone; a later part cannot
+  recover them. Only links that crossed organizations were dropped, and
+  before tasks had an organization every task and goal was the default
+  organization's, so a database upgraded with one organization lost none.
+  A hub that had another organization's tasks linked to default goals
+  before the upgrade can find the links only in a backup taken before it.
+  Every later part that drops or rewrites rows records them in the same
+  transaction (item 11 of [Converting a table family](#converting-a-table-family)).
+  The importer writes legacy goals, links, proposals and items
   to `default` and never copies a source `org_id`.
   `crates/ua-tools/tests/goals_tenant.rs` holds the upgrade and the
   isolation tests.
@@ -1040,9 +1087,15 @@ here for memory columns, owners and defaults.
   default nodes (`org_unsupported`); with `node_require_acceptance` on,
   another organization's nodes therefore take no real work until acceptance
   carries its own evidence store. Command notices go
-  through the mailbox (`message_index`, no `org_id`), so another
-  organization's notice stays recorded on its `node_command_notice` row,
-  unsent; its owner reads the outcome with `node_command_status`.
+  through the mailbox, which the messaging family keyed by organization
+  (`message_index.org_id`), so each notice is mailed within its own
+  organization: to the command's owner, an agent of that organization, in
+  that organization's mailbox (its owner session looked up there), with the
+  message event's content kept out of the default ledger. A notice is never
+  mailed through another organization's mailbox. (Before that follow-up,
+  another organization's notice was only recorded, unsent; such a row is
+  sent by the next sweep.) The doctor counts another organization's notices
+  still unsent.
   **Events.** `agent.node.*` and `agent.dispatch.transition` are
   `ORG-EVENT-DEFAULT` sites through `node_queue::emit`: for another
   organization the payload keeps only ids, states, attempts, fences,
@@ -1128,7 +1181,25 @@ here for memory columns, owners and defaults.
   `task_add` keys stay organization-wide,
   as before, so two callers in one organization sharing a `task_add` key
   share its receipt, and the conversation handoff's key is derived from
-  its actor. `crates/ua-tools/tests/idempotency_tenant.rs` holds the
+  its actor. **Escaping.** Every writer escapes `%` and `/` in the
+  organization id of its prefix (`%25`, `%2F`), as `memory_save` and
+  `message_send` always did and, since a follow-up, `task_add`,
+  `task_update`, `delegate` and the conversation handoff too
+  (`tasks::idem_key`), and every per-caller writer escapes its label, so the
+  organization part ends at the first `/` and no organization id, label and
+  key spell another organization's key text. A key whose organization id
+  holds neither character is byte for byte as before, and the default
+  organization's keys carry no prefix and are unchanged. For an id holding
+  one, a receipt stored in the interim unescaped form is still read, in that
+  organization only, as a fallback (`tasks::interim_idem_key`; for
+  `delegate` only when its request digest or its delegation's `from_agent`
+  shows it is the caller's). **Read guard.**
+  `every_read_of_idempotency_keys_filters_org_id` scans every crate's
+  non-test source and fails on any statement that reads, updates or deletes
+  `idempotency_keys` (`FROM`, `JOIN`, `UPDATE`, any case, across `\` line
+  continuations) without naming `org_id`; only the rebuild's three
+  whole-table statements are exempt, each named, and a stale exemption
+  fails too. `crates/ua-tools/tests/idempotency_tenant.rs` holds the
   upgrade (placement by prefix, an organization id with `/`, an unknown and
   an ambiguous prefix, every byte and rowid kept, index, trigger and view
   kept, the doctor count, no ledger row), pre-upgrade replays through the
@@ -2692,7 +2763,11 @@ such change does:
    led by `org_id` in a new static part.
 8. **Events.** Name `DEFAULT_ORG` only while `org_guard` requires it, mark the
    site `ORG-EVENT-DEFAULT`, and keep payloads free of content another
-   organization should not see.
+   organization should not see: its free text, labels and names `null`
+   (`plans::ledger_text`), its originator `system`
+   (`approvals::ledger_originator`), and no unsalted digest of its text or
+   keys (a guess could be confirmed against one); name a hub-generated id
+   instead.
 9. **Tests**, after `crates/ua-tools/tests/code_tenant.rs`: an upgrade from a
    database without the part (rows backfilled, triggers present) and an
    idempotent re-open; two organizations through every tool of the family,
@@ -2703,6 +2778,13 @@ such change does:
 10. **Classification.** Remove the tables from `TENANT_MISSING_ORG_ID` only,
     never from its frozen baseline, and update the status list above and the
     [Scoping per subsystem](#scoping-per-subsystem) table.
+11. **Record what a part drops or rewrites.** A part that deletes or
+    rewrites rows records them in the same transaction (their keys copied to
+    an archive table, or a count `system_doctor` reports), asserts it in the
+    upgrade test, and surfaces the count in `system_doctor`. A schema part
+    cannot append to the hash-chained ledger. `goals.v2.org_scope` predates
+    this rule and is the one known gap (the goal and work-proposal tables
+    above).
 
 ## Where the code lives
 

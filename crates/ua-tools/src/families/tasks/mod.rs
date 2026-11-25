@@ -624,28 +624,55 @@ pub(crate) use crate::families::plans::{ledger_label, ledger_text};
 /// The stored key of a client idempotency key. `idempotency_keys` is keyed
 /// by `(org_id, key)` (`idempotency.v2.tenant_keys`) and every read filters
 /// on the caller's organization. Another organization's key text keeps its
-/// interim organization prefix as defence in depth, byte for byte as before
-/// the rebuild, so a retry in flight across the upgrade still replays. The
-/// default organization keeps the `<tool>:<key>` form other readers rely on.
+/// interim organization prefix as defence in depth, with `%` and `/` in the
+/// organization id percent-escaped (as `memory_save`'s and `message_send`'s
+/// keys are), so the organization part always ends at the first `/` and no
+/// organization id and key can spell another organization's key. A key whose
+/// organization id holds neither character is byte for byte the interim
+/// form, so a retry in flight across the upgrade still replays. The default
+/// organization keeps the `<tool>:<key>` form other readers rely on. Callers
+/// that scope a key to a label (`task_update`, `delegate`) escape the label
+/// themselves before it reaches `key`.
 pub(crate) fn idem_key(org: &str, tool: &str, key: &str) -> String {
-    if org == ua_core::DEFAULT_ORG { format!("{tool}:{key}") } else { format!("org:{org}/{tool}:{key}") }
+    if org == ua_core::DEFAULT_ORG {
+        format!("{tool}:{key}")
+    } else {
+        format!("org:{}/{tool}:{key}", org.replace('%', "%25").replace('/', "%2F"))
+    }
 }
 
-/// A stored reply for (`tool`, `key`), if this key was already used.
+/// The interim stored form of a key of another organization, with the
+/// organization id unescaped, when it differs from [`idem_key`] (an id
+/// holding `%` or `/`). Rows are keyed by `(org_id, key)` and read only in
+/// `org`, where that prefix is the same for every key, so a receipt found
+/// under it is this organization's and unambiguous: a retry that spans the
+/// change still replays.
+pub(crate) fn interim_idem_key(org: &str, tool: &str, key: &str) -> Option<String> {
+    let interim = format!("org:{org}/{tool}:{key}");
+    (org != ua_core::DEFAULT_ORG && interim != idem_key(org, tool, key)).then_some(interim)
+}
+
+/// A stored reply for (`tool`, `key`), if this key was already used: under
+/// its current key, else under its interim form ([`interim_idem_key`]).
 pub(crate) fn idempotent_replay(
     conn: &Connection,
     org: &str,
     tool: &str,
     key: &str,
 ) -> UaResult<Option<Value>> {
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT result_json FROM idempotency_keys WHERE org_id = ?1 AND key = ?2 AND tool = ?3",
-            [org.to_string(), idem_key(org, tool, key), tool.to_string()],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(stored.map(|s| serde_json::from_str(&s).unwrap_or(Value::String(s))))
+    for k in std::iter::once(idem_key(org, tool, key)).chain(interim_idem_key(org, tool, key)) {
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT result_json FROM idempotency_keys WHERE org_id = ?1 AND key = ?2 AND tool = ?3",
+                [org.to_string(), k, tool.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(s) = stored {
+            return Ok(Some(serde_json::from_str(&s).unwrap_or(Value::String(s))));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn idempotent_record(

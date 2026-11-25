@@ -941,6 +941,28 @@ async fn organization_b_text_and_labels_never_reach_the_default_ledger() {
     for (channel, _, originator) in &ours {
         assert_eq!(originator.as_deref(), Some("system"), "{channel}");
     }
+    // Review follow-up: B's contract digests (unsalted SHA-256 of its item
+    // text, which a guess could confirm) never reach the default ledger;
+    // the events keep the field, as null.
+    let b_digest = h
+        .text(&format!("SELECT contract_digest FROM work_proposal_items WHERE proposal_id = '{pid}'"))
+        .unwrap();
+    assert_eq!(b_digest.len(), 64, "{b_digest}");
+    for (channel, payload, _) in &rows {
+        assert!(!payload.contains(&b_digest), "{channel} carries B's contract digest: {payload}");
+    }
+    let event = |channel: &str| -> Value {
+        let p = h
+            .text(&format!(
+                "SELECT payload FROM event_log WHERE channel = '{channel}' \
+                 AND json_extract(payload, '$.proposal_id') = '{pid}'"
+            ))
+            .unwrap();
+        serde_json::from_str(&p).unwrap()
+    };
+    assert_eq!(event("agent.work_proposal.filed")["digests"], json!([null]));
+    let rolled = event("agent.work_proposal.item_rolled_back");
+    assert!(rolled.get("contract_digest").is_some_and(Value::is_null), "{rolled}");
     // Ids and statuses remain.
     assert_eq!(
         h.count(&format!(
@@ -976,4 +998,13 @@ async fn organization_b_text_and_labels_never_reach_the_default_ledger() {
         ))
         .unwrap();
     assert!(p.contains("\"proposer\":\"lead-1\"") && p.ends_with("|lead-1"), "{p}");
+    let (_, da) = h.file(&a, "A batch two", "A item two").await;
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) FROM event_log WHERE channel = 'agent.work_proposal.filed' \
+             AND json_extract(payload, '$.digests[0]') = '{da}'"
+        )),
+        1,
+        "the default organization's digests stay"
+    );
 }

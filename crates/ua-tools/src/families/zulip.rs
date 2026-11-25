@@ -89,7 +89,9 @@ CREATE INDEX IF NOT EXISTS idx_zulip_sends_content ON zulip_sends(stream, topic,
 /// backfilled to the default organization) and its generated
 /// `zulip_sends_org_exists` / `zulip_sends_org_immutable` triggers. The table
 /// has no key beyond its AUTOINCREMENT id, so no rebuild is needed; the
-/// duplicate check filters on `org_id`. `zulip_fetch_cursors` is a hub table.
+/// duplicate check filters on `org_id`. `zulip_fetch_cursors` is a hub table:
+/// only the default organization may fetch (`require_destination`), so every
+/// cursor is the default organization's.
 /// Applied after `zulip.v1` and `organization.v1.store`.
 pub const TENANT_PART: Procedure =
     ua_store::org::tenant_part("organization.v1.tools.zulip", &["zulip_sends"]);
@@ -148,7 +150,7 @@ fn require_destination(org: &str) -> UaResult<()> {
     if org != ua_core::DEFAULT_ORG {
         return Err(UaError::denied(
             "zulip_not_configured",
-            "Zulip is configured for the hub's default organization only; nothing was sent or recorded",
+            "Zulip is configured for the hub's default organization only; nothing was sent, read or recorded",
         ));
     }
     Ok(())
@@ -990,6 +992,15 @@ fn parse_anchor(anchor: &str) -> UaResult<Option<i64>> {
 
 async fn zulip_fetch_messages(ctx: ToolCtx, a: FetchArgs) -> UaResult<Value> {
     require_identity(&ctx.caller)?;
+    // The configured site and channels are the default organization's
+    // destination, as for a send: another organization reads nothing from
+    // them and keeps no cursor. Refused before any read, request or write,
+    // so `zulip_fetch_cursors` (keyed by agent label, channel and topic)
+    // only ever holds the default organization's cursors and needs no
+    // `org_id`.
+    let org = ctx.caller.org_id.clone();
+    ctx.hub.db().read_async(move |c| require_org(c, &org)).await?;
+    require_destination(&ctx.caller.org_id)?;
     let cfg = ctx.hub.cfg();
     let agent = write_identity(&ctx.caller, Some(&clean_label(&a.agent_label)?))?;
     let (logical, stream) = channel(cfg, &a.channel)?;
