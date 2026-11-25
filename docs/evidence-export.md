@@ -257,7 +257,11 @@ match" for "the hub is honest".
   still verify; a bundle signed by a key the verifier does not have is `2`.
 - Revocation: a retired key stays in the store so older bundles verify, but a
   revoked key is refused outright and every checkpoint naming it no longer
-  verifies. Revocation is set once and cannot be undone.
+  verifies. Revocation is authoritative at the trust anchor, not in the
+  database: the verifier stops pinning the key, or holds a revocation list in
+  its trust file, and a bundle signed by a key on that list is `2`. The store's
+  `revoked_at` is advisory — it is a convenience for the hub's own CLI, and
+  anyone who can write the database can clear it.
 - Trust anchor: the key row sits in the same database as the checkpoint, so a
   verifier that trusts it is trusting the database it protects. `ua evidence
   verify` therefore takes `--anchor-key` and `--anchor-key-id` from the key the
