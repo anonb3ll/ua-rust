@@ -56,40 +56,47 @@ fn events(db: &Db) -> Vec<Value> {
 fn register_office_role_seat_and_service() {
     let db = db();
     db.write(|tx| {
-        let created = register_office(tx, office("platform", &["developer", "cto"]), "operator")?;
+        let created =
+            register_office(tx, DEFAULT_ORG_ID, office("platform", &["developer", "cto"]), "operator")?;
         assert!(created.changed);
         assert_eq!(created.value.profiles, ["developer", "lead"]);
         assert_eq!(created.value.slug, "platform");
 
-        let again = register_office(tx, office("platform", &["developer"]), "operator");
+        let again = register_office(tx, DEFAULT_ORG_ID, office("platform", &["developer"]), "operator");
         assert_eq!(again.unwrap_err().code(), "conflict");
 
-        let bad = register_office(tx, office("invalid/office", &["developer"]), "operator");
+        let bad = register_office(tx, DEFAULT_ORG_ID, office("invalid/office", &["developer"]), "operator");
         assert_eq!(bad.unwrap_err().code(), "invalid_argument");
 
-        let granted = register_role(tx, role("operator", "org_owner"), "operator")?;
+        let granted = register_role(tx, DEFAULT_ORG_ID, role("operator", "org_owner"), "operator")?;
         assert!(granted.changed);
         assert_eq!(granted.value.role, "org_owner");
-        let same = register_role(tx, role("Operator", "org_owner"), "operator")?;
+        let same = register_role(tx, DEFAULT_ORG_ID, role("Operator", "org_owner"), "operator")?;
         assert!(!same.changed);
         assert_eq!(same.value.label, "operator");
 
-        let seated = register_seat(tx, seat("builder-1", "Platform", "lead", Some("cloud")), "operator")?;
+        let seated = register_seat(
+            tx,
+            DEFAULT_ORG_ID,
+            seat("builder-1", "Platform", "lead", Some("cloud")),
+            "operator",
+        )?;
         assert!(seated.changed);
         assert_eq!(seated.value.office, "platform");
         assert_eq!(seated.value.profile, "lead");
         assert_eq!(seated.value.agent_kind, "cloud");
 
-        let moved = register_seat(tx, seat("Builder-1", "platform", "developer", None), "operator")?;
+        let moved =
+            register_seat(tx, DEFAULT_ORG_ID, seat("Builder-1", "platform", "developer", None), "operator")?;
         assert!(moved.changed);
         assert_eq!(moved.value.label, "builder-1");
         assert_eq!(moved.value.profile, "developer");
         assert_eq!(moved.value.agent_kind, "local");
 
-        let declared = register_service(tx, service(" bridge-sender "), "operator")?;
+        let declared = register_service(tx, DEFAULT_ORG_ID, service(" bridge-sender "), "operator")?;
         assert!(declared.changed);
         assert_eq!(declared.value, "bridge-sender");
-        let service_again = register_service(tx, service("Bridge-Sender"), "operator")?;
+        let service_again = register_service(tx, DEFAULT_ORG_ID, service("Bridge-Sender"), "operator")?;
         assert!(!service_again.changed);
 
         let registry = ua_org::load(tx, DEFAULT_ORG_ID, None, &["builder-1".into(), "stray-agent".into()])?;
@@ -118,8 +125,8 @@ fn a_seat_profile_must_belong_to_its_office() {
     let db = db();
     let err = db
         .write(|tx| {
-            register_office(tx, office("platform", &["developer"]), "operator")?;
-            register_seat(tx, seat("builder-1", "platform", "reviewer", None), "operator")?;
+            register_office(tx, DEFAULT_ORG_ID, office("platform", &["developer"]), "operator")?;
+            register_seat(tx, DEFAULT_ORG_ID, seat("builder-1", "platform", "reviewer", None), "operator")?;
             Ok(())
         })
         .unwrap_err();
@@ -131,20 +138,22 @@ fn a_seat_profile_must_belong_to_its_office() {
 fn the_last_owner_cannot_be_demoted_and_labels_do_not_overlap() {
     let db = db();
     db.write(|tx| {
-        register_role(tx, role("operator", "org_owner"), "operator")?;
-        register_role(tx, role("admin-1", "org_admin"), "operator")?;
-        let err = register_role(tx, role("operator", "member"), "admin-1").unwrap_err();
+        register_role(tx, DEFAULT_ORG_ID, role("operator", "org_owner"), "operator")?;
+        register_role(tx, DEFAULT_ORG_ID, role("admin-1", "org_admin"), "operator")?;
+        let err = register_role(tx, DEFAULT_ORG_ID, role("operator", "member"), "admin-1").unwrap_err();
         assert_eq!(err.code(), "conflict");
-        register_role(tx, role("admin-1", "org_owner"), "operator")?;
-        register_role(tx, role("operator", "member"), "admin-1")?;
+        register_role(tx, DEFAULT_ORG_ID, role("admin-1", "org_owner"), "operator")?;
+        register_role(tx, DEFAULT_ORG_ID, role("operator", "member"), "admin-1")?;
 
-        register_office(tx, office("platform", &["developer"]), "operator")?;
-        register_seat(tx, seat("builder-1", "platform", "developer", None), "operator")?;
-        let err = register_role(tx, role("builder-1", "member"), "operator").unwrap_err();
+        register_office(tx, DEFAULT_ORG_ID, office("platform", &["developer"]), "operator")?;
+        register_seat(tx, DEFAULT_ORG_ID, seat("builder-1", "platform", "developer", None), "operator")?;
+        let err = register_role(tx, DEFAULT_ORG_ID, role("builder-1", "member"), "operator").unwrap_err();
         assert_eq!(err.code(), "conflict");
-        let err = register_service(tx, service("builder-1"), "operator").unwrap_err();
+        let err = register_service(tx, DEFAULT_ORG_ID, service("builder-1"), "operator").unwrap_err();
         assert_eq!(err.code(), "conflict");
-        let err = register_seat(tx, seat("operator", "platform", "developer", None), "operator").unwrap_err();
+        let err =
+            register_seat(tx, DEFAULT_ORG_ID, seat("operator", "platform", "developer", None), "operator")
+                .unwrap_err();
         assert_eq!(err.code(), "conflict");
         Ok(())
     })
@@ -154,8 +163,9 @@ fn the_last_owner_cannot_be_demoted_and_labels_do_not_overlap() {
 #[test]
 fn a_session_credential_profile_cannot_be_an_office_profile() {
     let db = db();
-    let err =
-        db.write(|tx| register_office(tx, office("platform", &["acp-session"]), "operator")).unwrap_err();
+    let err = db
+        .write(|tx| register_office(tx, DEFAULT_ORG_ID, office("platform", &["acp-session"]), "operator"))
+        .unwrap_err();
     assert_eq!(err.code(), "invalid_argument");
 }
 
@@ -180,7 +190,7 @@ fn organizations_are_not_deleted_and_the_default_org_allows_every_profile() {
 fn role_labels_collide_case_insensitively() {
     let db = db();
     db.write(|tx| {
-        register_role(tx, role("operator", "member"), "operator")?;
+        register_role(tx, DEFAULT_ORG_ID, role("operator", "member"), "operator")?;
         Ok(())
     })
     .unwrap();

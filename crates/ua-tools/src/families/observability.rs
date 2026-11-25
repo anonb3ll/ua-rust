@@ -1801,7 +1801,10 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         let shared = ctx.hub.shared_webhook_routes_for_report().await;
         ctx.hub.db().read_async(move |c| github_credentials_check(c, &cfg, &caller, shared.as_ref())).await?
     };
-    let registry = ctx.hub.db().read_async(super::org::registry_health).await?;
+    let registry = {
+        let org = ctx.caller.org_id.clone();
+        ctx.hub.db().read_async(move |c| super::org::registry_health(c, &org)).await?
+    };
     let registry_status = if registry.live { LIVE } else { MISCONFIGURED };
     let cfg = ctx.hub.cfg();
     let reg = crate::builtin_registry_shared();

@@ -7,16 +7,18 @@
 //! organization rule for the shared label namespace.
 
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use ua_core::{Profile, UaError, UaResult};
 use ua_store::org::{NewSeat, OfficeRow, OrgRead, OrgWrite, RoleRow};
 
 /// Ledger channel for a registry change. The payload's `kind` says which.
 pub const CHANNEL: &str = "agent.org.registry";
 
-/// The organization every registry row belongs to until callers carry an
-/// organization id.
-pub const DEFAULT_ORG_ID: &str = "default";
+/// The organization id of the default organization, the only one that exists
+/// until tenancy lands. It is [`ua_core::DEFAULT_ORG`] under a registry-local
+/// name; a caller's registry row belongs to the caller's organization, never
+/// to this constant.
+pub const DEFAULT_ORG_ID: &str = ua_core::DEFAULT_ORG;
 
 pub const ISSUE_MEMBER_NOT_IN_ROSTER: &str = "member_not_in_agent_labels";
 pub const ISSUE_ACTIVE_WITHOUT_OFFICE: &str = "active_identity_without_office";
@@ -226,21 +228,41 @@ pub fn health(registry: &Registry) -> Health {
     }
 }
 
+/// The neutral originator a registry event records for a row outside the
+/// default organization. The ledger event lands in the default organization's
+/// ledger (`ORG-EVENT-DEFAULT`), and a registry row's label and office name are
+/// people's and agents' names: another organization's row must not leak them
+/// there. A default-organization row keeps its acting label.
+pub const NEUTRAL_ORIGINATOR: &str = "system";
+
+/// The originator a registry event records: the acting label in the default
+/// organization, [`NEUTRAL_ORIGINATOR`] elsewhere.
+fn ledger_originator(org_id: &str, actor: &str) -> String {
+    if org_id == DEFAULT_ORG_ID { actor.to_string() } else { NEUTRAL_ORIGINATOR.to_string() }
+}
+
+/// A label or name for a registry event payload: the value in the default
+/// organization, `null` elsewhere (the payload keeps its shape).
+fn ledger_text(org_id: &str, value: &str) -> Value {
+    if org_id == DEFAULT_ORG_ID { json!(value) } else { Value::Null }
+}
+
 pub fn register_office(
     repo: &mut impl OrgWrite,
+    org_id: &str,
     input: RegisterOffice,
     actor: &str,
 ) -> UaResult<Outcome<Office>> {
     let slug = clean_slug(&input.slug)?;
     let name = clean_name(&input.name)?;
-    let allowed = repo.allowed_profiles(DEFAULT_ORG_ID)?;
+    let allowed = repo.allowed_profiles(org_id)?;
     let profiles = canonical_profiles(&input.profiles, &allowed)?;
-    if repo.offices(DEFAULT_ORG_ID)?.iter().any(|o| o.slug == slug) {
+    if repo.offices(org_id)?.iter().any(|o| o.slug == slug) {
         return Err(UaError::conflict(format!("office {slug:?} is already registered")));
     }
     let row = OfficeRow {
         id: ulid::Ulid::generate().to_string(),
-        org_id: DEFAULT_ORG_ID.to_string(),
+        org_id: org_id.to_string(),
         slug,
         name,
         profiles,
@@ -252,27 +274,28 @@ pub fn register_office(
         CHANNEL,
         json!({
             "kind": "office.registered",
-            "org_id": DEFAULT_ORG_ID,
-            "id": office.id,
-            "slug": office.slug,
-            "name": office.name,
-            "profiles": office.profiles,
+            "org_id": org_id,
+            "id": &office.id,
+            "slug": ledger_text(org_id, &office.slug),
+            "name": ledger_text(org_id, &office.name),
+            "profiles": &office.profiles,
         }),
-        actor,
+        &ledger_originator(org_id, actor),
     )?;
     Ok(Outcome { changed: true, value: office })
 }
 
 pub fn register_role(
     repo: &mut impl OrgWrite,
+    org_id: &str,
     input: RegisterRole,
     actor: &str,
 ) -> UaResult<Outcome<RoleGrant>> {
     let label = clean_label(&input.label)?;
     let role = clean_role(&input.role)?;
-    refuse_service(repo, &label)?;
-    refuse_seat(repo, &label, "an identity label is a seat or a role, not both")?;
-    let existing = repo.roles(DEFAULT_ORG_ID)?;
+    refuse_service(repo, org_id, &label)?;
+    refuse_seat(repo, org_id, &label, "an identity label is a seat or a role, not both")?;
+    let existing = repo.roles(org_id)?;
     if let Some(prev) = existing.iter().find(|r| r.label.eq_ignore_ascii_case(&label)) {
         if prev.role == role {
             return Ok(Outcome { changed: false, value: role_view(prev.clone()) });
@@ -284,7 +307,7 @@ pub fn register_role(
             return Err(UaError::conflict("the last org_owner cannot be demoted"));
         }
         let row = RoleRow {
-            org_id: DEFAULT_ORG_ID.to_string(),
+            org_id: org_id.to_string(),
             label: prev.label.clone(),
             role: role.to_string(),
             added_by: actor.to_string(),
@@ -296,17 +319,17 @@ pub fn register_role(
             CHANNEL,
             json!({
                 "kind": "role.updated",
-                "org_id": DEFAULT_ORG_ID,
-                "label": value.label,
-                "role": value.role,
-                "previous": prev.role,
+                "org_id": org_id,
+                "label": ledger_text(org_id, &value.label),
+                "role": &value.role,
+                "previous": &prev.role,
             }),
-            actor,
+            &ledger_originator(org_id, actor),
         )?;
         return Ok(Outcome { changed: true, value });
     }
     let row = RoleRow {
-        org_id: DEFAULT_ORG_ID.to_string(),
+        org_id: org_id.to_string(),
         label,
         role: role.to_string(),
         added_by: actor.to_string(),
@@ -318,38 +341,43 @@ pub fn register_role(
         CHANNEL,
         json!({
             "kind": "role.registered",
-            "org_id": DEFAULT_ORG_ID,
-            "label": value.label,
-            "role": value.role,
+            "org_id": org_id,
+            "label": ledger_text(org_id, &value.label),
+            "role": &value.role,
         }),
-        actor,
+        &ledger_originator(org_id, actor),
     )?;
     Ok(Outcome { changed: true, value })
 }
 
-pub fn register_seat(repo: &mut impl OrgWrite, input: RegisterSeat, actor: &str) -> UaResult<Outcome<Seat>> {
+pub fn register_seat(
+    repo: &mut impl OrgWrite,
+    org_id: &str,
+    input: RegisterSeat,
+    actor: &str,
+) -> UaResult<Outcome<Seat>> {
     let label = clean_label(&input.label)?;
     let kind = clean_kind(input.agent_kind.as_deref())?;
     let office_query = input.office.trim();
-    let offices = repo.offices(DEFAULT_ORG_ID)?;
+    let offices = repo.offices(org_id)?;
     let office = offices
         .iter()
         .find(|o| o.slug.eq_ignore_ascii_case(office_query) || o.name.eq_ignore_ascii_case(office_query))
         .ok_or_else(|| UaError::not_found(format!("unknown office {office_query:?}")))?;
-    let allowed = repo.allowed_profiles(DEFAULT_ORG_ID)?;
+    let allowed = repo.allowed_profiles(org_id)?;
     let profile = one_profile(&input.profile, &allowed)?;
     if !office.profiles.iter().any(|p| p == profile) {
         return Err(UaError::invalid(format!("profile {profile:?} is not in office {:?}", office.slug)));
     }
-    refuse_service(repo, &label)?;
-    refuse_role(repo, &label, "an identity label is a seat or a role, not both")?;
-    let existing = repo.seats(DEFAULT_ORG_ID)?;
+    refuse_service(repo, org_id, &label)?;
+    refuse_role(repo, org_id, &label, "an identity label is a seat or a role, not both")?;
+    let existing = repo.seats(org_id)?;
     if let Some(prev) = existing.iter().find(|s| s.label.eq_ignore_ascii_case(&label)) {
         if prev.office_id == office.id && prev.profile == profile && prev.agent_kind == kind {
             return Ok(Outcome { changed: false, value: seat_view(prev) });
         }
         let row = NewSeat {
-            org_id: DEFAULT_ORG_ID.to_string(),
+            org_id: org_id.to_string(),
             label: prev.label.clone(),
             office_id: office.id.clone(),
             profile: profile.to_string(),
@@ -368,20 +396,20 @@ pub fn register_seat(repo: &mut impl OrgWrite, input: RegisterSeat, actor: &str)
             CHANNEL,
             json!({
                 "kind": "seat.updated",
-                "org_id": DEFAULT_ORG_ID,
-                "label": value.label,
-                "office": value.office,
-                "profile": value.profile,
-                "agent_kind": value.agent_kind,
-                "previous_office": prev.office_slug,
+                "org_id": org_id,
+                "label": ledger_text(org_id, &value.label),
+                "office": ledger_text(org_id, &value.office),
+                "profile": &value.profile,
+                "agent_kind": &value.agent_kind,
+                "previous_office": ledger_text(org_id, &prev.office_slug),
             }),
-            actor,
+            &ledger_originator(org_id, actor),
         )?;
         return Ok(Outcome { changed: true, value });
     }
     let created_at = ua_core::time::now();
     let row = NewSeat {
-        org_id: DEFAULT_ORG_ID.to_string(),
+        org_id: org_id.to_string(),
         label: label.clone(),
         office_id: office.id.clone(),
         profile: profile.to_string(),
@@ -400,53 +428,54 @@ pub fn register_seat(repo: &mut impl OrgWrite, input: RegisterSeat, actor: &str)
         CHANNEL,
         json!({
             "kind": "seat.registered",
-            "org_id": DEFAULT_ORG_ID,
-            "label": value.label,
-            "office": value.office,
-            "profile": value.profile,
-            "agent_kind": value.agent_kind,
+            "org_id": org_id,
+            "label": ledger_text(org_id, &value.label),
+            "office": ledger_text(org_id, &value.office),
+            "profile": &value.profile,
+            "agent_kind": &value.agent_kind,
         }),
-        actor,
+        &ledger_originator(org_id, actor),
     )?;
     Ok(Outcome { changed: true, value })
 }
 
 pub fn register_service(
     repo: &mut impl OrgWrite,
+    org_id: &str,
     input: RegisterService,
     actor: &str,
 ) -> UaResult<Outcome<String>> {
     let label = clean_label(&input.label)?;
-    if let Some(kept) = repo.services(DEFAULT_ORG_ID)?.into_iter().find(|s| s.eq_ignore_ascii_case(&label)) {
+    if let Some(kept) = repo.services(org_id)?.into_iter().find(|s| s.eq_ignore_ascii_case(&label)) {
         return Ok(Outcome { changed: false, value: kept });
     }
-    refuse_seat(repo, &label, "a service identity holds no office")?;
-    refuse_role(repo, &label, "a service identity holds no role")?;
-    repo.insert_service(DEFAULT_ORG_ID, &label)?;
+    refuse_seat(repo, org_id, &label, "a service identity holds no office")?;
+    refuse_role(repo, org_id, &label, "a service identity holds no role")?;
+    repo.insert_service(org_id, &label)?;
     repo.record(
         CHANNEL,
-        json!({ "kind": "service.registered", "org_id": DEFAULT_ORG_ID, "label": label }),
-        actor,
+        json!({ "kind": "service.registered", "org_id": org_id, "label": ledger_text(org_id, &label) }),
+        &ledger_originator(org_id, actor),
     )?;
     Ok(Outcome { changed: true, value: label })
 }
 
-fn refuse_service(repo: &mut impl OrgRead, label: &str) -> UaResult<()> {
-    if repo.services(DEFAULT_ORG_ID)?.iter().any(|s| s.eq_ignore_ascii_case(label)) {
+fn refuse_service(repo: &mut impl OrgRead, org_id: &str, label: &str) -> UaResult<()> {
+    if repo.services(org_id)?.iter().any(|s| s.eq_ignore_ascii_case(label)) {
         return Err(UaError::conflict("a service identity holds no office and no role"));
     }
     Ok(())
 }
 
-fn refuse_seat(repo: &mut impl OrgRead, label: &str, message: &str) -> UaResult<()> {
-    if repo.seats(DEFAULT_ORG_ID)?.iter().any(|s| s.label.eq_ignore_ascii_case(label)) {
+fn refuse_seat(repo: &mut impl OrgRead, org_id: &str, label: &str, message: &str) -> UaResult<()> {
+    if repo.seats(org_id)?.iter().any(|s| s.label.eq_ignore_ascii_case(label)) {
         return Err(UaError::conflict(message));
     }
     Ok(())
 }
 
-fn refuse_role(repo: &mut impl OrgRead, label: &str, message: &str) -> UaResult<()> {
-    if repo.roles(DEFAULT_ORG_ID)?.iter().any(|r| r.label.eq_ignore_ascii_case(label)) {
+fn refuse_role(repo: &mut impl OrgRead, org_id: &str, label: &str, message: &str) -> UaResult<()> {
+    if repo.roles(org_id)?.iter().any(|r| r.label.eq_ignore_ascii_case(label)) {
         return Err(UaError::conflict(message));
     }
     Ok(())

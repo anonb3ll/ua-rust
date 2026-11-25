@@ -3,15 +3,21 @@
 //! Tools: `org_registry_read`, `org_office_register`, `org_role_register`,
 //! `org_seat_register`, `org_service_register`.
 //!
-//! The organization id is the caller's, which this slice always resolves to
-//! `'default'`. A request that names `org_id` is refused with the other
-//! unknown fields. Registering does not grant a profile or an approval.
+//! The organization is the caller's, never a tool argument: a request that
+//! names `org_id` is refused with the other unknown fields. Every read and
+//! write is scoped to `ctx.caller.org_id`, and `require_same_org` refuses a
+//! caller whose organization differs from the row's before a row is read or
+//! written. The four write tools require a verified human operator in that
+//! organization (`Authz::require`); `org_role_register` is always gated, so a
+//! role grant needs a one-time human approval. Registering grants no profile
+//! and no approval.
 
 use rusqlite::Connection;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::UaResult;
+use ua_org::authz::{Authority, Authz, require_same_org};
 use ua_org::{RegisterOffice, RegisterRole, RegisterSeat, RegisterService};
 use ua_store::SchemaPart;
 use ua_store::org::SqliteOrg;
@@ -80,47 +86,66 @@ struct ServiceArgs {
     label: String,
 }
 
-fn agent_labels(c: &Connection) -> UaResult<Vec<String>> {
-    let mut stmt = c.prepare("SELECT label FROM agents ORDER BY label")?;
-    let rows = stmt.query_map([], |r| r.get(0))?;
+fn agent_labels(c: &Connection, org: &str) -> UaResult<Vec<String>> {
+    let mut stmt = c.prepare("SELECT label FROM agents WHERE org_id = ?1")?;
+    let rows = stmt.query_map([org], |r| r.get(0))?;
     rows.collect::<Result<Vec<_>, _>>().map_err(ua_core::UaError::from)
 }
 
-pub(crate) fn registry_health(c: &Connection) -> UaResult<ua_org::Health> {
+pub(crate) fn registry_health(c: &Connection, org: &str) -> UaResult<ua_org::Health> {
     let mut repo = SqliteOrg::new(c);
-    let active = agent_labels(c)?;
-    let registry = ua_org::load(&mut repo, ua_org::DEFAULT_ORG_ID, None, &active)?;
+    let active = agent_labels(c, org)?;
+    let registry = ua_org::load(&mut repo, org, None, &active)?;
     Ok(ua_org::health(&registry))
 }
 
 async fn read(ctx: ToolCtx, args: ReadArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
+    require_same_org(&ctx.caller, &org)?;
     let roster = args.agent_labels;
     ctx.hub
         .db()
         .read_async(move |c| {
             let mut repo = SqliteOrg::new(c);
-            let active = agent_labels(c)?;
-            let registry = ua_org::load(&mut repo, ua_org::DEFAULT_ORG_ID, roster.as_deref(), &active)?;
-            Ok(serde_json::to_value(registry)?)
+            let active = agent_labels(c, &org)?;
+            let registry = ua_org::load(&mut repo, &org, roster.as_deref(), &active)?;
+            Ok(serde_json::to_value(&registry)?)
         })
         .await
 }
 
+/// Refuse a caller who is not a verified human operator in `org`, and refuse a
+/// caller whose organization is not the row's. Until tenancy lands,
+/// `ua_org::authz` admits only the default organization, so any other
+/// organization is refused outright. The check runs before any row is read or
+/// written, so a refused caller cannot reach the registry at all.
+fn require_operator(ctx: &ToolCtx, org: &str) -> UaResult<()> {
+    require_same_org(&ctx.caller, org)?;
+    Authz::new(ctx.hub.cfg()).require(&ctx.caller, &[Authority::Operator], org)
+}
+
 async fn office(ctx: ToolCtx, args: OfficeArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
+    require_operator(&ctx, &org)?;
     let actor = ctx.caller.label.clone();
     let input = RegisterOffice { slug: args.slug, name: args.name, profiles: args.profiles };
-    let outcome = ctx.hub.db().write_async(move |tx| ua_org::register_office(tx, input, &actor)).await?;
+    let outcome =
+        ctx.hub.db().write_async(move |tx| ua_org::register_office(tx, &org, input, &actor)).await?;
     Ok(json!({ "changed": outcome.changed, "office": outcome.value }))
 }
 
 async fn role(ctx: ToolCtx, args: RoleArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
+    require_operator(&ctx, &org)?;
     let actor = ctx.caller.label.clone();
     let input = RegisterRole { label: args.label, role: args.role };
-    let outcome = ctx.hub.db().write_async(move |tx| ua_org::register_role(tx, input, &actor)).await?;
+    let outcome = ctx.hub.db().write_async(move |tx| ua_org::register_role(tx, &org, input, &actor)).await?;
     Ok(json!({ "changed": outcome.changed, "role": outcome.value }))
 }
 
 async fn seat(ctx: ToolCtx, args: SeatArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
+    require_operator(&ctx, &org)?;
     let actor = ctx.caller.label.clone();
     let input = RegisterSeat {
         label: args.label,
@@ -128,14 +153,17 @@ async fn seat(ctx: ToolCtx, args: SeatArgs) -> UaResult<Value> {
         profile: args.profile,
         agent_kind: args.agent_kind,
     };
-    let outcome = ctx.hub.db().write_async(move |tx| ua_org::register_seat(tx, input, &actor)).await?;
+    let outcome = ctx.hub.db().write_async(move |tx| ua_org::register_seat(tx, &org, input, &actor)).await?;
     Ok(json!({ "changed": outcome.changed, "seat": outcome.value }))
 }
 
 async fn service(ctx: ToolCtx, args: ServiceArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
+    require_operator(&ctx, &org)?;
     let actor = ctx.caller.label.clone();
     let input = RegisterService { label: args.label };
-    let outcome = ctx.hub.db().write_async(move |tx| ua_org::register_service(tx, input, &actor)).await?;
+    let outcome =
+        ctx.hub.db().write_async(move |tx| ua_org::register_service(tx, &org, input, &actor)).await?;
     Ok(json!({ "changed": outcome.changed, "service_identity": outcome.value }))
 }
 
@@ -168,10 +196,11 @@ pub fn register(r: &mut Registry) {
             "Grant a role to an identity label: org_owner, org_admin, team_lead, member or auditor. \
              The same label cannot also be a seat or a service identity. The last org_owner cannot be \
              demoted. Granting a role records the grant; it does not by itself change what the label \
-             can do. Returns {changed, role}.",
+             can do. Always needs a one-time human approval. Returns {changed, role}.",
             role,
         )
-        .family("org"),
+        .family("org")
+        .always_gated(),
     );
     r.add(
         tool(

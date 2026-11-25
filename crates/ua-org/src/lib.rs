@@ -18,8 +18,10 @@
 //! are catalog labels that send as themselves and hold no office and no role.
 //! Nothing here grants a profile or an approval.
 //!
-//! Registry rows belong to the `'default'` organization. Tool arguments do not
-//! carry an organization id. Team specs, team plans, topology, snapshots,
+//! Registry rows belong to the caller's organization: the tools pass
+//! `ctx.caller.org_id` and refuse a caller whose organization differs from the
+//! row's (`ua_org::authz::require_same_org`). Tool arguments do not carry an
+//! organization id. Team specs, team plans, topology, snapshots,
 //! self-organization, blueprints and skill packages are later slices.
 
 pub mod authz;
@@ -28,8 +30,9 @@ pub mod schema;
 
 pub use registry::{
     CHANNEL, DEFAULT_ORG_ID, Finding, Health, ISSUE_ACTIVE_WITHOUT_OFFICE, ISSUE_MEMBER_NOT_IN_ROSTER,
-    ISSUE_SERVICE_IN_OFFICE, ISSUE_SERVICE_NOT_IN_ROSTER, Office, Outcome, RegisterOffice, RegisterRole,
-    RegisterSeat, RegisterService, Registry, RoleGrant, Seat, find_office, health, load, office_for_identity,
-    offices_for_identity, register_office, register_role, register_seat, register_service,
+    ISSUE_SERVICE_IN_OFFICE, ISSUE_SERVICE_NOT_IN_ROSTER, NEUTRAL_ORIGINATOR, Office, Outcome,
+    RegisterOffice, RegisterRole, RegisterSeat, RegisterService, Registry, RoleGrant, Seat, find_office,
+    health, load, office_for_identity, offices_for_identity, register_office, register_role, register_seat,
+    register_service,
 };
 pub use schema::{SCHEMA, schema_parts};

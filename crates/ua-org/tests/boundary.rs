@@ -48,15 +48,9 @@ fn only_ua_tools_depends_on_ua_org() {
     let mut offenders: Vec<String> = Vec::new();
     for entry in walk(&memory_src) {
         let text = std::fs::read_to_string(&entry).expect("read ua-memory source");
-        for (n, line) in text.lines().enumerate() {
-            let mut rest = line;
-            while let Some(i) = rest.find("ua_org::") {
-                let tail = &rest[i + "ua_org::".len()..];
-                if !tail.starts_with("authz") {
-                    offenders.push(format!("{}:{}: {}", entry.display(), n + 1, line.trim()));
-                }
-                rest = &tail[tail.len()..];
-            }
+        for n in offenders_in(&text) {
+            let line = text.lines().nth(n).unwrap_or_default();
+            offenders.push(format!("{}:{}: {}", entry.display(), n + 1, line.trim()));
         }
     }
     assert!(
@@ -64,6 +58,32 @@ fn only_ua_tools_depends_on_ua_org() {
         "ua-memory may reach ua-org only through ua_org::authz; registry calls belong in ua-tools:\n{}",
         offenders.join("\n")
     );
+}
+
+/// The zero-based line numbers of `text` that reach `ua_org` outside
+/// `ua_org::authz`. Every occurrence on a line counts, not just the first: a
+/// line that imports `ua_org::authz` and also calls `ua_org::load` is an
+/// offender.
+fn offenders_in(text: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let mut from = 0;
+        while let Some(i) = line[from..].find("ua_org::") {
+            let start = from + i + "ua_org::".len();
+            if !line[start..].starts_with("authz") {
+                out.push(n);
+            }
+            from = start;
+        }
+    }
+    out
+}
+
+#[test]
+fn a_line_is_checked_for_every_ua_org_path_not_just_the_first() {
+    let text = "use ua_org::authz::require;\nlet r = ua_org::authz::x(); let s = ua_org::load(tx);\n";
+    assert_eq!(offenders_in(text), vec![1]);
+    assert_eq!(offenders_in("use ua_org::authz;\n"), Vec::<usize>::new());
 }
 
 /// Every `.rs` file under `dir`, depth first.
