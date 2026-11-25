@@ -445,7 +445,7 @@ async fn every_refused_url_shape_and_unported_source_action_is_rejected() {
     }
     assert_eq!(h.approval_count(), 0, "invalid inputs must never park approvals");
 
-    for action in ["source_unknown", "catalog", "install"] {
+    for action in ["source_unknown", "catalog", "team_install"] {
         let e = h.call(&human(), action, json!({})).await.unwrap_err();
         assert_eq!(e.code(), "invalid_argument", "{action}: {e:?}");
         assert!(e.to_string().contains("not ported"), "{action}: {e}");

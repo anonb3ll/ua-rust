@@ -48,14 +48,16 @@
 //!
 //! Multi-file skill packages reuse the Python hub's canonical `package_manifest`
 //! (schema version 1) and base64 `package_payload` format; every member's hash
-//! and size are verified on read (`get`, `resolve`, and harness config bundles),
-//! and imported Python-hub packages continue to verify. See `docs/skills.md`.
-//!
-//! Not ported: the catalog and team installs, and git skill sources.
+//! and size are verified on read (`get`, `resolve`, and harness config bundles)
+//! and on catalog `install`, and imported Python-hub packages continue to
+//! verify. Permanent per-org version yanks (`yank` -> `skill_version_yanks` +
+//! `skill.yanked`) immediately block `assign`, `install`, `get`, `resolve`,
+//! `node_config`, and re-importing/re-publishing the yanked `content_hash`.
+//! See `docs/skills.md` and `docs/skill-sources.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use base64::Engine as _;
@@ -151,6 +153,44 @@ pub const SOURCE_ID_SCHEMA: SchemaPart = SchemaPart {
 ALTER TABLE skill_publish_staging ADD COLUMN source_id TEXT;
 ",
 };
+
+/// `skill_registry.v5.yanks`: permanent per-organization skill version yanks
+/// (`docs/skill-sources.md` §6). Born tenant-scoped (`org_id TEXT NOT NULL`);
+/// generated `*_org_exists` and `*_org_immutable` triggers come from
+/// [`YANKS_TENANT_PART`].
+pub const YANKS_SCHEMA: SchemaPart = SchemaPart {
+    name: "skill_registry.v5.yanks",
+    sql: "
+CREATE TABLE IF NOT EXISTS skill_version_yanks (
+    org_id TEXT NOT NULL DEFAULT 'default',
+    name TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    reason TEXT,
+    yanked_by TEXT NOT NULL,
+    yanked_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, name, version)
+);
+CREATE INDEX IF NOT EXISTS idx_skill_version_yanks_org_hash
+    ON skill_version_yanks(org_id, content_hash);
+CREATE TRIGGER IF NOT EXISTS skill_version_yanks_immutable_update
+BEFORE UPDATE ON skill_version_yanks
+BEGIN
+    SELECT RAISE(ABORT, 'skill version yanks are permanent and cannot be modified');
+END;
+CREATE TRIGGER IF NOT EXISTS skill_version_yanks_immutable_delete
+BEFORE DELETE ON skill_version_yanks
+BEGIN
+    SELECT RAISE(ABORT, 'skill version yanks are permanent and cannot be deleted');
+END;
+",
+};
+
+/// `organization.v1.tools.skill_yanks`: installs `skill_version_yanks_org_exists`
+/// and `skill_version_yanks_org_immutable` after `skill_registry.v5.yanks` and
+/// `organization.v1.store`.
+pub const YANKS_TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.skill_yanks", &["skill_version_yanks"]);
 
 /// `skill_registry.v2.tenant_keys`: rebuild `skill_versions` around
 /// `UNIQUE(org_id, name, version)` and `skill_assignments` around
@@ -783,16 +823,43 @@ struct LoadedVersion {
     members: Vec<PackageMember>,
 }
 
-/// A version of `name` in `org` (the latest when `version` is `None`),
-/// verified end-to-end across every package member. Another organization's
-/// version reads as missing; a tampered stored file is refused.
-fn load_version(
+enum LoadOutcome {
+    Missing,
+    Yanked { version: i64 },
+    AttestationFailed { version: i64 },
+    Loaded(LoadedVersion),
+}
+
+fn is_version_yanked(c: &Connection, org: &str, name: &str, version: i64) -> UaResult<bool> {
+    Ok(c.query_row(
+        "SELECT 1 FROM skill_version_yanks WHERE org_id = ?1 AND name = ?2 AND version = ?3",
+        params![org, name, version],
+        |_| Ok(true),
+    )
+    .optional()?
+    .unwrap_or(false))
+}
+
+/// If any version in `org` with `content_hash` has been yanked, returns its
+/// `(name, version)` so re-importing or re-publishing the same content is
+/// refused (`docs/skill-sources.md` §6).
+fn find_yanked_hash(c: &Connection, org: &str, content_hash: &str) -> UaResult<Option<(String, i64)>> {
+    Ok(c.query_row(
+        "SELECT name, version FROM skill_version_yanks WHERE org_id = ?1 AND content_hash = ?2 \
+         ORDER BY yanked_at DESC, version DESC LIMIT 1",
+        params![org, content_hash],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()?)
+}
+
+fn fetch_raw_version(
     c: &Connection,
     org: &str,
     name: &str,
     version: Option<i64>,
-) -> UaResult<Option<LoadedVersion>> {
-    let raw = match version {
+) -> UaResult<Option<RawVersionRow>> {
+    Ok(match version {
         Some(v) => c
             .query_row(
                 &format!(
@@ -812,8 +879,18 @@ fn load_version(
                 raw_version_row,
             )
             .optional()?,
-    };
-    let Some(raw) = raw else {
+    })
+}
+
+/// Load and verify a version without refusing yanked versions (used when
+/// computing upgrade diffs from a previously yanked version to a fresh fix).
+fn load_version_raw_verified(
+    c: &Connection,
+    org: &str,
+    name: &str,
+    version: Option<i64>,
+) -> UaResult<Option<LoadedVersion>> {
+    let Some(raw) = fetch_raw_version(c, org, name, version)? else {
         return Ok(None);
     };
     let members = verify_and_decode(
@@ -825,6 +902,58 @@ fn load_version(
     let mut public = raw.public;
     public["files"] = Value::Array(members.iter().map(PackageMember::to_wire_json).collect());
     Ok(Some(LoadedVersion { public, source: raw.source, members }))
+}
+
+fn load_version_outcome(
+    c: &Connection,
+    org: &str,
+    name: &str,
+    version: Option<i64>,
+) -> UaResult<LoadOutcome> {
+    let Some(raw) = fetch_raw_version(c, org, name, version)? else {
+        return Ok(LoadOutcome::Missing);
+    };
+    let ver = raw.public["version"].as_i64().unwrap_or_default();
+    if is_version_yanked(c, org, name, ver)? || find_yanked_hash(c, org, &raw.content_hash)?.is_some() {
+        return Ok(LoadOutcome::Yanked { version: ver });
+    }
+    let members = match verify_and_decode(
+        &raw.content,
+        &raw.content_hash,
+        raw.manifest_raw.as_deref(),
+        raw.payload_raw.as_deref(),
+    ) {
+        Ok(m) => m,
+        Err(UaError::Conflict { .. }) => return Ok(LoadOutcome::AttestationFailed { version: ver }),
+        Err(e) => return Err(e),
+    };
+    let mut public = raw.public;
+    public["files"] = Value::Array(members.iter().map(PackageMember::to_wire_json).collect());
+    Ok(LoadOutcome::Loaded(LoadedVersion { public, source: raw.source, members }))
+}
+
+/// A version of `name` in `org` (the latest when `version` is `None`),
+/// verified end-to-end across every package member and checked against
+/// `skill_version_yanks`. Another organization's version reads as missing; a
+/// yanked version returns `conflict` (`yanked`); a tampered stored file is
+/// refused (`conflict`).
+fn load_version(
+    c: &Connection,
+    org: &str,
+    name: &str,
+    version: Option<i64>,
+) -> UaResult<Option<LoadedVersion>> {
+    match load_version_outcome(c, org, name, version)? {
+        LoadOutcome::Missing => Ok(None),
+        LoadOutcome::Yanked { version: v } => Err(UaError::conflict_code(
+            "yanked",
+            format!("skill {name:?} v{v} has been yanked and cannot be served"),
+        )),
+        LoadOutcome::AttestationFailed { .. } => {
+            Err(UaError::conflict("skill content hash does not match the reviewed registry version"))
+        }
+        LoadOutcome::Loaded(loaded) => Ok(Some(loaded)),
+    }
 }
 
 fn assignment_row(r: &Row<'_>) -> rusqlite::Result<Value> {
@@ -912,14 +1041,22 @@ pub(crate) fn resolve_with_skips(
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     for (name, pin, via) in picked.into_iter().take(MAX_RESOLVED_SKILLS) {
-        let loaded = match load_version(c, org, &name, pin) {
-            Ok(Some(loaded)) => loaded,
-            Ok(None) => continue,
-            Err(UaError::Conflict { .. }) => {
-                skipped.push(SkippedSkill { name, version: pin, via, reason: "attestation_failed" });
+        let loaded = match load_version_outcome(c, org, &name, pin)? {
+            LoadOutcome::Loaded(loaded) => loaded,
+            LoadOutcome::Missing => continue,
+            LoadOutcome::Yanked { version } => {
+                skipped.push(SkippedSkill { name, version: Some(version), via, reason: "yanked" });
                 continue;
             }
-            Err(e) => return Err(e),
+            LoadOutcome::AttestationFailed { version } => {
+                skipped.push(SkippedSkill {
+                    name,
+                    version: Some(version),
+                    via,
+                    reason: "attestation_failed",
+                });
+                continue;
+            }
         };
         let manifest = match &loaded.public["package_manifest"] {
             Value::Null => None,
@@ -940,8 +1077,8 @@ pub(crate) fn resolve_with_skips(
 
 /// The skills assigned to `agent` in `org` directly or through `profile`: direct
 /// assignments first (each source sorted by name), a direct one winning over
-/// a profile one of the same skill, at most [`MAX_RESOLVED_SKILLS`]. A pinned
-/// version that is missing is skipped; a stored version whose hash or member
+/// a profile one of the same skill, at most [`MAX_RESOLVED_SKILLS`]. Missing or
+/// yanked versions are omitted; a stored version whose hash or member
 /// attestation fails is refused, never served.
 pub(crate) fn resolve(
     c: &Connection,
@@ -950,7 +1087,7 @@ pub(crate) fn resolve(
     profile: Option<&str>,
 ) -> UaResult<Vec<Resolved>> {
     let (resolved, skipped) = resolve_with_skips(c, org, agent, profile)?;
-    if !skipped.is_empty() {
+    if skipped.iter().any(|s| s.reason != "yanked") {
         return Err(UaError::conflict("skill content hash does not match the reviewed registry version"));
     }
     Ok(resolved)
@@ -961,7 +1098,9 @@ pub(crate) fn resolve(
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SkillRegistryArgs {
-    /// `publish`, `list`, `get`, `assign`, `unassign`, `resolve` or `drift`.
+    /// `publish`, `list`, `get`, `assign`, `unassign`, `resolve`, `drift`,
+    /// `yank`, `install`, `source_add`, `source_revoke`, `source_list`,
+    /// `source_refresh`, `source_discover`, or `source_import`.
     pub action: String,
     /// The action's parameters (see the tool description).
     #[serde(default)]
@@ -1035,6 +1174,32 @@ struct DriftParams {
     profile: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YankParams {
+    name: String,
+    version: i64,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallParams {
+    name: String,
+    #[serde(default)]
+    version: Option<i64>,
+    #[serde(default)]
+    expected_hash: Option<String>,
+    target_dir: String,
+    #[serde(default = "default_true")]
+    overwrite: bool,
+}
+
 fn params<T: DeserializeOwned>(raw: Option<Value>) -> UaResult<T> {
     let raw = match raw {
         None | Some(Value::Null) => json!({}),
@@ -1074,6 +1239,31 @@ pub(super) fn operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
         return Err(UaError::denied(
             "operator_required",
             format!("{what} is an operator action (a human or a lifecycle operator)"),
+        ));
+    }
+    Ok(who)
+}
+
+/// Human-only operator authority check (`docs/skill-sources.md` §1 & §6):
+/// requires an existing org in `orgs`, a verified identity, and
+/// [`Authority::Operator`] (human operator only; never an agent or lifecycle
+/// operator).
+pub(super) fn human_operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
+    let org = ctx.caller.org_id.as_str();
+    let known = ctx
+        .hub
+        .db()
+        .read(|c| Ok(c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?))?;
+    if known.is_none() {
+        return Err(UaError::invalid(format!(
+            "unknown organization {org:?}; the skill registry was not changed"
+        )));
+    }
+    let who = author(ctx)?;
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], org) {
+        return Err(UaError::denied(
+            "operator_required",
+            format!("{what} requires a human operator of this organization"),
         ));
     }
     Ok(who)
@@ -1767,15 +1957,31 @@ fn staged_payload(c: &Connection, org: &str, s: &Staged) -> UaResult<Value> {
         payload["package_manifest"] = manifest;
         payload["package_files"] = Value::Array(package_files);
     }
-    if let Some(prev) = load_version(c, org, &s.name, None)?
+    if let Some(prev) = load_version_raw_verified(c, org, &s.name, None)?
         && prev.public["content_hash"].as_str() != Some(s.content_hash.as_str())
     {
         let prev_md = prev.public["content"].as_str().unwrap_or_default();
-        let source_changed = match (parse_git_provenance(&prev.source), parse_git_provenance(&s.source)) {
-            (Some((p_url, _, p_path)), Some((n_url, _, n_path))) => p_url != n_url || p_path != n_path,
-            (None, None) => false,
-            _ => true,
+        let prev_ver = prev.public["version"].as_i64().unwrap_or_default();
+        let prev_source_id: Option<String> = c
+            .query_row(
+                "SELECT source_id FROM skill_publish_staging \
+                 WHERE org_id = ?1 AND name = ?2 AND published_version = ?3 \
+                 ORDER BY created_at DESC LIMIT 1",
+                params![org, s.name, prev_ver],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let source_id_changed = match (&prev_source_id, &s.source_id) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
         };
+        let source_changed = source_id_changed
+            || match (parse_git_provenance(&prev.source), parse_git_provenance(&s.source)) {
+                (Some((p_url, _, p_path)), Some((n_url, _, n_path))) => p_url != n_url || p_path != n_path,
+                (None, None) => false,
+                _ => true,
+            };
         payload["previous_version"] = prev.public["version"].clone();
         payload["previous_content_hash"] = prev.public["content_hash"].clone();
         payload["previous_source"] = json!(prev.source);
@@ -1905,6 +2111,17 @@ pub(super) fn stage_members(
         if let Some(sid) = source_id.as_deref() {
             active_source_pinned_sha(tx, org, sid, "import")?;
         }
+        // §6: re-importing or re-publishing a yanked content_hash is refused,
+        // never idempotent.
+        if let Some((y_name, y_ver)) = find_yanked_hash(tx, org, &hash)? {
+            return Err(UaError::conflict_code(
+                "yanked",
+                format!(
+                    "content_hash {hash} matches yanked skill {y_name:?} v{y_ver}; \
+                     re-importing or re-publishing a yanked revision is refused"
+                ),
+            ));
+        }
         if let Some(skill) = existing_version(tx, org, &name, &hash)? {
             return Ok(json!({ "ok": true, "idempotent": true, "skill": skill, "review": review }));
         }
@@ -2010,6 +2227,18 @@ fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
                 staged.package_manifest.as_deref(),
                 staged.package_payload.as_deref(),
             )?;
+            // §6: if this content_hash was yanked (including between stage and
+            // publish), refuse instead of returning idempotent or publishing.
+            if let Some((y_name, y_ver)) = find_yanked_hash(tx, org, &staged.content_hash)? {
+                return Err(UaError::conflict_code(
+                    "yanked",
+                    format!(
+                        "content_hash {} matches yanked skill {y_name:?} v{y_ver}; \
+                         re-publishing a yanked revision is refused",
+                        staged.content_hash
+                    ),
+                ));
+            }
             if let Some(skill) = existing_version(tx, org, &staged.name, &staged.content_hash)? {
                 return Ok(Ok(json!({ "ok": true, "idempotent": true, "skill": skill })));
             }
@@ -2094,11 +2323,30 @@ fn list(ctx: &ToolCtx, p: ListParams) -> UaResult<Value> {
     let name = p.name.filter(|n| !n.trim().is_empty());
     let org = ctx.caller.org_id.as_str();
     ctx.hub.db().read(|c| {
-        let mut stmt = c.prepare(&format!(
-            "SELECT {LIST_COLS} FROM skill_versions WHERE org_id = ?1 AND (?2 IS NULL OR name = ?2) \
-             ORDER BY name, version DESC"
-        ))?;
-        let skills = stmt.query_map(params![org, name], version_row)?.collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = c.prepare(
+            "SELECT sv.id, sv.name, sv.version, sv.content_hash, sv.source, sv.published_by, \
+                    sv.published_at, sv.package_manifest, y.yanked_at, y.reason \
+             FROM skill_versions sv \
+             LEFT JOIN skill_version_yanks y \
+               ON y.org_id = sv.org_id AND y.name = sv.name AND y.version = sv.version \
+             WHERE sv.org_id = ?1 AND (?2 IS NULL OR sv.name = ?2) \
+             ORDER BY sv.name, sv.version DESC",
+        )?;
+        let skills = stmt
+            .query_map(params![org, name], |r| {
+                let mut v = version_row(r)?;
+                let yanked_at: Option<String> = r.get(8)?;
+                let yank_reason: Option<String> = r.get(9)?;
+                v["yanked"] = json!(yanked_at.is_some());
+                if let Some(at) = yanked_at {
+                    v["yanked_at"] = json!(at);
+                    if let Some(reason) = yank_reason {
+                        v["yank_reason"] = json!(reason);
+                    }
+                }
+                Ok(v)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({ "skills": skills }))
     })
 }
@@ -2157,6 +2405,14 @@ fn assign_as(ctx: &ToolCtx, who: String, p: AssignParams) -> UaResult<Value> {
                 None => UaError::not_found(format!("skill {name:?} has no published version yet")),
             });
         };
+        // §6: a yanked version (or any version carrying a yanked content_hash)
+        // can never be assigned.
+        if is_version_yanked(tx, org, &name, pin)? || find_yanked_hash(tx, org, &hash)?.is_some() {
+            return Err(UaError::conflict_code(
+                "yanked",
+                format!("skill {name:?} v{pin} has been yanked and cannot be assigned"),
+            ));
+        }
         // The skill rides into the harness of every node of this agent or
         // profile: a human approves the assignment of this content first.
         // The payload binds the organization, so a pass is never consumed
@@ -2393,7 +2649,10 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
         let mut stmt = c.prepare(
             "SELECT sv.name, sv.version, sv.content_hash, sv.package_manifest FROM skill_versions sv \
              JOIN (SELECT name, MAX(version) AS version FROM skill_versions WHERE org_id = ?1 GROUP BY name) latest \
-             ON sv.name = latest.name AND sv.version = latest.version WHERE sv.org_id = ?1",
+             ON sv.name = latest.name AND sv.version = latest.version \
+             LEFT JOIN skill_version_yanks y \
+               ON y.org_id = sv.org_id AND y.name = sv.name AND y.version = sv.version \
+             WHERE sv.org_id = ?1 AND y.version IS NULL",
         )?;
         let rows = stmt
             .query_map([org], |r| {
@@ -2458,6 +2717,454 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
     }))
 }
 
+const MAX_YANK_REASON_BYTES: usize = 500;
+
+fn yank(ctx: &ToolCtx, p: YankParams) -> UaResult<Value> {
+    let who = human_operator(ctx, "yanking a skill version")?;
+    yank_as(ctx, who, p)
+}
+
+/// `yank` for `who`, a human operator of the caller's organization
+/// (`docs/skill-sources.md` §6). Permanent: writes `skill_version_yanks` and
+/// appends `skill.yanked` in the same transaction behind a human approval.
+fn yank_as(ctx: &ToolCtx, who: String, p: YankParams) -> UaResult<Value> {
+    let name = check_name(&p.name)?;
+    let version = positive(Some(p.version))?.unwrap_or(1);
+    let reason = match p.reason {
+        None => None,
+        Some(raw) => {
+            if raw.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+                return Err(UaError::invalid("yank reason must not contain control characters"));
+            }
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.len() > MAX_YANK_REASON_BYTES {
+                return Err(UaError::invalid(format!(
+                    "yank reason exceeds the {MAX_YANK_REASON_BYTES}-byte limit"
+                )));
+            } else {
+                Some(trimmed)
+            }
+        }
+    };
+    let org = ctx.caller.org_id.as_str();
+    ctx.hub
+        .db()
+        .write(|tx| {
+            // Another organization's version answers identically to missing (`not_found`).
+            let content_hash: String = tx
+                .query_row(
+                    "SELECT content_hash FROM skill_versions \
+                     WHERE org_id = ?1 AND name = ?2 AND version = ?3",
+                    params![org, name, version],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| UaError::not_found(format!("unknown version {version} for skill {name:?}")))?;
+            if is_version_yanked(tx, org, &name, version)? {
+                return Err(UaError::conflict_code(
+                    "yanked",
+                    format!("skill {name:?} v{version} is already yanked; yanks are permanent"),
+                ));
+            }
+            let payload = json!({
+                "action": "yank",
+                "org_id": org,
+                "name": name,
+                "version": version,
+                "content_hash": content_hash,
+                "reason": reason,
+            });
+            if let Some(approval_id) = gate(tx, ctx, &payload)? {
+                return Ok(Err(approval_id));
+            }
+            let now = ua_core::time::now();
+            tx.execute(
+                "INSERT INTO skill_version_yanks (org_id, name, version, content_hash, reason, yanked_by, yanked_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![org, name, version, content_hash, reason, who, now],
+            )?;
+            emit(
+                tx,
+                org,
+                "skill.yanked",
+                json!({
+                    "name": ledger_text(org, &name),
+                    "version": version,
+                    "content_hash": ledger_text(org, &content_hash),
+                    "reason": reason.as_deref().map(|r| ledger_text(org, r)).unwrap_or(Value::Null),
+                    "yanked_at": now,
+                }),
+                &who,
+            )?;
+            Ok(Ok(json!({
+                "ok": true,
+                "yank": {
+                    "name": name,
+                    "version": version,
+                    "content_hash": content_hash,
+                    "reason": reason,
+                    "yanked_by": who,
+                    "yanked_at": now,
+                },
+            })))
+        })
+        .and_then(pending)
+}
+
+/// RAII cleanup guard for an atomic install staging directory: deletes the
+/// staging tree on drop unless disarmed after a successful swap.
+struct StageCleanup(Option<PathBuf>);
+
+impl StageCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StageCleanup {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Resolve an install target directory strictly inside the workspace root,
+/// refusing `..`, out-of-root absolute paths, backslashes, NUL bytes, and any
+/// symlink component. Creates missing directory segments inside the workspace
+/// one component at a time while checking `symlink_metadata` on every step.
+fn resolve_install_root(ctx: &ToolCtx, raw: &str) -> UaResult<(PathBuf, String)> {
+    let raw_t = raw.trim();
+    if raw_t.is_empty() || raw_t.contains('\0') || raw_t.contains('\\') {
+        return Err(UaError::invalid(format!("unsafe install target_dir {raw:?}")));
+    }
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(crate::families::workspace::workspace_org_unsupported());
+    }
+    let ws = ctx.hub.cfg().workspace_root();
+    let ws_real = ws
+        .canonicalize()
+        .map_err(|_| UaError::invalid("workspace root does not exist or cannot be resolved"))?;
+    let p = Path::new(raw_t);
+    let rel: PathBuf = if p.is_absolute() {
+        p.strip_prefix(&ws_real)
+            .or_else(|_| p.strip_prefix(&ws))
+            .map_err(|_| UaError::invalid(format!("target_dir {raw:?} is outside the workspace root")))?
+            .to_path_buf()
+    } else {
+        p.to_path_buf()
+    };
+
+    // Validate every path component BEFORE touching the filesystem so an
+    // invalid path (e.g. `newdir/../escape`) never creates stray directories.
+    let mut parts = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => {
+                let s = seg
+                    .to_str()
+                    .ok_or_else(|| UaError::invalid(format!("target_dir {raw:?} contains non-UTF-8")))?;
+                if s.is_empty() || s.chars().any(|c| c.is_control() || super::skills::hidden_char(c)) {
+                    return Err(UaError::invalid(format!("unsafe install target_dir {raw:?}")));
+                }
+                parts.push(s.to_string());
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(UaError::invalid(format!("target_dir {raw:?} escapes the workspace root")));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(UaError::invalid("target_dir must name a directory inside the workspace"));
+    }
+
+    let mut cur = ws_real;
+    for seg in &parts {
+        cur.push(seg);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(UaError::invalid(format!(
+                        "target_dir {raw:?} passes through a symlink; symlinks are not followed"
+                    )));
+                }
+                if !meta.file_type().is_dir() {
+                    return Err(UaError::invalid(format!(
+                        "target_dir {raw:?} path component is not a directory"
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o755);
+                }
+                builder
+                    .create(&cur)
+                    .map_err(|err| UaError::invalid(format!("cannot create target_dir: {err}")))?;
+                let meta = std::fs::symlink_metadata(&cur)
+                    .map_err(|err| UaError::invalid(format!("cannot verify target_dir: {err}")))?;
+                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                    return Err(UaError::invalid(format!(
+                        "target_dir {raw:?} passes through a symlink; symlinks are not followed"
+                    )));
+                }
+            }
+            Err(e) => {
+                return Err(UaError::invalid(format!("cannot inspect target_dir {raw:?}: {e}")));
+            }
+        }
+    }
+    Ok((cur, parts.join("/")))
+}
+
+/// Write one verified package member into `stage_dir` using `O_NOFOLLOW`,
+/// `O_CREAT | O_EXCL`, and mode `0o644` (never `0o755`).
+fn write_file_nofollow_0644(stage_dir: &Path, rel_path: &str, bytes: &[u8]) -> UaResult<()> {
+    let clean = validate_package_path(rel_path)?;
+    let mut cur = stage_dir.to_path_buf();
+    let segments: Vec<&str> = clean.split('/').collect();
+    for dir_seg in &segments[..segments.len() - 1] {
+        cur.push(dir_seg);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                    return Err(UaError::invalid(format!(
+                        "install staging path {clean:?} hit a non-directory or symlink"
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o755);
+                }
+                builder
+                    .create(&cur)
+                    .map_err(|err| UaError::internal(format!("cannot create staging subdir: {err}")))?;
+            }
+            Err(e) => {
+                return Err(UaError::internal(format!("cannot inspect staging subdir: {e}")));
+            }
+        }
+    }
+    cur.push(segments[segments.len() - 1]);
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o644);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = opts.open(&cur).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            UaError::invalid(format!("install path {clean:?} is a symlink; symlinks are not followed"))
+        } else {
+            UaError::internal(format!("cannot create staged file {clean:?}: {e}"))
+        }
+    })?;
+    file.write_all(bytes)
+        .map_err(|e| UaError::internal(format!("cannot write staged file {clean:?}: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| UaError::internal(format!("cannot set 0644 mode on {clean:?}: {e}")))?;
+    }
+    file.sync_all().map_err(|e| UaError::internal(format!("cannot sync staged file {clean:?}: {e}")))?;
+    let meta = file.metadata().map_err(|e| UaError::internal(format!("cannot stat staged file: {e}")))?;
+    if !meta.is_file() || meta.len() != bytes.len() as u64 {
+        return Err(UaError::internal(format!("staged file {clean:?} failed post-write check")));
+    }
+    Ok(())
+}
+
+/// Atomically stage every verified member into a sibling directory inside
+/// `target_root`, then swap into `target_root/<name>`. Any failure cleans up
+/// the staging directory and leaves `target_root/<name>` untouched (no partial
+/// package on disk).
+fn stage_and_swap_members(
+    target_root: &Path,
+    name: &str,
+    members: &[PackageMember],
+    overwrite: bool,
+) -> UaResult<()> {
+    let dest = target_root.join(name);
+    let replacing = match std::fs::symlink_metadata(&dest) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(UaError::invalid(format!(
+                    "install destination {name:?} is a symlink; symlinks are not followed"
+                )));
+            }
+            if !meta.file_type().is_dir() {
+                return Err(UaError::invalid(format!(
+                    "install destination {name:?} exists and is not a directory"
+                )));
+            }
+            if !overwrite {
+                return Err(UaError::conflict(format!(
+                    "skill directory {name:?} already exists; pass overwrite: true to replace"
+                )));
+            }
+            // Refuse wiping an unrelated non-skill directory: an existing
+            // destination must either be empty or hold a regular SKILL.md.
+            let has_entries = std::fs::read_dir(&dest)
+                .map_err(|e| UaError::invalid(format!("cannot inspect destination {name:?}: {e}")))?
+                .next()
+                .is_some();
+            if has_entries && !is_regular_file(&dest.join("SKILL.md")) {
+                return Err(UaError::conflict(format!(
+                    "existing directory {name:?} is not a skill directory (missing regular SKILL.md)"
+                )));
+            }
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(UaError::invalid(format!("cannot inspect destination {name:?}: {e}"))),
+    };
+
+    let nonce = &uuid::Uuid::new_v4().simple().to_string()[..12];
+    let stage_dir = target_root.join(format!(".{name}.ua-install-{nonce}"));
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o755);
+        }
+        builder
+            .create(&stage_dir)
+            .map_err(|e| UaError::internal(format!("cannot create install staging dir: {e}")))?;
+    }
+    let mut cleanup = StageCleanup::new(stage_dir.clone());
+
+    let mut seen_portable = BTreeSet::new();
+    for m in members {
+        let clean = validate_package_path(&m.path)?;
+        if !seen_portable.insert(portable_collision_key(&clean)) {
+            return Err(UaError::conflict(format!("duplicate or colliding member path {clean:?}")));
+        }
+        write_file_nofollow_0644(&stage_dir, &clean, &m.bytes)?;
+    }
+
+    // Re-check destination immediately before swap so a symlink swapped in
+    // during staging is never followed or replaced.
+    if let Ok(meta) = std::fs::symlink_metadata(&dest)
+        && meta.file_type().is_symlink()
+    {
+        return Err(UaError::invalid(format!(
+            "install destination {name:?} became a symlink; symlinks are not followed"
+        )));
+    }
+
+    if replacing {
+        let backup_dir = target_root.join(format!(".{name}.ua-backup-{nonce}"));
+        std::fs::rename(&dest, &backup_dir)
+            .map_err(|e| UaError::internal(format!("cannot move existing skill aside for swap: {e}")))?;
+        match std::fs::rename(&stage_dir, &dest) {
+            Ok(()) => {
+                cleanup.disarm();
+                let _ = std::fs::remove_dir_all(&backup_dir);
+            }
+            Err(e) => {
+                let _ = std::fs::rename(&backup_dir, &dest);
+                return Err(UaError::internal(format!("cannot commit staged skill install: {e}")));
+            }
+        }
+    } else {
+        std::fs::rename(&stage_dir, &dest)
+            .map_err(|e| UaError::internal(format!("cannot commit staged skill install: {e}")))?;
+        cleanup.disarm();
+    }
+    Ok(())
+}
+
+/// Catalog `install`: re-verify every package member against `package_manifest`
+/// and `content_hash`, refuse yanked versions or mismatched `expected_hash`,
+/// and materialize into `<target_dir>/<name>` atomically with `O_NOFOLLOW` and
+/// mode `0o644` (`docs/skill-sources.md` §4 & §6).
+fn install(ctx: &ToolCtx, p: InstallParams) -> UaResult<Value> {
+    let _who = author(ctx)?;
+    if ctx.caller.enforce_profile && !ctx.caller.profile.allows_tool("fs_write") {
+        return Err(UaError::denied(
+            "profile_denied",
+            "installing a skill writes to the workspace and requires write access",
+        ));
+    }
+    let name = check_name(&p.name)?;
+    let version = positive(p.version)?;
+    let expected_hash = match p.expected_hash {
+        None => None,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(UaError::invalid("expected_hash must be a 64-character hex SHA-256"));
+            }
+            Some(trimmed.to_ascii_lowercase())
+        }
+    };
+
+    // Load and re-verify strictly inside the caller's organization BEFORE
+    // checking workspace paths, so another org's skill returns `not_found`.
+    let org = ctx.caller.org_id.as_str();
+    let loaded =
+        ctx.hub.db().read(|c| load_version(c, org, &name, version))?.ok_or_else(|| match version {
+            Some(v) => UaError::not_found(format!("unknown version {v} for skill {name:?}")),
+            None => UaError::not_found(format!("unknown skill: {name:?}")),
+        })?;
+    let verified_hash = loaded.public["content_hash"].as_str().unwrap_or_default().to_string();
+    let verified_version = loaded.public["version"].as_i64().unwrap_or_default();
+    if let Some(exp) = expected_hash.as_deref()
+        && exp != verified_hash
+    {
+        return Err(UaError::conflict_code(
+            "hash_mismatch",
+            format!(
+                "expected_hash {exp} does not match verified registry hash {verified_hash} for {name:?} v{verified_version}"
+            ),
+        ));
+    }
+
+    let (target_root, target_rel) = resolve_install_root(ctx, &p.target_dir)?;
+    stage_and_swap_members(&target_root, &name, &loaded.members, p.overwrite)?;
+
+    let installed_rel = format!("{target_rel}/{name}");
+    let files: Vec<Value> = loaded
+        .members
+        .iter()
+        .map(|m| {
+            json!({
+                "path": m.path,
+                "bytes": m.bytes.len(),
+                "sha256": m.sha256,
+                "mode": MODE_FILE,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "ok": true,
+        "name": name,
+        "version": verified_version,
+        "content_hash": verified_hash,
+        "installed_path": installed_rel,
+        "file_count": files.len(),
+        "files": files,
+    }))
+}
+
 async fn skill_registry(ctx: ToolCtx, a: SkillRegistryArgs) -> UaResult<Value> {
     let raw = a.action.trim().to_ascii_lowercase();
     let action = crate::routes::action_of("skill_registry", Some(&a.action))?;
@@ -2469,13 +3176,15 @@ async fn skill_registry(ctx: ToolCtx, a: SkillRegistryArgs) -> UaResult<Value> {
         "unassign" => unassign(&ctx, params(a.params)?),
         "resolve" => resolve_action(&ctx, params(a.params)?),
         "drift" => drift(&ctx, params(a.params)?),
+        "yank" => yank(&ctx, params(a.params)?),
+        "install" => install(&ctx, params(a.params)?),
         "source_add" => super::skill_sources::source_add(&ctx, params(a.params)?),
         "source_revoke" => super::skill_sources::source_revoke(&ctx, params(a.params)?),
         "source_list" => super::skill_sources::source_list(&ctx, params(a.params)?),
         "source_refresh" => super::skill_sources::source_refresh(&ctx, params(a.params)?),
         "source_discover" => super::skill_sources::source_discover(&ctx, params(a.params)?),
         "source_import" => super::skill_sources::source_import(&ctx, params(a.params)?),
-        "catalog" | "install" | "team_install" | "starter_preview" | "starter_install" => {
+        "catalog" | "team_install" | "starter_preview" | "starter_install" => {
             Err(UaError::invalid(format!("action {raw:?} (the skill catalog) is not ported to this hub")))
         }
         "source_" => {
@@ -2500,17 +3209,23 @@ pub fn register(r: &mut Registry) {
              the approved staged copy without re-reading the source), list {name?}, get {name, version?}, assign \
              {skill_name, target, target_type: agent|profile, version?} (an agent assignment wins over a profile \
              one), unassign {skill_name, target, target_type}, resolve {agent_label, profile?} (own skills, or any \
-             agent's for an operator), drift {surface_dir, agent_label?, profile?} (read-only: missing, stale, \
-             unregistered, unassigned and synced skills), source_add {url, pinned_sha, tracking_ref?, \
-             allowed_subpaths?} (human operator only, behind human approval: register an https:// Git skill source \
-             pinned to an exact 40-char commit SHA), source_revoke {source_id, reason?} (human operator only, behind \
-             human approval: terminally revoke a skill source), source_list {status?} (list this organization's \
-             skill sources), source_refresh {source_id} (resolve the source's tracking_ref to a candidate SHA and \
-             report changes without moving pinned_sha), source_discover {source_id, sha?} (plumbing-only discovery \
-             of candidate skill packages under allowed_subpaths at pinned_sha), source_import {source_id, path, \
-             name?, sha?} (operator: read blobs by object id, run full D1 screens, stage into skill_publish_staging \
-             with git provenance and upgrade member diff for human publish approval). The harness config bundle \
-             served to a node carries the verified skill packages resolved for its agent.",
+             agent's for an operator; omits yanked versions), drift {surface_dir, agent_label?, profile?} \
+             (read-only: missing, stale, unregistered, unassigned and synced skills), yank {name, version, reason?} \
+             (human operator only, behind human approval: permanently yank a published version, blocking assign, \
+             install, get, resolve, node_config and re-importing/re-publishing the yanked content_hash), install \
+             {name, version?, expected_hash?, target_dir, overwrite?} (re-verify every member against \
+             package_manifest and content_hash, check optional expected_hash, and atomically materialize into \
+             <target_dir>/<name> inside the workspace with O_NOFOLLOW and mode 0o644), source_add {url, pinned_sha, \
+             tracking_ref?, allowed_subpaths?} (human operator only, behind human approval: register an https:// Git \
+             skill source pinned to an exact 40-char commit SHA), source_revoke {source_id, reason?} (human operator \
+             only, behind human approval: terminally revoke a skill source), source_list {status?} (list this \
+             organization's skill sources), source_refresh {source_id} (resolve the source's tracking_ref to a \
+             candidate SHA and report changes without moving pinned_sha), source_discover {source_id, sha?} \
+             (plumbing-only discovery of candidate skill packages under allowed_subpaths at pinned_sha), \
+             source_import {source_id, path, name?, sha?} (operator: read blobs by object id, run full D1 screens, \
+             stage into skill_publish_staging with git provenance and upgrade member diff for human publish \
+             approval). The harness config bundle served to a node carries the verified skill packages resolved for \
+             its agent.",
             skill_registry,
         )
         .gates_in_handler()
@@ -2757,5 +3472,148 @@ mod tests {
         let p: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(p["name"], "review-diff", "{payload}");
         assert!(p["content_hash"].is_string(), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn org_b_yank_binds_org_id_redacts_ledger_and_masks_foreign_versions() {
+        use ua_core::{ActorKind, Caller, Profile, identity::Transport};
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = ua_core::Config::for_home(home.path());
+        cfg.human_identities = vec!["operator".into()];
+        let hub = crate::Hub::in_memory(cfg).unwrap();
+        hub.db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+                     ('org-b', 'org-b', 'Org B', '[\"developer\", \"coordinator\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                let md = "---\nname: secret-skill\ndescription: Secret org skill.\n---\nBody.\n";
+                let h = content_hash(md);
+                tx.execute(
+                    "INSERT INTO skill_versions (org_id, name, version, content_hash, source, content, \
+                     published_by, published_at) VALUES ('org-b', 'secret-skill', 1, ?1, 'skills/secret-skill/SKILL.md', \
+                     ?2, 'operator', '2026-01-01T00:00:00+00:00')",
+                    params![h, md],
+                )?;
+                tx.execute(
+                    "INSERT INTO skill_versions (org_id, name, version, content_hash, source, content, \
+                     published_by, published_at) VALUES ('default', 'default-only', 1, ?1, 'skills/default-only/SKILL.md', \
+                     ?2, 'operator', '2026-01-01T00:00:00+00:00')",
+                    params![h, md],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let b_ctx = ToolCtx {
+            hub: hub.clone(),
+            caller: Caller {
+                label: "operator".into(),
+                kind: ActorKind::Human,
+                profile: Profile::Coordinator,
+                enforce_profile: true,
+                session_key: Some("s1".into()),
+                transport: Transport::Mcp,
+                org_id: "org-b".into(),
+            },
+        };
+
+        // Attempting to yank a default-org skill from org-b returns `not_found`.
+        let foreign_err = yank_as(
+            &b_ctx,
+            "operator".into(),
+            YankParams { name: "default-only".into(), version: 1, reason: Some("nope".into()) },
+        )
+        .unwrap_err();
+        assert_eq!(foreign_err.code(), "not_found");
+
+        // Yanking org-b's own version parks an approval bound to org-b.
+        let req_id = match yank_as(
+            &b_ctx,
+            "operator".into(),
+            YankParams { name: "secret-skill".into(), version: 1, reason: Some("secret-leak-note".into()) },
+        ) {
+            Err(UaError::ApprovalRequired { approval_id, .. }) => approval_id,
+            other => panic!("expected pending approval: {other:?}"),
+        };
+        let (a_org, a_payload): (String, Value) = hub
+            .db()
+            .read(move |c| {
+                let (o, p): (String, String) =
+                    c.query_row("SELECT org_id, payload FROM approvals WHERE id = ?1", [req_id], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
+                Ok((o, serde_json::from_str(&p)?))
+            })
+            .unwrap();
+        assert_eq!(a_org, "org-b");
+        assert_eq!(a_payload["org_id"], "org-b");
+        assert_eq!(a_payload["action"], "yank");
+
+        hub.db()
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE approvals SET status = 'approved', resolved_by = 'operator', resolved_at = ?2, \
+                     updated_at = ?2 WHERE id = ?1",
+                    params![req_id, ua_core::time::now()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let res = yank_as(
+            &b_ctx,
+            "operator".into(),
+            YankParams { name: "secret-skill".into(), version: 1, reason: Some("secret-leak-note".into()) },
+        )
+        .unwrap();
+        assert_eq!(res["ok"], true);
+
+        // Verify ORG-EVENT-DEFAULT redaction on `skill.yanked`.
+        let (orig, payload): (String, String) = hub
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT COALESCE(originator, ''), payload FROM event_log \
+                     WHERE channel = 'skill.yanked' ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(orig, crate::approvals::NEUTRAL_ORIGINATOR);
+        for secret in ["secret-skill", "secret-leak-note", "operator"] {
+            assert!(!payload.contains(secret), "skill.yanked leaked {secret}: {payload}");
+        }
+        let p: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(p["name"], Value::Null);
+        assert_eq!(p["content_hash"], Value::Null);
+        assert_eq!(p["reason"], Value::Null);
+        assert_eq!(p["version"], 1);
+    }
+
+    #[test]
+    fn install_stage_failure_leaves_no_partial_package_on_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let members = vec![
+            PackageMember {
+                path: "SKILL.md".into(),
+                bytes: b"---\nname: atomic-test\ndescription: Test.\n---\nBody.\n".to_vec(),
+                sha256: sha256_bytes(b"---\nname: atomic-test\ndescription: Test.\n---\nBody.\n"),
+                mode: MODE_FILE,
+            },
+            // Invalid path forces a failure mid-staging AFTER SKILL.md has been written.
+            PackageMember {
+                path: "../escape.txt".into(),
+                bytes: b"bad".to_vec(),
+                sha256: sha256_bytes(b"bad"),
+                mode: MODE_FILE,
+            },
+        ];
+        let err = stage_and_swap_members(root.path(), "atomic-test", &members, true).unwrap_err();
+        assert_eq!(err.code(), "invalid_argument");
+        assert!(!root.path().join("atomic-test").exists(), "failed install must leave no destination dir");
+        let leftover: Vec<_> = std::fs::read_dir(root.path()).unwrap().collect();
+        assert!(leftover.is_empty(), "failed install must clean up staging dir: {leftover:?}");
     }
 }

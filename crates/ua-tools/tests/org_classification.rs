@@ -130,6 +130,7 @@ const TENANT: &[&str] = &[
     "skill_assignments",
     "skill_publish_staging",
     "skill_sources",
+    "skill_version_yanks",
     "harness_config_bundles",
     "harness_config_proposals",
     "harness_config_drift",
