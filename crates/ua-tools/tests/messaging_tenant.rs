@@ -1083,8 +1083,8 @@ async fn client_message_ids_are_isolated_per_organization() {
     let default_mid = firsts[0]["message_id"].as_str().unwrap().to_string();
     let planted = json!({ "accepted": true, "message_id": default_mid, "body": A_BODY, "to_agent": "to-a" });
     h.sql(&format!(
-        "INSERT INTO idempotency_keys (key, tool, result_json, created_at)
-         VALUES ('org:org-b/message_send/courier/planted', 'message_send', '{planted}', 'x')"
+        "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at)
+         VALUES ('org-b', 'org:org-b/message_send/courier/planted', 'message_send', '{planted}', 'x')"
     ))
     .unwrap();
     let before = h.snapshot();

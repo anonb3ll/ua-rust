@@ -324,13 +324,13 @@ fn similar_notes(
 /// label are escaped, so the caller part always ends at the first `/` after
 /// the prefix and two callers' keys never meet.
 ///
-/// `idempotency_keys` is still a hub-wide table (its `(org_id, principal,
-/// key)` rebuild is a later change), so another organization's key is
-/// prefixed with its organization (`org:<org>/…`), escaped the same way as
-/// the label: the organization part ends at the first `/`, so no
-/// organization id, label and key can spell another organization's key. The
-/// same label and key in two organizations are two rows, and neither replays
-/// the other's receipt. The default organization keeps the
+/// `idempotency_keys` is keyed by `(org_id, key)` and a receipt is read only
+/// in the caller's organization. Another organization's key text also keeps
+/// its organization prefix (`org:<org>/…`) as defence in depth, byte for byte
+/// the form it had before the rebuild, escaped the same way as the label:
+/// the organization part ends at the first `/`, so no organization id, label
+/// and key can spell another organization's key. The same label and key in
+/// two organizations are two rows, and neither replays the other's receipt. The default organization keeps the
 /// `memory_save/<label>/<key>` form byte for byte, so pre-upgrade scoped
 /// receipts still replay.
 fn scoped_key(caller: &Caller, key: &str) -> String {
@@ -362,8 +362,8 @@ fn saved_receipt(tx: &WriteTx<'_>, caller: &Caller, key: &str) -> UaResult<Optio
     let read = |k: &str| -> UaResult<Option<String>> {
         Ok(tx
             .query_row(
-                "SELECT result_json FROM idempotency_keys WHERE key = ?1 AND tool = ?2",
-                params![k, SAVE_TOOL],
+                "SELECT result_json FROM idempotency_keys WHERE org_id = ?1 AND key = ?2 AND tool = ?3",
+                params![caller.org_id, k, SAVE_TOOL],
                 |r| r.get(0),
             )
             .optional()?)
@@ -427,8 +427,8 @@ fn idempotent_replay(tx: &WriteTx<'_>, caller: &Caller, p: &Prepared) -> UaResul
 fn record_idempotency(tx: &WriteTx<'_>, caller: &Caller, p: &Prepared, result: &Value) -> UaResult<()> {
     if let Some(key) = &p.idempotency_key {
         tx.execute(
-            "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![scoped_key(caller, key), SAVE_TOOL, result.to_string(), ua_core::time::now()],
+            "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![caller.org_id, scoped_key(caller, key), SAVE_TOOL, result.to_string(), ua_core::time::now()],
         )?;
     }
     Ok(())

@@ -412,12 +412,14 @@ here for memory columns, owners and defaults.
   their shape: `org_id` is not added (owner decision). `task_fts` stays an
   external-content index with no column: ranked search scopes its
   `eligible` subquery by `org_id` before the candidate cap.
-  - **Owner decisions (2026-11-23).** (a) `idempotency_keys` stays hub-wide
-    until its `(org_id, principal, key)` rebuild; meanwhile another
-    organization's `task_add`, `task_update` and `delegate` keys are stored
-    with its organization prefixed (`org:<org>/<tool>:<key>`), so a key
-    reused in another organization never replays, and the default
-    organization keeps its `<tool>:<key>` form. (b) The GitHub and CI paths
+  - **Owner decisions (2026-11-23).** (a) `idempotency_keys` stayed
+    hub-wide until its rebuild; meanwhile another organization's
+    `task_add`, `task_update` and `delegate` keys were stored with its
+    organization prefixed (`org:<org>/<tool>:<key>`), so a key reused in
+    another organization never replayed, and the default organization keeps
+    its `<tool>:<key>` form. The rebuild has landed
+    (`idempotency.v2.tenant_keys`, the idempotency keys family below); the
+    prefix stays in the key text as defence in depth. (b) The GitHub and CI paths
     without a caller stayed default-only until they ran per organization
     (superseded; see
     managed secrets below): every task scan now filters on the
@@ -1035,6 +1037,77 @@ here for memory columns, owners and defaults.
   follow-up key isolation (with an organization id containing `/`), the
   unknown and suspended refusals, the ledger leak test, the trigger checks
   and a family insert guard.
+- The idempotency keys: the standalone `idempotency.v2.tenant_keys`
+  rebuilds `idempotency_keys` with `org_id TEXT NOT NULL DEFAULT 'default'`
+  and the primary key `(org_id, key)` (owner decision (a)), on the
+  `managed_secrets` and `node_queue` contract: it runs outside the shared
+  transaction with `foreign_keys` off, in one `BEGIN IMMEDIATE`, rolls back
+  on any error, keeps rowids, every index, trigger and view (the table has
+  no `AUTOINCREMENT`, so there is no `sqlite_sequence` row), checks the row
+  count and `foreign_key_check`, and is safe to re-run after a crash
+  (`COALESCE(org_id, <placement>)` keeps a stored organization). A `NULL`
+  key, which `core.v1` allowed and no writer stored, stops the upgrade with
+  its row ids. `organization.v1.tools.idempotency` then adds
+  `idempotency_keys_org_exists` and `idempotency_keys_org_immutable`.
+  **Row mapping.** Key text, tool, result and timestamp are kept byte for
+  byte; only `org_id` is assigned. A row moves to organization O when its
+  key starts `org:<O>/<tool>:` (the unescaped form `task_add`,
+  `task_update`, `delegate` and the conversation handoff wrote) or
+  `org:<O escaped>/<tool>/` (`memory_save` and `message_send`, `%` and `/`
+  escaped), `<tool>` being the row's own `tool`, for exactly one
+  organization O other than the default in `orgs`. Matching the whole
+  organization part against `orgs`, rather than cutting at the first `/`,
+  places an organization id holding `/`. Every other row lands in
+  `default`: rows without a prefix (all the default organization's), a
+  prefix naming an organization `orgs` does not hold, and a key two
+  organizations spell (possible only in the unescaped form: `acme`'s key
+  `z/task_add:k` and `acme/task_add:z`'s key `k` are both
+  `org:acme/task_add:z/task_add:k`). **Nothing is dropped or rewritten**,
+  so no dropped-row record is needed; the rows kept in `default` under an
+  `org:` prefix are counted. No default-organization writer builds a key
+  starting `org:` (the pre-scoping raw `memory_save` keys, read only for
+  the note's own author in the default organization, are the one form that
+  could, and stay where they were), so such a row never replays to anyone
+  and ages out with the table. `system_doctor` reports the count as
+  `database.idempotency_keys_unplaced` (and in the `database` row's detail
+  when non-zero) to a default-organization reader only, since it is
+  hub-wide; the rebuild's audit record (`schema_procedures.generated_sql`)
+  names the row ids, never key text. A raw `memory_save` key that happened
+  to spell another organization's prefix moves there and fails closed: its
+  receipt names a default-organization note, so that organization's save is
+  refused (`idempotency_key_conflict`), never replayed. **Prefix decision.**
+  The writers keep the organization prefix in the stored key text (defence
+  in depth), so the stored key is byte for byte what it was and a retry in
+  flight across the upgrade replays its own receipt. Every reader filters
+  `org_id` on the caller's organization (`task_add`, `task_update`, the
+  conversation handoff, `delegate` and `delegation_manage lookup`,
+  `memory_save`, `message_send` and its client-id lookups,
+  `lifecycle_record`) and every writer names it, so a receipt is found only
+  when both the column and the key text name the caller's organization; the
+  column alone separates two organizations whose prefixes spell the same
+  text. `lifecycle_record`'s key carried no organization and is now the
+  caller's organization's; its pre-upgrade rows, prefixless in every
+  organization, land in `default` (see CHANGELOG for the retry exception).
+  No sweep deletes stored keys: the table, and the doctor's unplaced count,
+  only grow. **Principals.** The `principal` column the
+  earlier plan named is not added: the principal is already in the key text
+  of every per-caller writer (`task_update` and `delegate` the escaped
+  label, `memory_save` and `message_send` the escaped label or sender,
+  `lifecycle_record` the session id, which the caller supplies and which is
+  not checked against the caller, so two agents of one organization that
+  send the same session, kind and key share one receipt, as before).
+  `task_add` keys stay organization-wide,
+  as before, so two callers in one organization sharing a `task_add` key
+  share its receipt, and the conversation handoff's key is derived from
+  its actor. `crates/ua-tools/tests/idempotency_tenant.rs` holds the
+  upgrade (placement by prefix, an organization id with `/`, an unknown and
+  an ambiguous prefix, every byte and rowid kept, index, trigger and view
+  kept, the doctor count, no ledger row), pre-upgrade replays through the
+  tools, the crash re-run, a nullable `org_id` kept or placed, the `NULL`
+  key refusal, the same key in three organizations through `task_add`,
+  `task_update`, `memory_save`, `message_send` and `delegate`, two
+  organizations spelling one key, the lifecycle key, the triggers and a
+  family insert guard.
 - The insert guard ([guard 2](#organizationv1)): a test fails when an
   `INSERT` into a tenant table that carries its key does not name `org_id`,
   in any crate's non-test source or any trigger body. See
@@ -1620,7 +1693,7 @@ global key in the tree is classified:
 | `harness_config_bundles.version UNIQUE`, nullable `org_id` | **Rebuild** | `org_id NOT NULL`, `UNIQUE(org_id, version)`, rebuilt in the standalone procedure `harness_config.v3.tenant_keys`. |
 | `harness_config_proposals` nullable `org_id` | **Rebuild** | `org_id NOT NULL`, rebuilt in `harness_config.v3.tenant_keys`; the key stays a hub-global random id. |
 | `harness_config_report_window.node` | **Rebuild** | Key becomes `(org_id, node)`, rebuilt in `harness_config.v3.tenant_keys`, so the rate-limit upsert never updates another organization's window (node names are hub-wide: a name one organization forgets, including by hub recovery, can be registered again by another, which must not inherit the old window; `node_reassign` keeps a node in its organization). |
-| `idempotency_keys.key` | **Rebuild** | Until the rebuild, another organization's `task_add`, `task_update` and `delegate` keys are stored as `org:<org>/<tool>:<key>` (the default keeps `<tool>:<key>`), so no reuse replays across organizations. Key becomes `(org_id, principal, key)` with a new `principal` column (the verified caller, `(principal_type, principal)` flattened); a replay never returns another organization's or another principal's stored result, and a second principal's first use is a fresh insert, not a collision. Existing rows have no recorded caller, so the rebuild sets their `principal` to the reserved value `legacy:` and their `org_id` to `'default'`; no live caller ever matches `legacy:`, so an old key is never replayed to anyone and simply ages out. |
+| `idempotency_keys.key` | **Rebuild** | Key becomes `(org_id, key)`, rebuilt in the standalone procedure `idempotency.v2.tenant_keys`; every reader filters `org_id`, so a replay never returns another organization's stored result. Each pre-rebuild row is placed by its interim `org:<org>/…` prefix (else `default`) with its key text unchanged, and the writers keep the prefix, so a retry in flight across the upgrade still replays. The principal stays in the key text of every per-caller writer instead of a `principal` column (`task_add` keys stay organization-wide); see the idempotency keys family above. |
 | `node_dispatch` unique index on `launch_key` | **Rebuild** | Becomes `UNIQUE (org_id, launch_key)`, in the standalone procedure `node_queue.v2.tenant_keys`, which also makes `node_dispatch.org_id` `NOT NULL` and keeps ids and rowids. |
 | `node_dispatch.id`, `node_command.item_id`, `node_command_notice (item_id, attempt, terminal)`, `node_followups.id`, `node_followups (item_id, idempotency_key)`, `(item_id, seq)`, `node_acceptance.node` | Global, safe | Item and follow-up ids are hub-generated, the other keys are led by one or by a hub-namespace node name; no rebuild. The `*_org_parent` triggers keep every reference in one organization. |
 | `dispatch_runs.run_id`, `dispatch_receipts.id` | Global, safe | A run id is hub-derived from a salted hash, a receipt id an AUTOINCREMENT id; no rebuild (`organization.v1.tools.dispatch`, `dispatch.v4.org_scope`). |
@@ -2167,7 +2240,7 @@ and that its `org_exists` and `org_immutable` triggers exist.
 | Tenant: approvals and policy | `approvals` (`organization.v1.tools.approvals` and `approvals.v3.org_indexes`: the requester's organization; every match, read and decision is scoped), `policy_authorizations` (`organization.v1.tools.policy_authorizations` and `github.v3.policy_authorizations_org_scope`: the task's organization; every read, check, spend and revoke is scoped) | `org_id`, routing `team_id`, required authority |
 | Tenant: messages | `message_index`, `message_reads` (`organization.v1.tools.messaging` and `messaging.v2.org_scope`: the sender's organization; every send, read, mark, ack, reply and conversation check is scoped, and a send into another organization is refused), `notify_outbox` and `pending_notifications` (`organization.v1.tools.notify` and `notify.v2.org_indexes`: every notify tool reads and writes only the caller's organization's rows; the hub's webhook carries only the default organization's), `relay_messages` (`organization.v1.tools.relay` and `relay.v2.org_scope`: drafting and sending stay default-only; status, list, cancel and resolve are scoped), `zulip_sends` (`organization.v1.tools.zulip`: the duplicate check and `zulip_resolve_send` are scoped; only the default organization sends through the hub's Zulip) | `org_id` |
 | Tenant: skills and config | `skill_versions`, `skill_assignments`, `skill_publish_staging` (`skill_registry.v2.tenant_keys` and `organization.v1.tools.skills`, scoped keys and every registry read and write), `harness_config_bundles`, `harness_config_proposals`, `harness_config_drift`, `harness_config_report_window` (`harness_config.v3.tenant_keys` and `organization.v1.tools.harness_config`, scoped keys, every read and write, approvals bind `org_id`) | Catalog is per organization (keys rebuilt) |
-| Tenant: other | `managed_secrets` (`managed_secrets.v2.tenant_keys` and `organization.v1.tools.managed_secrets`: scoped key, every read and write, the organization bound into the associated data; another organization's GitHub credentials live here), `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `idempotency_keys`, `tool_calls` (`organization.v1.tools.tool_calls` and `core.v5.tool_calls_org_scope`: the caller's organization; every telemetry reader and policy count is scoped), `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`; a GitHub delivery's replay keys are recorded in each organization whose secret verified it), `github_poll_repos` (`github.v2.poll_repos` creates it keyed `(org_id, repo)` and copies `github_poll_state`'s rows to the default organization, `organization.v1.tools.github_poll` adds the triggers) | `org_id`; keys rebuilt where listed above |
+| Tenant: other | `managed_secrets` (`managed_secrets.v2.tenant_keys` and `organization.v1.tools.managed_secrets`: scoped key, every read and write, the organization bound into the associated data; another organization's GitHub credentials live here), `graph_canvas_scenes` and `graph_canvas_revisions` (`organization.v1.tools.graph`, scoped keys and queries), `tool_calls` (`organization.v1.tools.tool_calls` and `core.v5.tool_calls_org_scope`: the caller's organization; every telemetry reader and policy count is scoped), `web_search_cache` (`web.v2.tenant_keys` and `organization.v1.tools.web`, scoped key, reads, writes and eviction), `idempotency_keys` (`idempotency.v2.tenant_keys` and `organization.v1.tools.idempotency`: `(org_id, key)`, every read and write, the interim organization prefix kept in the key text), `code_symbols` (`organization.v1.tools.code`: the symbol tools read and write only the caller's organization's rows, so two organizations indexing one workspace keep separate symbols), `inbound_deliveries` (carries `org_id` and its triggers from its first part, `organization.v1.ingress`; a GitHub delivery's replay keys are recorded in each organization whose secret verified it), `github_poll_repos` (`github.v2.poll_repos` creates it keyed `(org_id, repo)` and copies `github_poll_state`'s rows to the default organization, `organization.v1.tools.github_poll` adds the triggers) | `org_id`; keys rebuilt where listed above |
 | Derived index | FTS5 virtual tables `task_fts` and `memory_fts`, and their shadow tables (`*_data`, `*_idx`, `*_content`, `*_docsize`, `*_config`) | No `org_id`; every read joins through the owner table (`tasks`, `memory`) and filters there. Accepted leak: bm25's corpus statistics span every organization |
 | SQLite internal | `sqlite_sequence`, `sqlite_stat*` | Not application data |
 | Tenant column on a global table | `event_log` | One chain, `org_id` per row — see [The ledger](#the-ledger) |
@@ -2513,9 +2586,10 @@ Parity and isolation
 7. **Global keys.** After the rebuild, A and B can each create a secret, a skill
    version, a skill assignment, a harness bundle, a project binding and a canvas
    board with the same name, and neither error reveals the other; the same
-   idempotency key used in A and B, or by two principals in one organization,
-   returns each its own result and the second first-use is a fresh call, not a
-   collision; the same node launch key used in A and B succeeds in both; the
+   idempotency key used in A and B, or by two principals in one organization
+   through a per-caller tool (every one but `task_add`, whose keys are
+   organization-wide), returns each its own result and the second first-use is
+   a fresh call, not a collision; the same node launch key used in A and B succeeds in both; the
    same web search in A and B is cached separately; a rebuild whose rebuilt
    tables fail `foreign_key_check` or that loses a trigger leaves the database
    unchanged and the hub refuses to start, while an unrelated dangling
