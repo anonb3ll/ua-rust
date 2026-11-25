@@ -1347,23 +1347,23 @@ here for memory columns, owners and defaults.
     only) and `fleet_nodes` (its own nodes in service with their state and
     last heartbeat, and its own retired node names; no `other_org_*`
     count). Neutral hub lines, `DORMANT` "not available to this
-    organization" whatever the hub holds, for `hub_auth`, `vault`,
-    `workspace_root`, `database`, `schema`, `notify_webhook` and
-    `policy_file`; none of those checks runs for it, so it learns no
-    static-token or human count, path, database or WAL size, page count,
-    deep `quick_check`, drifted schema object, webhook scheme, host,
-    secret header or last delivery, nor whether a policy file is
-    configured or broken. `ledger_chain`: `LIVE` "the hub's ledger
+    organization" whatever the hub holds, for `hub_auth`, `http_bind`,
+    `approval_gating`, `vault`, `workspace_root`, `database`, `schema`,
+    `notify_webhook`, `zulip` and `policy_file`. The hub skips these
+    checks for other organizations. The neutral lines conceal the
+    listener port and auth state, approval counts, Zulip host, static
+    token and human counts, paths, database and WAL sizes, page counts,
+    deep `quick_check`, schema drift, webhook configuration and latest
+    delivery, and the policy file state. `ledger_chain`: `LIVE` "the hub's ledger
     verifies" or `DEGRADED` "the hub's ledger is broken", with no entry
     count, seq or reason; it reuses the hub's last full verify (a
     default-organization doctor or anomaly check runs one on every call)
     while that is at most five minutes old, else runs one and keeps it, so
     other organizations cause at most one full ledger read per five
     minutes and the answer may be that old. The build-wide lines are the
-    same for every caller: `http_bind`, `approval_gating`,
-    `search_provider`, `build_features`, `zulip`, `slack`, `edition` and
-    the `build` block. The top-level `host` and `database` are null and
-    `deep_checks` is false. `check_anomalies` likewise gives it the
+    same for every caller: `search_provider`, `build_features`, `slack`,
+    `edition` and the `build` block. The top-level `host` and `database`
+    are null, and `deep_checks` is false. `check_anomalies` likewise gives it the
     neutral `ledger_chain` anomaly ("the hub's ledger is broken") and
     never runs `host_low_memory` (the hub's RAM) for it. A local
     harness (`dispatch_task` or `dispatch_resume` with a harness) is a
