@@ -204,8 +204,7 @@ impl Reserved {
                 labels.insert(l.to_ascii_lowercase());
             }
         };
-        cfg.human_identities.iter().for_each(|l| add(l));
-        cfg.lifecycle_operators().iter().for_each(|l| add(l));
+        ua_org::authz::authority_labels(cfg).for_each(&mut add);
         cfg.static_tokens().iter().for_each(|(l, _)| add(l));
         cfg.profiles.keys().for_each(|l| add(l));
         cfg.oauth_identities.iter().for_each(|l| add(l));
