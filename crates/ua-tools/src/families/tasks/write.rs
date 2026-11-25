@@ -371,6 +371,70 @@ fn opt_text(v: Option<String>) -> Sql {
     v.map(Sql::Text).unwrap_or(Sql::Null)
 }
 
+fn require_completion(tx: &rusqlite::Connection, org: &str, id: i64, notes: &str) -> UaResult<()> {
+    if has_marker(notes, PROJECT_SPEC_MARKER) {
+        let r = rollup(tx, org, id)?;
+        if r["complete"] != json!(true) {
+            let listed: Vec<String> = r["active"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| format!("#{} ({})", t["id"], t["status"].as_str().unwrap_or("")))
+                .collect();
+            return Err(UaError::invalid(format!(
+                "cannot mark project-spec task {id} done while active descendants exist: {}",
+                listed.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The task must still be eligible to close at the reviewed revision.
+pub(crate) fn check_release_completion(
+    conn: &rusqlite::Connection,
+    org: &str,
+    id: i64,
+    task: &serde_json::Map<String, Value>,
+) -> UaResult<()> {
+    let status = str_field(task, "status").unwrap_or("open");
+    if is_terminal(status) || str_field(task, "parked_at").is_some() {
+        return Err(UaError::conflict("the reviewed task is closed or parked"));
+    }
+    require_completion(conn, org, id, str_field(task, "notes").unwrap_or_default())
+}
+
+/// Finish a reviewed task inside the transaction that records its file
+/// release. The caller has checked the task writer, workflow and queue hold.
+pub(crate) fn complete_after_release(
+    tx: &mut ua_store::WriteTx<'_>,
+    org: &str,
+    id: i64,
+    who: &str,
+) -> UaResult<()> {
+    let old = require_task(tx, org, id)?;
+    check_release_completion(tx, org, id, &old)?;
+    let old_status = str_field(&old, "status").unwrap_or("open");
+    let updated = next_revision(str_field(&old, "updated_at"));
+    let ts = now();
+    tx.execute(
+        "UPDATE tasks SET status = 'done', completed_at = COALESCE(completed_at, ?3), updated_at = ?4,
+         next_owner = NULL,
+         ownership_generation = ownership_generation + (next_owner IS NOT NULL OR claimed_by IS NOT NULL)
+         WHERE org_id = ?1 AND id = ?2",
+        params![org, id, ts, updated],
+    )?;
+    emit(
+        tx,
+        org,
+        "agent.task.updated",
+        json!({ "task_id": id, "fields": ["status", "completed_at"], "from_status": old_status, "status": "done" }),
+        who,
+    )?;
+    emit(tx, org, "agent.task.completed", json!({ "task_id": id }), who)?;
+    Ok(())
+}
+
 async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
     if let Some(s) = &a.status {
         check_one_of("status", s, &STATUSES)?;
@@ -571,21 +635,7 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
                 s.set("status", text(st.clone()));
                 if st == "done" {
                     let notes_after = a.notes.as_deref().or(str_field(&old, "notes")).unwrap_or_default();
-                    if has_marker(notes_after, PROJECT_SPEC_MARKER) {
-                        let r = rollup(tx, &org, id)?;
-                        if r["complete"] != json!(true) {
-                            let listed: Vec<String> = r["active"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .map(|t| format!("#{} ({})", t["id"], t["status"].as_str().unwrap_or("")))
-                                .collect();
-                            return Err(UaError::invalid(format!(
-                                "cannot mark project-spec task {id} done while active descendants exist: {}",
-                                listed.join(", ")
-                            )));
-                        }
-                    }
+                    require_completion(tx, &org, id, notes_after)?;
                     s.set("completed_at", Sql::Text(str_field(&old, "completed_at").unwrap_or(&ts).to_string()));
                 } else if st != "cancelled" {
                     s.raw("completed_at", "NULL");

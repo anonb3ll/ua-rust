@@ -2,6 +2,7 @@
 
 pub mod backup;
 pub mod doctor;
+pub mod evidence;
 pub mod init;
 
 use std::fs::{self, File, OpenOptions};

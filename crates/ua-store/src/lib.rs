@@ -12,6 +12,7 @@
 
 pub mod backup;
 pub mod db;
+pub mod evidence;
 pub mod ledger;
 pub mod lock;
 pub mod org;

@@ -1075,7 +1075,13 @@ fn operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
 /// originator is the neutral `system`, never the acting label. Only the
 /// version, the target type, the hub-generated staging id and timestamps
 /// reach the default ledger.
-fn emit(tx: &mut ua_store::WriteTx<'_>, org: &str, channel: &str, payload: Value, by: &str) -> UaResult<()> {
+pub(super) fn emit(
+    tx: &mut ua_store::WriteTx<'_>,
+    org: &str,
+    channel: &str,
+    payload: Value,
+    by: &str,
+) -> UaResult<()> {
     ledger::append(
         tx,
         EventInput::new(ua_core::DEFAULT_ORG, channel, payload)
@@ -1085,11 +1091,16 @@ fn emit(tx: &mut ua_store::WriteTx<'_>, org: &str, channel: &str, payload: Value
 }
 
 /// Evaluate the one-time human approval for `payload` inside `tx`.
-/// `Ok(Some(id))` when it is pending (the caller commits and reports it).
-fn gate(tx: &mut ua_store::WriteTx<'_>, ctx: &ToolCtx, payload: &Value) -> UaResult<Option<i64>> {
+/// Returns `Ok(Ok(approval_id))` on pass, `Ok(Err(approval_id))` when pending,
+/// or `Err` when denied.
+pub(super) fn gate_pass(
+    tx: &mut ua_store::WriteTx<'_>,
+    ctx: &ToolCtx,
+    payload: &Value,
+) -> UaResult<Result<i64, i64>> {
     match approvals::gate(tx, ctx.hub.cfg(), &ctx.caller, GATE, payload)? {
-        GateOutcome::Pass { .. } => Ok(None),
-        GateOutcome::Pending { approval_id } => Ok(Some(approval_id)),
+        GateOutcome::Pass { approval_id } => Ok(Ok(approval_id)),
+        GateOutcome::Pending { approval_id } => Ok(Err(approval_id)),
         GateOutcome::Denied { approval_id, reason } => Err(UaError::denied(
             "approval_denied",
             format!("approval {approval_id} was denied: {}", reason.unwrap_or_default()),
@@ -1097,7 +1108,16 @@ fn gate(tx: &mut ua_store::WriteTx<'_>, ctx: &ToolCtx, payload: &Value) -> UaRes
     }
 }
 
-fn pending(out: Result<Value, i64>) -> UaResult<Value> {
+/// Evaluate the one-time human approval for `payload` inside `tx`.
+/// `Ok(Some(id))` when it is pending (the caller commits and reports it).
+fn gate(tx: &mut ua_store::WriteTx<'_>, ctx: &ToolCtx, payload: &Value) -> UaResult<Option<i64>> {
+    match gate_pass(tx, ctx, payload)? {
+        Ok(_) => Ok(None),
+        Err(approval_id) => Ok(Some(approval_id)),
+    }
+}
+
+pub(super) fn pending(out: Result<Value, i64>) -> UaResult<Value> {
     out.map_err(|approval_id| UaError::ApprovalRequired { tool: GATE.into(), approval_id })
 }
 
@@ -2111,6 +2131,9 @@ async fn skill_registry(ctx: ToolCtx, a: SkillRegistryArgs) -> UaResult<Value> {
         "unassign" => unassign(&ctx, params(a.params)?),
         "resolve" => resolve_action(&ctx, params(a.params)?),
         "drift" => drift(&ctx, params(a.params)?),
+        "source_add" => super::skill_sources::source_add(&ctx, params(a.params)?),
+        "source_revoke" => super::skill_sources::source_revoke(&ctx, params(a.params)?),
+        "source_list" => super::skill_sources::source_list(&ctx, params(a.params)?),
         "catalog" | "install" | "team_install" | "starter_preview" | "starter_install" => {
             Err(UaError::invalid(format!("action {raw:?} (the skill catalog) is not ported to this hub")))
         }
@@ -2137,8 +2160,11 @@ pub fn register(r: &mut Registry) {
              target_type: agent|profile, version?} (an agent assignment wins over a profile one), unassign \
              {skill_name, target, target_type}, resolve {agent_label, profile?} (own skills, or any agent's for an \
              operator), drift {surface_dir, agent_label?, profile?} (read-only: missing, stale, unregistered, \
-             unassigned and synced skills). The harness config bundle served to a node carries the verified skill \
-             packages resolved for its agent.",
+             unassigned and synced skills), source_add {url, pinned_sha, tracking_ref?, allowed_subpaths?} (human \
+             operator only, behind human approval: register an https:// Git skill source pinned to an exact 40-char \
+             commit SHA), source_revoke {source_id, reason?} (human operator only, behind human approval: terminally \
+             revoke a skill source), source_list {status?} (list this organization's skill sources). The harness \
+             config bundle served to a node carries the verified skill packages resolved for its agent.",
             skill_registry,
         )
         .gates_in_handler()

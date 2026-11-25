@@ -5,9 +5,10 @@ running `ua` in production. All deployment files under `deploy/` are
 ready-to-adapt templates using placeholder paths and identities.
 
 Run every hub administrative command (`ua init`, `ua doctor`, `ua backup`,
-`ua restore`, `ua serve`) **as the dedicated hub OS user** (never directly as
-root via bare `sudo`, which creates root-owned files in `$UA_HOME`). Commands
-check that the effective UID matches the owner of `$UA_HOME`.
+`ua restore`, `ua serve`, `ua evidence`) **as the dedicated hub OS user**
+(never directly as root via bare `sudo`, which creates root-owned files in
+`$UA_HOME`). Commands check that the effective UID matches the owner of
+`$UA_HOME`.
 
 ## 1. Initialize a hub (`ua init`)
 
@@ -205,7 +206,7 @@ On a refused database:
 | Command | Without the override | With the override |
 |---|---|---|
 | `ua serve` | refuses | **refuses** (see below) |
-| `ua mcp`, `ua call`, `ua tools`, `ua token`, `ua login-link`, `ua init` (when it mints a token), `ua import` | refuse | run, with a warning at every open |
+| `ua mcp`, `ua call`, `ua tools`, `ua token`, `ua login-link`, `ua init` (when it mints a token), `ua import`, `ua evidence` | refuse | run, with a warning at every open |
 | `ua doctor` | runs (read-only; its `schema` check fails with `extra=[...]`) | the same |
 | `ua backup` | runs (a read-only snapshot) | the same |
 | `ua restore` | runs (see below) | the same |
