@@ -17,6 +17,10 @@ from its commit history.
   the exact revision and destination. The release records approval and
   completion evidence and moves the task and workflow to done.
 
+- A verified human operator can cancel an unpublished file release by its
+  approval ID. Cancellation discards the saved bytes, frees the reserved
+  destination and records an audit event. A later attempt needs fresh approval.
+
 - Evidence checkpoint signing and the public-key store (S2 of
   `docs/evidence-export.md`): `evidence_key` holds Ed25519 public keys only,
   `evidence_checkpoint` holds one row per checkpoint with its canonical digest
