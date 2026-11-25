@@ -799,9 +799,6 @@ from its commit history.
   - `zulip_fetch_messages` refuses an unknown organization and any
     organization but the default (`zulip_not_configured`) before any
     request, cursor or event, as a send does.
-  - Another organization's `not_configured` notification row no longer
-    keeps its message text (it has no destination to resend to); the
-    default organization's still does.
   - Events no longer carry another organization's names or unsalted
     digests into the default ledger: skill registry events (name, target,
     source, content hash), notification events (category; originator
@@ -927,6 +924,10 @@ from its commit history.
 
 ### Behaviour changes
 
+- Another organization's `not_configured` notification row no longer
+  keeps its message text: it has no destination, and nothing resends from
+  the outbox automatically (a resend is manual). The default
+  organization's row still does.
 - Known gap, documented: `goals.v2.org_scope` deleted every
   `task_goal_links` row whose goal was in another organization than its
   task, with no ledger event, count or archive. The part is merged and

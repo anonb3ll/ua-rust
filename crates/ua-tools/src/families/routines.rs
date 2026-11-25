@@ -945,7 +945,7 @@ async fn routine_add(ctx: ToolCtx, a: AddArgs) -> UaResult<Value> {
             ledger::append(
                 tx,
                 EventInput::new(ua_core::DEFAULT_ORG, "agent.routine.added", json!({ "routine_id": id, "trigger": a.trigger }))
-                    .by(owner.clone()),
+                    .by(crate::approvals::ledger_originator(&org, &owner)),
             )?;
             Ok(json!({ "id": id }))
         })
@@ -1031,7 +1031,7 @@ async fn routine_pause(ctx: ToolCtx, a: PauseArgs) -> UaResult<Value> {
                     "agent.routine.paused",
                     json!({ "routine_id": a.routine_id, "paused": a.paused, "previous_paused": previous }),
                 )
-                .by(caller.label.clone()),
+                .by(crate::approvals::ledger_originator(org, &caller.label)),
             )?;
             Ok(json!({ "id": a.routine_id, "paused": i64::from(a.paused), "previous_paused": i64::from(previous) }))
         })

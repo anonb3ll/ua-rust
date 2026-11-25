@@ -777,33 +777,93 @@ const UNSCOPED_ALLOWED: &[(&str, &str)] = &[
 /// and lower-cased. SQL is matched case-insensitively, and a statement split
 /// over lines with `\` continuations is read as one.
 fn unscoped_reads(src: &str) -> Vec<String> {
+    const TABLE: &str = "idempotency_keys";
+    const NOT_ALIAS: [&str; 12] = [
+        "where", "on", "set", "join", "inner", "left", "cross", "order", "group", "limit", "using", "natural",
+    ];
     let lower = src.to_ascii_lowercase();
+    let b = lower.as_bytes();
     let mut out = Vec::new();
-    for kw in ["from", "join", "update"] {
-        let pat = format!("{kw} idempotency_keys");
-        let mut at = 0;
-        while let Some(i) = lower[at..].find(&pat).map(|i| at + i) {
-            at = i + pat.len();
-            let before_ok = i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphanumeric();
-            let after_ok =
-                lower.as_bytes().get(at).is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_'));
-            if !before_ok || !after_ok {
-                continue;
+    let mut at = 0;
+    while let Some(i) = lower[at..].find(TABLE).map(|i| at + i) {
+        at = i + TABLE.len();
+        if b.get(at).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+            continue; // idempotency_keys_new and the like
+        }
+        // Walk back over a quote, a `main.` schema prefix and any whitespace,
+        // literal or escaped (`\n`, `\t`, a `\` line continuation), to the
+        // keyword that names the table.
+        let mut j = i;
+        while j > 0 && matches!(b[j - 1], b'"' | b'`' | b'[') {
+            j -= 1;
+        }
+        if lower[..j].ends_with("main.") {
+            j -= 5;
+        }
+        loop {
+            if j > 0 && b[j - 1].is_ascii_whitespace() {
+                j -= 1;
+            } else if j > 1 && b[j - 2] == b'\\' && matches!(b[j - 1], b'n' | b't') {
+                j -= 2;
+            } else if j > 0 && b[j - 1] == b'\\' {
+                j -= 1;
+            } else {
+                break;
             }
-            // The rest of the string literal: up to the first unescaped `"`.
-            let bytes = lower.as_bytes();
-            let mut end = i;
-            while end < bytes.len() && !(bytes[end] == b'"' && bytes[end - 1] != b'\\') {
-                end += 1;
+        }
+        let kw_start = lower[..j].rfind(|c: char| !c.is_ascii_alphabetic()).map_or(0, |k| k + 1);
+        if !["from", "join", "update"].contains(&&lower[kw_start..j]) {
+            continue;
+        }
+        // The rest of the string literal: up to the first unescaped `"`.
+        let mut end = at;
+        while end < b.len() && !(b[end] == b'"' && b[end - 1] != b'\\') {
+            end += 1;
+        }
+        let stmt = lower[kw_start..end].replace("\\\n", " ").replace("\\n", " ").replace("\\t", " ");
+        let stmt = stmt.split_whitespace().collect::<Vec<_>>().join(" ");
+        let words: Vec<&str> = stmt.split(' ').collect();
+        let t = words.iter().position(|w| w.trim_matches(|c| c == '"' || c == '`').ends_with(TABLE));
+        let alias = t.and_then(|t| {
+            let mut k = t + 1;
+            if words.get(k) == Some(&"as") {
+                k += 1;
             }
-            let stmt = lower[i..end].replace("\\\n", " ").replace("\\n", " ").replace("\\t", " ");
-            let stmt = stmt.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !stmt.contains("org_id") {
-                out.push(stmt);
-            }
+            words.get(k).map(|w| w.trim_end_matches([',', ';', ')'])).filter(|w| {
+                !w.is_empty()
+                    && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !NOT_ALIAS.contains(w)
+            })
+        });
+        if !scoped(&stmt, alias) {
+            out.push(stmt);
         }
     }
     out
+}
+
+/// Whether `stmt` filters the idempotency table's own `org_id`: `<alias>.org_id`
+/// (or `idempotency_keys.org_id`, or a bare `org_id` when there is no alias)
+/// compared with `=`, `<>`, `!=`, `in` or `is`. `ORDER BY org_id` or another table's
+/// `t.org_id` is not a filter.
+fn scoped(stmt: &str, alias: Option<&str>) -> bool {
+    let compared = |rest: &str| {
+        let rest = rest.trim_start();
+        ["=", "<>", "!=", "in ", "in(", "is "].iter().any(|op| rest.starts_with(op))
+    };
+    let mut from = 0;
+    while let Some(k) = stmt[from..].find("org_id").map(|k| from + k) {
+        from = k + "org_id".len();
+        let prefix = &stmt[..k];
+        let ok_prefix = match alias {
+            Some(a) => prefix.ends_with(&format!("{a}.")) || prefix.ends_with("idempotency_keys."),
+            None => !prefix.ends_with('.') || prefix.ends_with("idempotency_keys."),
+        };
+        if ok_prefix && !prefix.trim_end().ends_with("by") && compared(&stmt[from..]) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Review follow-up N4 of the `idempotency_keys` rebuild: every statement in
@@ -845,6 +905,12 @@ fn the_read_guard_finds_unscoped_statements() {
         r#"c.query_row("SELECT t.id FROM tasks t JOIN idempotency_keys k ON k.key = t.title", [], f)"#,
         r#"c.execute("UPDATE idempotency_keys SET result_json = ?2 WHERE key = ?1", p)"#,
         r#"c.execute("DELETE FROM idempotency_keys WHERE created_at < ?1", [t])"#,
+        "c.query_row(\"SELECT 1 FROM\n    idempotency_keys WHERE key = ?1\", [k], f)",
+        r#"c.query_row("SELECT 1 FROM  idempotency_keys WHERE key = ?1", [k], f)"#,
+        r#"c.query_row("SELECT 1 FROM main.idempotency_keys WHERE key = ?1", [k], f)"#,
+        r#"c.query_row("SELECT 1 FROM `idempotency_keys` WHERE key = ?1", [k], f)"#,
+        r#"c.query_row("SELECT 1 FROM idempotency_keys k JOIN tasks t ON t.org_id = ?1 WHERE k.key = ?2", p, f)"#,
+        r#"c.query_row("SELECT key FROM idempotency_keys WHERE key LIKE ?1 ORDER BY org_id", p, f)"#,
     ];
     for src in bad {
         assert_eq!(unscoped_reads(src).len(), 1, "missed: {src}");
