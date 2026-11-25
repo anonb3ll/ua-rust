@@ -41,6 +41,9 @@ mcp-server = []
 # WebSocket) lives in ua-server, whose `slack-socket` feature turns this on so
 # system_doctor and capability_catalog report whether the binary has it.
 slack-socket = []
+# Test-only helpers (for example local `file://` skill source fixtures in
+# offline integration tests). Never enabled in default or production builds.
+test-util = []
 
 [dependencies]
 subtle.workspace = true
