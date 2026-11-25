@@ -480,6 +480,11 @@ impl FetchOptions {
     pub fn for_local_file_test() -> Self {
         Self { allow_file_urls: true, ..Self::production() }
     }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn is_file_allowed(&self) -> bool {
+        self.allow_file_urls
+    }
 }
 
 /// Exact program, argv, and scrubbed environment built for one `git` invocation.
@@ -605,7 +610,7 @@ where
 
 // --- bare cache & locked execution -------------------------------------------------
 
-fn hex_prefix(bytes: &[u8], chars: usize) -> String {
+pub(crate) fn hex_prefix(bytes: &[u8], chars: usize) -> String {
     let full = hex::encode(Sha256::digest(bytes));
     full[..chars.min(full.len())].to_string()
 }
@@ -626,7 +631,7 @@ fn cache_mutex(path: &Path) -> Arc<Mutex<()>> {
     guard.entry(path.to_path_buf()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
-fn with_locked_cache<T>(cache: &Path, f: impl FnOnce() -> UaResult<T>) -> UaResult<T> {
+pub(crate) fn with_locked_cache<T>(cache: &Path, f: impl FnOnce() -> UaResult<T>) -> UaResult<T> {
     let parent = cache.parent().ok_or_else(|| UaError::internal("invalid cache path"))?;
     fs::create_dir_all(parent)
         .map_err(|e| UaError::internal(format!("could not create skill_sources cache dir: {e}")))?;
@@ -664,7 +669,7 @@ fn with_locked_cache<T>(cache: &Path, f: impl FnOnce() -> UaResult<T>) -> UaResu
     res
 }
 
-fn dir_size_bytes(root: &Path) -> u64 {
+pub(crate) fn dir_size_bytes(root: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -838,7 +843,7 @@ pub fn build_fetch_command(
     )
 }
 
-fn ensure_bare_repo(cache: &Path, opts: &FetchOptions) -> UaResult<()> {
+pub(crate) fn ensure_bare_repo(cache: &Path, opts: &FetchOptions) -> UaResult<()> {
     if cache.join("HEAD").is_file() {
         return Ok(());
     }
@@ -855,7 +860,7 @@ fn ensure_bare_repo(cache: &Path, opts: &FetchOptions) -> UaResult<()> {
     Ok(())
 }
 
-fn commit_present(cache: &Path, sha: &str, opts: &FetchOptions) -> bool {
+pub(crate) fn commit_present(cache: &Path, sha: &str, opts: &FetchOptions) -> bool {
     let target = format!("{sha}^{{commit}}");
     let Ok(spec) = build_git_command(Some(cache), None, None, &["cat-file", "-e", &target], opts) else {
         return false;

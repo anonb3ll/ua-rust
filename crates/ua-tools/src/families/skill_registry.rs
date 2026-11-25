@@ -413,7 +413,7 @@ pub const BINARY_ASSET_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "web
 pub const PACKAGE_SCHEMA_VERSION: u64 = 1;
 /// File mode recorded for every file published by this hub (`0o644`).
 /// Executable bits are never honoured.
-const MODE_FILE: u64 = 0o644;
+pub(crate) const MODE_FILE: u64 = 0o644;
 /// Supporting-file mode accepted when verifying packages imported from the
 /// Python hub (`0o755`), never honoured as executable and never accepted on
 /// `SKILL.md`.
@@ -429,7 +429,7 @@ fn valid_name(name: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
 }
 
-fn check_name(raw: &str) -> UaResult<String> {
+pub(crate) fn check_name(raw: &str) -> UaResult<String> {
     let name = raw.trim();
     if valid_name(name) {
         Ok(name.to_string())
@@ -587,7 +587,7 @@ pub(crate) fn validate_package_path(value: &str) -> UaResult<String> {
     Ok(value.to_string())
 }
 
-fn portable_collision_key(path: &str) -> String {
+pub(crate) fn portable_collision_key(path: &str) -> String {
     ComposingNormalizer::new_nfc().normalize(path).to_lowercase()
 }
 
@@ -655,6 +655,7 @@ fn version_row(r: &Row<'_>) -> rusqlite::Result<Value> {
 
 struct RawVersionRow {
     public: Value,
+    source: String,
     content: String,
     content_hash: String,
     manifest_raw: Option<String>,
@@ -666,6 +667,7 @@ fn raw_version_row(r: &Row<'_>) -> rusqlite::Result<RawVersionRow> {
     Ok(RawVersionRow {
         public,
         content_hash: r.get(3)?,
+        source: r.get(4)?,
         manifest_raw: r.get(7)?,
         content: r.get(8)?,
         payload_raw: r.get(9)?,
@@ -766,6 +768,7 @@ fn verify_and_decode(
 
 struct LoadedVersion {
     public: Value,
+    source: String,
     members: Vec<PackageMember>,
 }
 
@@ -810,7 +813,7 @@ fn load_version(
     )?;
     let mut public = raw.public;
     public["files"] = Value::Array(members.iter().map(PackageMember::to_wire_json).collect());
-    Ok(Some(LoadedVersion { public, members }))
+    Ok(Some(LoadedVersion { public, source: raw.source, members }))
 }
 
 fn assignment_row(r: &Row<'_>) -> rusqlite::Result<Value> {
@@ -1040,7 +1043,7 @@ fn author(ctx: &ToolCtx) -> UaResult<String> {
 /// is served. An organization `orgs` does not hold is refused first, before
 /// anything is read or written (organizations are never deleted, so the
 /// check cannot go stale).
-fn operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
+pub(super) fn operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
     let org = ctx.caller.org_id.as_str();
     let known = ctx
         .hub
@@ -1460,11 +1463,166 @@ fn load_staged(c: &Connection, org: &str, id: &str) -> UaResult<Option<Staged>> 
     .optional()?)
 }
 
+/// Parse `git:<canonical_url>@<40-char-sha>:<repo_path>` provenance strings.
+fn parse_git_provenance(source: &str) -> Option<(&str, &str, &str)> {
+    let rest = source.strip_prefix("git:")?;
+    let (url, tail) = rest.split_once('@')?;
+    let (sha, repo_path) = tail.split_once(':')?;
+    if url.is_empty() || sha.len() != 40 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    Some((url, sha, repo_path))
+}
+
+/// Deterministic member diff between a previously published package version and
+/// a newly staged version (`docs/skill-sources.md` §5): `added`, `removed`,
+/// `modified`, and `unchanged` paths with old/new byte counts and SHA-256 hashes.
+fn compute_member_diff(prev_members: &[PackageMember], new_members: &[PackageMember]) -> Value {
+    let prev_map: BTreeMap<&str, &PackageMember> =
+        prev_members.iter().map(|m| (m.path.as_str(), m)).collect();
+    let new_map: BTreeMap<&str, &PackageMember> = new_members.iter().map(|m| (m.path.as_str(), m)).collect();
+    let mut all_paths: BTreeSet<&str> = prev_map.keys().copied().collect();
+    all_paths.extend(new_map.keys().copied());
+
+    let (mut added, mut removed, mut modified, mut unchanged) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for path in all_paths {
+        match (prev_map.get(path), new_map.get(path)) {
+            (None, Some(new_m)) => added.push(json!({
+                "path": path,
+                "new_bytes": new_m.bytes.len(),
+                "new_sha256": new_m.sha256,
+            })),
+            (Some(old_m), None) => removed.push(json!({
+                "path": path,
+                "old_bytes": old_m.bytes.len(),
+                "old_sha256": old_m.sha256,
+            })),
+            (Some(old_m), Some(new_m))
+                if old_m.sha256 != new_m.sha256 || old_m.bytes.len() != new_m.bytes.len() =>
+            {
+                modified.push(json!({
+                    "path": path,
+                    "old_bytes": old_m.bytes.len(),
+                    "new_bytes": new_m.bytes.len(),
+                    "old_sha256": old_m.sha256,
+                    "new_sha256": new_m.sha256,
+                }));
+            }
+            (Some(_), Some(new_m)) => unchanged.push(json!({
+                "path": path,
+                "bytes": new_m.bytes.len(),
+                "sha256": new_m.sha256,
+            })),
+            (None, None) => {}
+        }
+    }
+    json!({
+        "added": added,
+        "removed": removed,
+        "modified": modified,
+        "unchanged": unchanged,
+    })
+}
+
+fn compute_skill_md_diff(prev_md: &str, new_md: &str) -> String {
+    let diff =
+        similar::TextDiff::configure().timeout(std::time::Duration::from_secs(2)).diff_lines(prev_md, new_md);
+    diff.unified_diff().context_radius(3).header("a/SKILL.md", "b/SKILL.md").to_string()
+}
+
+/// Format a human-readable summary of `member_diff` and `skill_md_diff` for
+/// `ApprovalRow::display` (`approval_pending`, `approvals::get`, and Inbox UI).
+pub(crate) fn approval_display(
+    _c: &Connection,
+    approval_org: &str,
+    payload: &Value,
+) -> UaResult<Option<Value>> {
+    if payload["action"].as_str() != Some("publish") {
+        return Ok(None);
+    }
+    let org = payload["org_id"].as_str().unwrap_or(ua_core::DEFAULT_ORG);
+    if org != approval_org {
+        return Ok(None);
+    }
+    let Some(member_diff) = payload.get("member_diff") else {
+        return Ok(None);
+    };
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(prev_v) = payload["previous_version"].as_i64() {
+        let prev_hash = payload["previous_content_hash"].as_str().unwrap_or("");
+        let new_hash = payload["content_hash"].as_str().unwrap_or("");
+        lines.push(format!("Upgrade from v{prev_v} ({prev_hash}) to new revision ({new_hash})"));
+    }
+    if let Some(src) = payload["source"].as_str() {
+        lines.push(format!("Source: {src}"));
+    }
+    lines.push("Members:".into());
+    for item in member_diff["added"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "+ {} ({} bytes, sha256 {})",
+            item["path"].as_str().unwrap_or("?"),
+            item["new_bytes"].as_u64().unwrap_or(0),
+            item["new_sha256"].as_str().unwrap_or("?"),
+        ));
+    }
+    for item in member_diff["removed"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "- {} ({} bytes, sha256 {})",
+            item["path"].as_str().unwrap_or("?"),
+            item["old_bytes"].as_u64().unwrap_or(0),
+            item["old_sha256"].as_str().unwrap_or("?"),
+        ));
+    }
+    for item in member_diff["modified"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "~ {} ({} -> {} bytes, sha256 {} -> {})",
+            item["path"].as_str().unwrap_or("?"),
+            item["old_bytes"].as_u64().unwrap_or(0),
+            item["new_bytes"].as_u64().unwrap_or(0),
+            item["old_sha256"].as_str().unwrap_or("?"),
+            item["new_sha256"].as_str().unwrap_or("?"),
+        ));
+    }
+    for item in member_diff["unchanged"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "  {} (unchanged, {} bytes)",
+            item["path"].as_str().unwrap_or("?"),
+            item["bytes"].as_u64().unwrap_or(0),
+        ));
+    }
+    let skill_md_diff = payload["skill_md_diff"].as_str().unwrap_or_default();
+    if !skill_md_diff.is_empty() {
+        lines.push(String::new());
+        lines.push(skill_md_diff.trim_end().to_string());
+    }
+    let diff_text = lines.join("\n");
+    let mut lines_added = 0usize;
+    let mut lines_removed = 0usize;
+    for l in skill_md_diff.lines() {
+        if l.starts_with('+') && !l.starts_with("+++") {
+            lines_added += 1;
+        } else if l.starts_with('-') && !l.starts_with("---") {
+            lines_removed += 1;
+        }
+    }
+    Ok(Some(json!({
+        "previous_version": payload["previous_version"],
+        "previous_content_hash": payload["previous_content_hash"],
+        "member_diff": member_diff,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "diff": diff_text,
+    })))
+}
+
 /// What a publish approval shows and binds: the organization, the full staged
-/// `SKILL.md` (at most 64 KiB), its hash, the review's findings, and for
-/// staged packages the canonical manifest (every file's path, size, hash and
-/// mode) plus every supporting file's full text (within `MAX_APPROVAL_TEXT_BYTES`).
-fn staged_payload(org: &str, s: &Staged) -> UaResult<Value> {
+/// `SKILL.md` (at most 64 KiB), its hash, the review's findings, for staged
+/// packages the canonical manifest (every file's path, size, hash and mode)
+/// plus every supporting file's full text (within `MAX_APPROVAL_TEXT_BYTES`),
+/// Git provenance when imported from a Git source, and on upgrade the member
+/// diff and `SKILL.md` unified diff against the latest published version (§5).
+fn staged_payload(c: &Connection, org: &str, s: &Staged) -> UaResult<Value> {
     let members = verify_and_decode(
         &s.content,
         &s.content_hash,
@@ -1480,6 +1638,12 @@ fn staged_payload(org: &str, s: &Staged) -> UaResult<Value> {
         "content": s.content,
         "review_findings": s.findings,
     });
+    if let Some((canonical_url, new_sha, repo_path)) = parse_git_provenance(&s.source) {
+        payload["source"] = json!(s.source);
+        payload["canonical_url"] = json!(canonical_url);
+        payload["new_sha"] = json!(new_sha);
+        payload["repo_path"] = json!(repo_path);
+    }
     if let Some(m_str) = &s.package_manifest {
         let manifest: Value =
             serde_json::from_str(m_str).map_err(|_| UaError::conflict("staged skill manifest is corrupt"))?;
@@ -1501,6 +1665,22 @@ fn staged_payload(org: &str, s: &Staged) -> UaResult<Value> {
         }
         payload["package_manifest"] = manifest;
         payload["package_files"] = Value::Array(package_files);
+    }
+    if let Some(prev) = load_version(c, org, &s.name, None)?
+        && prev.public["content_hash"].as_str() != Some(s.content_hash.as_str())
+    {
+        let prev_md = prev.public["content"].as_str().unwrap_or_default();
+        payload["previous_version"] = prev.public["version"].clone();
+        payload["previous_content_hash"] = prev.public["content_hash"].clone();
+        payload["member_diff"] = compute_member_diff(&prev.members, &members);
+        payload["skill_md_diff"] = json!(compute_skill_md_diff(prev_md, &s.content));
+        if parse_git_provenance(&s.source).is_some() {
+            payload["previous_source"] = json!(prev.source);
+            payload["previous_sha"] = match parse_git_provenance(&prev.source) {
+                Some((_, old_sha, _)) => json!(old_sha),
+                None => Value::Null,
+            };
+        }
     }
     Ok(payload)
 }
@@ -1532,20 +1712,25 @@ fn existing_version(c: &Connection, org: &str, name: &str, hash: &str) -> UaResu
     Ok(Some(public))
 }
 
-/// `publish {name, path}`: review the skill, copy every file into the hub's
-/// staging table and ask for the approval. It never publishes; after approval,
-/// `publish {staging_id}` versions the staged copy without reading the
-/// workspace again.
-fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult<Value> {
-    let name = check_name(name.as_deref().unwrap_or_default())?;
-    let (target, rel) = workspace_target(ctx, path)?;
-    let (dir, rel_md) = skill_dir(&target, &rel, path)?;
-    let members = capture_package(&dir, path)?;
-    let text = std::str::from_utf8(&members["SKILL.md"].bytes)
+/// Screen, manifest, stage into `skill_publish_staging`, and park a one-time
+/// human publish approval for an already-captured package (`members`).
+/// Shared by D1 workspace `publish {name, path}` and D2b `source_import`.
+pub(super) fn stage_members(
+    ctx: &ToolCtx,
+    who: &str,
+    name: String,
+    source_provenance: String,
+    members: BTreeMap<String, PackageMember>,
+    mut review: Value,
+) -> UaResult<Value> {
+    let md = members.get("SKILL.md").ok_or_else(|| UaError::invalid("skill package is missing SKILL.md"))?;
+    if md.bytes.contains(&0) {
+        return Err(UaError::invalid("SKILL.md must not contain NUL bytes"));
+    }
+    let text = std::str::from_utf8(&md.bytes)
         .map_err(|_| UaError::invalid("SKILL.md must be valid UTF-8"))?
         .to_string();
     let support_findings = audit_supporting_files(&members)?;
-    let mut review = super::skills::review_dirs(vec![dir.clone()], &dir, "info");
     if !support_findings.is_empty() {
         if let Some(arr) = review["findings"].as_array_mut() {
             arr.extend(support_findings.iter().cloned());
@@ -1567,11 +1752,6 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
     }
     if review["status"] == "fail" {
         return Ok(json!({ "ok": false, "blocked": true, "name": name, "review": review }));
-    }
-    // Re-check SKILL.md did not change while skill_review read it from disk.
-    let md_after = read_regular_nofollow(&dir.join("SKILL.md"), "SKILL.md", MAX_SKILL_FILE_BYTES)?;
-    if md_after != members["SKILL.md"].bytes {
-        return Err(UaError::conflict("skill changed while it was being reviewed; retry publish"));
     }
     if let Some(fm) = frontmatter(&text)
         && let Some(fm_name) = fm.get("name").and_then(Value::as_str)
@@ -1618,8 +1798,8 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
         let reuse: Option<String> = tx
             .query_row(
                 "SELECT id FROM skill_publish_staging WHERE org_id = ?1 AND name = ?2 AND content_hash = ?3 \
-                 AND requested_by = ?4 AND published_version IS NULL ORDER BY created_at DESC LIMIT 1",
-                params![org, name, hash, who],
+                 AND source = ?4 AND requested_by = ?5 AND published_version IS NULL ORDER BY created_at DESC LIMIT 1",
+                params![org, name, hash, source_provenance, who],
                 |r| r.get(0),
             )
             .optional()?;
@@ -1637,7 +1817,7 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
                         name,
                         text,
                         hash,
-                        rel_md,
+                        source_provenance,
                         json!(findings).to_string(),
                         who,
                         ua_core::time::now(),
@@ -1649,20 +1829,44 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
             }
         };
         let staged = load_staged(tx, org, &id)?.ok_or_else(|| UaError::internal("staged row vanished"))?;
-        let approval_payload = staged_payload(org, &staged)?;
+        let approval_payload = staged_payload(tx, org, &staged)?;
         let state = approvals::request(tx, &cfg, &caller, GATE, &approval_payload)?;
-        Ok(json!({
+        let mut resp = json!({
             "ok": false,
             "status": format!("approval_{}", state.status()),
             "approval_id": state.approval_id(),
             "staging_id": id,
             "name": name,
             "content_hash": hash,
+            "source": source_provenance,
             "package_manifest": manifest,
             "review": review,
-            "next": "once a human approves, call publish {staging_id}; the staged copy is published, not the file",
-        }))
+            "next": "once a human approves, call publish {staging_id}; the staged copy is published, not the source",
+        });
+        if let Some(diff) = approval_payload.get("member_diff") {
+            resp["previous_version"] = approval_payload["previous_version"].clone();
+            resp["member_diff"] = diff.clone();
+        }
+        Ok(resp)
     })
+}
+
+/// `publish {name, path}`: review the skill, copy every file into the hub's
+/// staging table and ask for the approval. It never publishes; after approval,
+/// `publish {staging_id}` versions the staged copy without reading the
+/// workspace again.
+fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult<Value> {
+    let name = check_name(name.as_deref().unwrap_or_default())?;
+    let (target, rel) = workspace_target(ctx, path)?;
+    let (dir, rel_md) = skill_dir(&target, &rel, path)?;
+    let members = capture_package(&dir, path)?;
+    let review = super::skills::review_dirs(vec![dir.clone()], &dir, "info");
+    // Re-check SKILL.md did not change while skill_review read it from disk.
+    let md_after = read_regular_nofollow(&dir.join("SKILL.md"), "SKILL.md", MAX_SKILL_FILE_BYTES)?;
+    if md_after != members["SKILL.md"].bytes {
+        return Err(UaError::conflict("skill changed while it was being reviewed; retry publish"));
+    }
+    stage_members(ctx, who, name, rel_md, members, review)
 }
 
 /// `publish {staging_id}`: version the staged copy behind its approval.
@@ -1677,13 +1881,19 @@ fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
             if staged.requested_by != who {
                 return Err(missing());
             }
-            let approval_payload = staged_payload(org, &staged)?;
+            verify_and_decode(
+                &staged.content,
+                &staged.content_hash,
+                staged.package_manifest.as_deref(),
+                staged.package_payload.as_deref(),
+            )?;
             if let Some(skill) = existing_version(tx, org, &staged.name, &staged.content_hash)? {
                 return Ok(Ok(json!({ "ok": true, "idempotent": true, "skill": skill })));
             }
             if staged.published_version.is_some() {
                 return Err(UaError::conflict("this staged publish was already used"));
             }
+            let approval_payload = staged_payload(tx, org, &staged)?;
             if let Some(approval) = gate(tx, ctx, &approval_payload)? {
                 return Ok(Err(approval));
             }
@@ -1738,6 +1948,11 @@ fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
             Ok(Ok(json!({ "ok": true, "idempotent": false, "skill": skill })))
         })
         .and_then(pending)
+}
+
+#[cfg(test)]
+pub(super) fn publish_staged_for_test(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
+    publish_staged(ctx, who, id)
 }
 
 fn publish(ctx: &ToolCtx, p: PublishParams) -> UaResult<Value> {
@@ -2134,6 +2349,9 @@ async fn skill_registry(ctx: ToolCtx, a: SkillRegistryArgs) -> UaResult<Value> {
         "source_add" => super::skill_sources::source_add(&ctx, params(a.params)?),
         "source_revoke" => super::skill_sources::source_revoke(&ctx, params(a.params)?),
         "source_list" => super::skill_sources::source_list(&ctx, params(a.params)?),
+        "source_refresh" => super::skill_sources::source_refresh(&ctx, params(a.params)?),
+        "source_discover" => super::skill_sources::source_discover(&ctx, params(a.params)?),
+        "source_import" => super::skill_sources::source_import(&ctx, params(a.params)?),
         "catalog" | "install" | "team_install" | "starter_preview" | "starter_install" => {
             Err(UaError::invalid(format!("action {raw:?} (the skill catalog) is not ported to this hub")))
         }
@@ -2154,17 +2372,22 @@ pub fn register(r: &mut Registry) {
              agent label or a profile and pinned to the approved version. publish, assign and unassign are operator \
              actions, each behind a one-time human approval. Actions: publish {name, path} (review a skill directory \
              or SKILL.md in the workspace, stage every file into the hub and ask for approval showing SKILL.md, the \
-             manifest and supporting text files; refused when skill_review finds a high-severity issue, including \
-             permission front matter, hidden text or credentials), publish {staging_id} (version the approved staged \
-             copy without re-reading the workspace), list {name?}, get {name, version?}, assign {skill_name, target, \
-             target_type: agent|profile, version?} (an agent assignment wins over a profile one), unassign \
-             {skill_name, target, target_type}, resolve {agent_label, profile?} (own skills, or any agent's for an \
-             operator), drift {surface_dir, agent_label?, profile?} (read-only: missing, stale, unregistered, \
-             unassigned and synced skills), source_add {url, pinned_sha, tracking_ref?, allowed_subpaths?} (human \
-             operator only, behind human approval: register an https:// Git skill source pinned to an exact 40-char \
-             commit SHA), source_revoke {source_id, reason?} (human operator only, behind human approval: terminally \
-             revoke a skill source), source_list {status?} (list this organization's skill sources). The harness \
-             config bundle served to a node carries the verified skill packages resolved for its agent.",
+             manifest, supporting text files and upgrade diffs; refused when skill_review finds a high-severity \
+             issue, including permission front matter, hidden text or credentials), publish {staging_id} (version \
+             the approved staged copy without re-reading the source), list {name?}, get {name, version?}, assign \
+             {skill_name, target, target_type: agent|profile, version?} (an agent assignment wins over a profile \
+             one), unassign {skill_name, target, target_type}, resolve {agent_label, profile?} (own skills, or any \
+             agent's for an operator), drift {surface_dir, agent_label?, profile?} (read-only: missing, stale, \
+             unregistered, unassigned and synced skills), source_add {url, pinned_sha, tracking_ref?, \
+             allowed_subpaths?} (human operator only, behind human approval: register an https:// Git skill source \
+             pinned to an exact 40-char commit SHA), source_revoke {source_id, reason?} (human operator only, behind \
+             human approval: terminally revoke a skill source), source_list {status?} (list this organization's \
+             skill sources), source_refresh {source_id, tracking_ref?} (resolve tracking_ref to a candidate SHA and \
+             report changes without moving pinned_sha), source_discover {source_id, sha?} (plumbing-only discovery \
+             of candidate skill packages under allowed_subpaths at pinned_sha), source_import {source_id, path, \
+             name?, sha?} (operator: read blobs by object id, run full D1 screens, stage into skill_publish_staging \
+             with git provenance and upgrade member diff for human publish approval). The harness config bundle \
+             served to a node carries the verified skill packages resolved for its agent.",
             skill_registry,
         )
         .gates_in_handler()

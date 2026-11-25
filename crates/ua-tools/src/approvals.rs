@@ -740,6 +740,9 @@ fn display(c: &rusqlite::Connection, row: &ApprovalRow) -> UaResult<Option<Value
     if row.tool == crate::families::harness_config::APPLY_TOOL {
         return crate::families::harness_config::approval_display(c, &row.org_id, row.id, &row.payload);
     }
+    if row.tool == crate::families::skill_registry::GATE {
+        return crate::families::skill_registry::approval_display(c, &row.org_id, &row.payload);
+    }
     Ok(None)
 }
 
