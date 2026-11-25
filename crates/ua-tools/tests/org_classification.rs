@@ -149,6 +149,8 @@ const TENANT: &[&str] = &[
     // deliverables (`ua-deliverables`): org_id and the triggers from birth
     "deliverables",
     "deliverable_revisions",
+    "deliverable_files",
+    "deliverable_releases",
 ];
 
 /// Tenant tables that do not yet pass the tenant check. May only shrink.
