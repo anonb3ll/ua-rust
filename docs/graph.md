@@ -142,16 +142,20 @@ reachability check** within `org_id` over live edges of the same kind:
     the write is refused with `invalid_argument` and a distinct reason code
     `cycle_check_bound_exceeded` (never guessed or allowed unverified, while
     letting callers distinguish a scale/load bound hit from a real cycle).
-- **Mirror behavior on bound hit:** because a domain mirror runs in the **same
-  write transaction** as its authoritative table write (`subtask_of`,
-  `goal_parent`, `delegates_to`, `escalates_to`), a
+- **Mirror and direct-write behavior on bound hit:** because a domain mirror
+  runs in the **same write transaction** as its authoritative table write
+  (`subtask_of`, `goal_parent`, `delegates_to`, `escalates_to`), a
   `cycle_check_bound_exceeded` refusal aborts and rolls back the entire write
   transaction rather than letting the authoritative table and `graph_edges`
-  diverge; the caller may retry on transient deadline hits. (Bounded trees such
+  diverge. Note that **retrying helps only for the 50 ms wall-clock deadline**;
+  the `1,000`-node and `5,000`-edge caps are deterministic. (Bounded trees such
   as `goals.parent_goal_id`, capped at depth 8, visit at most 8 edges and cannot
-  trigger the node or edge caps.) Because the check is bounded inside the write
-  transaction, every insert stays strictly sub-linear in total graph size and
-  prevents quadratic blowup on pathological chains.
+  trigger the node or edge caps.) For `depends_on`, which C2 writes directly to
+  `graph_edges` rather than mirroring, this adds `cycle_check_bound_exceeded` as
+  an explicit contract change (see the migration map below). Because the check
+  is bounded inside the write transaction, every insert stays strictly
+  sub-linear in total graph size and prevents quadratic blowup on pathological
+  chains.
 
 ## Provenance and temporal validity
 
@@ -455,7 +459,8 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
     UNIQUE (org_id, kind, external_id),
     UNIQUE (org_id, id),
     CHECK (visibility != 'team' OR team_id IS NOT NULL),
-    CHECK (visibility != 'private' OR (owner_type IS NOT NULL AND owner_id IS NOT NULL))
+    CHECK (visibility != 'private' OR (owner_type IS NOT NULL AND owner_id IS NOT NULL)),
+    CHECK ((asserted_by = 'system') = (asserted_by_kind = 'system'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_org_kind_vis
@@ -510,6 +515,7 @@ CREATE TABLE IF NOT EXISTS graph_edges (
     CHECK (src_id != dst_id),
     CHECK (state = 'active' OR kind = 'contradicts'),
     CHECK (valid_to IS NULL OR valid_to >= valid_from),
+    CHECK ((asserted_by = 'system') = (asserted_by_kind = 'system')),
     FOREIGN KEY (org_id, src_id) REFERENCES graph_nodes(org_id, id),
     FOREIGN KEY (org_id, dst_id) REFERENCES graph_nodes(org_id, id)
 );
@@ -622,14 +628,14 @@ tables, tool contracts, and tests remain untouched until C2.
 
 | Existing surface | Location | Current role | C1 | C2+ disposition |
 | --- | --- | --- | --- | --- |
-| `task_dependencies` | `crates/ua-tools/src/families/core_schema.rs:46`, `tasks/graph.rs` | Explicit task prerequisite DAG (`dependency_add`, `dependency_list`, `dependency_remove`) with CTE cycle check and creator-only delete. | Unchanged | **Move in C2** to `graph_edges(kind = 'depends_on')` behind the existing `dependency_*` tool contract (same JSON shapes and errors). Creator check migrates from `created_by` label to `asserted_by` stable principal ID once #2790 lands. |
+| `task_dependencies` | `crates/ua-tools/src/families/core_schema.rs:46`, `tasks/graph.rs` | Explicit task prerequisite DAG (`dependency_add`, `dependency_list`, `dependency_remove`) with CTE cycle check and creator-only delete. | Unchanged | **Move in C2** to `graph_edges(kind = 'depends_on')`, written directly (not mirrored) behind `dependency_*`. **Explicit contract change:** JSON shapes and `cycle_detected` stay identical, but a dependency subgraph exceeding `1,000` reachable nodes / `5,000` reachable edges / `50 ms` from the new edge now returns `invalid_argument` (`cycle_check_bound_exceeded`) where today's CTE has no bound (retrying helps only for the 50 ms deadline; node/edge caps are deterministic). **Sequencing:** in non-default organizations, `dependency_*` waits for `#2790`, because there is no immutable principal ID yet and stamping `'system'` would lose the creator identity that creator-only delete relies on. |
 | `task_goal_links` | `crates/ua-tools/src/families/tasks/mod.rs:93`, `tasks/goals.rs` | Single goal a task serves (`goal_manage` `link`/`unlink`/`ancestry`). | Unchanged | **Move in C2** to `graph_edges(kind = 'serves_goal')`, keeping N:1 uniqueness via `idx_graph_edges_single_out_live` and preserving the `goal_manage` contract. |
 | `goals.parent_goal_id` | `crates/ua-tools/src/families/tasks/mod.rs:84` | Why-chain tree column (max depth 8). | Unchanged | **Stays** authoritative on `goals`; optional read-only mirror to `goal_parent` in C2 if cross-domain traversals need it. |
 | `graph_canvas_scenes`, `graph_canvas_revisions` | `crates/ua-tools/src/families/graph.rs` | Excalidraw scene blob store + deterministic parser emitting `task_suggestions` and `dependency_suggestions` (**proposals only**). | Unchanged | **Stays as-is.** Canvas scenes are visual documents, never an authoritative edge store. Post-C2 UI/tools may render a `ua-graph` subgraph onto a board, while human-approved proposals still create real edges through domain tools. |
 | `memory_entities`, `memory_links` | `crates/ua-tools/src/families/export.rs:586` (`GRAPH_TABLES`), [memory.md](memory.md) §4–§5 | Do not exist in `crates/` today; `export.rs` checks `has_table()` for Python-hub migration manifests. | Unchanged | **No separate tables (`graph.v1` is the only edge store).** `memory.md` §4's model stands while its storage section is superseded by `graph_nodes` / `graph_edges` (amended in Memory v2 `#2799`, not C2). Memory §4 entity/link writes go through `GraphRepo` once C1 lands; `export.rs::GRAPH_TABLES` reads from `ua-graph` (or a compatibility view). |
 | `vault_query` (`[[wikilink]]` PPR) | `crates/ua-tools/src/families/vault/query.rs` | On-the-fly disk walk + undirected Personalized PageRank over markdown files. | Unchanged | **Stays disk-authoritative in C1.** In C2+ (with track B9 content-hash vault ingest), `vault_query` can read indexed `vault_note` / `links_to` rows through `seed_expand`, keeping the disk walk as fallback for unindexed vaults. |
-| Relational FKs (`tasks.parent_id`, `deliverables.task_id`, `delegations.task_id`, `task_hold_members`, `plan_steps.plan_id`) | Their owning families | Core relational invariants enforced by owning tables. | Unchanged | **Stay authoritative** on their owning tables; projected into `graph_edges` (`subtask_of`, `produces`, `delegated_to`) only where cross-domain traversal or G3 provenance needs them. |
-| Team-spec topology (`delegates_to`, `reviews`, `escalates_to`, `can_observe`) | [organization.md](organization.md) (`team_specs`) | Enforced seat interaction rules inside append-only canonical JSON specs. | Unchanged | **Authoritative in `team_specs`**; projected into `graph_edges` on spec commit in C2+ for graph queries and visualization, never editable directly via `graph_edge_assert`. |
+| Relational FKs (`tasks.parent_id`, `deliverables.task_id`, `delegations.task_id`, `task_hold_members`, `plan_steps.plan_id`) | Their owning families | Core relational invariants enforced by owning tables. | Unchanged | **Stay authoritative** on their owning tables; projected into `graph_edges` (`subtask_of`, `produces`, `delegated_to`) in the same write transaction only where cross-domain traversal or G3 provenance needs them. For acyclic mirrors (`subtask_of`), a `cycle_check_bound_exceeded` refusal rolls back the enclosing transaction (retryable only on the 50 ms deadline; node/edge caps are deterministic). |
+| Team-spec topology (`delegates_to`, `reviews`, `escalates_to`, `can_observe`) | [organization.md](organization.md) (`team_specs`) | Enforced seat interaction rules inside append-only canonical JSON specs. | Unchanged | **Authoritative in `team_specs`**; projected into `graph_edges` on spec commit in C2+ in the same write transaction for graph queries and visualization, never editable directly via `graph_edge_assert`. For acyclic mirrors (`delegates_to`, `escalates_to`), a `cycle_check_bound_exceeded` refusal rolls back the spec commit (retryable only on the 50 ms deadline; node/edge caps are deterministic). |
 
 ## Alignment with `memory.md` step 5
 
