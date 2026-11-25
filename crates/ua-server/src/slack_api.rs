@@ -274,7 +274,17 @@ async fn execute(
     // and again on every lookup), the default organization's.
     let id = AuthIdentity::in_default(identity.clone(), ActorKind::Human, true);
     let caller = caller_for(&state, &id, None, Transport::Slack);
+    // Refused, like a static token, while a row of another organization
+    // holds the identity's label.
+    let held = crate::auth::held_outside_default(&state, &identity).await;
     let (tool, outcome) = match slack::command_call(&parsed, &d.delivery_id) {
+        _ if held => (
+            None,
+            Err(ua_core::UaError::denied(
+                "agent_label_taken",
+                "this Slack identity's label is held outside the default organization; nothing was run",
+            )),
+        ),
         Ok(Some(call)) => {
             (Some(call.tool), state.registry.call(&state.hub, &caller, call.tool, call.args).await)
         }

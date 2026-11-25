@@ -214,11 +214,17 @@ fn one(src: &str) -> Vec<String> {
 fn non_test_callers_and_events_are_in_the_default_organization() {
     let files = sources();
     assert!(files.len() > 100, "found only {} source files", files.len());
-    let events: usize =
-        files.iter().map(|(_, s)| find_all(&without_tests(s), "EventInput::new(").count()).sum();
-    // A sanity floor for the scanner, not a quota: families that route
-    // their events through one `emit` helper lower the count.
-    assert!(events > 80, "found only {events} EventInput::new calls outside tests");
+    // A sanity floor for the scanner, not a quota. Families route their
+    // events through an `emit` helper as often as they build an
+    // `EventInput` in place, so both spellings count.
+    let events: usize = files
+        .iter()
+        .map(|(_, s)| {
+            let m = without_tests(s);
+            find_all(&m, "EventInput::new(").count() + find_all(&m, "emit(").count()
+        })
+        .sum();
+    assert!(events > 100, "found only {events} EventInput::new and emit( calls outside tests");
     let found = findings(&files);
     assert!(found.is_empty(), "{}", found.join("\n"));
 }

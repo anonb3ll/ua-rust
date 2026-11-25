@@ -83,19 +83,39 @@ pub fn lookup_token(state: &AppState, token: &str) -> Option<(String, String)> {
             found = Some(label);
         }
     }
+    let reserved = ua_tools::families::agents::Reserved::of(state.hub.cfg());
     if let Some(label) = found {
         let elsewhere = state
             .hub
             .db()
-            .read(|c| ua_tools::families::tokens::held_outside_default(c, &label))
+            .read(|c| ua_tools::families::tokens::held_outside_default(c, &reserved, &label))
             .unwrap_or(true);
         return (!elsewhere).then(|| (label, ua_core::DEFAULT_ORG.to_string()));
     }
-    state.hub.db().read(|c| ua_tools::families::tokens::resolve_managed_token(c, token)).ok().flatten()
+    state
+        .hub
+        .db()
+        .read(|c| ua_tools::families::tokens::resolve_managed_token(c, &reserved, token))
+        .ok()
+        .flatten()
 }
 
 fn path_is(path: &str, prefix: &str) -> bool {
     path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a row of another organization holds `label`, for a credential
+/// that always resolves to the default organization (a Control Center
+/// session, a Slack human). Fails closed: an unreadable state refuses.
+pub async fn held_outside_default(state: &AppState, label: &str) -> bool {
+    let label = label.to_string();
+    let reserved = ua_tools::families::agents::Reserved::of(state.hub.cfg());
+    state
+        .hub
+        .db()
+        .read_async(move |c| ua_tools::families::tokens::held_outside_default(c, &reserved, &label))
+        .await
+        .unwrap_or(true)
 }
 
 /// Whether `label` is a retired agent identity. Fails closed: an unreadable
@@ -146,10 +166,11 @@ pub fn resolve_bearer_blocking(state: &AppState, token: &str, path: &str) -> Opt
     // explicit profile was removed from configuration is refused. A grant
     // carries no organization yet, so it resolves to the default one and is
     // refused for a subject another organization's agent holds.
+    let reserved = ua_tools::families::agents::Reserved::of(cfg);
     let elsewhere = state
         .hub
         .db()
-        .read(|c| ua_tools::families::tokens::held_outside_default(c, &access.subject))
+        .read(|c| ua_tools::families::tokens::held_outside_default(c, &reserved, &access.subject))
         .unwrap_or(true);
     (audience_ok
         && !cfg.is_human(&access.subject)
@@ -238,6 +259,12 @@ pub async fn authenticate(State(state): State<AppState>, mut req: Request, next:
                 let body = serde_json::json!({ "ok": false, "error": "csrf", "message": "missing or wrong X-CSRF-Token" });
                 return (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
             }
+        }
+        // A Control Center session is a configured human, the default
+        // organization's: refused, like a static token, while a row of
+        // another organization holds its label.
+        if held_outside_default(&state, &session.label).await {
+            return unauthorized(&state, Some("invalid_token"), "session refused");
         }
         let id = AuthIdentity::in_default(session.label.clone(), ActorKind::Human, true);
         req.extensions_mut().insert(session);

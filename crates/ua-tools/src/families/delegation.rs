@@ -573,16 +573,25 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
             return Ok(done);
         }
         crate::families::tasks::require_org(tx, &org)?;
-        // A delegation targets only an agent of the delegator's own
-        // organization: another organization's agent could never claim it
-        // (its claim reads its own organization), so the request fails
-        // closed, answered as for an agent this organization does not have.
-        // A label no organization holds is accepted, as before (it may
-        // register here later).
-        if crate::families::agents::foreign_label(tx, &org, &to_agent)? {
+        // A delegation targets only a registered agent of the delegator's
+        // own organization (owner decision): an `agents` row in this
+        // organization with exactly this label, the spelling its claims
+        // match. A label no agent has registered and a label another
+        // organization's agent holds get the same answer, built from the
+        // requested label alone, so neither reveals whether the label
+        // exists elsewhere.
+        let registered = tx
+            .query_row(
+                "SELECT 1 FROM agents WHERE org_id = ?1 AND label = ?2",
+                params![org, to_agent],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !registered {
             return Err(UaError::not_found(format!(
-                "no agent {to_agent:?} in this organization; a delegation targets an agent of the delegator's \
-                 organization. Nothing was created"
+                "no agent {to_agent:?} in this organization; a delegation targets a registered agent of the \
+                 delegator's organization. Nothing was created"
             )));
         }
         let ts = ua_core::time::now();
@@ -1233,7 +1242,8 @@ pub fn register(r: &mut Registry) {
         tool(
             "delegate",
             "Delegate work to another agent: creates a child task addressed to to_agent and a pending \
-             delegations row. The spec must meet the Delegation Spec Standard. Grants the receiver no extra \
+             delegations row. to_agent must be a registered agent of your organization (not_found \
+             otherwise). The spec must meet the Delegation Spec Standard. Grants the receiver no extra \
              tools. Returns {delegation_id, task_id, memory_id}.",
             |ctx: ToolCtx, a: DelegateArgs| blocking(move || create(&ctx, a)),
         )

@@ -2,8 +2,11 @@
 //! (`docs/organization.md`, Resolution and the agents and sessions family):
 //! a managed token resolves to its own organization, which must be its
 //! agent's, and a static token, which is hub configuration, resolves to the
-//! default organization and is refused while another organization's agent
-//! holds its label. Every value here is fake.
+//! default organization. A static token's label is reserved for the default
+//! organization, so another organization's row for it never locks the
+//! static token out, and a managed token of another organization for it
+//! never authenticates. Retiring then forgetting an agent never brings a
+//! static or managed token back. Every value here is fake.
 
 mod common;
 
@@ -18,6 +21,9 @@ const B_TOKEN: &str = "b-managed-token-not-real-0123456789abcdef";
 const A_TOKEN: &str = "a-managed-token-not-real-0123456789abcdef";
 const ODD_TOKEN: &str = "odd-managed-token-not-real-0123456789abcd";
 const STATIC_TOKEN: &str = "static-token-not-real-0123456789abcdef01";
+const SQUAT_TOKEN: &str = "squat-managed-token-not-real-0123456789ab";
+const OPERATOR_TOKEN: &str = "operator-static-token-not-real-012345678";
+const DEPLOY_TOKEN: &str = "deploy-static-token-not-real-0123456789ab";
 
 fn sql(hub: &TestHub, sql: &str) {
     let sql = sql.to_string();
@@ -99,10 +105,79 @@ async fn a_token_whose_organization_is_not_its_agents_is_refused() {
     let hub = hub();
     let resp = call(&hub, ODD_TOKEN, "session_list", json!({})).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    // A static token is the default organization's; its label is held by
-    // another organization's agent, so it does not authenticate.
+    // A static token is the default organization's and its label is
+    // reserved: another organization's row for it (only SQL can make one)
+    // does not lock it out, and a managed token of that organization for
+    // the reserved label never authenticates.
     let resp = call(&hub, STATIC_TOKEN, "session_list", json!({})).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::OK);
+    sql(
+        &hub,
+        &format!(
+            "INSERT INTO agent_tokens (org_id, agent_label, token_hash, issued_at)
+                 VALUES ('{ORG_B}', 'squatted-label', '{}', 't0');",
+            digest(SQUAT_TOKEN)
+        ),
+    );
+    assert_eq!(call(&hub, SQUAT_TOKEN, "session_list", json!({})).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(call(&hub, STATIC_TOKEN, "session_list", json!({})).await.status(), StatusCode::OK);
     // The well-formed tokens still do.
     assert_eq!(call(&hub, A_TOKEN, "session_list", json!({})).await.status(), StatusCode::OK);
+}
+
+async fn manage(
+    hub: &TestHub,
+    action: &str,
+    params: serde_json::Value,
+) -> axum::http::Response<axum::body::Body> {
+    call(hub, OPERATOR_TOKEN, "coordination_manage", json!({ "action": action, "params": params })).await
+}
+
+async fn issue(hub: &TestHub, label: &str, value: &str) {
+    let resp =
+        call(hub, OPERATOR_TOKEN, "agent_token_issue", json!({ "agent_label": label, "value": value })).await;
+    assert_eq!(resp.status(), StatusCode::OK, "{}", json_body(resp).await);
+}
+
+#[tokio::test]
+async fn retire_then_forget_never_revives_a_static_or_managed_token() {
+    let mut cfg = common::config();
+    cfg.oauth_enabled = false;
+    cfg.agent_tokens =
+        Some(SecretString::from(format!("operator:{OPERATOR_TOKEN},deploy-bot:{DEPLOY_TOKEN}")));
+    let hub = TestHub::new(cfg);
+    let (plain_before, plain_after, deploy_after) = (
+        "plain-managed-before-not-real-0123456789",
+        "plain-managed-after-not-real-01234567890",
+        "deploy-managed-after-not-real-0123456789",
+    );
+    issue(&hub, "plain-bot", plain_before).await;
+    for token in [DEPLOY_TOKEN, plain_before] {
+        assert_eq!(call(&hub, token, "session_list", json!({})).await.status(), StatusCode::OK);
+    }
+    for label in ["deploy-bot", "plain-bot"] {
+        let resp = manage(&hub, "agent_retire", json!({ "agent": label, "reason": "test retire" })).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{}", json_body(resp).await);
+    }
+    // Managed tokens issued after the retire.
+    issue(&hub, "plain-bot", plain_after).await;
+    issue(&hub, "deploy-bot", deploy_after).await;
+    let refused = [DEPLOY_TOKEN, plain_before, plain_after, deploy_after];
+    for token in refused {
+        assert_eq!(call(&hub, token, "session_list", json!({})).await.status(), StatusCode::UNAUTHORIZED);
+    }
+    // A static-token label is never forgotten while configuration names it.
+    let resp = manage(&hub, "agent_forget", json!({ "agent": "deploy-bot", "reason": "test forget" })).await;
+    let body = json_body(resp).await;
+    assert_eq!(body["reason_code"], "agent_label_configured", "{body}");
+    let resp = manage(&hub, "agent_forget", json!({ "agent": "plain-bot", "reason": "test forget" })).await;
+    assert_eq!(resp.status(), StatusCode::OK, "{}", json_body(resp).await);
+    // After the forget, every token is still refused.
+    for token in refused {
+        assert_eq!(call(&hub, token, "session_list", json!({})).await.status(), StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        text(&hub, "SELECT group_concat(status) FROM agent_tokens WHERE agent_label = 'plain-bot'"),
+        "revoked,revoked"
+    );
 }

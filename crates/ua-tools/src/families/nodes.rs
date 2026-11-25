@@ -1418,6 +1418,7 @@ pub(crate) async fn node_unretire(ctx: ToolCtx, a: RetireArgs) -> UaResult<Value
 
 fn reassign(
     tx: &mut WriteTx<'_>,
+    reserved: &super::agents::Reserved,
     org: &str,
     name: &str,
     to: &str,
@@ -1435,7 +1436,7 @@ fn reassign(
     // An agent belongs to one organization (`agents.org_id`); a label with
     // no agent row is still refused when it owns a node, has node work or
     // has a dispatch run in another organization.
-    if super::agents::foreign_label(tx, org, to)? || agent_orgs(tx, to)?.iter().any(|o| o != org) {
+    if super::agents::foreign_label(tx, reserved, org, to)? || agent_orgs(tx, to)?.iter().any(|o| o != org) {
         return Err(UaError::denied(
             "agent_org_mismatch",
             format!("agent {to:?} works in another organization; a node is reassigned only within its own"),
@@ -1541,7 +1542,8 @@ pub(crate) async fn node_reassign(ctx: ToolCtx, a: ReassignArgs) -> UaResult<Val
     let to = validate_label(Some(&a.to_agent), "to_agent")?;
     let reason = retire_reason(a.reason.as_deref())?;
     let org = ctx.caller.org_id.clone();
-    ctx.hub.db().write_async(move |tx| reassign(tx, &org, &name, &to, &who, &reason)).await
+    let reserved = super::agents::Reserved::of(ctx.hub.cfg());
+    ctx.hub.db().write_async(move |tx| reassign(tx, &reserved, &org, &name, &to, &who, &reason)).await
 }
 
 /// `coordination_manage(action="node_forget")`: delete a retired node's row

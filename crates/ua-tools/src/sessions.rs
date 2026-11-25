@@ -128,12 +128,13 @@ async fn bind(ctx: ToolCtx, profile: Option<Profile>) -> UaResult<Value> {
     }
     let now = ua_core::time::now();
     let (label2, org2) = (label.clone(), org.clone());
+    let reserved = crate::families::agents::Reserved::of(ctx.hub.cfg());
     ctx.hub
         .db()
         .write_async(move |tx| {
             let org = org2;
             crate::families::agents::require_org(tx, &org)?;
-            crate::families::agents::require_label_free(tx, &org, &label2)?;
+            crate::families::agents::require_label_free(tx, &reserved, &org, &label2)?;
             let n = match profile {
                 Some(p) => tx.execute(
                     "INSERT INTO session_profiles (org_id, identity, session_key, profile, updated_at) \

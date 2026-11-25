@@ -86,11 +86,11 @@ CREATE INDEX IF NOT EXISTS idx_session_handoff_notes_org_session
     ON session_handoff_notes(org_id, session_id, created_at);
 
 CREATE TRIGGER IF NOT EXISTS agent_sessions_org_parent BEFORE INSERT ON agent_sessions
-WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent AND org_id IS NOT NEW.org_id)
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent COLLATE NOCASE AND org_id IS NOT NEW.org_id)
   OR EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
 BEGIN SELECT RAISE(ABORT, 'agent or task belongs to another organization'); END;
 CREATE TRIGGER IF NOT EXISTS agent_sessions_org_parent_update BEFORE UPDATE OF agent, task_id ON agent_sessions
-WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent AND org_id IS NOT NEW.org_id)
+WHEN EXISTS (SELECT 1 FROM agents WHERE label = NEW.agent COLLATE NOCASE AND org_id IS NOT NEW.org_id)
   OR EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND org_id IS NOT NEW.org_id)
 BEGIN SELECT RAISE(ABORT, 'agent or task belongs to another organization'); END;
 
@@ -178,13 +178,74 @@ pub(crate) fn require_org(c: &Connection, org: &str) -> UaResult<()> {
     }
 }
 
+/// The labels hub configuration names: `human_identities`,
+/// `lifecycle_operators`, static `agent_tokens` labels, the `[profiles]` map,
+/// `oauth_identities`, `oauth_client_credentials` identities, Slack
+/// identities, and the policy file's role identities and `profile_defaults`
+/// keys. They are **reserved** for the default organization
+/// (`docs/organization.md`, "Reserved labels"): the configuration's trust is
+/// the default organization's, so another organization may never register,
+/// bind, or hold a token for such a label, in any letter case, and the
+/// default organization's static token, OAuth grant or human sign-in for it
+/// is never locked out by another organization. Compared without regard to
+/// case. A policy file that cannot be read adds nothing here; the policy
+/// gate already refuses every governed call while it is broken.
+#[derive(Debug, Clone, Default)]
+pub struct Reserved(std::collections::BTreeSet<String>);
+
+impl Reserved {
+    /// The reserved labels of `cfg`, read now (the policy file is reloaded
+    /// when it changes, so this is built per call, not cached).
+    pub fn of(cfg: &ua_core::Config) -> Self {
+        let mut labels = std::collections::BTreeSet::new();
+        let mut add = |l: &str| {
+            let l = l.trim();
+            if !l.is_empty() {
+                labels.insert(l.to_ascii_lowercase());
+            }
+        };
+        cfg.human_identities.iter().for_each(|l| add(l));
+        cfg.lifecycle_operators().iter().for_each(|l| add(l));
+        cfg.static_tokens().iter().for_each(|(l, _)| add(l));
+        cfg.profiles.keys().for_each(|l| add(l));
+        cfg.oauth_identities.iter().for_each(|l| add(l));
+        cfg.oauth_client_credentials().iter().for_each(|(_, _, l)| add(l));
+        cfg.slack_identities.iter().for_each(|i| add(&i.identity));
+        if let Some(Ok(policy)) = cfg.policy_file.as_deref().map(crate::policy::load) {
+            // A role entry is an identity (`agent:<label>` or a bare name,
+            // which may also be a profile) or a profile (`profile:<name>`).
+            for role in policy.rules.iter().flat_map(|r| &r.roles) {
+                if !role.starts_with("profile:") {
+                    add(role.strip_prefix("agent:").unwrap_or(role));
+                }
+            }
+            policy.profile_defaults.keys().for_each(|l| add(l));
+        }
+        Self(labels)
+    }
+
+    /// Whether configuration names `label`, in any letter case.
+    pub fn contains(&self, label: &str) -> bool {
+        self.0.contains(&label.trim().to_ascii_lowercase())
+    }
+}
+
 /// The organization holding agent label `label`, compared without regard to
-/// case (the label namespace is one and case-insensitive): the organization
-/// of an agent row with that label (an exact match wins over a case
-/// variant), else of a lifecycle row for it (a label paused or retired
-/// before it ever registered), else of an active managed token for it (a
-/// token issued before its agent first connected), else none.
-pub(crate) fn label_org(c: &Connection, label: &str) -> UaResult<Option<String>> {
+/// case (the label namespace is one and case-insensitive): the default
+/// organization for a label hub configuration names ([`Reserved`]), else
+/// the organization of an agent row with that label (an exact match wins
+/// over a case variant), else of a lifecycle row for it (a label paused or
+/// retired before it ever registered), else of an active managed token for
+/// it (a token issued before its agent first connected), else none.
+pub(crate) fn label_org(c: &Connection, reserved: &Reserved, label: &str) -> UaResult<Option<String>> {
+    if reserved.contains(label) {
+        return Ok(Some(ua_core::DEFAULT_ORG.to_string()));
+    }
+    row_label_org(c, label)
+}
+
+/// [`label_org`] from the database rows alone, configuration aside.
+fn row_label_org(c: &Connection, label: &str) -> UaResult<Option<String>> {
     for sql in [
         "SELECT org_id FROM agents WHERE label = ?1 COLLATE NOCASE ORDER BY (label = ?1) DESC LIMIT 1",
         "SELECT org_id FROM agent_lifecycle WHERE agent = ?1",
@@ -210,15 +271,22 @@ pub(crate) fn label_taken(label: &str) -> UaError {
     )
 }
 
-/// Whether `label` is an agent of another organization than `org`: to
+/// Whether `label` is an agent of another organization than `org` (or,
+/// outside the default organization, a label configuration reserves): to
 /// `org` it is a missing agent.
-pub(crate) fn foreign_label(c: &Connection, org: &str, label: &str) -> UaResult<bool> {
-    Ok(label_org(c, label)?.is_some_and(|o| o != org))
+pub(crate) fn foreign_label(c: &Connection, reserved: &Reserved, org: &str, label: &str) -> UaResult<bool> {
+    Ok(label_org(c, reserved, label)?.is_some_and(|o| o != org))
 }
 
-/// Refuse `label` when another organization's agent holds it.
-pub(crate) fn require_label_free(c: &Connection, org: &str, label: &str) -> UaResult<()> {
-    if foreign_label(c, org, label)? { Err(label_taken(label)) } else { Ok(()) }
+/// Refuse `label` when another organization's agent holds it, or when it is
+/// a configuration-reserved label and `org` is not the default organization.
+pub(crate) fn require_label_free(
+    c: &Connection,
+    reserved: &Reserved,
+    org: &str,
+    label: &str,
+) -> UaResult<()> {
+    if foreign_label(c, reserved, org, label)? { Err(label_taken(label)) } else { Ok(()) }
 }
 
 /// Append an agents-family event about a row of organization `org`.
@@ -398,6 +466,7 @@ fn open_marks() -> String {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn touch_agent(
     tx: &mut WriteTx<'_>,
+    reserved: &Reserved,
     org: &str,
     label: &str,
     via: &str,
@@ -407,7 +476,7 @@ pub(crate) fn touch_agent(
     verified_self: bool,
 ) -> UaResult<bool> {
     require_org(tx, org)?;
-    require_label_free(tx, org, label)?;
+    require_label_free(tx, reserved, org, label)?;
     let existed: bool = tx
         .query_row("SELECT 1 FROM agents WHERE org_id = ?1 AND label = ?2", params![org, label], |_| Ok(()))
         .optional()?
@@ -934,11 +1003,13 @@ async fn heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
     let verified_self = verified(&ctx.caller).is_some();
     let host = clean(a.host.as_deref());
     let org = ctx.caller.org_id.clone();
+    let reserved = Reserved::of(ctx.hub.cfg());
     ctx.hub
         .db()
         .write_async(move |tx| {
             touch_agent(
                 tx,
+                &reserved,
                 &org,
                 &label,
                 "heartbeat_tool",
@@ -987,8 +1058,11 @@ pub(crate) async fn agent_list(ctx: ToolCtx, _a: AgentListArgs) -> UaResult<Valu
 pub(crate) async fn agent_context(ctx: ToolCtx, _a: AgentContextArgs) -> UaResult<Value> {
     let identity = verified(&ctx.caller).map(str::to_string);
     let profile = ctx.caller.profile.as_str();
-    let workspace = ctx.hub.cfg().workspace_root().to_string_lossy().into_owned();
     let org = ctx.caller.org_id.clone();
+    // The hub's workspace is the default organization's; another
+    // organization's caller gets `null`, never the hub's filesystem path.
+    let workspace =
+        (org == ua_core::DEFAULT_ORG).then(|| ctx.hub.cfg().workspace_root().to_string_lossy().into_owned());
     let (agents, live) = ctx
         .hub
         .db()
@@ -1055,11 +1129,12 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
         clean(a.host.as_deref()),
     );
     let (task_id, include_packet, recall) = (a.task_id, a.include_packet, a.recall_prior_packet);
+    let reserved = Reserved::of(ctx.hub.cfg());
     ctx.hub
         .db()
         .write_async(move |tx| {
             require_org(tx, &org)?;
-            require_label_free(tx, &org, &label)?;
+            require_label_free(tx, &reserved, &org, &label)?;
             reap(tx)?;
             if let Some(tid) = task_id {
                 let found = tx
@@ -1129,7 +1204,7 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
                     (id, true, None)
                 }
             };
-            touch_agent(tx, &org, &label, "session_start", None, host.as_deref(), None, verified_self)?;
+            touch_agent(tx, &reserved, &org, &label, "session_start", None, host.as_deref(), None, verified_self)?;
             if created {
                 emit(
                     tx,

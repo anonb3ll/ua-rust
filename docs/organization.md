@@ -437,9 +437,11 @@ here for memory columns, owners and defaults.
     was allowed pending the agents conversion (it could never be claimed:
     the delegate looks the task up in its own organization and finds
     none). Since agents carry an organization it is refused instead, fail
-    closed: `delegate` answers a `to_agent` another organization's agent
-    holds as `not_found` ("no agent in this organization") and creates
-    nothing; a label no organization holds is still accepted.
+    closed, and (owner decision) the target must be a **registered agent of
+    the delegator's own organization**: `delegate` answers a `to_agent` that
+    no agent has registered and one another organization's agent holds
+    byte-for-byte alike, as `not_found` ("no agent in this organization"),
+    and creates nothing. This applies to the default organization too.
     Policy authorizations, which carry no `org_id` yet, are reached only
     through their task's organization; delegations carry their own (below).
     (d) Task replies carry no `org_id`.
@@ -549,11 +551,14 @@ here for memory columns, owners and defaults.
   changes nothing and answers as it would for a missing id. A write for an
   organization `orgs` does not hold is refused (`unknown_organization`)
   before anything changes. Replies carry no `org_id` (owner decision (d)).
-  Owner decision (c), resolved fail-closed by the agents family: a
-  delegation to another organization's agent is refused (`not_found`,
-  nothing created); one to an agent of the delegator's organization, or to
-  a label no organization holds, is created in the delegator's
-  organization. `delegate`
+  Owner decision (c), resolved fail-closed by the agents family, then
+  narrowed by the owner: a delegation targets only an agent registered in
+  the delegator's organization (an `agents` row there with exactly that
+  label, the spelling its claims match). A label no agent has registered
+  and a label another organization's agent holds are refused alike
+  (`not_found`, the same message built from the requested label alone,
+  nothing created), through every door (`delegate`, `delegation_manage`
+  create, `handoff`). `delegate`
   idempotency keys are stored per delegating agent as
   `delegate:<label>:<key>`, organization-prefixed outside the default
   (owner decision (a)), with `%`, `:` and `/` in the label percent-escaped
@@ -1137,6 +1142,56 @@ here for memory columns, owners and defaults.
     retired or forgotten, hub_recovery}`, and the ledger entries are that
     code's redacted events. Without `any_org`, a lifecycle action on a label
     another organization holds is refused as taken.
+  - **Forget never revives a credential.** A retired agent's lifecycle row
+    is what refuses its static configuration token, which cannot be
+    revoked. So `agent_forget` is refused (`agent_label_configured`) for a
+    label hub configuration names (the reserved labels below); the operator
+    removes it from configuration first. Refusing was chosen over a
+    tombstone that `is_retired` would keep honouring: a tombstone leaves
+    the label unusable for good, which is what forget exists to undo, and
+    every credential path would have to read a second store. A forget also
+    revokes, again, every managed token, OAuth sign-in and session
+    credential issued for the label since the retire (`agent_forgotten`),
+    so none comes back with the freed label. It deletes exactly one agent
+    row: when two rows spell the label in different letter cases
+    (`agents.label` is case-sensitive) it is refused
+    (`agent_label_ambiguous`). The stops a lifecycle action requests (doing
+    claims released or reported, node items cancelled, dispatch runs
+    stopped) and a retire's doing-claim refusal read the agent's own
+    organization only: another organization's task, item or run whose
+    agent text matches the label is never this agent's work.
+  - **Reserved labels** (the design below, "Reserved labels" and scenario
+    17a). Every label hub configuration names is the default
+    organization's: `human_identities`, `lifecycle_operators`, static
+    token labels, the `[profiles]` map, `oauth_identities`,
+    `oauth_client_credentials` identities, Slack identities, and the policy
+    file's role identities (`agent:<label>` or a bare name; a
+    `profile:<name>` entry names a profile) and `profile_defaults` keys,
+    compared without regard to case (`agents::Reserved`). The label
+    namespace (`label_org`, `require_label_free`, `held_outside_default`)
+    treats such a label as held by `default`: another organization's
+    heartbeat, `session_start`, profile binding and token issue for it are
+    refused as taken; a managed token or session credential of another
+    organization for it never authenticates; and the default
+    organization's static token, OAuth grant, Control Center session and
+    Slack identity for it are never locked out. **Not yet built** from the
+    design: who inside the default organization may create a reserved
+    label's row (any default writer still may), and the `system_doctor`
+    `MISCONFIGURED` report for a label added to configuration while
+    another organization already holds a row for it. Such a row (only
+    possible if it predates the reservation) is inert instead: its tokens
+    and credentials are refused and its writers are refused as taken; to
+    remove it, take the label out of configuration, recover it with
+    `any_org`, then add it back.
+  - **No human or operator path outside the default organization yet.**
+    Human identities and lifecycle operators are hub configuration, the
+    default organization's, and no resolver produces a verified human of
+    another organization until memberships exist. So in another
+    organization no one can grant an idle-session wake, revoke a credential
+    as an operator, issue or rotate a managed token, or resolve a
+    `crew_intervene` park; those paths are organization-scoped and tested
+    with a hand-built caller (`unreachable_b_human` in
+    `agents_tenant.rs`) so they stay correct when memberships land.
   - **Parts.** `organization.v1.tools.agents` gives the nine tables `org_id`
     and the generated triggers; `agents.v2.org_scope` adds
     `idx_agents_org_seen`, `idx_agent_sessions_org_agent`,
@@ -1167,8 +1222,9 @@ here for memory columns, owners and defaults.
     (`agents.org_id`) is in another organization; a node session
     credential to `session_credentials.org_id` (its item's); a static
     configuration token, an OAuth grant (which carries no organization yet)
-    and a Control Center session to `default`, the first two refused while
-    another organization's agent holds their label. A token is issued in
+    and a Control Center session to `default`, each refused (as is a Slack
+    identity's command) while another organization holds its label, which
+    a reserved label never is. A token is issued in
     the issuer's organization and refused for a label another holds. The
     CLI issues default tokens. Profiles: the hub configuration's
     `[profiles]` map is the default organization's; another organization's
@@ -1188,7 +1244,11 @@ here for memory columns, owners and defaults.
     checks, memory's `source_host` and the handoff rows of `VISIBLE_EVENT`.
     Another organization's agent or session answers exactly as a missing
     one (a lifecycle observation naming another organization's session is
-    recorded with no session). An unknown or suspended organization is
+    recorded with no session). `agent_context` returns the hub's
+    `workspace` path to the default organization only (`null` elsewhere). A
+    node session credential is refused on use (`org_mismatch`) unless its
+    organization is the one holding its subject's label, as a managed
+    token is. An unknown or suspended organization is
     refused (`unknown_organization`, `organization_suspended`) before any
     write. The session reaper is a hub job: it reaps every organization's
     sessions, each in its own, ledgered per organization with ids only.
@@ -1205,7 +1265,8 @@ here for memory columns, owners and defaults.
     consent actions act on the caller's organization's sessions; a grant
     still needs a verified human, so none happens outside the default
     organization until memberships exist); owner decision (c) for
-    delegations (now fail-closed, above); and `node_reassign`'s
+    delegations (now fail-closed and registered agents only, above); and
+    `node_reassign`'s
     `agent_org_mismatch` (now `agents.org_id` first). **Kept, and why:**
     device acceptance (its evidence is read back from the ledger, where
     another organization's node events carry no data) and command notices

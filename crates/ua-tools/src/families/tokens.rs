@@ -164,6 +164,7 @@ pub fn digest(value: &str) -> String {
 /// organization, and a token never authenticates it into another.
 pub fn resolve_managed_token(
     c: &rusqlite::Connection,
+    reserved: &crate::families::agents::Reserved,
     presented: &str,
 ) -> UaResult<Option<(String, String)>> {
     let row: Option<(String, String)> = c
@@ -175,7 +176,7 @@ pub fn resolve_managed_token(
         )
         .optional()?;
     let Some((label, org)) = row else { return Ok(None) };
-    if crate::families::agents::label_org(c, &label)?.is_some_and(|held| held != org) {
+    if crate::families::agents::label_org(c, reserved, &label)?.is_some_and(|held| held != org) {
         tracing::warn!("a managed token's organization disagrees with its agent's; the token is refused");
         return Ok(None);
     }
@@ -183,11 +184,24 @@ pub fn resolve_managed_token(
 }
 
 /// Whether `label`, presented by a credential that always resolves to the
-/// default organization (a static configuration token, an OAuth grant), is
-/// held by another organization's agent: such a credential is refused, so
-/// the hub's configuration never authenticates into another organization.
-pub fn held_outside_default(c: &rusqlite::Connection, label: &str) -> UaResult<bool> {
-    crate::families::agents::foreign_label(c, ua_core::DEFAULT_ORG, label)
+/// default organization (a static configuration token, an OAuth grant, a
+/// Control Center or Slack human), is held by another organization: such a
+/// credential is refused, so the hub's configuration never authenticates
+/// into another organization.
+///
+/// A configuration-reserved label ([`crate::families::agents::Reserved`]) is
+/// always the default organization's, so it is never held elsewhere and the
+/// default credential for it is never locked out. No writer lets another
+/// organization register, bind or hold a token for such a label; a row of
+/// another organization that predates the reservation is inert (its managed
+/// tokens and session credentials are refused, its writers are refused as a
+/// taken label) until an operator removes it with hub recovery.
+pub fn held_outside_default(
+    c: &rusqlite::Connection,
+    reserved: &crate::families::agents::Reserved,
+    label: &str,
+) -> UaResult<bool> {
+    crate::families::agents::foreign_label(c, reserved, ua_core::DEFAULT_ORG, label)
 }
 
 /// Minimum length of a caller-supplied agent token.
@@ -327,6 +341,7 @@ fn default_action() -> String {
 #[allow(clippy::too_many_arguments)]
 fn insert_token(
     tx: &rusqlite::Transaction<'_>,
+    reserved: &crate::families::agents::Reserved,
     org: &str,
     label: &str,
     hash: &str,
@@ -336,7 +351,7 @@ fn insert_token(
     rotated_from: Option<i64>,
 ) -> UaResult<(i64, String)> {
     crate::families::agents::require_org(tx, org)?;
-    crate::families::agents::require_label_free(tx, org, label)?;
+    crate::families::agents::require_label_free(tx, reserved, org, label)?;
     let now = ua_core::time::now();
     let dup: bool = tx
         .query_row("SELECT 1 FROM agent_tokens WHERE token_hash = ?1", [hash], |_| Ok(true))
@@ -364,11 +379,21 @@ async fn issue(ctx: ToolCtx, a: IssueArgs) -> UaResult<Value> {
     let expires = expires_at(a.ttl_days)?;
     let by = ctx.caller.label.clone();
     let org = ctx.caller.org_id.clone();
+    let reserved = crate::families::agents::Reserved::of(ctx.hub.cfg());
     ctx.hub
         .db()
         .write_async(move |tx| {
-            let (id, issued_at) =
-                insert_token(tx, &org, &label, &hash, expires.as_deref(), &by, a.note.as_deref(), None)?;
+            let (id, issued_at) = insert_token(
+                tx,
+                &reserved,
+                &org,
+                &label,
+                &hash,
+                expires.as_deref(),
+                &by,
+                a.note.as_deref(),
+                None,
+            )?;
             crate::families::agents::emit(
                 tx,
                 &org,
@@ -400,6 +425,7 @@ async fn rotate(ctx: ToolCtx, a: RotateArgs) -> UaResult<Value> {
     let expires = expires_at(a.ttl_days)?;
     let by = ctx.caller.label.clone();
     let org = ctx.caller.org_id.clone();
+    let reserved = crate::families::agents::Reserved::of(ctx.hub.cfg());
     ctx.hub
         .db()
         .write_async(move |tx| {
@@ -412,7 +438,7 @@ async fn rotate(ctx: ToolCtx, a: RotateArgs) -> UaResult<Value> {
                 )
                 .optional()?;
             let (id, issued_at) =
-                insert_token(tx, &org, &label, &hash, expires.as_deref(), &by, a.note.as_deref(), previous)?;
+                insert_token(tx, &reserved, &org, &label, &hash, expires.as_deref(), &by, a.note.as_deref(), previous)?;
             if let Some(prev) = previous {
                 tx.execute(
                     "UPDATE agent_tokens SET status = 'rotated', rotated_at = ?2 WHERE id = ?1 AND org_id = ?3",

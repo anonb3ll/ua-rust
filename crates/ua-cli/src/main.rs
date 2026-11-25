@@ -160,10 +160,11 @@ pub(crate) fn issue_agent_token(
     let token = format!("ua_{}", hex::encode(raw));
     let hash = hex::encode(Sha256::digest(token.as_bytes()));
     let now = ua_core::time::now();
+    let reserved = ua_tools::families::agents::Reserved::of(hub.cfg());
     hub.db().write(|tx| {
         // The CLI runs on the hub host and issues default-organization
         // tokens; a label another organization's agent holds is refused.
-        if ua_tools::families::tokens::held_outside_default(tx, label)? {
+        if ua_tools::families::tokens::held_outside_default(tx, &reserved, label)? {
             return Err(ua_core::UaError::conflict_code(
                 "agent_label_taken",
                 format!("agent label {label:?} is taken; agent labels are one hub-wide namespace"),

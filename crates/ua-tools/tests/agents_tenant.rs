@@ -134,6 +134,17 @@ fn human(label: &str, org: &str) -> Caller {
     Caller { kind: ActorKind::Human, profile: Profile::Operator, enforce_profile: false, ..agent(label, org) }
 }
 
+/// A verified human of organization B. **No resolver produces one today**:
+/// human identities are hub configuration, the default organization's, and
+/// a non-default organization has no human or operator path until
+/// memberships exist (`docs/organization.md`, the agents and sessions
+/// family). The calls made as this caller cover paths unreachable until
+/// then (a wake grant, a token issue, an operator refusal), kept so those
+/// paths stay organization-scoped when memberships land.
+fn unreachable_b_human(label: &str) -> Caller {
+    human(label, ORG_B)
+}
+
 fn operator() -> Caller {
     human("operator", DEFAULT_ORG)
 }
@@ -176,11 +187,18 @@ struct H {
 
 impl H {
     fn new() -> Self {
+        Self::with(|_, _| {})
+    }
+
+    /// A hub whose configuration `edit` adjusts (given the temporary
+    /// directory, for a policy file).
+    fn with(edit: impl FnOnce(&mut Config, &Path)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_home(dir.path().join("home"));
         cfg.human_identities = vec!["operator".into()];
         cfg.lifecycle_operators = Some(vec!["operator".into(), "fleet-bot".into()]);
         cfg.session_credentials_enabled = true;
+        edit(&mut cfg, dir.path());
         let hub = Hub::in_memory(cfg).unwrap();
         add_org(hub.db(), ORG_B, "active");
         add_org(hub.db(), SUSPENDED, "suspended");
@@ -523,6 +541,7 @@ async fn every_read_is_isolated_per_organization() {
 
 #[tokio::test]
 async fn a_managed_token_resolves_to_its_agents_organization() {
+    use ua_tools::families::agents::Reserved;
     use ua_tools::families::tokens::{digest, held_outside_default, resolve_managed_token};
     let h = H::new();
     let b = agent(B_AGENT, ORG_B);
@@ -548,7 +567,8 @@ async fn a_managed_token_resolves_to_its_agents_organization() {
         .unwrap();
     let resolve = |v: &str| {
         let v = v.to_string();
-        h.hub.db().read(move |c| resolve_managed_token(c, &v)).unwrap()
+        let reserved = Reserved::of(h.hub.cfg());
+        h.hub.db().read(move |c| resolve_managed_token(c, &reserved, &v)).unwrap()
     };
     assert_eq!(resolve(b_value), Some((B_AGENT.to_string(), ORG_B.to_string())));
     assert_eq!(resolve(a_value), Some((A_AGENT.to_string(), DEFAULT_ORG.to_string())));
@@ -558,7 +578,8 @@ async fn a_managed_token_resolves_to_its_agents_organization() {
     // static token, an OAuth grant) is refused for B's agent.
     let held = |l: &str| {
         let l = l.to_string();
-        h.hub.db().read(move |c| held_outside_default(c, &l)).unwrap()
+        let reserved = Reserved::of(h.hub.cfg());
+        h.hub.db().read(move |c| held_outside_default(c, &reserved, &l)).unwrap()
     };
     assert!(held(B_AGENT) && held(&B_AGENT.to_uppercase()));
     assert!(!held(A_AGENT) && !held("never-registered"));
@@ -597,7 +618,11 @@ async fn agent_labels_are_one_namespace_and_the_hub_can_recover_one() {
             assert_eq!(reason(&e), "agent_label_taken", "{}/{}: {tool}: {e:?}", who.org_id, who.label);
             assert!(!e.to_string().contains(ORG_B) && !e.to_string().contains(DEFAULT_ORG), "{e:?}");
         }
-        let issuer = human("operator", if who.org_id == ORG_B { ORG_B } else { DEFAULT_ORG });
+        let issuer = if who.org_id == ORG_B {
+            unreachable_b_human("operator")
+        } else {
+            human("operator", DEFAULT_ORG)
+        };
         let e = h
             .call(&issuer, "agent_token_issue", json!({ "agent_label": label, "value": "v".repeat(40) }))
             .await
@@ -619,7 +644,7 @@ async fn agent_labels_are_one_namespace_and_the_hub_can_recover_one() {
         h.manage(&fleet, "agent_retire", json!({ "agent": B_SQUAT, "reason": B_REASON })).await.unwrap_err();
     assert_eq!(reason(&e), "agent_label_taken", "{e:?}");
     // Only the default organization's lifecycle operators recover a label.
-    for who in [agent(A_AGENT, DEFAULT_ORG), human("operator", ORG_B), agent("fleet-bot", ORG_B)] {
+    for who in [agent(A_AGENT, DEFAULT_ORG), unreachable_b_human("operator"), agent("fleet-bot", ORG_B)] {
         let e = h
             .manage(&who, "agent_retire", json!({ "agent": B_SQUAT, "reason": B_REASON, "any_org": true }))
             .await
@@ -779,12 +804,14 @@ async fn session_credentials_and_wakes_work_per_organization() {
     assert_eq!(e.to_string().replace(B_NODE, "N"), missing.to_string().replace("node-zz", "N"));
 
     // Idle-session wakes: B's own session asks through B's node, a B human
-    // grants it, and only B's node is offered it once trigger mail waits.
+    // grants it (unreachable until memberships exist, see
+    // `unreachable_b_human`), and only B's node is offered it once trigger
+    // mail waits.
     let b_sid = h
         .session(&b_device, json!({ "kind": "interactive", "external_session_id": B_EXT, "host": B_NODE }))
         .await;
     h.manage(&b_device, "session_wake_opt_in", json!({ "session_id": b_sid, "node": B_NODE })).await.unwrap();
-    h.manage(&human("b-human-not-real", ORG_B), "session_wake_grant", json!({ "session_id": b_sid }))
+    h.manage(&unreachable_b_human("b-human-not-real"), "session_wake_grant", json!({ "session_id": b_sid }))
         .await
         .unwrap();
     assert_eq!(h.text(&format!("SELECT org_id FROM session_wake WHERE session_id = '{b_sid}'")), ORG_B);
@@ -807,29 +834,58 @@ async fn session_credentials_and_wakes_work_per_organization() {
 }
 
 #[tokio::test]
-async fn a_delegation_targets_only_the_delegators_organization() {
+async fn a_delegation_targets_only_a_registered_agent_of_the_delegators_organization() {
+    // Owner decision: the target must be a registered agent of the
+    // delegator's own organization, in every organization, the default too.
     let h = H::new();
     let (lead_a, b) = (agent(A_LEAD, DEFAULT_ORG), agent(B_AGENT, ORG_B));
     h.ok(&b, "agent_heartbeat", json!({})).await;
     h.ok(&agent(B_PEER, ORG_B), "agent_heartbeat", json!({})).await;
+    h.ok(&agent(A_AGENT, DEFAULT_ORG), "agent_heartbeat", json!({})).await;
     let before = h.count("SELECT COUNT(*) FROM delegations");
-    let got = h.call(&lead_a, "delegate", json!({ "to_agent": B_AGENT, "task_spec": SPEC })).await;
-    assert_eq!(got.as_ref().unwrap_err().code(), "not_found", "{got:?}");
+    let refused = |r: &Result<Value, UaError>| match r {
+        Err(e) => format!("{} {:?} {e:?}", e.code(), e.reason_code()),
+        Ok(v) => panic!("delegation accepted: {v}"),
+    };
+    // A label no agent has registered, then the same label once another
+    // organization's agent holds it: byte-identical answers, so neither
+    // reveals whether the label exists elsewhere.
+    let unregistered =
+        h.call(&lead_a, "delegate", json!({ "to_agent": "kite-agent-not-real", "task_spec": SPEC })).await;
+    h.ok(&agent("kite-agent-not-real", ORG_B), "agent_heartbeat", json!({})).await;
+    let elsewhere =
+        h.call(&lead_a, "delegate", json!({ "to_agent": "kite-agent-not-real", "task_spec": SPEC })).await;
+    assert!(refused(&unregistered).starts_with("not_found "), "{unregistered:?}");
+    assert_eq!(refused(&unregistered), refused(&elsewhere));
+    // The same through the other doors (`handoff`, `delegation_manage`), and
+    // from organization B toward a default agent and an unregistered label.
+    for (who, tool, args) in [
+        (&lead_a, "delegate", json!({ "to_agent": B_AGENT, "task_spec": SPEC })),
+        (&lead_a, "delegate", json!({ "to_agent": B_PEER.to_uppercase(), "task_spec": SPEC })),
+        (&lead_a, "handoff", json!({ "to_agent": B_AGENT, "task_spec": SPEC })),
+        (&lead_a, "handoff", json!({ "to_agent": "never-registered", "task_spec": SPEC })),
+        (
+            &lead_a,
+            "delegation_manage",
+            json!({ "action": "create", "params": { "to_agent": "never-registered", "task_spec": SPEC } }),
+        ),
+        (&b, "delegate", json!({ "to_agent": A_AGENT, "task_spec": SPEC })),
+        (&b, "delegate", json!({ "to_agent": "never-registered", "task_spec": SPEC })),
+    ] {
+        let got = h.call(who, tool, args.clone()).await;
+        assert_eq!(got.as_ref().map_err(UaError::code).unwrap_err(), "not_found", "{tool}({args}): {got:?}");
+    }
     assert_eq!(h.count("SELECT COUNT(*) FROM delegations"), before, "nothing created");
     assert_eq!(h.count("SELECT COUNT(*) FROM tasks"), 0, "no task either");
-    // A label no organization holds, and an agent of the delegator's own
-    // organization, are delegated to as before.
-    h.ok(&lead_a, "delegate", json!({ "to_agent": "never-registered-agent", "task_spec": SPEC })).await;
+    // A registered agent of the delegator's own organization, exactly as
+    // registered, is delegated to, in either organization.
+    h.ok(&lead_a, "delegate", json!({ "to_agent": A_AGENT, "task_spec": SPEC })).await;
     h.ok(&b, "delegate", json!({ "to_agent": B_PEER, "task_spec": SPEC })).await;
     assert_eq!(h.count("SELECT COUNT(*) FROM delegations WHERE org_id = 'org-b'"), 1);
-    // B's agent claims its own delegation.
+    assert_eq!(h.count("SELECT COUNT(*) FROM delegations WHERE org_id = 'default'"), 1);
+    // B's agent sees its own delegation.
     let mine = h.ok(&agent(B_PEER, ORG_B), "delegate_list", json!({})).await;
     assert!(mine.to_string().contains(B_PEER), "{mine}");
-    // The default organization's lead cannot delegate to B's agent in any
-    // letter case either.
-    let got =
-        h.call(&lead_a, "delegate", json!({ "to_agent": B_PEER.to_uppercase(), "task_spec": SPEC })).await;
-    assert_eq!(got.unwrap_err().code(), "not_found");
 }
 
 #[tokio::test]
@@ -936,6 +992,13 @@ fn the_triggers_keep_every_reference_in_one_organization() {
             "INSERT INTO session_credentials (org_id, credential_id, token_sha256, agent_label, node, item_id, attempt, tools_json, issued_by, issued_at, idle_expires_at, expires_at) VALUES ('{ORG_B}', 'c1', 'h2', '{B_AGENT}', '{A_NODE}', 'nd-1', 1, '[]', 'x', 't', 't', 't')"
         ),
         format!("UPDATE agent_sessions SET agent = '{A_AGENT}' WHERE id = 's-b'"),
+        // The label namespace ignores case, so a case variant of another
+        // organization's agent is that agent (`agent_sessions_org_parent`).
+        format!(
+            "INSERT INTO agent_sessions (org_id, id, agent, kind, started_at, last_heartbeat_at) VALUES ('{ORG_B}', 's-y', '{}', 'k', 't', 't')",
+            A_AGENT.to_uppercase()
+        ),
+        format!("UPDATE agent_sessions SET agent = '{}' WHERE id = 's-b'", A_AGENT.to_uppercase()),
         "UPDATE agents SET org_id = 'default' WHERE org_id = 'org-b'".to_string(),
     ] {
         let e = h.sql(&bad).unwrap_err();
@@ -986,7 +1049,7 @@ async fn no_label_host_path_or_text_of_another_organization_reaches_the_ledger()
     h.ok(&b, "session_end", json!({ "session_id": s.b_sid, "exit_status": B_EXIT, "summary": B_REASON }))
         .await;
     h.ok(
-        &human("b-human-not-real", ORG_B),
+        &unreachable_b_human("b-human-not-real"),
         "agent_token_issue",
         json!({ "agent_label": B_PEER, "value": "w".repeat(40) }),
     )
@@ -1007,6 +1070,224 @@ async fn no_label_host_path_or_text_of_another_organization_reaches_the_ledger()
         1
     );
     assert_eq!(h.count("SELECT COUNT(*) FROM idempotency_keys WHERE key LIKE 'org:%/lifecycle%'"), 0);
+}
+
+// --- forget, reserved labels and the lifecycle scope --------------------------------------------
+
+/// A fake static token value (never a real credential).
+const STATIC_VALUE: &str = "static-token-value-not-real-0123456789";
+
+fn retire_args(label: &str) -> Value {
+    json!({ "agent": label, "reason": "decommissioned in a test" })
+}
+
+#[tokio::test]
+async fn forget_refuses_a_configured_label_and_revokes_credentials_issued_after_the_retire() {
+    let h = H::with(|cfg, _| cfg.agent_tokens = Some(format!("deploy-bot:{STATIC_VALUE}").into()));
+    let fleet = agent("fleet-bot", DEFAULT_ORG);
+    // A static-token label: the retired row is all that keeps its token
+    // refused, so it is never forgotten while configuration names it.
+    h.ok(&agent("deploy-bot", DEFAULT_ORG), "agent_heartbeat", json!({})).await;
+    h.manage(&fleet, "agent_retire", retire_args("deploy-bot")).await.unwrap();
+    for label in ["deploy-bot", "DEPLOY-BOT"] {
+        let e = h.manage(&fleet, "agent_forget", retire_args(label)).await.unwrap_err();
+        assert_eq!(reason(&e), "agent_label_configured", "{e:?}");
+    }
+    assert!(h.hub.db().read(|c| ua_tools::families::governance::is_retired(c, "deploy-bot")).unwrap());
+    assert_eq!(h.count("SELECT COUNT(*) FROM agents WHERE label = 'deploy-bot'"), 1);
+
+    // A managed token issued after the retire is revoked by the forget, so
+    // it does not come back with the freed label.
+    h.ok(&agent("plain-bot", DEFAULT_ORG), "agent_heartbeat", json!({})).await;
+    h.manage(&fleet, "agent_retire", retire_args("plain-bot")).await.unwrap();
+    h.ok(&operator(), "agent_token_issue", json!({ "agent_label": "plain-bot", "value": "p".repeat(40) }))
+        .await;
+    assert_eq!(h.text("SELECT status FROM agent_tokens WHERE agent_label = 'plain-bot'"), "active");
+    let out = h.manage(&fleet, "agent_forget", retire_args("plain-bot")).await.unwrap();
+    assert_eq!(out["forgotten"], true, "{out}");
+    assert_eq!(out["revoked"]["agent_tokens"].as_array().map(Vec::len), Some(1), "{out}");
+    assert_eq!(h.text("SELECT status FROM agent_tokens WHERE agent_label = 'plain-bot'"), "revoked");
+    assert_eq!(h.count("SELECT COUNT(*) FROM agents WHERE label = 'plain-bot'"), 0);
+}
+
+#[tokio::test]
+async fn configuration_reserved_labels_belong_to_the_default_organization() {
+    use ua_tools::families::agents::Reserved;
+    use ua_tools::families::tokens::{digest, held_outside_default, resolve_managed_token};
+    let h = H::with(|cfg, dir| {
+        cfg.agent_tokens = Some(format!("deploy-bot:{STATIC_VALUE}").into());
+        cfg.profiles.insert("profiled-bot".into(), "research".into());
+        cfg.oauth_identities = vec!["oauth-bot".into()];
+        let policy = dir.join("policy.yaml");
+        std::fs::write(
+            &policy,
+            "profile_defaults:\n  defaulted-bot: coordinator\nrules:\n  - name: role_rule\n    type: role\n    \
+             tool: approval_pending\n    roles: [\"agent:policy-bot\", \"profile:developer\"]\n",
+        )
+        .unwrap();
+        cfg.policy_file = Some(policy);
+    });
+    let reserved = Reserved::of(h.hub.cfg());
+    let labels = [
+        "deploy-bot",    // a static token
+        "profiled-bot",  // [profiles]
+        "oauth-bot",     // oauth_identities
+        "operator",      // human_identities
+        "fleet-bot",     // lifecycle_operators
+        "policy-bot",    // a policy role identity
+        "defaulted-bot", // a policy profile_defaults identity
+    ];
+    for l in labels {
+        assert!(reserved.contains(l) && reserved.contains(&l.to_uppercase()), "{l}");
+    }
+    assert!(!reserved.contains("developer"), "a `profile:` role names a profile, not a label");
+    let before = h.snapshot();
+    for l in labels {
+        for label in [l.to_string(), l.to_uppercase()] {
+            let b = agent(&label, ORG_B);
+            for (tool, args) in [
+                ("agent_heartbeat", json!({})),
+                ("session_start", json!({ "kind": "interactive" })),
+                ("profile_activate", json!({ "profile": "research" })),
+            ] {
+                let e = h.call(&b, tool, args).await.unwrap_err();
+                assert_eq!(reason(&e), "agent_label_taken", "{label}: {tool}: {e:?}");
+            }
+            let e = h
+                .call(
+                    &unreachable_b_human("b-human-not-real"),
+                    "agent_token_issue",
+                    json!({ "agent_label": label, "value": "r".repeat(40) }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(reason(&e), "agent_label_taken", "{label}: {e:?}");
+        }
+    }
+    assert_eq!(h.snapshot(), before, "nothing written");
+    // A token stored for organization B by SQL never resolves, and the
+    // default organization's credentials are not locked out by it.
+    for (i, l) in labels.iter().enumerate() {
+        let value = format!("reserved-token-value-not-real-{i:04}-0123456789");
+        h.sql(&format!(
+            "INSERT INTO agent_tokens (org_id, agent_label, token_hash, issued_at) VALUES ('{ORG_B}', '{l}', '{}', 't0');",
+            digest(&value)
+        ))
+        .unwrap();
+        let r = reserved.clone();
+        assert_eq!(h.hub.db().read(move |c| resolve_managed_token(c, &r, &value)).unwrap(), None, "{l}");
+        let (label, r) = (l.to_string(), reserved.clone());
+        assert!(!h.hub.db().read(move |c| held_outside_default(c, &r, &label)).unwrap(), "{l}");
+    }
+    // The default organization registers its configured labels as before.
+    h.ok(&agent("deploy-bot", DEFAULT_ORG), "agent_heartbeat", json!({})).await;
+    h.ok(&agent("profiled-bot", DEFAULT_ORG), "session_start", json!({ "kind": "interactive" })).await;
+}
+
+#[tokio::test]
+async fn lifecycle_stops_and_the_retire_refusal_stay_in_the_agents_organization() {
+    let h = H::new();
+    let b = agent(B_AGENT, ORG_B);
+    h.ok(&b, "agent_heartbeat", json!({})).await;
+    // A default-organization task whose claimant text is B's label is not
+    // B's agent's work: the claim gate reads the claimant's organization.
+    h.sql(&format!(
+        "INSERT INTO tasks (org_id, id, title, status, claimed_by, created_at, updated_at)
+             VALUES ('default', 77, 'Default work', 'doing', '{B_AGENT}', 't0', 't0');"
+    ))
+    .unwrap();
+    let out = h.manage(&b, "agent_terminate", json!({ "agent": B_AGENT, "reason": B_REASON })).await.unwrap();
+    assert!(!out["stops"].to_string().contains("task:77"), "{out}");
+    assert_eq!(
+        h.text("SELECT status || ':' || claimed_by FROM tasks WHERE id = 77"),
+        format!("doing:{B_AGENT}")
+    );
+    h.manage(&b, "agent_resume", json!({ "agent": B_AGENT })).await.unwrap();
+    // Hub recovery retires B's agent: the default task neither refuses it
+    // nor is touched by it.
+    let fleet = agent("fleet-bot", DEFAULT_ORG);
+    let out = h
+        .manage(&fleet, "agent_retire", json!({ "agent": B_AGENT, "reason": B_REASON, "any_org": true }))
+        .await
+        .unwrap();
+    assert_eq!(out["retired"], true, "{out}");
+    assert_eq!(
+        h.text("SELECT status || ':' || claimed_by FROM tasks WHERE id = 77"),
+        format!("doing:{B_AGENT}")
+    );
+    // A doing claim of B's own still refuses the retire of B's agent.
+    h.ok(&agent(B_PEER, ORG_B), "agent_heartbeat", json!({})).await;
+    h.sql(&format!(
+        "INSERT INTO tasks (org_id, id, title, status, claimed_by, created_at, updated_at)
+             VALUES ('{ORG_B}', 78, 'B work', 'doing', '{B_PEER}', 't0', 't0');"
+    ))
+    .unwrap();
+    let e = h
+        .manage(&fleet, "agent_retire", json!({ "agent": B_PEER, "reason": B_REASON, "any_org": true }))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&e), "agent_has_doing_claims", "{e:?}");
+}
+
+#[tokio::test]
+async fn forget_never_deletes_a_second_spelling_of_the_label() {
+    let h = H::new();
+    h.sql(
+        "INSERT INTO agents (org_id, label, created_at, updated_at) VALUES
+             ('default', 'Twin-bot', 't0', 't0'), ('default', 'twin-bot', 't0', 't0');",
+    )
+    .unwrap();
+    let fleet = agent("fleet-bot", DEFAULT_ORG);
+    h.manage(&fleet, "agent_retire", retire_args("twin-bot")).await.unwrap();
+    let e = h.manage(&fleet, "agent_forget", retire_args("twin-bot")).await.unwrap_err();
+    assert_eq!(reason(&e), "agent_label_ambiguous", "{e:?}");
+    assert_eq!(h.count("SELECT COUNT(*) FROM agents WHERE label = 'twin-bot' COLLATE NOCASE"), 2);
+    // With one spelling left, forget deletes exactly it.
+    h.sql("DELETE FROM agents WHERE label = 'Twin-bot';").unwrap();
+    h.manage(&fleet, "agent_forget", retire_args("twin-bot")).await.unwrap();
+    assert_eq!(h.count("SELECT COUNT(*) FROM agents WHERE label = 'twin-bot' COLLATE NOCASE"), 0);
+}
+
+#[tokio::test]
+async fn a_session_credential_is_refused_once_its_subject_is_another_organizations() {
+    let h = H::new();
+    let (b_device, b_lead) = (agent(B_DEVICE, ORG_B), agent(B_PEER, ORG_B));
+    h.ok(&b_device, "node_register", json!({ "node": B_NODE, "facts": facts(B_ROOT) })).await;
+    let item = h
+        .gated(
+            &b_lead,
+            "node_dispatch",
+            json!({ "node": B_NODE, "backend": "acp:claude", "prompt": "p", "cwd": format!("{B_ROOT}/repo") }),
+        )
+        .await["item_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    h.ok(&b_device, "node_claim", json!({ "node": B_NODE })).await;
+    let minted = h
+        .ok(&b_device, "node_session_credential", json!({ "node": B_NODE, "item_id": item, "attempt": 1 }))
+        .await;
+    let value = minted["credential"].as_str().unwrap().to_string();
+    let verify = |v: &str| ua_tools::families::node_queue::credentials::verify(&h.hub, v);
+    assert!(verify(&value).is_ok());
+    // The subject's label moves to the default organization (only SQL can
+    // do this): the credential's organization no longer holds it, so the
+    // credential is refused, as a managed token is.
+    h.sql(&format!(
+        "DELETE FROM agents WHERE label = '{B_DEVICE}';
+         INSERT INTO agents (org_id, label, created_at, updated_at) VALUES ('default', '{B_DEVICE}', 't0', 't0');"
+    ))
+    .unwrap();
+    assert_eq!(verify(&value).unwrap_err().check, "org_mismatch");
+}
+
+#[tokio::test]
+async fn agent_context_shows_the_hub_workspace_to_the_default_organization_only() {
+    let h = H::new();
+    let a = h.ok(&agent(A_AGENT, DEFAULT_ORG), "agent_context", json!({})).await;
+    assert!(a["workspace"].as_str().is_some_and(|w| !w.is_empty()), "{a}");
+    let b = h.ok(&agent(B_AGENT, ORG_B), "agent_context", json!({})).await;
+    assert_eq!(b["workspace"], Value::Null, "{b}");
 }
 
 // --- the insert guard --------------------------------------------------------------------------

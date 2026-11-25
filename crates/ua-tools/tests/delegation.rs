@@ -27,7 +27,22 @@ fn hub_with(cfg: impl FnOnce(&mut Config)) -> Hub {
     let mut c = Config::for_home(std::env::temp_dir());
     c.human_identities = vec!["operator".into()];
     cfg(&mut c);
-    Hub::in_memory(c).unwrap()
+    register_targets(Hub::in_memory(c).unwrap())
+}
+
+/// A delegation targets only a registered agent of the delegator's
+/// organization: register the agents these tests delegate to.
+fn register_targets(hub: Hub) -> Hub {
+    hub.db()
+        .write(|tx| {
+            tx.execute_batch(
+                "INSERT OR IGNORE INTO agents (org_id, label, created_at, updated_at) VALUES
+                     ('default', 'builder-1', 't0', 't0'), ('default', 'builder-2', 't0', 't0');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    hub
 }
 
 fn hub() -> Hub {
@@ -340,7 +355,7 @@ async fn cancel_is_for_the_delegator_or_assignee() {
 #[tokio::test]
 async fn concurrent_delegate_claim_has_one_winner() {
     let dir = tempfile::tempdir().unwrap();
-    let hub = Hub::open(Config::for_home(dir.path())).unwrap();
+    let hub = register_targets(Hub::open(Config::for_home(dir.path())).unwrap());
     let reg = builtin_registry();
     let id = delegate(&reg, &hub, &agent("lead-1"), "builder-1").await["delegation_id"].as_i64().unwrap();
     let mut handles = Vec::new();

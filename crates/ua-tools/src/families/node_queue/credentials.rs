@@ -646,6 +646,15 @@ fn decide(c: &Connection, hub: &Hub, token: &str, now: Timestamp) -> UaResult<De
     if hub.cfg().revoked_agents.iter().any(|r| r.eq_ignore_ascii_case(&agent)) || hub.cfg().is_human(&agent) {
         return Ok(Decision::Refuse("label_revoked", Some(id)));
     }
+    // Defence in depth, as for a managed token: the credential's
+    // organization must be the one holding its subject's label (a
+    // configuration-reserved label is the default organization's). The
+    // `_org_parent` triggers keep a credential in its item's organization,
+    // but nothing there ties the item's agent label to that organization.
+    let reserved = crate::families::agents::Reserved::of(hub.cfg());
+    if crate::families::agents::label_org(c, &reserved, &agent)?.is_some_and(|held| held != org) {
+        return Ok(Decision::Refuse("org_mismatch", Some(id)));
+    }
     let touch =
         last_used.as_deref().and_then(parse_ts).is_none_or(|t| (now - t).as_secs() >= LAST_USED_RESOLUTION_S);
     let tools: Vec<String> = serde_json::from_str::<Vec<String>>(&tools).unwrap_or_default();
