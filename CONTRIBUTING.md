@@ -14,6 +14,7 @@ requirements.
 | `ua-store` | SQLite access and the ledger. No tool logic. |
 | `ua-memory` | The memory domain: schema parts, note model, save, search, ranking, embeddings, lifecycle. Depends only on `ua-core` and `ua-store`, never on the `Registry`. Its tools are registered in `ua-tools` (`families/memory`), and adapters reach memory only through them; `ua-memory/tests/boundary.rs` fails if any other crate depends on it. |
 | `ua-deliverables` | The deliverable domain: schema parts, validation, reads and writes of deliverables and their revisions. Depends only on `ua-core` and `ua-store`, never on the `Registry`. Its tools are registered in `ua-tools` (`families/deliverables.rs`); `ua-deliverables/tests/dependencies.rs` fails if it gains another workspace dependency or any crate other than `ua-tools` depends on it. |
+| `ua-org` | The organization registry: offices, roles and seats. Depends only on `ua-core` and `ua-store`, never on the `Registry`. It reaches SQLite through `ua-store`'s `OrgRead` and `OrgWrite`. Its tools are registered in `ua-tools` (`families/org`), and adapters reach the registry only through them; `ua-org/tests/boundary.rs` fails if any other crate depends on it. |
 | `ua-tools` | Tools. Every tool is registered in the `Registry` and runs only through `Registry::call`. |
 | `ua-server` | Adapters (MCP, HTTP, UI). Adapters build a `Caller` and call the registry; they never run tool code directly. |
 | `ua-cli` | The `ua` binary. |
