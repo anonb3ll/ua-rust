@@ -151,6 +151,12 @@ const TENANT: &[&str] = &[
     "deliverable_revisions",
     "deliverable_files",
     "deliverable_releases",
+    // the organization registry (`ua-org`): org_id from birth, the generated
+    // triggers from `organization.v1.registry.tenant`
+    "offices",
+    "org_role_grants",
+    "org_seats",
+    "org_service_identities",
 ];
 
 /// Tenant tables that do not yet pass the tenant check. May only shrink.

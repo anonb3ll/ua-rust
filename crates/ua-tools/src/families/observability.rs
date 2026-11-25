@@ -1909,6 +1909,11 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         let shared = ctx.hub.shared_webhook_routes_for_report().await;
         ctx.hub.db().read_async(move |c| github_credentials_check(c, &cfg, &caller, shared.as_ref())).await?
     };
+    let registry = {
+        let org = ctx.caller.org_id.clone();
+        ctx.hub.db().read_async(move |c| super::org::registry_health(c, &org)).await?
+    };
+    let registry_status = if registry.live { LIVE } else { MISCONFIGURED };
     let cfg = ctx.hub.cfg();
     let reg = crate::builtin_registry_shared();
     let path = ctx.hub.db().path();
@@ -1947,6 +1952,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         github,
         hub_resource_check(&ctx.caller, "policy_file", "UA_POLICY_FILE", || policy_check(cfg)),
         fleet_nodes_check(&facts, cfg.node_require_acceptance, hub_reader),
+        finding("org_registry", registry_status, registry.detail, "org registry"),
         finding("edition", LIVE, format!("edition {}", cfg.edition), "UA_EDITION"),
     ];
     let mut summary: BTreeMap<String, i64> = ["live", "dormant", "degraded", "misconfigured", "unknown"]
@@ -2204,7 +2210,7 @@ pub fn register(r: &mut Registry) {
              code_intel, readability, mcp_gateway, mcp_server, slack_socket and embeddings, build.compiled_out_tools \
              the tools a disabled feature removes), semantic search (embeddings feature), ledger chain, database \
              size and WAL, schema parts, notification webhook, Slack ingress (HTTP routes and Socket Mode state) \
-             and policy file. Each finding names the setting that gates it. Never returns \
+             and policy file, and the org registry. Each finding names the setting that gates it. Never returns \
              secret values. refresh=true adds SQLite quick_check.",
             system_doctor,
         )
