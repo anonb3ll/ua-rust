@@ -390,7 +390,10 @@ async fn notifications_are_isolated_in_both_directions() {
     let rows = h.outbox();
     assert_eq!(rows[0].0, DEFAULT_ORG);
     // Organization B has no destination to resend to, so its text is not kept.
-    assert_eq!((rows[1].0.as_str(), rows[1].3.as_str(), rows[1].4.as_deref()), (ORG_B, "not_configured", None));
+    assert_eq!(
+        (rows[1].0.as_str(), rows[1].3.as_str(), rows[1].4.as_deref()),
+        (ORG_B, "not_configured", None)
+    );
     assert_eq!(h.count(&format!("SELECT chars FROM notify_outbox WHERE id = {b_id}")), 11);
 
     let ids = |v: &Value| -> Vec<i64> {
@@ -499,10 +502,18 @@ async fn notification_events_of_another_organization_carry_no_names() {
     let b_category = "falcon-board-alerts";
     let b_agent = Caller { label: "kestrel-notifier".into(), ..agent(ORG_B) };
     h.ok(&b_agent, "notify", json!({ "message": "beta secret one" })).await;
-    h.ok(&b_agent, "batch_notify", json!({ "messages": ["beta secret two"], "category": b_category, "flush_now": true }))
-        .await;
-    h.ok(&agent(DEFAULT_ORG), "batch_notify", json!({ "messages": ["alpha two"], "category": "drift", "flush_now": true }))
-        .await;
+    h.ok(
+        &b_agent,
+        "batch_notify",
+        json!({ "messages": ["beta secret two"], "category": b_category, "flush_now": true }),
+    )
+    .await;
+    h.ok(
+        &agent(DEFAULT_ORG),
+        "batch_notify",
+        json!({ "messages": ["alpha two"], "category": "drift", "flush_now": true }),
+    )
+    .await;
     let events: Vec<(String, String, String)> = h
         .hub
         .db()

@@ -1653,11 +1653,9 @@ mod tests {
         let b_hash = hub
             .db()
             .read(|c| {
-                Ok(c.query_row(
-                    "SELECT content_hash FROM skill_versions WHERE org_id = 'org-b'",
-                    [],
-                    |r| r.get::<_, String>(0),
-                )?)
+                Ok(c.query_row("SELECT content_hash FROM skill_versions WHERE org_id = 'org-b'", [], |r| {
+                    r.get::<_, String>(0)
+                })?)
             })
             .unwrap();
         for (channel, originator, payload) in &events {

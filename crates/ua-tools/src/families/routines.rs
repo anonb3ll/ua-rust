@@ -371,8 +371,7 @@ fn create_fire(
     // unsalted digest, which a guess could confirm: the event names the
     // hub-generated receipt row instead (`run:<id>`, unique per fire like the
     // key), and its originator is the neutral `system`.
-    let event_key =
-        if org == ua_core::DEFAULT_ORG { fire_key.to_string() } else { format!("run:{run_row}") };
+    let event_key = if org == ua_core::DEFAULT_ORG { fire_key.to_string() } else { format!("run:{run_row}") };
     ledger::append(
         tx,
         EventInput::new(ua_core::DEFAULT_ORG,

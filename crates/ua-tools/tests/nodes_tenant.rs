@@ -1284,9 +1284,12 @@ async fn the_doctor_counts_other_organizations_blocked_nodes_and_unsent_notices(
 async fn run_command(h: &H, lead: &Caller, device: &Caller, node: &str, root: &str, arg: &str) -> String {
     let params = json!({ "node": node, "argv": ["ls", arg], "cwd": format!("{root}/repo") });
     let parked = h.manage(lead, "node_command_start", params.clone()).await.unwrap_err();
-    let UaError::ApprovalRequired { approval_id, .. } = parked else { panic!("expected an approval: {parked:?}") };
+    let UaError::ApprovalRequired { approval_id, .. } = parked else {
+        panic!("expected an approval: {parked:?}")
+    };
     h.approve(approval_id);
-    let id = h.manage(lead, "node_command_start", params).await.unwrap()["item_id"].as_str().unwrap().to_string();
+    let id =
+        h.manage(lead, "node_command_start", params).await.unwrap()["item_id"].as_str().unwrap().to_string();
     let claimed = h.ok(device, "node_claim", json!({ "node": node })).await;
     assert_eq!(claimed["item"]["item_id"], id.as_str(), "{claimed}");
     let token = claimed["item"]["command"]["fence_token"].as_str().unwrap().to_string();
@@ -1319,7 +1322,9 @@ async fn a_command_notice_is_mailed_within_its_own_organization() {
     }
     assert_eq!(h.count(&format!("SELECT COUNT(*) FROM message_index WHERE recipient = '{B_LEAD}'")), 1);
     assert_eq!(
-        h.count(&format!("SELECT COUNT(*) FROM message_index WHERE org_id = '{DEFAULT_ORG}' AND recipient = '{B_LEAD}'")),
+        h.count(&format!(
+            "SELECT COUNT(*) FROM message_index WHERE org_id = '{DEFAULT_ORG}' AND recipient = '{B_LEAD}'"
+        )),
         0
     );
 
@@ -1356,9 +1361,10 @@ async fn an_owed_notice_of_another_organization_is_retried_within_it() {
     let h = H::new();
     h.fleet().await;
     let ts = "2026-01-01T00:00:00+00:00";
-    for (org, item, node, owner) in
-        [(ORG_B, "nd-00000000000000b1", NODE_B, B_LEAD), (DEFAULT_ORG, "nd-00000000000000a1", NODE_A, "lead-1")]
-    {
+    for (org, item, node, owner) in [
+        (ORG_B, "nd-00000000000000b1", NODE_B, B_LEAD),
+        (DEFAULT_ORG, "nd-00000000000000a1", NODE_A, "lead-1"),
+    ] {
         h.sql(&format!(
             "INSERT INTO node_dispatch (org_id, id, node, agent, backend, prompt, cwd, timeout_s, status, attempts, \
              created_by, created_at, updated_at) VALUES ('{org}', '{item}', '{node}', 'fake-agent', 'command', 'p', \
@@ -1368,7 +1374,9 @@ async fn an_owed_notice_of_another_organization_is_retried_within_it() {
         ))
         .unwrap();
     }
-    let sent = |item: &str| h.count(&format!("SELECT sent_at IS NOT NULL FROM node_command_notice WHERE item_id = '{item}'"));
+    let sent = |item: &str| {
+        h.count(&format!("SELECT sent_at IS NOT NULL FROM node_command_notice WHERE item_id = '{item}'"))
+    };
     ua_tools::families::node_queue::sweep(&h.hub, Some(NODE_B)).unwrap();
     assert_eq!((sent("nd-00000000000000b1"), sent("nd-00000000000000a1")), (1, 0));
     assert_eq!(
@@ -1378,7 +1386,9 @@ async fn an_owed_notice_of_another_organization_is_retried_within_it() {
     ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
     assert_eq!(sent("nd-00000000000000a1"), 1);
     assert_eq!(
-        h.count(&format!("SELECT COUNT(*) FROM message_index WHERE org_id = '{DEFAULT_ORG}' AND sender = 'hub-node'")),
+        h.count(&format!(
+            "SELECT COUNT(*) FROM message_index WHERE org_id = '{DEFAULT_ORG}' AND sender = 'hub-node'"
+        )),
         1
     );
 }

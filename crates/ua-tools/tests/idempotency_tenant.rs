@@ -572,9 +572,7 @@ fn expected_rows() -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     // Every writer escapes `%` and `/` in the organization id, so the
     // organization part of a key always ends at the first `/`.
-    for (org, prefix) in
-        [(DEFAULT_ORG, ""), (ORG_B, "org:org-b/"), (ORG_SLASH, "org:acme%2Fops/")]
-    {
+    for (org, prefix) in [(DEFAULT_ORG, ""), (ORG_B, "org:org-b/"), (ORG_SLASH, "org:acme%2Fops/")] {
         rows.push(format!("{org}|{prefix}delegate:lead-1:same|delegate"));
         rows.push(format!("{org}|{prefix}memory_save/builder-1/same|memory_save"));
         rows.push(format!("{org}|{prefix}message_send/builder-1/same|message_send"));
@@ -648,8 +646,12 @@ async fn an_interim_unescaped_receipt_still_replays_in_its_organization() {
         update
     );
     assert_eq!(
-        h.ok(&lead, "delegate", json!({ "task_spec": SPEC, "to_agent": "builder-1", "idempotency_key": "i3" }))
-            .await,
+        h.ok(
+            &lead,
+            "delegate",
+            json!({ "task_spec": SPEC, "to_agent": "builder-1", "idempotency_key": "i3" })
+        )
+        .await,
         delegated
     );
     let found = h
@@ -783,7 +785,8 @@ fn unscoped_reads(src: &str) -> Vec<String> {
         while let Some(i) = lower[at..].find(&pat).map(|i| at + i) {
             at = i + pat.len();
             let before_ok = i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphanumeric();
-            let after_ok = lower.as_bytes().get(at).is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_'));
+            let after_ok =
+                lower.as_bytes().get(at).is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_'));
             if !before_ok || !after_ok {
                 continue;
             }

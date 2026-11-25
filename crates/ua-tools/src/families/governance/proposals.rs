@@ -35,7 +35,8 @@
 //!
 //! An approval creates its task and marks the item approved in one write
 //! transaction. Every transition appends an `agent.work_proposal.*` event in
-//! the same transaction; payloads carry ids, statuses and digests only.
+//! the same transaction; payloads carry ids, statuses and digests only (and
+//! no digest for another organization's proposal, [`ledger_digest`]).
 //!
 //! **Organizations.** A proposal and its items carry the `org_id` of the
 //! caller that filed them, and every read and write is the caller's
@@ -437,6 +438,16 @@ fn emit(tx: &mut WriteTx<'_>, org: &str, kind: &str, by: &str, payload: Value) -
     Ok(())
 }
 
+/// A contract digest for an `agent.work_proposal.*` event: the digest for
+/// the default organization, `null` for another. The digest is an unsalted
+/// SHA-256 of the item's title, notes and scope, so in the default
+/// organization's ledger it would let anyone who can guess another
+/// organization's text confirm it. That organization still reads its digests
+/// on its own rows (`work_proposal_items`) and in its tasks' notes.
+fn ledger_digest(org: &str, digest: &str) -> Value {
+    if org == ua_core::DEFAULT_ORG { json!(digest) } else { Value::Null }
+}
+
 // --- file -----------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -514,7 +525,7 @@ pub(crate) async fn work_proposal_file(ctx: ToolCtx, a: FileArgs) -> UaResult<Va
                     "proposer": ledger_text(&org, &who),
                     "status": "pending",
                     "items": clean.len(),
-                    "digests": clean.iter().map(|c| c.digest.clone()).collect::<Vec<_>>(),
+                    "digests": clean.iter().map(|c| ledger_digest(&org, &c.digest)).collect::<Vec<_>>(),
                     "reporting_mode": mode,
                 }),
             )?;
@@ -664,7 +675,7 @@ pub(crate) async fn work_proposal_decide(ctx: ToolCtx, a: DecideArgs) -> UaResul
                     "item_rejected",
                     &who,
                     json!({ "proposal_id": pid, "index": d.index, "status": "rejected",
-                            "contract_digest": row.contract_digest }),
+                            "contract_digest": ledger_digest(&org, &row.contract_digest) }),
                 )?;
             }
             for d in a.decisions.iter().filter(|d| d.approve) {
@@ -706,7 +717,8 @@ pub(crate) async fn work_proposal_decide(ctx: ToolCtx, a: DecideArgs) -> UaResul
                     "item_approved",
                     &who,
                     json!({ "proposal_id": pid, "index": d.index, "status": "approved",
-                            "contract_digest": frozen.digest, "edited": edited, "task_id": task_id }),
+                            "contract_digest": ledger_digest(&org, &frozen.digest), "edited": edited,
+                            "task_id": task_id }),
                 )?;
             }
             refresh(tx, &org, &pid)?;
@@ -910,7 +922,7 @@ pub(crate) async fn work_proposal_recover(ctx: ToolCtx, a: RecoverArgs) -> UaRes
                             "item_recovered",
                             &actor,
                             json!({ "proposal_id": pid, "index": idx, "status": "approved",
-                                    "contract_digest": digest, "task_id": task_id }),
+                                    "contract_digest": ledger_digest(&org, &digest), "task_id": task_id }),
                         )?;
                         forward.push(json!({ "proposal_id": pid, "index": idx, "task_id": task_id }));
                     }
@@ -925,7 +937,8 @@ pub(crate) async fn work_proposal_recover(ctx: ToolCtx, a: RecoverArgs) -> UaRes
                             &org,
                             "item_rolled_back",
                             &actor,
-                            json!({ "proposal_id": pid, "index": idx, "status": "pending", "contract_digest": digest }),
+                            json!({ "proposal_id": pid, "index": idx, "status": "pending",
+                                    "contract_digest": ledger_digest(&org, &digest) }),
                         )?;
                         back.push(json!({ "proposal_id": pid, "index": idx }));
                     }
