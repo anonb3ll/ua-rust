@@ -226,11 +226,10 @@ fn delegation_row(c: &Connection, org: &str, id: i64) -> UaResult<Value> {
 /// The stored idempotency key of a delegation: per delegating agent, with
 /// `%`, `:` and `/` in its label percent-escaped (as `task_update`'s keys are),
 /// so the label ends at the first `:` after the tool name and two agents
-/// never share a stored key. `idempotency_keys` is still hub-wide, so another
-/// organization's key is prefixed with its organization
-/// (`crate::families::tasks::idem_key`) and never replays the default
-/// organization's receipt, or a third's; the default keeps the
-/// `delegate:<label>:<key>` form. Only a label holding `:` is stored
+/// never share a stored key. Receipts are keyed by `(org_id, key)` and read
+/// only in the caller's organization; another organization's key text also
+/// keeps its organization prefix (`crate::families::tasks::idem_key`), and
+/// the default keeps the `delegate:<label>:<key>` form. Only a label holding `:` is stored
 /// differently from before; [`legacy_receipt_key`] names its old form.
 fn receipt_key(org: &str, from_agent: &str, key: &str) -> String {
     crate::families::tasks::idem_key(org, "delegate", &format!("{}:{key}", escape_label(from_agent)))
@@ -270,12 +269,12 @@ fn org_emit(
     emit(tx, &neutral, channel, payload)
 }
 
-/// A stored receipt: (request digest, committed result).
-fn read_receipt(c: &Connection, key: &str) -> UaResult<Option<(String, Value)>> {
+/// A stored receipt of organization `org`: (request digest, committed result).
+fn read_receipt(c: &Connection, org: &str, key: &str) -> UaResult<Option<(String, Value)>> {
     let raw: Option<String> = c
         .query_row(
-            "SELECT result_json FROM idempotency_keys WHERE key = ?1 AND tool = 'delegate'",
-            [key],
+            "SELECT result_json FROM idempotency_keys WHERE org_id = ?1 AND key = ?2 AND tool = 'delegate'",
+            [org, key],
             |r| r.get(0),
         )
         .optional()?;
@@ -302,12 +301,17 @@ fn replay(existing: Option<(String, Value)>, digest: &str) -> UaResult<Option<Va
 /// unescaped key when its digest is this request's. The digest covers
 /// `from_agent`, so the old key never replays another agent's receipt; any
 /// other receipt there reads as none, and the request runs fresh.
-fn find_receipt(c: &Connection, keys: &(String, Option<String>), digest: &str) -> UaResult<Option<Value>> {
-    if let Some(done) = replay(read_receipt(c, &keys.0)?, digest)? {
+fn find_receipt(
+    c: &Connection,
+    org: &str,
+    keys: &(String, Option<String>),
+    digest: &str,
+) -> UaResult<Option<Value>> {
+    if let Some(done) = replay(read_receipt(c, org, &keys.0)?, digest)? {
         return Ok(Some(done));
     }
     if let Some(old) = &keys.1
-        && let Some((d, result)) = read_receipt(c, old)?
+        && let Some((d, result)) = read_receipt(c, org, old)?
         && d == digest
     {
         return Ok(Some(result));
@@ -554,7 +558,7 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
 
     // A committed retry replays before any gate: no second approval, no effect.
     if let Some(k) = rkeys.clone() {
-        let found = ctx.hub.db().read(|c| find_receipt(c, &k, &digest))?;
+        let found = ctx.hub.db().read(|c| find_receipt(c, &org, &k, &digest))?;
         if let Some(done) = found {
             return Ok(done);
         }
@@ -564,7 +568,7 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     let warnings: Vec<String> = check.warnings.clone();
     ctx.hub.db().write(|tx| {
         if let Some(k) = rkeys.as_ref()
-            && let Some(done) = find_receipt(tx, k, &digest)?
+            && let Some(done) = find_receipt(tx, &org, k, &digest)?
         {
             return Ok(done);
         }
@@ -656,8 +660,9 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
         }
         if let Some(k) = rkey.as_deref() {
             tx.execute(
-                "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, 'delegate', ?2, ?3)",
-                params![k, json!({ "digest": digest, "result": result }).to_string(), ts],
+                "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at) \
+                 VALUES (?1, ?2, 'delegate', ?3, ?4)",
+                params![org, k, json!({ "digest": digest, "result": result }).to_string(), ts],
             )?;
         }
         Ok(result)
@@ -671,13 +676,13 @@ fn lookup(ctx: &ToolCtx, a: LookupArgs) -> UaResult<Value> {
     let rkey = receipt_key(&org, &actor, &key);
     let old = legacy_receipt_key(&org, &actor, &key);
     let found = ctx.hub.db().read(|c| {
-        if let Some(hit) = read_receipt(c, &rkey)? {
+        if let Some(hit) = read_receipt(c, &org, &rkey)? {
             return Ok(Some(hit));
         }
         // A receipt under the old unescaped key counts only when its
         // delegation is this agent's: that key is shared with another label.
         let Some(old) = old else { return Ok(None) };
-        let Some((d, result)) = read_receipt(c, &old)? else { return Ok(None) };
+        let Some((d, result)) = read_receipt(c, &org, &old)? else { return Ok(None) };
         let Some(id) = result["delegation_id"].as_i64() else { return Ok(None) };
         let mine = c
             .query_row(

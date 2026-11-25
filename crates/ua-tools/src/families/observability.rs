@@ -952,6 +952,11 @@ struct DbFacts {
     quick_check: Option<String>,
     /// Registered nodes, or why they could not be read.
     fleet: Result<nodes::Fleet, String>,
+    /// Idempotency receipts the `idempotency.v2.tenant_keys` rebuild kept in
+    /// the default organization under an organization prefix no single
+    /// organization held (`families::idempotency::unplaced_rows`). A
+    /// hub-wide count, so only a default-organization reader gets it.
+    idempotency_unplaced: Option<i64>,
 }
 
 /// Database facts for `system_doctor`. The memory counts are organization
@@ -1000,6 +1005,9 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
         last_delivery,
         quick_check,
         fleet: nodes::fleet(c, ua_core::DEFAULT_ORG, Timestamp::now()).map_err(|e| e.to_string()),
+        idempotency_unplaced: (org == ua_core::DEFAULT_ORG)
+            .then(|| crate::families::idempotency::unplaced_rows(c).ok())
+            .flatten(),
     })
 }
 
@@ -1294,6 +1302,14 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
         }
         detail.push_str(&format!("; quick_check={q}"));
     }
+    // Informational: such a receipt never replays to anyone, it is kept
+    // rather than dropped (`docs/organization.md`, idempotency keys).
+    if let Some(n) = facts.idempotency_unplaced.filter(|n| *n > 0) {
+        detail.push_str(&format!(
+            "; {n} idempotency key(s) kept in the default organization under an organization prefix no \
+             organization holds"
+        ));
+    }
     let stats = json!({
         "file_bytes": main,
         "wal_bytes": wal,
@@ -1302,6 +1318,7 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
         "freelist_count": facts.freelist,
         "journal_mode": facts.journal_mode,
         "quick_check": facts.quick_check,
+        "idempotency_keys_unplaced": facts.idempotency_unplaced,
     });
     (finding("database", status, detail, "UA_DB_PATH"), stats)
 }

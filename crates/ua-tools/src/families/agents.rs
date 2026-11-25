@@ -1282,26 +1282,6 @@ async fn session_list(ctx: ToolCtx, a: SessionListArgs) -> UaResult<Value> {
         .await
 }
 
-/// One `/`-delimited part of a stored key: `%` and `/` escaped.
-fn key_part(s: &str) -> String {
-    s.replace('%', "%25").replace('/', "%2F")
-}
-
-/// The stored idempotency key of a `lifecycle_record` call.
-/// `idempotency_keys` is still a hub-wide table, so another organization's
-/// key is prefixed with its organization
-/// (`org:<org>/lifecycle/<session>/<kind>/<key>`, each part with `%` and `/`
-/// escaped) and never replays, probes or occupies the default
-/// organization's, or a third's. The default organization keeps the
-/// `lifecycle:<session>:<kind>:<key>` form byte for byte.
-fn lifecycle_key(org: &str, session: &str, kind: &str, key: &str) -> String {
-    if org == ua_core::DEFAULT_ORG {
-        format!("lifecycle:{session}:{kind}:{key}")
-    } else {
-        format!("org:{}/lifecycle/{}/{kind}/{}", key_part(org), key_part(session), key_part(key))
-    }
-}
-
 /// Drop excluded keys at any depth.
 fn strip_excluded(value: Value) -> Value {
     match value {
@@ -1332,9 +1312,11 @@ async fn lifecycle_record(ctx: ToolCtx, a: LifecycleArgs) -> UaResult<Value> {
     }
     let session_id = clean(a.session_id.as_deref());
     let task_id = a.task_id;
-    let org = ctx.caller.org_id.clone();
     let key = clean(a.idempotency_key.as_deref())
-        .map(|k| lifecycle_key(&org, session_id.as_deref().unwrap_or("_"), &kind, &k));
+        .map(|k| format!("lifecycle:{}:{kind}:{k}", session_id.as_deref().unwrap_or("_")));
+    // The key is the caller's organization's: another organization's use of
+    // the same session id, kind and key is a fresh capture, never a replay.
+    let org = ctx.caller.org_id.clone();
     let outcome = ctx
         .hub
         .db()
@@ -1343,8 +1325,9 @@ async fn lifecycle_record(ctx: ToolCtx, a: LifecycleArgs) -> UaResult<Value> {
             if let Some(k) = &key {
                 let cached: Option<String> = tx
                     .query_row(
-                        "SELECT result_json FROM idempotency_keys WHERE key = ?1 AND tool = 'lifecycle_record'",
-                        [k],
+                        "SELECT result_json FROM idempotency_keys \
+                         WHERE org_id = ?1 AND key = ?2 AND tool = 'lifecycle_record'",
+                        [org.as_str(), k.as_str()],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -1414,9 +1397,9 @@ async fn lifecycle_record(ctx: ToolCtx, a: LifecycleArgs) -> UaResult<Value> {
             });
             if let Some(k) = &key {
                 tx.execute(
-                    "INSERT INTO idempotency_keys (key, tool, result_json, created_at) \
-                     VALUES (?1, 'lifecycle_record', ?2, ?3)",
-                    params![k, out.to_string(), ua_core::time::now()],
+                    "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at) \
+                     VALUES (?1, ?2, 'lifecycle_record', ?3, ?4)",
+                    params![org, k, out.to_string(), ua_core::time::now()],
                 )?;
             }
             Ok(out)

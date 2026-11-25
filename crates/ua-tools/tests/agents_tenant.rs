@@ -998,8 +998,15 @@ async fn no_label_host_path_or_text_of_another_organization_reaches_the_ledger()
         "SELECT COUNT(*) FROM event_log WHERE originator IN ('{B_AGENT}', '{B_PEER}', 'b-human-not-real')"
     ));
     assert_eq!(b_events, 0, "{ledger}");
-    // The idempotency key of another organization is stored with its prefix.
-    assert_eq!(h.count("SELECT COUNT(*) FROM idempotency_keys WHERE key LIKE 'org:org-b/lifecycle/%'"), 1);
+    // The idempotency key of another organization is its own row of the
+    // `(org_id, key)` table, beside the default organization's same key.
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) FROM idempotency_keys WHERE org_id = '{ORG_B}' AND tool = 'lifecycle_record'"
+        )),
+        1
+    );
+    assert_eq!(h.count("SELECT COUNT(*) FROM idempotency_keys WHERE key LIKE 'org:%/lifecycle%'"), 0);
 }
 
 // --- the insert guard --------------------------------------------------------------------------

@@ -199,6 +199,13 @@ pub fn schema_parts() -> Vec<Part> {
     parts.push(families::node_queue::TENANT_KEYS.into());
     parts.push(families::node_queue::TENANT_PART.into());
     parts.push(families::node_queue::ORG_SCOPE.into());
+    // The idempotency receipts rebuilt with the organization in their key
+    // (`(org_id, key)`), each existing row placed by its interim
+    // organization prefix or else in the default organization, then their
+    // organization triggers. Before the agents parts: the rebuild reads
+    // `orgs`, and no other part reads this table.
+    parts.push(families::idempotency::TENANT_KEYS.into());
+    parts.push(families::idempotency::TENANT_PART.into());
     // The organization column and triggers of the nine agent and session
     // tables (no key rebuild: agent labels stay one hub-wide namespace, and
     // every other key is hub-generated or led by a label or a session id),

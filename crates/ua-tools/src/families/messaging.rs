@@ -84,8 +84,8 @@ CREATE TABLE IF NOT EXISTS message_reads (
 /// each message was sent, and a read receipt follows its message. Nothing is
 /// moved or dropped. No key rebuild: a message id and an event ulid are
 /// hub-minted, the receipt key is led by the message id, and a sender's
-/// client message id lives in `idempotency_keys`, prefixed per organization
-/// (see [`client_key`]).
+/// client message id lives in `idempotency_keys`, keyed by `(org_id, key)`
+/// and prefixed per organization (see [`client_key`]).
 pub const TENANT_PART: ua_store::Procedure =
     ua_store::org::tenant_part("organization.v1.tools.messaging", &["message_index", "message_reads"]);
 
@@ -745,12 +745,13 @@ fn unreserved(label: String) -> UaResult<String> {
 }
 
 /// The idempotency key of a client-chosen id, scoped to its organization
-/// and its sender. `idempotency_keys` is still a hub-wide table, so another
-/// organization's key is prefixed with its organization
-/// (`org:<org>/message_send/<sender>/<id>`) and can never replay, probe or
-/// occupy the default organization's, or a third's. Each part has `%` and
-/// `/` escaped, so an organization id containing `/` cannot spell another
-/// organization's prefix. The default organization's key is
+/// and its sender. `idempotency_keys` is keyed by `(org_id, key)` and read
+/// only in the sender's organization; another organization's key text also
+/// keeps its organization prefix (`org:<org>/message_send/<sender>/<id>`) as
+/// defence in depth, byte for byte the form it had before the rebuild, so it
+/// can never replay, probe or occupy the default organization's, or a
+/// third's. Each part has `%` and `/` escaped, so an organization id
+/// containing `/` cannot spell another organization's prefix. The default organization's key is
 /// `message_send/<sender>/<id>`, escaped the same way: byte for byte the
 /// earlier key, so its receipts still replay, for every sender and client id
 /// without `%` or `/` (a client id and a validated label never have one; a
@@ -770,11 +771,11 @@ fn key_part(s: &str) -> String {
     s.replace('%', "%25").replace('/', "%2F")
 }
 
-fn saved_send(conn: &Connection, key: &str) -> UaResult<Option<Value>> {
+fn saved_send(conn: &Connection, org: &str, key: &str) -> UaResult<Option<Value>> {
     let cached: Option<String> = conn
         .query_row(
-            "SELECT result_json FROM idempotency_keys WHERE key = ?1 AND tool = ?2",
-            params![key, SEND_TOOL],
+            "SELECT result_json FROM idempotency_keys WHERE org_id = ?1 AND key = ?2 AND tool = ?3",
+            params![org, key, SEND_TOOL],
             |r| r.get(0),
         )
         .optional()?;
@@ -794,8 +795,8 @@ fn saved_result(conn: &Connection, org: &str, client_id: &str, sender: &str) -> 
     // Before ids were scoped, a client id was the message id itself, under a
     // hub-wide key. The sender's own retry of such a send still finds it.
     // Every such key was the default organization's.
-    let legacy = || saved_send(conn, &format!("{SEND_TOOL}:{client_id}"));
-    let found = match saved_send(conn, &client_key(org, sender, client_id))? {
+    let legacy = || saved_send(conn, ua_core::DEFAULT_ORG, &format!("{SEND_TOOL}:{client_id}"));
+    let found = match saved_send(conn, org, &client_key(org, sender, client_id))? {
         Some(v) => Some(v),
         None if org == ua_core::DEFAULT_ORG => legacy()?.filter(|v| v["from_agent"].as_str() == Some(sender)),
         None => None,
@@ -821,7 +822,7 @@ fn saved_result(conn: &Connection, org: &str, client_id: &str, sender: &str) -> 
 /// under client id `id` when there is one, else `id` unchanged. Only the
 /// sender's own keys are consulted, so this reveals nothing about others.
 fn own_message_id(conn: &Connection, org: &str, sender: &str, id: String) -> UaResult<String> {
-    Ok(saved_send(conn, &client_key(org, sender, &id))?
+    Ok(saved_send(conn, org, &client_key(org, sender, &id))?
         .and_then(|v| v["message_id"].as_str().map(str::to_string))
         .unwrap_or(id))
 }
@@ -1238,8 +1239,8 @@ fn send(tx: &mut WriteTx<'_>, v: &Viewer, a: SendArgs, crew: Option<&str>) -> Ua
     }
     if let Some(client_id) = &given_id {
         tx.execute(
-            "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![client_key(org, &sender, client_id), SEND_TOOL, result.to_string(), ua_core::time::now()],
+            "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![org, client_key(org, &sender, client_id), SEND_TOOL, result.to_string(), ua_core::time::now()],
         )?;
     }
     Ok(result)
