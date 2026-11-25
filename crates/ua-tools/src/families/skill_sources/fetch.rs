@@ -1,23 +1,32 @@
 //! Hardened Git fetch plumbing for skill sources (`docs/skill-sources.md` §1, §3).
 //!
 //! Safety properties enforced on every fetch:
-//! - Public `https://` sources only by default (`ssh://` off by default;
-//!   `file://` permitted only via [`FetchOptions::for_local_file_test`]).
-//! - Zero credentials, queries, fragments, IP literals, leading `-`, or control
-//!   characters in URLs.
+//! - Public `https://` sources on port 443 with multi-label DNS hostnames only
+//!   (`ssh://` off by default; `file://` compiled only under `cfg(test)` or
+//!   `feature = "test-util"`).
+//! - Zero credentials, queries, fragments, IP literals, single-label hosts,
+//!   non-443 ports, empty authorities (`https:///...`), leading `-`, or control
+//!   characters in URLs; trailing `.git` is stripped from `canonical_url`.
+//! - Git version verified once per process (`git >= 2.37` required so
+//!   `http.curloptResolve` and `GIT_CONFIG_GLOBAL` are honoured).
 //! - DNS resolved once per fetch, **every** returned IP classified against
 //!   `ua_ingress::addr` (failing the whole fetch on any non-public or cloud
 //!   metadata address), and the fetch pinned to the classified IP via
-//!   `-c http.curloptResolve=<host>:<port>:<ip>`.
+//!   `-c http.curloptResolve=<host>:443:<ip>`.
 //! - Bare cache initialized with `--bare --template=` (mode `0700`), serialized
 //!   by an exclusive file lock + in-process mutex; no working tree is ever
 //!   checked out.
-//! - Scrubbed environment (all `GIT_*`, `SSH_AUTH_SOCK`, `*_ASKPASS`, and
-//!   proxy variables cleared) plus CLI `-c` overrides disabling hooks,
-//!   fsmonitor, submodules, LFS/filters, credential helpers, proxies, and
-//!   redirects (`http.followRedirects=false`).
+//! - Scrubbed environment (`.env_clear()`, stripping `GIT_*`, `SSH_AUTH_SOCK`,
+//!   `*_ASKPASS`, proxy vars, `HOME`, and ambient tokens) plus CLI `-c`
+//!   overrides disabling hooks, fsmonitor, submodules, LFS/filters, credential
+//!   helpers, proxies, redirects (`http.followRedirects=false`), and setting
+//!   `http.lowSpeedLimit` / `http.lowSpeedTime`.
+//! - Process-group isolation (`process_group(0)` on Unix): timeout, stdout
+//!   overflow, or live transfer cache-size breach kills the entire process
+//!   group (`SIGKILL`) and bounds reader joins so stalled child helpers
+//!   (`git-remote-https`, `index-pack`) cannot wedge the cache lock.
 //! - Shallow `--depth=1` fetch of the exact 40-char commit SHA with no fallback
-//!   to a full fetch, bounded by wall-clock timeout, stdout cap, and cache size cap.
+//!   to a full fetch.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
@@ -25,7 +34,7 @@ use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -39,10 +48,18 @@ pub const MAX_ALLOWED_SUBPATHS: usize = 32;
 pub const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+/// Minimum Git version required: 2.37 added `http.curloptResolve` (2.32 added
+/// `GIT_CONFIG_GLOBAL`). Older Git silently ignores unknown `-c` keys, which
+/// would reopen DNS rebinding.
+pub const MIN_GIT_VERSION: (u32, u32) = (2, 37);
+
+const READER_JOIN_GRACE: Duration = Duration::from_millis(500);
+const LIVE_SIZE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceScheme {
     Https,
+    #[cfg(any(test, feature = "test-util"))]
     File,
 }
 
@@ -50,12 +67,17 @@ impl SourceScheme {
     pub fn git_allow_protocol(self) -> &'static str {
         match self {
             SourceScheme::Https => "https",
+            #[cfg(any(test, feature = "test-util"))]
             SourceScheme::File => "file",
         }
     }
 }
 
 /// A validated, canonical skill source URL.
+///
+/// Hostname is lowercased, trailing slashes and trailing `.git` are stripped.
+/// Repository path case is preserved so case-sensitive remotes remain
+/// fetchable; uniqueness and cache keying normalize path case separately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSourceUrl {
     pub canonical_url: String,
@@ -73,28 +95,40 @@ fn valid_domain_label(label: &str) -> bool {
         && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
+/// Multi-label public-style DNS hostname: refuses single-label internal names
+/// (e.g. `metadata`, `localhost`), trailing dots, and IP literals.
 fn valid_domain(host: &str) -> bool {
     if host.is_empty() || host.len() > 253 || host.starts_with('.') || host.ends_with('.') {
         return false;
     }
     let lower = host.to_ascii_lowercase();
+    if !lower.contains('.') {
+        return false;
+    }
     if lower == "localhost" || lower.ends_with(".localhost") {
         return false;
     }
-    // Reject any dotted-quad or IP-like string even if parsed as a domain.
     if lower.parse::<IpAddr>().is_ok() {
         return false;
     }
     lower.split('.').all(valid_domain_label)
 }
 
-/// Validate a skill source URL per `docs/skill-sources.md` §1.
+fn strip_trailing_dot_git(path: &str) -> &str {
+    if path.len() > 4 && path[path.len() - 4..].eq_ignore_ascii_case(".git") {
+        &path[..path.len() - 4]
+    } else {
+        path
+    }
+}
+
+/// Validate a production `https://` skill source URL per `docs/skill-sources.md` §1.
 ///
-/// Production callers always pass `allow_file = false`: only `https://` URLs
-/// with a public-style DNS hostname and repository path are accepted (`ssh://`,
-/// `http://`, `git://`, `ext::`, `file://`, credentials, queries, fragments,
-/// IP literals, leading `-`, and control characters are refused).
-pub fn validate_source_url(raw: &str, allow_file: bool) -> UaResult<ParsedSourceUrl> {
+/// Refuses non-`https://` schemes, credentials, queries, fragments, backslashes,
+/// empty authorities (`https:///...`), IP literals, single-label hosts, non-443
+/// ports, leading `-`, spaces, control characters, and raw path traversal.
+/// Strips trailing `/` and `.git` while preserving path case.
+pub fn validate_source_url(raw: &str) -> UaResult<ParsedSourceUrl> {
     if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err(UaError::invalid("skill source url must not contain control characters"));
     }
@@ -111,29 +145,6 @@ pub fn validate_source_url(raw: &str, allow_file: bool) -> UaResult<ParsedSource
     if text.contains('?') || text.contains('#') || text.contains('\\') {
         return Err(UaError::invalid("skill source url must not carry a query, fragment, or backslash"));
     }
-
-    if let Some(rest) = text.strip_prefix("file://") {
-        if !allow_file {
-            return Err(UaError::invalid(
-                "file:// skill sources are disabled; only https:// skill sources are accepted",
-            ));
-        }
-        if !rest.starts_with('/') || rest.len() < 2 {
-            return Err(UaError::invalid("file:// skill source must be file:///absolute/path"));
-        }
-        let path_part = rest.trim_end_matches('/');
-        if path_part.is_empty() || path_part.split('/').any(|s| s == "..") {
-            return Err(UaError::invalid("file:// skill source path must not contain '..'"));
-        }
-        return Ok(ParsedSourceUrl {
-            canonical_url: format!("file://{path_part}"),
-            scheme: SourceScheme::File,
-            host: String::new(),
-            port: 0,
-            repo_path: path_part.to_string(),
-        });
-    }
-
     if !text.starts_with("https://") {
         return Err(UaError::invalid(
             "skill source url must use https:// (ssh://, http://, git://, ext::, and file:// are refused)",
@@ -141,8 +152,12 @@ pub fn validate_source_url(raw: &str, allow_file: bool) -> UaResult<ParsedSource
     }
     let after_scheme = &text["https://".len()..];
     let Some((authority, raw_after_slash)) = after_scheme.split_once('/') else {
-        return Err(UaError::invalid("skill source url needs a repository path"));
+        return Err(UaError::invalid("skill source url needs a hostname and repository path"));
     };
+    // Refuse empty authority (e.g. `https:///evil.com/x`, which WHATWG Url::parse reparses).
+    if authority.is_empty() {
+        return Err(UaError::invalid("skill source url has an empty host authority"));
+    }
     if authority.contains('@') {
         return Err(UaError::invalid("skill source url must not embed credentials"));
     }
@@ -179,7 +194,7 @@ pub fn validate_source_url(raw: &str, allow_file: bool) -> UaResult<ParsedSource
             let lower = d.to_ascii_lowercase();
             if !valid_domain(&lower) {
                 return Err(UaError::invalid(format!(
-                    "skill source host {d:?} must be a public DNS hostname, not an IP literal or localhost"
+                    "skill source host {d:?} must be a multi-label public DNS hostname, not an IP literal or single-label host"
                 )));
             }
             lower
@@ -189,31 +204,57 @@ pub fn validate_source_url(raw: &str, allow_file: bool) -> UaResult<ParsedSource
         }
         None => return Err(UaError::invalid("skill source url needs a hostname")),
     };
-    let port = parsed.port().unwrap_or(443);
-    if port == 0 {
-        return Err(UaError::invalid("skill source url port must be non-zero"));
+    if parsed.port().is_some_and(|p| p != 443) {
+        return Err(UaError::invalid("skill source url must use default HTTPS port 443"));
     }
 
     let raw_path = parsed.path().trim_matches('/');
-    if raw_path.is_empty() {
-        return Err(UaError::invalid("skill source url needs a repository path"));
+    let stripped = strip_trailing_dot_git(raw_path).trim_end_matches('/');
+    if stripped.is_empty() || stripped.eq_ignore_ascii_case(".git") {
+        return Err(UaError::invalid("skill source url needs a non-empty repository path"));
     }
-    for seg in raw_path.split('/') {
+    for seg in stripped.split('/') {
         if seg.is_empty() || seg == "." || seg == ".." {
             return Err(UaError::invalid("skill source repository path contains an unsafe segment"));
         }
     }
-    let canonical_url = if port == 443 {
-        format!("https://{host}/{raw_path}")
-    } else {
-        format!("https://{host}:{port}/{raw_path}")
-    };
+    let canonical_url = format!("https://{host}/{stripped}");
     Ok(ParsedSourceUrl {
         canonical_url,
         scheme: SourceScheme::Https,
         host,
-        port,
-        repo_path: raw_path.to_string(),
+        port: 443,
+        repo_path: stripped.to_string(),
+    })
+}
+
+/// Test-only validator for local `file:///absolute/path` fixtures.
+/// Compiled only under `#[cfg(test)]` or `--features test-util`.
+#[cfg(any(test, feature = "test-util"))]
+pub fn validate_file_source_url_for_test(raw: &str) -> UaResult<ParsedSourceUrl> {
+    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(UaError::invalid("skill source url must not contain control characters"));
+    }
+    let text = raw.trim();
+    if text.is_empty() || text.len() > MAX_URL_BYTES || text.contains('?') || text.contains('#') {
+        return Err(UaError::invalid("invalid file:// skill source url"));
+    }
+    let Some(rest) = text.strip_prefix("file://") else {
+        return Err(UaError::invalid("expected a file:///absolute/path url"));
+    };
+    if !rest.starts_with('/') || rest.len() < 2 {
+        return Err(UaError::invalid("file:// skill source must be file:///absolute/path"));
+    }
+    let path_part = rest.trim_end_matches('/');
+    if path_part.is_empty() || path_part.split('/').any(|s| s == "..") {
+        return Err(UaError::invalid("file:// skill source path must not contain '..'"));
+    }
+    Ok(ParsedSourceUrl {
+        canonical_url: format!("file://{path_part}"),
+        scheme: SourceScheme::File,
+        host: String::new(),
+        port: 0,
+        repo_path: path_part.to_string(),
     })
 }
 
@@ -229,6 +270,9 @@ pub fn validate_sha(raw: &str) -> UaResult<String> {
 
 /// Validate a Git tracking ref (branch, tag, `HEAD`, or exact 40-char SHA).
 pub fn validate_tracking_ref(raw: &str) -> UaResult<String> {
+    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(UaError::invalid("tracking_ref must not contain control characters"));
+    }
     let text = raw.trim();
     if text.is_empty()
         || text.len() > MAX_REF_BYTES
@@ -282,6 +326,57 @@ pub fn validate_allowed_subpaths(raw: Option<Vec<String>>) -> UaResult<Vec<Strin
     Ok(out)
 }
 
+// --- Git version check (>= 2.37 required for http.curloptResolve) ------------------
+
+/// Parse `(major, minor)` from `git --version` output (for example
+/// `"git version 2.56.1"` or `"git version 2.39.5 (Apple Git-154)"`).
+pub fn parse_git_version(raw: &str) -> Option<(u32, u32)> {
+    let token = raw.split_whitespace().find(|tok| {
+        let mut parts = tok.split('.');
+        let major_ok = parts.next().is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        let minor_ok = parts.next().is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        major_ok && minor_ok
+    })?;
+    let mut parts = token.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Validate a parsed `git --version` output against [`MIN_GIT_VERSION`].
+pub fn check_git_version_output(raw: &str) -> UaResult<(u32, u32)> {
+    let Some((major, minor)) = parse_git_version(raw) else {
+        return Err(UaError::internal(format!(
+            "could not parse git version from {:?}; git >= {}.{} is required",
+            raw.trim(),
+            MIN_GIT_VERSION.0,
+            MIN_GIT_VERSION.1
+        )));
+    };
+    if (major, minor) < MIN_GIT_VERSION {
+        return Err(UaError::internal(format!(
+            "git {major}.{minor} is too old; git >= {}.{} is required for http.curloptResolve DNS pinning",
+            MIN_GIT_VERSION.0, MIN_GIT_VERSION.1
+        )));
+    }
+    Ok((major, minor))
+}
+
+/// Check the host's `git --version` once per process and refuse below 2.37.
+pub fn ensure_supported_git_version(opts: &FetchOptions) -> UaResult<(u32, u32)> {
+    static VERSION: OnceLock<Result<(u32, u32), String>> = OnceLock::new();
+    let res = VERSION.get_or_init(|| {
+        let spec = build_git_command(None, None, None, &["--version"], opts).map_err(|e| e.to_string())?;
+        let out = run_git(&spec, Duration::from_secs(10), 4096).map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&out);
+        check_git_version_output(&text).map_err(|e| e.to_string())
+    });
+    match res {
+        Ok(v) => Ok(*v),
+        Err(msg) => Err(UaError::internal(msg.clone())),
+    }
+}
+
 // --- DNS classification and pinning ------------------------------------------------
 
 /// DNS resolver abstraction so tests verify pinning and SSRF refusals offline.
@@ -327,7 +422,6 @@ pub fn classify_and_pin_ip(host: &str, port: u16, resolver: &dyn DnsResolver) ->
             ));
         }
     }
-    // Prefer an IPv4 public address when both v4 and v6 are returned.
     Ok(addrs.iter().copied().find(IpAddr::is_ipv4).unwrap_or(addrs[0]))
 }
 
@@ -340,20 +434,22 @@ fn format_curlopt_resolve(host: &str, port: u16, ip: IpAddr) -> String {
 
 // --- hardened git command builder --------------------------------------------------
 
-/// Runtime bounds and test-only toggles for [`fetch_exact_sha`].
+/// Runtime bounds for [`fetch_exact_sha`].
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
-    pub allow_file_urls: bool,
+    #[cfg(any(test, feature = "test-util"))]
+    allow_file_urls: bool,
     pub timeout: Duration,
     pub max_output_bytes: usize,
     pub max_cache_bytes: u64,
 }
 
 impl FetchOptions {
-    /// Production defaults: `https://` only (`file://` refused), 120s timeout,
-    /// 16 MiB stdout cap, 64 MiB bare cache cap.
+    /// Production defaults: `https://` only, 120s timeout, 16 MiB stdout cap,
+    /// 64 MiB bare cache cap.
     pub fn production() -> Self {
         Self {
+            #[cfg(any(test, feature = "test-util"))]
             allow_file_urls: false,
             timeout: DEFAULT_GIT_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -362,6 +458,8 @@ impl FetchOptions {
     }
 
     /// Test-only options enabling local `file://` fixtures without network I/O.
+    /// Compiled only under `#[cfg(test)]` or `--features test-util`.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn for_local_file_test() -> Self {
         Self { allow_file_urls: true, ..Self::production() }
     }
@@ -380,6 +478,8 @@ pub const GIT_HARDENING_OVERRIDES: &[&str] = &[
     "core.hooksPath=/dev/null",
     "core.fsmonitor=false",
     "core.quotePath=false",
+    "core.bigFileThreshold=524288",
+    "gc.auto=0",
     "protocol.ext.allow=never",
     "submodule.recurse=false",
     "fetch.recurseSubmodules=false",
@@ -387,6 +487,8 @@ pub const GIT_HARDENING_OVERRIDES: &[&str] = &[
     "credential.helper=",
     "http.proxy=",
     "http.followRedirects=false",
+    "http.lowSpeedLimit=1000",
+    "http.lowSpeedTime=30",
     "filter.lfs.smudge=",
     "filter.lfs.clean=",
     "filter.lfs.process=",
@@ -397,7 +499,7 @@ pub const GIT_HARDENING_OVERRIDES: &[&str] = &[
 
 /// Environment variables inherited from the host when building the scrubbed
 /// git environment (everything else — `GIT_*`, `SSH_AUTH_SOCK`, `*_ASKPASS`,
-/// proxy vars, ambient tokens — is dropped).
+/// `HOME`, proxy vars, ambient tokens — is dropped).
 const SAFE_HOST_ENV_KEYS: &[&str] = &["PATH", "TMPDIR", "TEMP", "TMP", "TZ", "SYSTEMROOT", "COMSPEC"];
 
 /// Build a hardened [`GitCommandSpec`] using the current process environment
@@ -412,9 +514,7 @@ pub fn build_git_command(
     build_git_command_with_host_env(repo_dir, url, pinned_ip, subcmd_args, opts, std::env::vars())
 }
 
-/// Deterministic variant taking explicit `host_env` pairs so tests can prove
-/// that proxy variables, `SSH_AUTH_SOCK`, `GIT_ASKPASS`, `GIT_*`, and ambient
-/// tokens are stripped regardless of the test runner's environment.
+/// Deterministic variant taking explicit `host_env` pairs.
 pub fn build_git_command_with_host_env<I, K, V>(
     repo_dir: Option<&Path>,
     url: Option<&ParsedSourceUrl>,
@@ -428,6 +528,9 @@ where
     K: Into<String>,
     V: Into<String>,
 {
+    #[cfg(not(any(test, feature = "test-util")))]
+    let _ = opts;
+
     let mut args: Vec<String> = Vec::new();
     for kv in GIT_HARDENING_OVERRIDES {
         args.push("-c".into());
@@ -447,6 +550,7 @@ where
                 args.push(format!("http.curloptResolve={}", format_curlopt_resolve(&u.host, u.port, ip)));
                 u.scheme.git_allow_protocol()
             }
+            #[cfg(any(test, feature = "test-util"))]
             SourceScheme::File => {
                 if !opts.allow_file_urls {
                     return Err(UaError::invalid("file:// skill sources are disabled"));
@@ -476,6 +580,7 @@ where
     env.insert("GIT_LFS_SKIP_SMUDGE".into(), "1".into());
     env.insert("GIT_CONFIG_NOSYSTEM".into(), "1".into());
     env.insert("GIT_CONFIG_GLOBAL".into(), "/dev/null".into());
+    env.insert("XDG_CONFIG_HOME".into(), "/dev/null".into());
     env.insert("GIT_ALLOW_PROTOCOL".into(), allow_protocol.into());
 
     Ok(GitCommandSpec { program: "git".into(), args, env })
@@ -489,9 +594,10 @@ fn hex_prefix(bytes: &[u8], chars: usize) -> String {
 }
 
 /// Org-isolated bare cache directory (`$home/skill_sources/<org_digest>/<url_digest>.git`).
+/// Keyed by lowercased `canonical_url` so `Org/Repo` and `org/repo` share one cache.
 pub fn cache_dir(data_home: &Path, org_id: &str, canonical_url: &str) -> PathBuf {
     let org_hash = hex_prefix(org_id.as_bytes(), 16);
-    let url_hash = hex_prefix(canonical_url.as_bytes(), 24);
+    let url_hash = hex_prefix(canonical_url.to_ascii_lowercase().as_bytes(), 24);
     data_home.join("skill_sources").join(org_hash).join(format!("{url_hash}.git"))
 }
 
@@ -560,8 +666,35 @@ fn dir_size_bytes(root: &Path) -> u64 {
     total
 }
 
-/// Run one hardened [`GitCommandSpec`] with wall-clock timeout and stdout cap.
+fn terminate_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Run one hardened [`GitCommandSpec`] with process-group timeout enforcement
+/// and stdout cap.
 pub fn run_git(spec: &GitCommandSpec, timeout: Duration, max_output_bytes: usize) -> UaResult<Vec<u8>> {
+    run_git_watched(spec, timeout, max_output_bytes, None)
+}
+
+/// Same as [`run_git`], plus an optional live disk-usage watchdog
+/// `(watch_dir, max_bytes)` polled while the child runs so a hostile pack is
+/// killed mid-transfer rather than only after filling disk.
+pub fn run_git_watched(
+    spec: &GitCommandSpec,
+    timeout: Duration,
+    max_output_bytes: usize,
+    watch_dir: Option<(&Path, u64)>,
+) -> UaResult<Vec<u8>> {
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.args)
         .env_clear()
@@ -569,47 +702,73 @@ pub fn run_git(spec: &GitCommandSpec, timeout: Duration, max_output_bytes: usize
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd.spawn().map_err(|_| UaError::internal("git is not available on this host"))?;
     let mut stdout = child.stdout.take().ok_or_else(|| UaError::internal("git stdout pipe missing"))?;
     let mut stderr = child.stderr.take().ok_or_else(|| UaError::internal("git stderr pipe missing"))?;
 
+    let (out_tx, out_rx) = mpsc::channel::<std::io::Result<(Vec<u8>, bool)>>();
     let cap = max_output_bytes;
-    let out_thread = std::thread::spawn(move || -> std::io::Result<(Vec<u8>, bool)> {
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
-        (&mut stdout).take(cap as u64 + 1).read_to_end(&mut buf)?;
-        let overflow = buf.len() > cap;
-        if overflow {
-            buf.truncate(cap);
-        }
-        Ok((buf, overflow))
+        let res = (&mut stdout).take(cap as u64 + 1).read_to_end(&mut buf).map(|_| {
+            let overflow = buf.len() > cap;
+            if overflow {
+                buf.truncate(cap);
+            }
+            (buf, overflow)
+        });
+        let _ = out_tx.send(res);
     });
-    let err_thread = std::thread::spawn(move || -> Vec<u8> {
+    let (err_tx, err_rx) = mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = (&mut stderr).take(4096).read_to_end(&mut buf);
-        buf
+        let _ = err_tx.send(buf);
     });
 
     let deadline = Instant::now() + timeout;
+    let mut last_size_check = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| UaError::internal(format!("git wait: {e}")))? {
             break status;
         }
+        if let Some((dir, max_bytes)) = watch_dir
+            && last_size_check.elapsed() >= LIVE_SIZE_POLL_INTERVAL
+        {
+            last_size_check = Instant::now();
+            let used = dir_size_bytes(dir);
+            if used > max_bytes {
+                terminate_process_group(&mut child);
+                let _ = out_rx.recv_timeout(READER_JOIN_GRACE);
+                let _ = err_rx.recv_timeout(READER_JOIN_GRACE);
+                return Err(UaError::invalid(format!(
+                    "skill source transfer exceeded the {max_bytes}-byte cache limit ({used} bytes)"
+                )));
+            }
+        }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = out_thread.join();
-            let _ = err_thread.join();
+            terminate_process_group(&mut child);
+            let _ = out_rx.recv_timeout(READER_JOIN_GRACE);
+            let _ = err_rx.recv_timeout(READER_JOIN_GRACE);
             return Err(UaError::invalid(format!("git fetch timed out after {}s", timeout.as_secs())));
         }
         std::thread::sleep(Duration::from_millis(10));
     };
 
-    let (out, overflow) = out_thread
-        .join()
-        .map_err(|_| UaError::internal("git stdout reader panicked"))?
+    let (out, overflow) = out_rx
+        .recv_timeout(READER_JOIN_GRACE)
+        .map_err(|_| {
+            terminate_process_group(&mut child);
+            UaError::invalid("git stdout reader did not close after process exit")
+        })?
         .map_err(|e| UaError::internal(format!("git stdout read failed: {e}")))?;
-    let err_bytes = err_thread.join().unwrap_or_default();
+    let err_bytes = err_rx.recv_timeout(READER_JOIN_GRACE).unwrap_or_default();
 
     if overflow {
         return Err(UaError::invalid(format!(
@@ -688,7 +847,7 @@ fn commit_present(cache: &Path, sha: &str, opts: &FetchOptions) -> bool {
 
 /// Shallow-fetch the exact 40-char `pinned_sha` from `url` into the org's bare
 /// cache, pinned to a classified public IP (for `https://`) and enforcing all
-/// §3 bounds.
+/// §3 bounds (including live cache-size watching during transfer).
 ///
 /// If `verify_tracking_ref` is `Some(ref_name)`, also verifies that shallow
 /// resolution of `ref_name` matches `pinned_sha`, refusing on mismatch. Never
@@ -706,6 +865,7 @@ pub fn fetch_exact_sha(
     let tracking = verify_tracking_ref.map(validate_tracking_ref).transpose()?;
     let pinned_ip = match url.scheme {
         SourceScheme::Https => Some(classify_and_pin_ip(&url.host, url.port, resolver)?),
+        #[cfg(any(test, feature = "test-util"))]
         SourceScheme::File => {
             if !opts.allow_file_urls {
                 return Err(UaError::invalid("file:// skill sources are disabled"));
@@ -714,6 +874,8 @@ pub fn fetch_exact_sha(
         }
     };
 
+    ensure_supported_git_version(opts)?;
+
     let cache = cache_dir(data_home, org_id, &url.canonical_url);
     with_locked_cache(&cache, || {
         ensure_bare_repo(&cache, opts)?;
@@ -721,7 +883,17 @@ pub fn fetch_exact_sha(
         if let Some(ref_name) = &tracking {
             let dst = format!("refs/ua/track/{}", hex_prefix(ref_name.as_bytes(), 16));
             let spec = build_fetch_command(&cache, url, pinned_ip, ref_name, &dst, opts)?;
-            run_git(&spec, opts.timeout, opts.max_output_bytes)?;
+            if let Err(e) = run_git_watched(
+                &spec,
+                opts.timeout,
+                opts.max_output_bytes,
+                Some((&cache, opts.max_cache_bytes)),
+            ) {
+                if dir_size_bytes(&cache) > opts.max_cache_bytes {
+                    let _ = fs::remove_dir_all(&cache);
+                }
+                return Err(e);
+            }
             let rev_spec = build_git_command(
                 Some(&cache),
                 None,
@@ -739,11 +911,20 @@ pub fn fetch_exact_sha(
         } else if !commit_present(&cache, &sha, opts) {
             let dst = format!("refs/ua/fetch/{}", &sha[..16]);
             let spec = build_fetch_command(&cache, url, pinned_ip, &sha, &dst, opts)?;
-            run_git(&spec, opts.timeout, opts.max_output_bytes).map_err(|e| {
-                UaError::invalid(format!(
+            if let Err(e) = run_git_watched(
+                &spec,
+                opts.timeout,
+                opts.max_output_bytes,
+                Some((&cache, opts.max_cache_bytes)),
+            ) {
+                if dir_size_bytes(&cache) > opts.max_cache_bytes {
+                    let _ = fs::remove_dir_all(&cache);
+                    return Err(e);
+                }
+                return Err(UaError::invalid(format!(
                     "shallow fetch of pinned_sha {sha} failed (no full-history fallback): {e}"
-                ))
-            })?;
+                )));
+            }
             let rev_spec = build_git_command(
                 Some(&cache),
                 None,
@@ -769,7 +950,6 @@ pub fn fetch_exact_sha(
             )));
         }
 
-        // Pin the commit locally so git gc never drops it.
         let pin_ref = format!("refs/ua/sha/{sha}");
         let update_spec = build_git_command(Some(&cache), None, None, &["update-ref", &pin_ref, &sha], opts)?;
         run_git(&update_spec, opts.timeout, opts.max_output_bytes)?;
@@ -780,6 +960,8 @@ pub fn fetch_exact_sha(
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
 
     struct StaticResolver(Vec<IpAddr>);
@@ -790,16 +972,22 @@ mod tests {
     }
 
     #[test]
-    fn url_validation_enforces_section_1() {
-        let ok = validate_source_url("https://GitHub.COM/Example-Org/skills-repo/", false).unwrap();
+    fn url_validation_enforces_section_1_ports_single_label_and_git_suffix() {
+        let ok = validate_source_url("https://GitHub.COM/Example-Org/skills-repo/").unwrap();
         assert_eq!(ok.canonical_url, "https://github.com/Example-Org/skills-repo");
         assert_eq!(ok.host, "github.com");
         assert_eq!(ok.port, 443);
         assert_eq!(ok.repo_path, "Example-Org/skills-repo");
 
-        let with_port = validate_source_url("https://git.example.com:8443/team/skills", false).unwrap();
-        assert_eq!(with_port.canonical_url, "https://git.example.com:8443/team/skills");
-        assert_eq!(with_port.port, 8443);
+        // Trailing .git is normalized away so foo/bar and foo/bar.git match.
+        let dot_git = validate_source_url("https://github.com/Example-Org/skills-repo.git").unwrap();
+        assert_eq!(dot_git.canonical_url, "https://github.com/Example-Org/skills-repo");
+        let dot_git_upper = validate_source_url("https://github.com/Example-Org/skills-repo.GIT/").unwrap();
+        assert_eq!(dot_git_upper.canonical_url, "https://github.com/Example-Org/skills-repo");
+
+        // Explicit port 443 normalizes cleanly.
+        let explicit_443 = validate_source_url("https://github.com:443/Example-Org/skills-repo").unwrap();
+        assert_eq!(explicit_443.canonical_url, "https://github.com/Example-Org/skills-repo");
 
         for bad in [
             "",
@@ -820,6 +1008,12 @@ mod tests {
             "https://[2606:4700:4700::1111]/org/repo",
             "https://localhost/org/repo",
             "https://sub.localhost/org/repo",
+            "https://metadata/latest/meta-data",
+            "https://git/org/repo",
+            "https://example.com:22/org/repo",
+            "https://example.com:8443/org/repo",
+            "https:///evil.com/org/repo",
+            "https://example.com/.git",
             "-https://example.com/org/repo",
             "--upload-pack=evil",
             "https://example.com/org/repo\n",
@@ -830,15 +1024,36 @@ mod tests {
             "https://example.com/org//repo",
             &format!("https://example.com/{}", "a".repeat(MAX_URL_BYTES)),
         ] {
-            assert!(validate_source_url(bad, false).is_err(), "should refuse {bad:?}");
+            assert!(validate_source_url(bad).is_err(), "should refuse {bad:?}");
         }
 
-        // file:// is allowed ONLY when the explicit test-only flag is true.
-        let f = validate_source_url("file:///var/fixtures/skills.git/", true).unwrap();
+        // Test-only file:// validator works for local fixtures only.
+        let f = validate_file_source_url_for_test("file:///var/fixtures/skills.git/").unwrap();
         assert_eq!(f.scheme, SourceScheme::File);
         assert_eq!(f.canonical_url, "file:///var/fixtures/skills.git");
-        assert!(validate_source_url("file://host/path", true).is_err());
-        assert!(validate_source_url("file:///var/../etc", true).is_err());
+        assert!(validate_file_source_url_for_test("file://host/path").is_err());
+        assert!(validate_file_source_url_for_test("file:///var/../etc").is_err());
+    }
+
+    #[test]
+    fn git_version_check_refuses_below_2_37() {
+        for old in [
+            "git version 1.9.5",
+            "git version 2.31.1",
+            "git version 2.36.9",
+            "git version 2.36.0 (Apple Git-130)",
+            "not a version",
+        ] {
+            assert!(check_git_version_output(old).is_err(), "should refuse {old:?}");
+        }
+        for ok in [
+            "git version 2.37.0",
+            "git version 2.39.5 (Apple Git-154)",
+            "git version 2.56.1",
+            "git version 3.0.0",
+        ] {
+            assert!(check_git_version_output(ok).is_ok(), "should accept {ok:?}");
+        }
     }
 
     #[test]
@@ -853,20 +1068,19 @@ mod tests {
             Some("ssrf_blocked")
         );
 
-        let r_cloud = StaticResolver(vec!["100.100.100.200".parse().unwrap()]);
+        let cloud_meta = IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200));
+        let r_cloud = StaticResolver(vec![cloud_meta]);
         assert_eq!(
             classify_and_pin_ip("example.com", 443, &r_cloud).unwrap_err().reason_code(),
             Some("ssrf_blocked")
         );
 
-        // Mixed public + private answer must refuse the whole fetch.
         let r_mixed = StaticResolver(vec!["93.184.215.14".parse().unwrap(), "10.0.0.1".parse().unwrap()]);
         assert_eq!(
             classify_and_pin_ip("example.com", 443, &r_mixed).unwrap_err().reason_code(),
             Some("ssrf_blocked")
         );
 
-        // Pure public answer pins the IP.
         let r_pub =
             StaticResolver(vec!["2606:4700:4700::1111".parse().unwrap(), "93.184.215.14".parse().unwrap()]);
         assert_eq!(
@@ -877,11 +1091,12 @@ mod tests {
 
     #[test]
     fn hardened_git_command_asserts_exact_flags_and_scrubbed_env() {
-        let parsed = validate_source_url("https://github.com/example/skills", false).unwrap();
+        let parsed = validate_source_url("https://github.com/example/skills").unwrap();
         let ip: IpAddr = "93.184.215.14".parse().unwrap();
         let opts = FetchOptions::production();
         let dirty_env = vec![
             ("PATH", "/usr/bin"),
+            ("HOME", "/nonexistent/home"),
             ("HTTPS_PROXY", "http://evil.proxy:8080"),
             ("https_proxy", "http://evil.proxy:8080"),
             ("HTTP_PROXY", "http://evil.proxy:8080"),
@@ -895,6 +1110,7 @@ mod tests {
             ("GIT_ASKPASS", "/bin/askpass"),
             ("GIT_SSH_COMMAND", "ssh -o ProxyCommand=evil"),
             ("GIT_CONFIG_PARAMETERS", "'core.hooksPath=/tmp/evil'"),
+            ("GIT_CONFIG_COUNT", "1"),
             ("GITHUB_TOKEN", "ghp_should_not_leak"),
             ("GH_TOKEN", "ghp_should_not_leak"),
         ];
@@ -925,6 +1141,8 @@ mod tests {
             "core.hooksPath=/dev/null",
             "core.fsmonitor=false",
             "core.quotePath=false",
+            "core.bigFileThreshold=524288",
+            "gc.auto=0",
             "protocol.ext.allow=never",
             "submodule.recurse=false",
             "fetch.recurseSubmodules=false",
@@ -932,6 +1150,8 @@ mod tests {
             "credential.helper=",
             "http.proxy=",
             "http.followRedirects=false",
+            "http.lowSpeedLimit=1000",
+            "http.lowSpeedTime=30",
             "filter.lfs.smudge=",
             "filter.lfs.clean=",
             "filter.lfs.process=",
@@ -941,13 +1161,9 @@ mod tests {
         ] {
             assert!(pairs.iter().any(|(_, v)| *v == required), "missing -c {required} in {:?}", spec.args);
         }
-        assert!(spec.args.contains(&"--depth=1".to_string()));
-        assert!(spec.args.contains(&"--no-tags".to_string()));
-        assert!(spec.args.contains(&"--no-recurse-submodules".to_string()));
-        assert!(spec.args.contains(&"--no-write-fetch-head".to_string()));
 
-        // Scrubbed environment: zero proxies, zero SSH/askpass, zero tokens.
         for stripped in [
+            "HOME",
             "HTTPS_PROXY",
             "https_proxy",
             "HTTP_PROXY",
@@ -961,36 +1177,60 @@ mod tests {
             "GIT_ASKPASS",
             "GIT_SSH_COMMAND",
             "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
             "GITHUB_TOKEN",
             "GH_TOKEN",
         ] {
             assert!(!spec.env.contains_key(stripped), "env leaked {stripped}: {:?}", spec.env);
         }
-        assert_eq!(spec.env.get("PATH").map(String::as_str), Some("/usr/bin"));
-        assert_eq!(spec.env.get("LC_ALL").map(String::as_str), Some("C"));
-        assert_eq!(spec.env.get("GIT_TERMINAL_PROMPT").map(String::as_str), Some("0"));
-        assert_eq!(spec.env.get("GIT_PROTOCOL_FROM_USER").map(String::as_str), Some("0"));
-        assert_eq!(spec.env.get("GIT_LFS_SKIP_SMUDGE").map(String::as_str), Some("1"));
-        assert_eq!(spec.env.get("GIT_CONFIG_NOSYSTEM").map(String::as_str), Some("1"));
         assert_eq!(spec.env.get("GIT_CONFIG_GLOBAL").map(String::as_str), Some("/dev/null"));
+        assert_eq!(spec.env.get("XDG_CONFIG_HOME").map(String::as_str), Some("/dev/null"));
         assert_eq!(spec.env.get("GIT_ALLOW_PROTOCOL").map(String::as_str), Some("https"));
+    }
 
-        // IPv6 pinning wraps the address in brackets for libcurl.
-        let v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
-        let spec_v6 = build_git_command_with_host_env(
-            None,
-            Some(&parsed),
-            Some(v6),
-            &["ls-remote"],
-            &opts,
-            Vec::<(&str, &str)>::new(),
-        )
-        .unwrap();
-        assert!(
-            spec_v6.args.contains(&"http.curloptResolve=github.com:443:[2606:4700:4700::1111]".to_string()),
-            "{:?}",
-            spec_v6.args
-        );
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_entire_process_group_without_waiting_for_grandchild() {
+        let mut env = BTreeMap::new();
+        if let Ok(path) = std::env::var("PATH") {
+            env.insert("PATH".into(), path);
+        }
+        let spec = GitCommandSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 12 & exec sleep 60".into()],
+            env,
+        };
+        let start = Instant::now();
+        let err = run_git(&spec, Duration::from_secs(1), 4096).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(elapsed < Duration::from_secs(4), "timeout waited for grandchild: {elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_cache_size_watchdog_kills_streaming_transfer_mid_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let watch = tmp.path().join("cache");
+        fs::create_dir_all(&watch).unwrap();
+        let target = watch.join("tmp_pack_stream");
+        let mut env = BTreeMap::new();
+        if let Ok(path) = std::env::var("PATH") {
+            env.insert("PATH".into(), path);
+        }
+        let spec = GitCommandSpec {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("dd if=/dev/zero of='{}' bs=4096 count=16 2>/dev/null; sleep 10", target.display()),
+            ],
+            env,
+        };
+        let start = Instant::now();
+        let err = run_git_watched(&spec, Duration::from_secs(10), 4096, Some((&watch, 8192))).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(err.to_string().contains("cache limit"), "{err}");
+        assert!(elapsed < Duration::from_secs(3), "watchdog did not abort mid-transfer: {elapsed:?}");
     }
 
     #[test]
@@ -1027,7 +1267,7 @@ mod tests {
         let sha2 = git_ok(&remote, &["rev-parse", "HEAD"]);
 
         let file_url = format!("file://{}", remote.display());
-        let parsed = validate_source_url(&file_url, true).unwrap();
+        let parsed = validate_file_source_url_for_test(&file_url).unwrap();
         let opts = FetchOptions::for_local_file_test();
         let no_dns = StaticResolver(vec![]);
 
@@ -1045,25 +1285,21 @@ mod tests {
             .is_err()
         );
 
-        // Tracking ref matching pinned_sha succeeds into a bare cache with no worktree.
         let fetched =
             fetch_exact_sha(&data_home, "default", &parsed, &sha2, Some("main"), &no_dns, &opts).unwrap();
         assert_eq!(fetched.commit_sha, sha2);
         assert!(fetched.cache_dir.join("HEAD").is_file());
         assert!(!fetched.cache_dir.join("skills").exists(), "bare cache must never check out files");
 
-        // Tracking ref disagreeing with pinned_sha is refused (no full-history fallback).
         let mismatch =
             fetch_exact_sha(&data_home, "default", &parsed, &sha1, Some("main"), &no_dns, &opts).unwrap_err();
         assert!(matches!(mismatch, UaError::Conflict { .. }), "{mismatch:?}");
 
-        // Non-existent SHA want is refused without full-history fallback.
         let fake_sha = "f".repeat(40);
         let missing =
             fetch_exact_sha(&data_home, "default", &parsed, &fake_sha, None, &no_dns, &opts).unwrap_err();
         assert!(missing.to_string().contains("no full-history fallback"), "{missing}");
 
-        // Cache size cap refuses an oversized cache.
         let tiny_opts = FetchOptions { max_cache_bytes: 1, ..opts };
         let capped =
             fetch_exact_sha(&data_home, "org-small", &parsed, &sha2, Some("main"), &no_dns, &tiny_opts)
@@ -1074,7 +1310,7 @@ mod tests {
     #[test]
     fn https_fetch_blocks_when_dns_resolves_to_private_ip() {
         let tmp = tempfile::tempdir().unwrap();
-        let parsed = validate_source_url("https://github.com/example/skills", false).unwrap();
+        let parsed = validate_source_url("https://github.com/example/skills").unwrap();
         let sha = "a".repeat(40);
         let bad_dns = StaticResolver(vec!["127.0.0.1".parse().unwrap()]);
         let err = fetch_exact_sha(

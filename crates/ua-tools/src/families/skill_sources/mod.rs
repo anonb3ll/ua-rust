@@ -58,7 +58,13 @@ CREATE TABLE IF NOT EXISTS skill_sources (
 CREATE INDEX IF NOT EXISTS idx_skill_sources_org_status
     ON skill_sources(org_id, status, added_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_sources_org_url_active
-    ON skill_sources(org_id, canonical_url) WHERE status = 'active';
+    ON skill_sources(org_id, lower(canonical_url)) WHERE status = 'active';
+CREATE TRIGGER IF NOT EXISTS skill_sources_revoke_terminal
+BEFORE UPDATE ON skill_sources
+WHEN OLD.status = 'revoked'
+BEGIN
+    SELECT RAISE(ABORT, 'revoked skill sources are terminal and cannot be modified');
+END;
 ",
 };
 
@@ -183,7 +189,7 @@ pub(crate) fn source_add(ctx: &ToolCtx, p: SourceAddParams) -> UaResult<Value> {
 }
 
 pub(crate) fn source_add_as(ctx: &ToolCtx, who: String, p: SourceAddParams) -> UaResult<Value> {
-    let parsed = validate_source_url(&p.url, false)?;
+    let parsed = validate_source_url(&p.url)?;
     let tracking_ref = validate_tracking_ref(p.tracking_ref.as_deref().unwrap_or("HEAD"))?;
     let pinned_sha = validate_sha(&p.pinned_sha)?;
     let allowed_subpaths = validate_allowed_subpaths(p.allowed_subpaths)?;
@@ -198,7 +204,7 @@ pub(crate) fn source_add_as(ctx: &ToolCtx, who: String, p: SourceAddParams) -> U
                 .query_row(
                     &format!(
                         "SELECT {SOURCE_COLS} FROM skill_sources \
-                         WHERE org_id = ?1 AND canonical_url = ?2 AND status = 'active' LIMIT 1"
+                         WHERE org_id = ?1 AND lower(canonical_url) = lower(?2) AND status = 'active' LIMIT 1"
                     ),
                     params![org, parsed.canonical_url],
                     source_row,
@@ -214,6 +220,23 @@ pub(crate) fn source_add_as(ctx: &ToolCtx, who: String, p: SourceAddParams) -> U
                 return Err(UaError::conflict(format!(
                     "an active skill source ({}) already exists for {:?}; revoke it before adding a replacement",
                     row.id, parsed.canonical_url
+                )));
+            }
+
+            // §1 "fresh pinned_sha": refuse re-adding a previously revoked commit SHA
+            // for this repository in this organization.
+            let revoked_same_sha: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM skill_sources \
+                     WHERE org_id = ?1 AND lower(canonical_url) = lower(?2) \
+                     AND pinned_sha = ?3 AND status = 'revoked' LIMIT 1",
+                    params![org, parsed.canonical_url, pinned_sha],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(prev_id) = revoked_same_sha {
+                return Err(UaError::conflict(format!(
+                    "pinned_sha {pinned_sha} was previously revoked on source {prev_id}; re-adding requires a fresh pinned_sha"
                 )));
             }
 
