@@ -1392,3 +1392,55 @@ async fn an_owed_notice_of_another_organization_is_retried_within_it() {
         1
     );
 }
+
+/// A suspended organization's owed notices are skipped, not attempted (the
+/// mailbox would refuse them, and failures at the head of the queue would
+/// fill every batch); they go out once it is active again.
+#[tokio::test]
+async fn a_suspended_organizations_notices_wait_without_blocking_others() {
+    let h = H::new();
+    h.fleet().await;
+    let ts = "2026-01-01T00:00:00+00:00";
+    let mut b_items = Vec::new();
+    for n in 0..55 {
+        let item = format!("nd-00000000000b{n:04}");
+        h.sql(&format!(
+            "INSERT INTO node_dispatch (org_id, id, node, agent, backend, prompt, cwd, timeout_s, status, attempts, \
+             created_by, created_at, updated_at) VALUES ('{ORG_B}', '{item}', '{NODE_B}', 'fake-agent', 'command', \
+             'p', '/srv', 60, 'finished', 1, '{B_LEAD}', '{ts}', '{ts}'); \
+             INSERT INTO node_command_notice (org_id, item_id, attempt, terminal, owner_agent, body, created_at) \
+             VALUES ('{ORG_B}', '{item}', 1, 'finished', '{B_LEAD}', 'fake done', '{ts}');"
+        ))
+        .unwrap();
+        b_items.push(item);
+    }
+    let later = "2026-01-02T00:00:00+00:00";
+    h.sql(&format!(
+        "INSERT INTO node_dispatch (org_id, id, node, agent, backend, prompt, cwd, timeout_s, status, attempts, \
+         created_by, created_at, updated_at) VALUES ('{DEFAULT_ORG}', 'nd-00000000000000a9', '{NODE_A}', \
+         'fake-agent', 'command', 'p', '/srv', 60, 'finished', 1, 'lead-1', '{later}', '{later}'); \
+         INSERT INTO node_command_notice (org_id, item_id, attempt, terminal, owner_agent, body, created_at) \
+         VALUES ('{DEFAULT_ORG}', 'nd-00000000000000a9', 1, 'finished', 'lead-1', 'fake done', '{later}'); \
+         UPDATE orgs SET status = 'suspended' WHERE id = '{ORG_B}';"
+    ))
+    .unwrap();
+    let swept = ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
+    assert_eq!(swept["notices_delivered"], 1, "{swept}");
+    assert_eq!(
+        h.count("SELECT COUNT(*) FROM node_command_notice WHERE org_id = 'default' AND sent_at IS NULL"),
+        0
+    );
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) FROM node_command_notice WHERE org_id = '{ORG_B}' AND sent_at IS NULL \
+             AND last_error IS NULL"
+        )),
+        55
+    );
+    h.sql(&format!("UPDATE orgs SET status = 'active' WHERE id = '{ORG_B}'")).unwrap();
+    let swept = ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
+    assert_eq!(swept["notices_delivered"], 50, "{swept}");
+    ua_tools::families::node_queue::sweep(&h.hub, None).unwrap();
+    assert_eq!(h.count("SELECT COUNT(*) FROM node_command_notice WHERE sent_at IS NULL"), 0);
+    assert_eq!(h.count(&format!("SELECT COUNT(*) FROM message_index WHERE org_id = '{ORG_B}'")), 55);
+}

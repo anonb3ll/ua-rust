@@ -217,7 +217,10 @@ pub(crate) enum NoticeScope<'a> {
 /// organization) in that organization's mailbox, its owner session is looked
 /// up there, and another organization's message event keeps no content in
 /// the default ledger (`messaging::send_system`). A notice is never mailed
-/// through another organization's mailbox.
+/// through another organization's mailbox. A suspended organization's
+/// notices are left owed, not attempted: the mailbox refuses it, and failing
+/// notices at the head of the queue would otherwise fill every batch. They
+/// go out once it is active again (the doctor counts them meanwhile).
 pub(crate) fn deliver_pending(hub: &Hub, scope: NoticeScope<'_>) -> UaResult<usize> {
     let (org, item, node) = match scope {
         NoticeScope::Item(o, i) => (Some(o.to_string()), Some(i.to_string()), None),
@@ -230,6 +233,7 @@ pub(crate) fn deliver_pending(hub: &Hub, scope: NoticeScope<'_>) -> UaResult<usi
             "SELECT n.org_id, n.item_id, n.attempt, n.terminal, n.owner_agent, n.body, n.task_id \
              FROM node_command_notice n \
              WHERE n.sent_at IS NULL AND (?3 IS NULL OR n.org_id = ?3) AND (?1 IS NULL OR n.item_id = ?1) \
+             AND EXISTS (SELECT 1 FROM orgs o WHERE o.id = n.org_id AND o.status = 'active') \
              AND (?2 IS NULL OR n.item_id IN \
                   (SELECT d.id FROM node_dispatch d WHERE d.org_id = n.org_id AND d.node = ?2)) \
              ORDER BY n.created_at LIMIT 50",
