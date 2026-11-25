@@ -179,23 +179,29 @@ impl Destination {
     }
 
     /// Pending publication keeps its private staging name until a receipt
-    /// commits. Inspect it under the same database write lock as publication.
+    /// commits. Inspect both names under the publication write lock.
     pub fn check_unpublished(&self, staging: &str, name: &str) -> UaResult<()> {
         let staged = match fs::statat(&self.fd, staging, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => stat,
-            Err(Errno::NOENT) => return Ok(()),
+            Ok(stat) => Some(stat),
+            Err(Errno::NOENT) => None,
             Err(e) => return Err(file_error(e)),
         };
-        if FileType::from_raw_mode(staged.st_mode) == FileType::RegularFile && staged.st_nlink == 1 {
+        if staged.as_ref().is_some_and(|stat| {
+            FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_nlink == 1
+        }) {
             return Ok(());
         }
         match fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) if (stat.st_dev, stat.st_ino) == (staged.st_dev, staged.st_ino) => {
+            Ok(stat)
+                if staged
+                    .is_some_and(|staged| (staged.st_dev, staged.st_ino) == (stat.st_dev, stat.st_ino)) =>
+            {
                 return Err(UaError::conflict_code(
                     "release_already_published",
                     "a published file release cannot be cancelled",
                 ));
             }
+            Err(Errno::NOENT) if staged.is_none() => return Ok(()),
             Ok(_) | Err(Errno::NOENT) => {}
             Err(e) => return Err(file_error(e)),
         }

@@ -113,6 +113,7 @@ A verified human operator can call `deliverable_release_cancel(approval_id)`
 when an authorized release can no longer proceed. Use the approval ID of the
 stalled release. The hub checks the original release directory and refuses
 if publication occurred or the staging state makes publication uncertain.
+An existing destination with a missing staged file is treated as uncertain.
 Cancellation drops the pending bytes and frees the revision and destination
 reservations in the same transaction as the cancellation event. The consumed
 approval and the cancellation record remain in the audit trail. The hub

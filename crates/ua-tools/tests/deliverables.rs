@@ -757,6 +757,9 @@ mod file_releases {
         fs::hard_link(&stage, &dest).unwrap();
         let cancel = json!({"approval_id": id});
         assert_eq!(reason(&f.h.err(&human(), CANCEL, cancel.clone()).await), "release_already_published");
+        fs::remove_file(&stage).unwrap();
+        assert_eq!(reason(&f.h.err(&human(), CANCEL, cancel.clone()).await), "release_publication_uncertain");
+        fs::hard_link(&dest, &stage).unwrap();
         let moved = f.destination.join("moved.txt");
         fs::rename(&dest, &moved).unwrap();
         assert_eq!(reason(&f.h.err(&human(), CANCEL, cancel).await), "release_publication_uncertain");
