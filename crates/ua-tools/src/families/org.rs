@@ -22,6 +22,15 @@ pub fn schema_parts() -> Vec<SchemaPart> {
     ua_org::schema_parts()
 }
 
+/// `organization.v1.registry.tenant`: the generated `_org_exists` and
+/// `_org_immutable` triggers of the four registry tables. They already carry
+/// `org_id NOT NULL`, so this part adds no column and backfills nothing.
+/// Applied after `organization.registry.v1` (see `ua_tools::schema_parts`).
+pub const TENANT_PART: ua_store::Procedure = ua_store::org::tenant_part(
+    "organization.v1.registry.tenant",
+    &["offices", "org_role_grants", "org_seats", "org_service_identities"],
+);
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReadArgs {
