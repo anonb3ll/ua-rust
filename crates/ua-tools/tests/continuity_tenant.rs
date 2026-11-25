@@ -745,7 +745,8 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     ] {
         let e = h.coord_err(&ghost, action, params).await;
         assert_eq!(reason(&e), "unknown_organization", "{action}: {e}");
-        assert!(e.to_string().contains("no task was changed"), "{action}: {e}");
+        // The registry refuses the organization before the tool runs.
+        assert!(e.to_string().contains("nothing ran and nothing was written"), "{action}: {e}");
     }
     assert_eq!(h.snapshot(), before);
     assert_eq!(h.events(), events);

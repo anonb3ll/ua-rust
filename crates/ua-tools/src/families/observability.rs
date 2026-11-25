@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use ua_core::time::{format_ts, parse_ts};
-use ua_core::{Config, UaError, UaResult};
+use ua_core::{Caller, Config, UaError, UaResult};
 use ua_store::ledger;
 
 use crate::families::agents::{self, AgentContextArgs, AgentListArgs};
@@ -1097,6 +1097,23 @@ fn approval_check(cfg: &Config, reg: &Registry) -> Value {
     finding("approval_gating", status, detail, "UA_APPROVAL_TOOLS, UA_HUMAN_IDENTITIES")
 }
 
+/// A check of the hub's own filesystem (the vault, the workspace), which
+/// belongs to the default organization. Another organization's caller gets
+/// one neutral line, the same whatever the hub holds, and the check never
+/// runs for it: it learns neither whether the path exists nor whether a
+/// directory is writable (`docs/organization.md`, hub resources).
+fn hub_filesystem_check(
+    caller: &Caller,
+    capability: &str,
+    gate: &str,
+    check: impl FnOnce() -> Value,
+) -> Value {
+    if caller.org_id == ua_core::DEFAULT_ORG {
+        return check();
+    }
+    finding(capability, DORMANT, "not available to this organization", gate)
+}
+
 fn vault_check(cfg: &Config) -> Value {
     let gate = "UA_VAULT_PATH, UA_VAULT_WRITE_DIRS";
     let Some(vault) = &cfg.vault_path else {
@@ -1792,8 +1809,10 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         hub_auth_check(cfg, &facts),
         bind_check(cfg),
         approval_check(cfg, reg),
-        vault_check(cfg),
-        workspace_check(cfg),
+        hub_filesystem_check(&ctx.caller, "vault", "UA_VAULT_PATH, UA_VAULT_WRITE_DIRS", || vault_check(cfg)),
+        hub_filesystem_check(&ctx.caller, "workspace_root", "UA_WORKSPACE, UA_AGENT_WORKSPACES", || {
+            workspace_check(cfg)
+        }),
         search_check(reg),
         build_features_check(),
         embeddings_check(&facts),

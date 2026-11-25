@@ -837,11 +837,10 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     assert_eq!(reason(&e), "unknown_organization", "{e:?}");
     assert_eq!(h.counts(), before);
 
-    // Reads in an unknown organization see nothing: the default
-    // organization's node answers as unregistered there.
+    // Reads in an unknown organization are refused too: the registry
+    // refuses the organization before any tool runs.
     let e = h.config(&ghost, NODE, json!({})).await.unwrap_err();
-    assert_eq!(e.code(), "not_found", "{e:?}");
-    let status = h.ok(&ghost, "harness_config_status", json!({})).await;
-    assert_eq!(status["active"], Value::Null);
-    assert_eq!(status["pending_proposals"], 0);
+    assert_eq!(reason(&e), "unknown_organization", "{e:?}");
+    let e = h.call(&ghost, "harness_config_status", json!({})).await.unwrap_err();
+    assert_eq!(reason(&e), "unknown_organization", "{e:?}");
 }

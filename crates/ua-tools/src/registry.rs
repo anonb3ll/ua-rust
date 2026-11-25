@@ -575,6 +575,7 @@ impl Registry {
         let Some(def) = self.tools.get(name) else {
             return Err(UaError::not_found(format!("unknown tool {name:?}")));
         };
+        require_caller_org(hub, caller).await?;
 
         // A hub-internal identity with a narrow grant may make only the calls
         // the grant names, whatever its profile or enforce_profile say.
@@ -753,6 +754,43 @@ impl Registry {
         }
 
         Ok(Admitted { caller, args, policy_gated, reservation, route, route_policy_gated })
+    }
+}
+
+/// Refuse a caller whose organization `orgs` does not hold, or holds as
+/// suspended, before anything runs: no handler, no grant or policy
+/// evaluation, no `tool_calls` row and no decision event (an event or row
+/// for an organization that does not exist could not be written anyway).
+///
+/// One primary-key read per call of another organization. The default
+/// organization is seeded with the schema and cannot be deleted, so its
+/// callers, every caller today, skip it. It is checked here rather than
+/// only when a credential resolves because the registry is the one path
+/// every caller takes (HTTP and MCP credentials, the hub's own per
+/// organization jobs, stdio, tests), and rather than cached because a
+/// suspension must apply to the next call.
+async fn require_caller_org(hub: &Hub, caller: &Caller) -> UaResult<()> {
+    if caller.org_id == ua_core::DEFAULT_ORG {
+        return Ok(());
+    }
+    let org = caller.org_id.clone();
+    let status: Option<String> = hub
+        .db()
+        .read_async(move |c| {
+            use rusqlite::OptionalExtension;
+            Ok(c.query_row("SELECT status FROM orgs WHERE id = ?1", [&org], |r| r.get(0)).optional()?)
+        })
+        .await?;
+    match status.as_deref() {
+        Some("active") => Ok(()),
+        None => Err(UaError::denied(
+            "unknown_organization",
+            format!("unknown organization {:?}; nothing ran and nothing was written", caller.org_id),
+        )),
+        Some(_) => Err(UaError::denied(
+            "organization_suspended",
+            format!("organization {:?} is suspended; nothing ran and nothing was written", caller.org_id),
+        )),
     }
 }
 

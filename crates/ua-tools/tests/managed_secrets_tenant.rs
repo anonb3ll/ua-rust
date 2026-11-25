@@ -875,6 +875,73 @@ async fn a_stdio_mcp_server_refuses_another_organizations_caller_without_secrets
     assert_ne!(reason(&e), "org_unsupported", "{e:?}");
 }
 
+/// A Streamable HTTP server is reached from the hub's network position
+/// (here loopback), so another organization's caller is refused its `call`
+/// and live `list` even when it injects no secret, before the policy, the
+/// slot, any approval or any connection: the listener sees no connection
+/// attempt. A static `list` reads only the registration and is not refused.
+/// The default organization's caller does connect, which shows the listener
+/// would have seen one.
+#[tokio::test]
+async fn a_secretless_http_mcp_server_refuses_another_organizations_caller() {
+    if !cfg!(feature = "mcp-gateway") {
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = H::with(|c| {
+        c.mcp_servers.insert(
+            "lan-docs".into(),
+            json!({
+                "transport": "streamable_http",
+                "url": format!("http://127.0.0.1:{port}/mcp"),
+                "address_scope": "loopback",
+                "tools": { "echo": "read", "store": "write" },
+                "read_profiles": ["developer", "operator"],
+                "review_expires_at": "2099-01-01",
+                "timeout_s": 1,
+            }),
+        );
+    });
+    let approvals = || {
+        h.hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    };
+    let before = approvals();
+    let dev = |c: Caller| Caller { profile: Profile::Developer, ..c };
+    for who in [agent(ORG_B), human(ORG_B)] {
+        let gw = dev(who);
+        for args in [
+            json!({ "server": "lan-docs", "tool": "echo" }),
+            json!({ "server": "lan-docs", "tool": "store", "arguments": { "k": "fake" } }),
+            json!({ "action": "list", "server": "lan-docs", "live": true }),
+        ] {
+            let e = h.err(&gw, "mcp_gateway", args.clone()).await;
+            assert_eq!(reason(&e), "org_unsupported", "{args}: {e:?}");
+            assert!(e.to_string().contains("hub's"), "{e:?}");
+        }
+        let listed = h.ok(&gw, "mcp_gateway", json!({ "action": "list", "server": "lan-docs" })).await;
+        assert_eq!(listed["live"], false, "{listed}");
+    }
+    assert_eq!(
+        listener.accept().map(|_| ()).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "nothing connected for another organization"
+    );
+    assert_eq!(approvals(), before, "no approval was parked for the write");
+
+    // The default organization's caller passes the check and connects (the
+    // listener never answers, so the call then fails for its own reason).
+    let e =
+        h.err(&dev(agent(DEFAULT_ORG)), "mcp_gateway", json!({ "server": "lan-docs", "tool": "echo" })).await;
+    assert_ne!(reason(&e), "org_unsupported", "{e:?}");
+    listener.set_nonblocking(false).unwrap();
+    assert!(listener.accept().is_ok(), "the default organization's call reached the server");
+}
+
 #[test]
 fn a_legacy_row_with_a_null_name_stops_the_upgrade_with_its_row_id() {
     let dir = tempfile::tempdir().unwrap();

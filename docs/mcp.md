@@ -43,14 +43,17 @@ pieces make this work:
   ([github](github.md#credentials-per-organization)); a secret stored
   under one of those names before (say, the relay's) can no longer be
   rotated with `managed_secret_set`: delete it and store it under a new
-  name. Because the MCP servers' secrets are the default organization's,
+  name. Every downstream server is the hub's, the default
+  organization's: its secrets are the default organization's, a stdio
+  server runs as a process on the hub's host, and a Streamable HTTP server
+  is reached from the hub's network position (loopback, tailnet and
+  private ranges its `address_scope` admits), with or without secrets. So
   another organization's caller is refused (`org_unsupported`) by
-  `mcp_gateway` `call` and live `list` on a server that injects secrets.
-  A stdio server runs as a process on the hub, the default organization's
-  host, so its `call` and live `list` are refused to another
-  organization's caller too, with or without secrets, before anything is
-  spawned. A static `list` and a Streamable HTTP server with no secret
-  are not refused.
+  `mcp_gateway` `call` and live `list` on every server, before the policy
+  check, the call slot, any approval, any secret read and any spawn or
+  connection, until servers are per organization. A static `list` reads
+  only the registration (what `mcp_server_list` already shows) and is not
+  refused.
 - **Encryption.** AES-256-GCM, a fresh random 96-bit nonce per write, and the
   secret's organization, name and consumer as associated data, so a row
   copied into another organization or under another name or consumer does

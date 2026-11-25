@@ -622,9 +622,10 @@ async fn an_unknown_organization_is_refused_before_any_write() {
         assert!(e.to_string().contains("unknown organization"), "{action}: {e:?}");
     }
     assert_eq!(h.counts(), before);
-    // Reads in an unknown organization see nothing.
-    let listed = h.ok(&device(UNKNOWN), "list", json!({})).await;
-    assert_eq!(listed["skills"], json!([]));
+    // Reads are refused too: the registry refuses the organization before
+    // any tool runs.
+    let e = h.call(&device(UNKNOWN), "list", json!({})).await.unwrap_err();
+    assert_eq!(e.reason_code(), Some("unknown_organization"), "{e:?}");
 }
 
 #[tokio::test]

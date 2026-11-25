@@ -596,7 +596,8 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     };
     let before = snapshot(&h);
     let who = lead(UNKNOWN);
-    let routine_guard = format!("unknown organization {UNKNOWN:?}; no routine was changed");
+    // The registry refuses the organization before any tool runs.
+    let routine_guard = format!("unknown organization {UNKNOWN:?}; nothing ran and nothing was written");
     for (tool, args) in [
         ("routine_add", json!({ "title": "x", "trigger": "api" })),
         // Writes with nothing of their own to insert are refused too.
@@ -613,9 +614,6 @@ async fn an_unknown_organization_is_refused_before_any_write() {
             json!({ "name": "vet", "inputs": { "command": "echo x" } }),
         )
         .await;
-    assert!(
-        e.to_string().contains(&format!("unknown organization {UNKNOWN:?}; no workflow run was recorded")),
-        "{e}"
-    );
+    assert!(e.to_string().contains(&routine_guard), "{e}");
     assert_eq!(snapshot(&h), before);
 }

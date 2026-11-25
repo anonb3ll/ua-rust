@@ -6,9 +6,10 @@
 //! 1. resolves the server (registry or config) and refuses it when it is
 //!    revoked, past its review window, or misconfigured;
 //! 2. refuses a tool the registration does not classify;
-//! 3. refuses another organization's caller for a server that injects the
-//!    hub's secrets or runs as a stdio process on the hub (a static `list`
-//!    reads neither and is not refused);
+//! 3. refuses another organization's caller on every server, stdio or
+//!    Streamable HTTP, secrets or not: each is the hub's process, network
+//!    position or credential (a static `list` reads only the registration
+//!    and is not refused);
 //!    for a read, refuses an anonymous caller when the server injects secrets
 //!    and checks the caller against `read_profiles` (empty: humans and
 //!    configured operator identities); for a write, needs an authenticated
@@ -461,39 +462,30 @@ fn try_slot(server: &str) -> UaResult<OwnedSemaphorePermit> {
 
 // --- secrets ----------------------------------------------------------------------
 
-/// A downstream server's credentials are the hub's (the default
-/// organization's managed secrets): another organization's caller never has
-/// them injected on its behalf. A stdio server is a process the hub spawns
-/// on its own host, with the hub's filesystem and network, so it too serves
-/// the default organization only, secrets or not. A Streamable HTTP server
-/// with no injected secret is not refused here. Checked before the policy
-/// check, the slot, any approval and any spawn or connection. Fail closed
-/// until servers are per organization.
+/// Every downstream server is the hub's, the default organization's: a
+/// stdio server is a process the hub spawns on its own host, with the hub's
+/// filesystem and network; a Streamable HTTP server is reached from the
+/// hub's network position (loopback, tailnet and private ranges a server's
+/// `address_scope` admits), secrets or not; and an injected credential is
+/// the default organization's managed secret. Another organization's caller
+/// is therefore refused every `call` and live `list`, on every server,
+/// before the policy check, the slot, any approval, any secret read and any
+/// spawn or connection, until servers are per organization. A static `list`
+/// reads only the registration, which `mcp_server_list` already shows, and
+/// is not refused.
 fn require_hub_org_for_server(ctx: &ToolCtx, server: &Server) -> UaResult<()> {
     if ctx.caller.org_id == super::HUB_SECRETS_ORG {
         return Ok(());
     }
-    if !server.spec.secrets.is_empty() {
-        return Err(UaError::denied(
-            "org_unsupported",
-            format!(
-                "MCP server {:?} injects the hub's credentials, which serve the default organization only; \
-                 nothing was read or sent",
-                server.name
-            ),
-        ));
-    }
-    if server.spec.transport == TransportKind::Stdio {
-        return Err(UaError::denied(
-            "org_unsupported",
-            format!(
-                "MCP server {:?} runs as a process on the hub, which serves the default organization only; \
-                 nothing was started or sent",
-                server.name
-            ),
-        ));
-    }
-    Ok(())
+    Err(UaError::denied(
+        "org_unsupported",
+        format!(
+            "MCP server {:?} is the hub's: it runs as a process on the hub or is reached from the hub's \
+             network, with the hub's credentials, and serves the default organization only; nothing was \
+             read, started or sent",
+            server.name
+        ),
+    ))
 }
 
 /// The injected secrets, and each one's keyed fingerprint by name.

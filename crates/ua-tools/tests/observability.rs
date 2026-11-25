@@ -509,3 +509,47 @@ async fn doctor_reports_slack_without_secrets() {
         assert!(on["detail"].as_str().unwrap().contains("without the slack-socket feature"), "{on}");
     }
 }
+
+/// The vault and the workspace are the hub's filesystem, the default
+/// organization's: another organization's doctor gets one neutral line for
+/// each, the same whether the vault is absent, misconfigured or live, so it
+/// learns neither whether the path exists nor whether a write directory is
+/// writable. The default organization's doctor still reports each state.
+#[tokio::test]
+async fn doctor_tells_another_organization_nothing_about_the_hub_filesystem() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(vault.join("Inbox")).unwrap();
+    let not_a_dir = dir.path().join("vault-file");
+    std::fs::write(&not_a_dir, "fake").unwrap();
+    let reg = builtin_registry();
+    let other = Caller { org_id: "org-b".into(), ..agent("reviewer-1", Profile::Lead) };
+    let mut seen_b = Vec::new();
+    let mut seen_default = Vec::new();
+    for (i, path) in [None, Some(not_a_dir.clone()), Some(vault.clone())].into_iter().enumerate() {
+        let mut cfg = Config::for_home(dir.path().join(format!("home-{i}")));
+        cfg.vault_path = path;
+        cfg.vault_write_dirs = vec!["Inbox".into(), "Missing".into()];
+        let hub = Hub::in_memory(cfg).unwrap();
+        exec(
+            &hub,
+            "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+             ('org-b', 'org-b', 'Org B', '[\"lead\"]', '2026-01-01T00:00:00+00:00')",
+        );
+        let line = |report: &Value, cap: &str| {
+            report["checks"].as_array().unwrap().iter().find(|c| c["capability"] == cap).cloned().unwrap()
+        };
+        let b = call(&reg, &hub, &other, "system_doctor", json!({})).await;
+        for cap in ["vault", "workspace_root"] {
+            let row = line(&b, cap);
+            assert_eq!(row["status"], "DORMANT", "{row}");
+            assert_eq!(row["detail"], "not available to this organization", "{row}");
+        }
+        assert!(!b.to_string().contains("write dir"), "{b}");
+        seen_b.push((line(&b, "vault"), line(&b, "workspace_root")));
+        let own = call(&reg, &hub, &agent("reviewer-1", Profile::Lead), "system_doctor", json!({})).await;
+        seen_default.push(line(&own, "vault")["status"].clone());
+    }
+    assert!(seen_b.windows(2).all(|w| w[0] == w[1]), "{seen_b:?}");
+    assert_eq!(seen_default, [json!("DORMANT"), json!("MISCONFIGURED"), json!("DEGRADED")]);
+}

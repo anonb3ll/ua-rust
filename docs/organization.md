@@ -676,11 +676,16 @@ here for memory columns, owners and defaults.
   (`relay_manage` `request_send`, `send`) and an MCP server that injects
   secrets (`mcp_gateway` `call`, live `list`) use the default
   organization's secrets, so another organization's caller is refused
-  (`org_unsupported`) before anything is read. A stdio MCP server is a
-  process the hub spawns on its own host, so its `call` and live `list`
-  are refused to another organization's caller the same way, secrets or
-  not, before anything is started; a Streamable HTTP server that injects
-  no secret, and a static `list`, are not refused. The `github.credential.*` and `managed_secret.*` events are
+  (`org_unsupported`) before anything is read. Every downstream MCP
+  server is the hub's, secrets or not: a stdio server is a process the hub
+  spawns on its own host, and a Streamable HTTP server is reached from the
+  hub's network position (loopback, tailnet and private ranges). So
+  `mcp_gateway` `call` and live `list` are refused to another
+  organization's caller on every server, before the policy check, the
+  slot, any approval, any secret read and any spawn or connection, until
+  servers are per organization. A static `list` reads only the
+  registration, which `mcp_server_list` already shows, and is not
+  refused. The `github.credential.*` and `managed_secret.*` events are
   `ORG-EVENT-DEFAULT` sites: for another organization the secret name and
   consumer are `null` and the originator is `system`. The automation paths
   run per organization through `github_credential_for` (the
@@ -1253,10 +1258,31 @@ here for memory columns, owners and defaults.
     (before any request reaches the plugin, configured or not),
     `memory_promote`, `vault_to_memory_ingest` and `export_journal` refuse
     another organization's caller (`org_unsupported`) before a path is
-    resolved, and its learning-proposal preview reads no vault. A stdio
-    `mcp_gateway` server, a process on the hub, is refused the same way.
-    So until per-organization workspaces and vaults exist, another
-    organization has no hub filesystem at all.
+    resolved, and its learning-proposal preview (`dry_run`) reads no vault,
+    so it never learns whether a proposal or an earlier one exists there.
+    The Dash docsets (`dash_list`, `dash_search`, `dash_view`) are refused
+    (`org_unsupported`) before `dash_docsets` is read. `system_doctor`
+    gives another organization one neutral `vault` line and one neutral
+    `workspace_root` line ("not available to this organization", the same
+    whatever the hub holds) and never runs either check for it. A local
+    harness (`dispatch_task` or `dispatch_resume` with a harness) is a
+    process on the hub and is refused (`org_unsupported`) before the
+    harness is looked up or a task's `worktree_path` is resolved, and
+    every downstream MCP server, stdio or Streamable HTTP, is refused for
+    `mcp_gateway` `call` and live `list` (above). A `worktree_path` another
+    organization records through `task_claim` or `session_start` is stored
+    as given: it is data in that organization's rows, and every tool that
+    would treat it as a path on the hub (the local harness, the `git_*`
+    task tools through `workspace::sandbox`, the crew drop file, an
+    autonomous cycle's worktree read) refuses another organization first;
+    a node route resolves it on the node, which serves the default
+    organization only. So until per-organization workspaces and vaults
+    exist, another organization has no hub filesystem at all: no
+    workspace, vault, Obsidian, docset, local harness or MCP server
+    process, and no report of their state. (The hub's configuration files
+    are read on every organization's behalf, as configuration: the policy
+    file, and the workflow definitions in `workflow_dir`, whose steps each
+    run through the registry under these same refusals.)
   - **No human or operator path outside the default organization yet.**
     Human identities and lifecycle operators are hub configuration, the
     default organization's, and no resolver produces a verified human of
@@ -2515,7 +2541,22 @@ The vault is hub-scoped, so anything that copies tenant data into it —
 `memory_promote` above all — is allowed only in `'default'` (see
 `docs/memory.md`). Reading it is too: every `vault_*` and `obsidian_*`
 tool and `export_journal` refuse another organization's caller
-(`org_unsupported`) before touching the vault or the plugin.
+(`org_unsupported`) before touching the vault or the plugin. The other hub
+resources refused the same way are listed under "No workspace outside the
+default organization yet" above.
+
+The governed call path (`Registry::call`, and an approval requested ahead
+of a call) refuses a caller whose organization `orgs` does not hold
+(`unknown_organization`) or holds as suspended (`organization_suspended`)
+before anything runs: no handler, no policy evaluation, no `tool_calls`
+row and no decision event. It is one primary-key read per call of an
+organization other than the default, which is seeded with the schema and
+cannot be deleted, so its callers skip it. It sits in the registry rather
+than only where a credential resolves because every caller passes the
+registry (HTTP and MCP credentials, stdio, the hub's per-organization
+jobs), and it is not cached so a suspension applies to the next call. Each
+family's own `require_org` stays behind it for paths that write without
+the registry.
 
 ## The ledger
 

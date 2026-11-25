@@ -511,10 +511,7 @@ pub struct ManageArgs {
 /// no exact match are refused (`agent_label_ambiguous`), as `agent_forget`
 /// refuses them, rather than silently picking one.
 fn registered_target(c: &Connection, org: &str, label: &str) -> UaResult<Option<String>> {
-    let spellings: Vec<String> = c
-        .prepare("SELECT label FROM agents WHERE org_id = ?1 AND label = ?2 COLLATE NOCASE ORDER BY label")?
-        .query_map(params![org, label], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
+    let spellings = case_variants(c, org, label)?;
     if spellings.iter().any(|s| s == label) {
         return Ok(Some(label.to_string()));
     }
@@ -529,6 +526,14 @@ fn registered_target(c: &Connection, org: &str, label: &str) -> UaResult<Option<
             ),
         )),
     }
+}
+
+/// Every registered spelling of `label` in organization `org`, in any letter
+/// case.
+fn case_variants(c: &Connection, org: &str, label: &str) -> UaResult<Vec<String>> {
+    Ok(c.prepare("SELECT label FROM agents WHERE org_id = ?1 AND label = ?2 COLLATE NOCASE ORDER BY label")?
+        .query_map(params![org, label], |r| r.get(0))?
+        .collect::<Result<_, _>>()?)
 }
 
 /// Every door to this (`delegate`, `delegation_manage` create, `handoff`)
@@ -586,14 +591,35 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
         });
         hex::encode(Sha256::digest(approvals::canonical_payload(&request).as_bytes()))
     };
+    //
+    // A target that became ambiguous after the receipt (a second case
+    // variant registered since) no longer resolves, but the receipt's digest
+    // is over the one spelling registered then: each variant's digest is
+    // tried, and a match replays that committed result, creating and
+    // re-routing nothing. A retry that matches none is refused as ambiguous
+    // (`agent_label_ambiguous`), not as a different request.
     let digests_for = |c: &Connection, org: &str| -> Vec<String> {
         let mut out = vec![digest_for(&to_agent)];
-        if let Ok(Some(reg)) = registered_target(c, org, &to_agent)
-            && reg != to_agent
-        {
-            out.insert(0, digest_for(&reg));
+        match registered_target(c, org, &to_agent) {
+            Ok(Some(reg)) if reg != to_agent => out.insert(0, digest_for(&reg)),
+            Ok(_) => {}
+            Err(_) => out.extend(
+                case_variants(c, org, &to_agent)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|v| **v != to_agent)
+                    .map(|v| digest_for(v)),
+            ),
         }
         out
+    };
+    let lookup = |c: &Connection, org: &str, k: &(String, Option<String>)| -> UaResult<Option<Value>> {
+        find_receipt(c, org, k, &digests_for(c, org)).map_err(|e| {
+            match registered_target(c, org, &to_agent) {
+                Err(ambiguous) => ambiguous,
+                Ok(_) => e,
+            }
+        })
     };
     let org = ctx.caller.org_id.clone();
     let rkeys = idem
@@ -603,7 +629,7 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
 
     // A committed retry replays before any gate: no second approval, no effect.
     if let Some(k) = rkeys.clone() {
-        let found = ctx.hub.db().read(|c| find_receipt(c, &org, &k, &digests_for(c, &org)))?;
+        let found = ctx.hub.db().read(|c| lookup(c, &org, &k))?;
         if let Some(done) = found {
             return Ok(done);
         }
@@ -613,7 +639,7 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
     let warnings: Vec<String> = check.warnings.clone();
     ctx.hub.db().write(|tx| {
         if let Some(k) = rkeys.as_ref()
-            && let Some(done) = find_receipt(tx, &org, k, &digests_for(tx, &org))?
+            && let Some(done) = lookup(tx, &org, k)?
         {
             return Ok(done);
         }
