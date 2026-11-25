@@ -179,7 +179,6 @@ fn tenant_columns(conn: &Connection, tables: &'static [&'static str]) -> anyhow:
     Ok(all.join("\n"))
 }
 
-
 // ---------------------------------------------------------------------------
 // Organization registry persistence (the registry slice)
 // ---------------------------------------------------------------------------
