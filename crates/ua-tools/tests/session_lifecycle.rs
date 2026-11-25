@@ -373,6 +373,59 @@ async fn learnings_without_a_vault_can_only_dry_run() {
     assert_eq!(err.code(), "denied");
 }
 
+/// Another organization's learning preview (dry run) never reads the hub's
+/// vault: a proposal file already at its path, and an earlier proposal that
+/// would deduplicate its candidate, change nothing in its answer, and no
+/// vault text reaches it. The same vault does deduplicate the default
+/// organization's preview, so the files would have mattered there.
+#[tokio::test]
+async fn another_organizations_learning_preview_never_reveals_the_vault() {
+    const VAULT_MARK: &str = "fake-vault-content-not-real-5c1d";
+    let e = Env::new();
+    e.hub
+        .db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+                 ('org-b', 'org-b', 'Org B', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let inbox = e.vault.path().join("Inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let b = Caller { org_id: "org-b".into(), ..agent("builder-b") };
+    let s = e.start(&b, json!({})).await;
+    e.end(&b, &s, Some(FIXED)).await;
+    let preview =
+        || async { e.ok(&b, "propose_session_learnings", json!({ "session_id": s, "dry_run": true })).await };
+
+    let bare = preview().await;
+    assert!(!bare["candidates"].as_array().unwrap().is_empty(), "{bare}");
+    // Seed the vault: a proposal at this session's own path, and an earlier
+    // proposal holding the same learning.
+    let own = e.vault.path().join(bare["path"].as_str().unwrap());
+    std::fs::write(&own, format!("---\nfingerprint: {VAULT_MARK}\n---\n{VAULT_MARK}\n")).unwrap();
+    std::fs::write(inbox.join("Session-Learning-earlier.md"), format!("{FIXED}\n{VAULT_MARK}\n")).unwrap();
+
+    let seeded = preview().await;
+    assert_eq!(seeded, bare, "the vault changed another organization's preview");
+    assert!(!seeded.to_string().contains(VAULT_MARK), "{seeded}");
+    assert!(seeded.get("existing").is_none_or(|x| x == false), "{seeded}");
+    let e2 = e.err(&b, "propose_session_learnings", json!({ "session_id": s })).await;
+    assert_eq!(e2.reason_code(), Some("org_unsupported"), "{e2}");
+    assert!(!e2.to_string().contains(VAULT_MARK), "{e2}");
+
+    // The default organization's preview of the same learning is
+    // deduplicated against the earlier proposal.
+    let a = agent("builder-1");
+    let sa = e.start(&a, json!({})).await;
+    e.end(&a, &sa, Some(FIXED)).await;
+    let mine = e.ok(&a, "propose_session_learnings", json!({ "session_id": sa, "dry_run": true })).await;
+    assert_eq!(mine["skipped"], "low_signal", "{mine}");
+}
+
 // --- crew ----------------------------------------------------------------------------------------
 
 #[tokio::test]

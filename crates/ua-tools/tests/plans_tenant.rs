@@ -519,9 +519,9 @@ async fn a_step_or_checkpoint_cannot_move_to_another_organizations_plan() {
 // --- unknown organization ----------------------------------------------------------------------
 
 /// A caller whose organization `orgs` does not hold is refused by the
-/// family's own guard (its wording, not the trigger's bare "unknown
-/// organization"), before anything is written, including writes with
-/// nothing to insert (an update, a delete).
+/// registry before the tool runs, so before anything is written, including
+/// writes with nothing to insert (an update, a delete), and before any
+/// read. (The family's own guard stays behind it.)
 #[tokio::test]
 async fn an_unknown_organization_is_refused_before_any_write() {
     let h = H::new();
@@ -529,7 +529,7 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     let before = h.snapshot();
     let events = h.count("SELECT COUNT(*) FROM event_log");
     let who = agent(UNKNOWN);
-    let guard = format!("unknown organization {UNKNOWN:?}; no plan was changed");
+    let guard = format!("unknown organization {UNKNOWN:?}; nothing ran and nothing was written");
 
     let mut calls = writes(&a_id);
     calls.push(("delete", json!({ "plan_id": a_id })));
@@ -542,11 +542,11 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     assert_eq!(h.snapshot(), before);
     assert_eq!(h.count("SELECT COUNT(*) FROM event_log"), events);
 
-    // Reads in an unknown organization see nothing.
-    let l = h.ok(&who, "list", json!({ "status": "all" })).await;
-    assert_eq!(l["plans"], json!([]));
-    let e = h.manage(&who, "get", json!({ "plan_id": a_id })).await.unwrap_err();
-    assert_eq!(e.to_string(), UaError::not_found(format!("no plan with id {a_id:?}")).to_string());
+    // Reads in an unknown organization are refused the same way.
+    for (action, params) in [("list", json!({ "status": "all" })), ("get", json!({ "plan_id": a_id }))] {
+        let e = h.manage(&who, action, params).await.unwrap_err();
+        assert_eq!(reason(&e), "unknown_organization", "{action}: {e}");
+    }
 }
 
 // --- defence in depth --------------------------------------------------------------------------

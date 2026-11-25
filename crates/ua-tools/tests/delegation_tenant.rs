@@ -963,3 +963,37 @@ async fn a_retry_spelling_the_target_in_other_letter_cases_replays() {
     assert_eq!(e.code(), "conflict", "{e:?}");
     assert_eq!((h.snapshot(), h.events()), before);
 }
+
+/// A retry whose target became ambiguous after the receipt (a second case
+/// variant registered since) is matched against each variant: the committed
+/// result replays, and nothing is created or re-routed. A retry under the
+/// same key that matches no variant is refused as ambiguous
+/// (`agent_label_ambiguous`), not as a different request.
+#[tokio::test]
+async fn a_retry_whose_target_became_ambiguous_replays_or_says_so() {
+    let h = H::new();
+    let lead = agent_named("lead-1", DEFAULT_ORG);
+    h.sql("INSERT INTO agents (org_id, label, created_at, updated_at) VALUES ('default', 'builder-amb', 't0', 't0');")
+        .unwrap();
+    let args = |to: &str, spec: &str| json!({ "task_spec": spec, "to_agent": to, "idempotency_key": "amb-key-not-real" });
+    let first = h.reg.call(&h.hub, &lead, "delegate", args("Builder-Amb", SPEC)).await.unwrap();
+    let id = first["delegation_id"].as_i64().unwrap();
+    // A second case variant is registered after the receipt.
+    h.sql("INSERT INTO agents (org_id, label, created_at, updated_at) VALUES ('default', 'BUILDER-AMB', 't0', 't0');")
+        .unwrap();
+    let before = (h.snapshot(), h.events());
+    for spelling in ["Builder-Amb", "builder-amb"] {
+        let again = h.reg.call(&h.hub, &lead, "delegate", args(spelling, SPEC)).await.unwrap();
+        assert_eq!(again, first, "{spelling}");
+    }
+    assert_eq!(
+        h.text(&format!("SELECT to_agent FROM delegations WHERE id = {id}")).as_deref(),
+        Some("builder-amb"),
+        "not re-routed"
+    );
+    let other_spec = format!("{SPEC}\n\nA fake extra line, not real.");
+    let e = h.reg.call(&h.hub, &lead, "delegate", args("Builder-Amb", &other_spec)).await.unwrap_err();
+    assert_eq!(reason(&e), "agent_label_ambiguous", "{e:?}");
+    assert!(!e.to_string().contains("different delegation request"), "{e}");
+    assert_eq!((h.snapshot(), h.events()), before, "nothing created");
+}

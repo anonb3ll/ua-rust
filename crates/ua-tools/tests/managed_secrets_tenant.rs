@@ -798,12 +798,11 @@ async fn hub_scoped_secret_users_refuse_another_organizations_caller() {
             for args in [
                 json!({ "server": "docs", "tool": "echo" }),
                 json!({ "action": "list", "server": "docs", "live": true }),
+                json!({ "action": "list", "server": "docs" }),
             ] {
                 let e = h.err(&gw, "mcp_gateway", args.clone()).await;
                 assert_eq!(reason(&e), "org_unsupported", "{args}: {e:?}");
             }
-            // A static list reads no secret and is not refused.
-            h.ok(&gw, "mcp_gateway", json!({ "action": "list", "server": "docs" })).await;
         }
 
         for (action, params) in [
@@ -835,8 +834,8 @@ async fn hub_scoped_secret_users_refuse_another_organizations_caller() {
 
 /// A stdio MCP server is a process the hub spawns on its own host, the
 /// default organization's: another organization's caller is refused its
-/// `call` and live `list` even when it injects no secret, before anything is
-/// spawned. A static `list` reads nothing and is not refused.
+/// `call` and `list`, live or static, even when it injects no secret, before
+/// anything is spawned.
 #[tokio::test]
 async fn a_stdio_mcp_server_refuses_another_organizations_caller_without_secrets() {
     if !cfg!(feature = "mcp-gateway") {
@@ -860,12 +859,12 @@ async fn a_stdio_mcp_server_refuses_another_organizations_caller_without_secrets
         for args in [
             json!({ "server": "local-docs", "tool": "echo" }),
             json!({ "action": "list", "server": "local-docs", "live": true }),
+            json!({ "action": "list", "server": "local-docs" }),
         ] {
             let e = h.err(&gw, "mcp_gateway", args.clone()).await;
             assert_eq!(reason(&e), "org_unsupported", "{args}: {e:?}");
             assert!(e.to_string().contains("process on the hub"), "{e:?}");
         }
-        h.ok(&gw, "mcp_gateway", json!({ "action": "list", "server": "local-docs" })).await;
     }
     // The default organization's caller passes the check and fails later,
     // trying to start the (nonexistent) command.
@@ -873,6 +872,222 @@ async fn a_stdio_mcp_server_refuses_another_organizations_caller_without_secrets
         .err(&dev(agent(DEFAULT_ORG)), "mcp_gateway", json!({ "server": "local-docs", "tool": "echo" }))
         .await;
     assert_ne!(reason(&e), "org_unsupported", "{e:?}");
+}
+
+/// A Streamable HTTP server is reached from the hub's network position
+/// (here loopback), so another organization's caller is refused its `call`
+/// and `list`, live or static, even when it injects no secret, before the
+/// policy, the slot, any approval or any connection: the listener sees no
+/// connection attempt. The default organization's caller does connect,
+/// which shows the listener would have seen one.
+#[tokio::test]
+async fn a_secretless_http_mcp_server_refuses_another_organizations_caller() {
+    if !cfg!(feature = "mcp-gateway") {
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = H::with(|c| {
+        c.mcp_servers.insert(
+            "lan-docs".into(),
+            json!({
+                "transport": "streamable_http",
+                "url": format!("http://127.0.0.1:{port}/mcp"),
+                "address_scope": "loopback",
+                "tools": { "echo": "read", "store": "write" },
+                "read_profiles": ["developer", "operator"],
+                "review_expires_at": "2099-01-01",
+                "timeout_s": 1,
+            }),
+        );
+    });
+    let approvals = || {
+        h.hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    };
+    let before = approvals();
+    let dev = |c: Caller| Caller { profile: Profile::Developer, ..c };
+    for who in [agent(ORG_B), human(ORG_B)] {
+        let gw = dev(who);
+        for args in [
+            json!({ "server": "lan-docs", "tool": "echo" }),
+            json!({ "server": "lan-docs", "tool": "store", "arguments": { "k": "fake" } }),
+            json!({ "action": "list", "server": "lan-docs", "live": true }),
+            json!({ "action": "list", "server": "lan-docs" }),
+        ] {
+            let e = h.err(&gw, "mcp_gateway", args.clone()).await;
+            assert_eq!(reason(&e), "org_unsupported", "{args}: {e:?}");
+            assert!(e.to_string().contains("hub's"), "{e:?}");
+        }
+    }
+    assert_eq!(
+        listener.accept().map(|_| ()).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "nothing connected for another organization"
+    );
+    assert_eq!(approvals(), before, "no approval was parked for the write");
+
+    // The default organization's caller passes the check and connects (the
+    // listener never answers, so the call then fails for its own reason).
+    let e =
+        h.err(&dev(agent(DEFAULT_ORG)), "mcp_gateway", json!({ "server": "lan-docs", "tool": "echo" })).await;
+    assert_ne!(reason(&e), "org_unsupported", "{e:?}");
+    listener.set_nonblocking(false).unwrap();
+    assert!(listener.accept().is_ok(), "the default organization's call reached the server");
+}
+
+/// The MCP server registry is the hub's configuration: `mcp_server_list`
+/// refuses another organization's caller (`org_unsupported`) and shows it
+/// no URL, command, address scope, secret name or review state, while the
+/// default organization's caller still sees the server.
+#[tokio::test]
+async fn the_mcp_server_list_refuses_another_organizations_caller() {
+    let h = H::with(|c| {
+        c.mcp_servers.insert(
+            "docs".into(),
+            json!({
+                "transport": "stdio",
+                "command": "/nonexistent/fake-mcp-server-not-real",
+                "secrets": [{ "secret": "docs-token", "inject": "env:FAKE_TOKEN" }],
+                "tools": { "echo": "read" },
+                "review_expires_at": "2099-01-01",
+            }),
+        );
+    });
+    for who in [agent(ORG_B), human(ORG_B)] {
+        let who = Caller { profile: Profile::Operator, ..who };
+        for args in [json!({}), json!({ "include_revoked": true })] {
+            let e = h.err(&who, "mcp_server_list", args.clone()).await;
+            assert_eq!(reason(&e), "org_unsupported", "{args}: {e:?}");
+            let text = format!("{e:?}");
+            for hidden in ["docs", "fake-mcp-server-not-real", "FAKE_TOKEN"] {
+                assert!(!text.contains(hidden), "{hidden} in {text}");
+            }
+        }
+    }
+    let listed = h
+        .ok(&Caller { profile: Profile::Operator, ..human(DEFAULT_ORG) }, "mcp_server_list", json!({}))
+        .await;
+    assert_eq!(listed["count"], 1, "{listed}");
+}
+
+/// Another organization's `mcp_gateway` call, accepted or refused, writes
+/// nothing to the default organization's ledger: no `agent.mcp_gateway.call`
+/// event carrying its label or the server name it sent. The default
+/// organization's call still records its event.
+#[tokio::test]
+async fn another_organizations_gateway_call_writes_nothing_to_the_default_ledger() {
+    if !cfg!(feature = "mcp-gateway") {
+        return;
+    }
+    let h = H::with(|c| {
+        c.mcp_servers.insert(
+            "docs".into(),
+            json!({
+                "transport": "stdio",
+                "command": "/nonexistent/fake-mcp-server-not-real",
+                "tools": { "echo": "read" },
+                "read_profiles": ["developer", "operator"],
+                "review_expires_at": "2099-01-01",
+            }),
+        );
+    });
+    let gateway_events = |needle: &str| -> i64 {
+        h.hub
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM event_log WHERE channel = 'agent.mcp_gateway.call' \
+                     AND (?1 = '' OR payload LIKE '%' || ?1 || '%' OR originator = ?1)",
+                    [needle],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+    };
+    let dev = |c: Caller| Caller { profile: Profile::Developer, ..c };
+    let b = dev(caller("fake-b-label-not-real", ActorKind::Agent, ORG_B));
+    let attacker = "fake-attacker-text-not-real-0123456789-0123456789-0123456789";
+    for args in [
+        json!({ "server": "docs", "tool": "echo" }),
+        json!({ "action": "list", "server": "docs" }),
+        json!({ "server": attacker, "tool": "echo" }),
+        json!({ "action": "list", "server": attacker }),
+    ] {
+        let e = h.err(&b, "mcp_gateway", args.clone()).await;
+        assert_eq!(reason(&e), "org_unsupported", "{args}: {e:?}");
+    }
+    assert_eq!(gateway_events(""), 0, "no gateway event for another organization's calls");
+    assert_eq!(
+        h.hub
+            .db()
+            .read(|c| Ok(c.query_row(
+                "SELECT COUNT(*) FROM event_log WHERE payload LIKE '%fake-attacker-text%' \
+                 OR payload LIKE '%fake-b-label%' OR originator = 'fake-b-label-not-real'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )?))
+            .unwrap(),
+        0
+    );
+    h.ok(&dev(agent(DEFAULT_ORG)), "mcp_gateway", json!({ "action": "list", "server": "docs" })).await;
+    assert_eq!(gateway_events("lead-1"), 1, "the default organization's call is still ledgered");
+}
+
+/// The MCP tools' organization refusal is a registry pre-gate: with a
+/// registry approval gate on `mcp_gateway` and `mcp_server_list`
+/// (`UA_APPROVAL_TOOLS`), another organization's call to either is refused
+/// `org_unsupported` and parks no approval nobody could grant. The default
+/// organization's call to each does park one, which shows the gate applies
+/// to both: `approval_tools` gates a read-only tool too, so without its
+/// pre-gate organization B's `mcp_server_list` call would park an approval
+/// (checked by removing it) and each half of the test is load-bearing.
+#[tokio::test]
+async fn the_gateway_refuses_another_organization_before_any_approval_is_parked() {
+    if !cfg!(feature = "mcp-gateway") {
+        return;
+    }
+    let h = H::with(|c| {
+        c.approval_tools = vec!["mcp_gateway".into(), "mcp_server_list".into()];
+        c.mcp_servers.insert(
+            "docs".into(),
+            json!({
+                "transport": "stdio",
+                "command": "/nonexistent/fake-mcp-server-not-real",
+                "tools": { "echo": "read" },
+                "read_profiles": ["developer", "operator"],
+                "review_expires_at": "2099-01-01",
+            }),
+        );
+    });
+    let approvals = || {
+        h.hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    };
+    let dev = |c: Caller| Caller { profile: Profile::Developer, ..c };
+    let op = |c: Caller| Caller { profile: Profile::Operator, ..c };
+    for who in [agent(ORG_B), human(ORG_B)] {
+        for args in
+            [json!({ "server": "docs", "tool": "echo" }), json!({ "action": "list", "server": "docs" })]
+        {
+            let e = h.err(&dev(who.clone()), "mcp_gateway", args.clone()).await;
+            assert_eq!(reason(&e), "org_unsupported", "{args}: {e:?}");
+        }
+        let e = h.err(&op(who), "mcp_server_list", json!({})).await;
+        assert_eq!(reason(&e), "org_unsupported", "{e:?}");
+    }
+    assert_eq!(approvals(), 0, "nothing was parked for another organization");
+    let e = h.err(&dev(agent(DEFAULT_ORG)), "mcp_gateway", json!({ "server": "docs", "tool": "echo" })).await;
+    assert!(matches!(e, UaError::ApprovalRequired { .. }), "{e:?}");
+    assert_eq!(approvals(), 1);
+    let e = h.err(&op(agent(DEFAULT_ORG)), "mcp_server_list", json!({})).await;
+    assert!(matches!(e, UaError::ApprovalRequired { .. }), "{e:?}");
+    assert_eq!(approvals(), 2);
 }
 
 #[test]

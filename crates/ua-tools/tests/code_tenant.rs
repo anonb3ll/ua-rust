@@ -271,16 +271,26 @@ async fn another_organization_has_no_code_index_of_the_hub_workspace() {
 async fn an_unknown_organization_is_refused_and_writes_nothing() {
     let env = setup();
     let before = stored(&env.hub);
-    // Refused before the workspace is read (it is the default
-    // organization's), so before the organization is even looked up.
-    let err = env.call("nowhere", "fs_index_symbols", json!({})).await.unwrap_err();
-    assert_eq!(err.reason_code(), Some("org_unsupported"), "{err}");
+    let calls = || {
+        env.hub
+            .db()
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM tool_calls", [], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    };
+    let rows = calls();
+    // The registry refuses an organization `orgs` does not hold before the
+    // tool runs, so before the workspace is read.
     std::fs::create_dir_all(env.ws.join("empty")).unwrap();
-    let err = env.call("nowhere", "fs_index_symbols", json!({ "path": "empty" })).await.unwrap_err();
-    assert_eq!(err.reason_code(), Some("org_unsupported"), "{err}");
-    let err = env.call("nowhere", "fs_repo_map", json!({})).await.unwrap_err();
-    assert_eq!(err.reason_code(), Some("org_unsupported"), "{err}");
+    for (tool, args) in [
+        ("fs_index_symbols", json!({})),
+        ("fs_index_symbols", json!({ "path": "empty" })),
+        ("fs_repo_map", json!({})),
+    ] {
+        let err = env.call("nowhere", tool, args.clone()).await.unwrap_err();
+        assert_eq!(err.reason_code(), Some("unknown_organization"), "{tool}({args}): {err}");
+    }
     assert_eq!(stored(&env.hub), before);
+    assert_eq!(calls(), rows, "a refused call records no tool_calls row");
     let events: i64 = env
         .hub
         .db()
@@ -312,4 +322,49 @@ async fn the_index_event_is_unchanged_for_the_default_organization() {
     assert_eq!(org, ua_core::DEFAULT_ORG);
     let payload: Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(payload, json!({ "path": ".", "files_indexed": 1, "symbols_indexed": 1 }));
+}
+
+/// The docset directories are the hub's filesystem: another organization's
+/// caller is refused (`org_unsupported`) before `dash_docsets` is read, with
+/// the same answer whether docsets are configured or not, while the default
+/// organization reads them.
+#[tokio::test]
+async fn dash_tools_refuse_another_organization_before_reading_the_docsets() {
+    let home = tempfile::tempdir().unwrap();
+    let docsets = tempfile::tempdir().unwrap();
+    let docs = docsets.path().join("Fake.docset/Contents/Resources/Documents");
+    std::fs::create_dir_all(&docs).unwrap();
+    // A docset needs an index file to be listed; an empty one is enough.
+    std::fs::write(docsets.path().join("Fake.docset/Contents/Resources/docSet.dsidx"), b"").unwrap();
+    std::fs::write(docs.join("index.html"), "<html><body><p>fake docset page not real</p></body></html>")
+        .unwrap();
+    let mut seen: Vec<Vec<String>> = Vec::new();
+    for configured in [false, true] {
+        let mut cfg = Config::for_home(home.path());
+        if configured {
+            cfg.dash_docsets = vec![docsets.path().to_path_buf()];
+        }
+        let hub = Hub::in_memory(cfg).unwrap();
+        add_org(&hub, OTHER);
+        let reg = builtin_registry();
+        let mut answers = Vec::new();
+        for (tool, args) in [
+            ("dash_list", json!({})),
+            ("dash_search", json!({ "query": "fake" })),
+            ("dash_view", json!({ "docset_id": "Fake", "path": "index.html" })),
+        ] {
+            let err = reg.call(&hub, &caller(OTHER), tool, args.clone()).await.unwrap_err();
+            assert_eq!(err.reason_code(), Some("org_unsupported"), "{configured} {tool}: {err}");
+            answers.push(err.to_string());
+        }
+        assert!(answers.iter().all(|a| !a.contains("Fake")), "{answers:?}");
+        seen.push(answers);
+        // The default organization reaches the docsets (or their absence).
+        let own = reg.call(&hub, &caller(ua_core::DEFAULT_ORG), "dash_list", json!({})).await;
+        match configured {
+            false => assert_eq!(own.unwrap_err().reason_code(), Some("not_configured")),
+            true => assert!(own.unwrap().to_string().contains("Fake"), "the default organization lists it"),
+        }
+    }
+    assert_eq!(seen[0], seen[1], "the same answer whether docsets are configured or not");
 }

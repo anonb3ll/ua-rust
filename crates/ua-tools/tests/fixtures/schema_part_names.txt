@@ -53,6 +53,7 @@ provider_accounts.v1
 relay.v1
 routines.v1
 skill_registry.v1
+skill_registry.v3.packages
 slack.v1
 slack.v2
 wake.v1

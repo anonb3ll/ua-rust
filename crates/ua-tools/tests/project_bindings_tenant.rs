@@ -544,7 +544,8 @@ async fn an_unknown_organization_is_refused_before_any_write() {
         .err(&human(UNKNOWN), "project_repo_bind", json!({ "project": "web", "repo": "owner-b/repo" }))
         .await;
     assert_eq!(reason(&e), "unknown_organization");
-    assert!(e.to_string().contains("no binding was changed"), "{e}");
+    // The registry refuses the organization before the tool runs.
+    assert!(e.to_string().contains("nothing ran and nothing was written"), "{e}");
     // An unbind has nothing to insert, so the existence trigger cannot catch it.
     let e = h.err(&human(UNKNOWN), "project_repo_unbind", json!({ "project": "web" })).await;
     assert_eq!(reason(&e), "unknown_organization");
@@ -552,11 +553,12 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     assert_eq!(h.rows(), before);
     assert_eq!(h.events("project.repo.bound"), bound);
     assert_eq!(h.events("project.repo.unbound"), 0);
-    // Reads see nothing of any other organization.
-    let got = h.ok(&agent(UNKNOWN), "project_repo_get", json!({ "project": "web" })).await;
-    assert_eq!(got["binding"], Value::Null);
-    let list = h.ok(&agent(UNKNOWN), "project_repo_list", json!({})).await;
-    assert_eq!(list["projects"], json!([]));
+    // Reads are refused the same way.
+    for (tool, args) in [("project_repo_get", json!({ "project": "web" })), ("project_repo_list", json!({}))]
+    {
+        let e = h.err(&agent(UNKNOWN), tool, args).await;
+        assert_eq!(reason(&e), "unknown_organization", "{tool}: {e}");
+    }
 }
 
 // --- task-driven lookups -------------------------------------------------------------
