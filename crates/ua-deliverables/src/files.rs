@@ -80,7 +80,7 @@ pub fn submit(tx: &mut WriteTx<'_>, input: Submission<'_>) -> UaResult<(FileRevi
             ledger::append(
                 tx,
                 EventInput::new(
-                    org,
+                    DEFAULT_ORG,
                     CREATED,
                     json!({
                         "org_id": org, "task_id": input.task_id, "deliverable_id": id, "kind": "file",
@@ -129,7 +129,7 @@ pub fn submit(tx: &mut WriteTx<'_>, input: Submission<'_>) -> UaResult<(FileRevi
     )?;
     ledger::append(
         tx,
-        EventInput::new(org, REVISED, json!({
+        EventInput::new(DEFAULT_ORG, REVISED, json!({
             "org_id": org, "task_id": input.task_id, "deliverable_id": id, "kind": "file",
             "revision_id": revision_id, "rev_no": rev_no, "identity": identity, "size_bytes": input.bytes.len(),
         }))
@@ -186,7 +186,7 @@ pub fn destination_reserved(conn: &Connection, org: &str, root: &str, name: &str
 }
 
 pub fn authorize(tx: &mut WriteTx<'_>, file: &FileRevision, release: &Release) -> UaResult<()> {
-    let org = &file.deliverable.org_id;
+    let org = row_org(tx, &file.deliverable.org_id)?;
     let revision_id = file.revision.id;
     tx.execute(
         "INSERT INTO deliverable_releases (org_id, revision_id, approval_id, requester, approver, destination,
@@ -200,11 +200,12 @@ pub fn authorize(tx: &mut WriteTx<'_>, file: &FileRevision, release: &Release) -
 }
 
 pub fn complete(tx: &mut WriteTx<'_>, file: &FileRevision, release: &Release) -> UaResult<String> {
+    let org = row_org(tx, &file.deliverable.org_id)?;
     let now = ua_core::time::now();
     let changed = tx.execute(
         "UPDATE deliverable_releases SET released_at = ?3, payload = NULL
          WHERE org_id = ?1 AND revision_id = ?2 AND released_at IS NULL",
-        params![file.deliverable.org_id, file.revision.id, now],
+        params![org, file.revision.id, now],
     )?;
     if changed != 1 {
         return Err(UaError::conflict("release is already complete"));
@@ -221,7 +222,7 @@ fn release_event(
 ) -> UaResult<()> {
     ledger::append(
         tx,
-        EventInput::new(&file.deliverable.org_id, channel, json!({
+        EventInput::new(DEFAULT_ORG, channel, json!({
             "task_id": file.deliverable.task_id, "deliverable_id": file.deliverable.id,
             "revision_id": file.revision.id, "sha256": file.revision.identity, "size_bytes": file.size_bytes,
             "approval_id": release.approval_id, "approver": release.approver,
@@ -233,10 +234,11 @@ fn release_event(
 }
 
 pub fn record_tamper(tx: &mut WriteTx<'_>, file: &FileRevision, requester: &str) -> UaResult<()> {
+    row_org(tx, &file.deliverable.org_id)?;
     ledger::append(
         tx,
         EventInput::new(
-            &file.deliverable.org_id,
+            DEFAULT_ORG,
             TAMPERED,
             json!({
                 "task_id": file.deliverable.task_id, "deliverable_id": file.deliverable.id,
