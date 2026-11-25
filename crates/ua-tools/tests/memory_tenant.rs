@@ -696,9 +696,12 @@ async fn an_unknown_organization_is_refused_before_any_write() {
         let e = h.call(&ghost, tool, args.clone()).await.unwrap_err();
         assert_eq!(reason(&e), "unknown_organization", "{tool}({args}): {e}");
     }
-    // Reads find nothing and write nothing.
-    assert_eq!(h.ok(&ghost, "memory_list", json!({})).await["items"], json!([]));
-    assert_eq!(h.ok(&ghost, "memory_search", json!({ "query": "fake" })).await["results"], json!([]));
+    // Reads are refused too: the registry refuses the organization before
+    // any tool runs.
+    for (tool, args) in [("memory_list", json!({})), ("memory_search", json!({ "query": "fake" }))] {
+        let e = h.call(&ghost, tool, args).await.unwrap_err();
+        assert_eq!(reason(&e), "unknown_organization", "{tool}: {e}");
+    }
     assert_eq!((h.snapshot(), h.events()), before);
 }
 

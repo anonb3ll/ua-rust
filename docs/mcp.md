@@ -43,14 +43,22 @@ pieces make this work:
   ([github](github.md#credentials-per-organization)); a secret stored
   under one of those names before (say, the relay's) can no longer be
   rotated with `managed_secret_set`: delete it and store it under a new
-  name. Because the MCP servers' secrets are the default organization's,
-  another organization's caller is refused (`org_unsupported`) by
-  `mcp_gateway` `call` and live `list` on a server that injects secrets.
-  A stdio server runs as a process on the hub, the default organization's
-  host, so its `call` and live `list` are refused to another
-  organization's caller too, with or without secrets, before anything is
-  spawned. A static `list` and a Streamable HTTP server with no secret
-  are not refused.
+  name. Every downstream server is the hub's, the default
+  organization's: its secrets are the default organization's, a stdio
+  server runs as a process on the hub's host, and a Streamable HTTP server
+  is reached from the hub's network position (loopback, tailnet and
+  private ranges its `address_scope` admits), with or without secrets,
+  and its registration (URL or command, address scope, secret names and
+  whether each is stored, review state) is the hub's configuration. So
+  another organization's caller is refused (`org_unsupported`) by every
+  `mcp_gateway` action (`call`, and `list` live or static) and by
+  `mcp_server_list`, until servers are per organization. The refusal is
+  the tools' registry pre-gate: it depends on the caller alone and comes
+  before any registry approval gate (so nothing is parked), before the
+  server is resolved, the policy check, the call slot, any secret read
+  and any spawn or connection. Such a call writes no
+  `agent.mcp_gateway.call` event, so nothing it sends reaches the default
+  organization's ledger.
 - **Encryption.** AES-256-GCM, a fresh random 96-bit nonce per write, and the
   secret's organization, name and consumer as associated data, so a row
   copied into another organization or under another name or consumer does
@@ -124,7 +132,8 @@ the operator sets the secrets again for the new registration. A secret set
 after the revocation was requested changes the payload and needs a new
 approval. `mcp_server_list` shows every server with its status (`active`,
 `review_expired`, `review_required`, `revoked` or `misconfigured`), its
-secret names and whether each is stored. It never shows a secret value.
+secret names and whether each is stored. It never shows a secret value,
+and it refuses another organization's caller (`org_unsupported`).
 
 Each change appends an `agent.mcp_server` ledger event (`registered`,
 `reviewed`, `revoked`) with the spec hash and approval id, in the same

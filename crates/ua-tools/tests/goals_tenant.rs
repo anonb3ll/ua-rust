@@ -861,7 +861,8 @@ async fn an_unknown_organization_is_refused_before_any_write() {
         let e = h.coord(&ghost, action, params).await.unwrap_err();
         assert_eq!(reason(&e), "unknown_organization", "{action}: {e}");
     }
-    // Deciding is refused by authority before storage is reached.
+    // Deciding is refused too: the registry refuses the organization before
+    // the tool's authority check runs.
     let e = h
         .coord(
             &human(UNKNOWN),
@@ -870,7 +871,7 @@ async fn an_unknown_organization_is_refused_before_any_write() {
         )
         .await
         .unwrap_err();
-    assert_eq!(reason(&e), "org_mismatch", "{e}");
+    assert_eq!(reason(&e), "unknown_organization", "{e}");
     assert_eq!((h.snapshot(), h.events()), before);
 }
 

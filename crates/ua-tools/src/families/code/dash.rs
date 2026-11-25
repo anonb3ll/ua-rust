@@ -4,6 +4,11 @@
 //! with none configured every tool answers `not_configured`. Docset indexes
 //! are opened read-only; page paths are confined to the docset's
 //! `Contents/Resources/Documents`.
+//!
+//! The docset directories are the hub's filesystem, the default
+//! organization's: another organization's caller is refused
+//! (`org_unsupported`) before `dash_docsets` is read, so it learns neither
+//! whether docsets are configured nor what they hold.
 
 use std::path::PathBuf;
 
@@ -216,6 +221,19 @@ fn view(cfg: &Config, docset_id: &str, path: &str) -> UaResult<Value> {
     }))
 }
 
+/// Refuse another organization's caller before the docset configuration is
+/// read or any docset is opened (see the module docs).
+fn require_hub_org(ctx: &ToolCtx) -> UaResult<()> {
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            "the documentation sets are on the hub's filesystem, which belongs to the default organization; \
+             nothing was read",
+        ));
+    }
+    Ok(())
+}
+
 pub fn register(r: &mut Registry) {
     r.add(
         tool(
@@ -223,6 +241,7 @@ pub fn register(r: &mut Registry) {
             "List the Dash/Zeal docsets found in the directories UA_DASH_DOCSETS names (fails with \
              not_configured when it is unset). Returns {docsets: [{name, id, path, platform}]}.",
             |ctx: ToolCtx, _a: ListArgs| async move {
+                require_hub_org(&ctx)?;
                 let cfg = ctx.hub.cfg().clone();
                 blocking(move || list(&cfg)).await
             },
@@ -237,6 +256,7 @@ pub fn register(r: &mut Registry) {
              search to one docset by id, name or id prefix. Returns {results: [{docset_name, docset_id, \
              name, type, path}]}.",
             |ctx: ToolCtx, a: SearchArgs| async move {
+                require_hub_org(&ctx)?;
                 let cfg = ctx.hub.cfg().clone();
                 blocking(move || search(&cfg, &a.query, a.docset.as_deref())).await
             },
@@ -252,6 +272,7 @@ pub fn register(r: &mut Registry) {
              content, truncated, extraction}; extraction is readability, full-page (no article found, or a \
              build without the readability feature) or raw-html.",
             |ctx: ToolCtx, a: ViewArgs| async move {
+                require_hub_org(&ctx)?;
                 let cfg = ctx.hub.cfg().clone();
                 blocking(move || view(&cfg, &a.docset_id, &a.path)).await
             },

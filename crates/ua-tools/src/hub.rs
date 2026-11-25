@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ua_core::Config;
 use ua_store::Db;
@@ -21,6 +21,15 @@ struct HubInner {
     db: Db,
     ci: Arc<dyn CiVerifier>,
     webhook_scan: Arc<WebhookScan>,
+    ledger_status: Arc<RwLock<Option<LedgerStatus>>>,
+}
+
+/// The outcome of the last full ledger verify in this process
+/// ([`Hub::record_ledger_verify`]).
+#[derive(Clone, Copy)]
+struct LedgerStatus {
+    at: Instant,
+    ok: bool,
 }
 
 /// The GitHub webhook secret sharing check
@@ -227,7 +236,8 @@ impl Hub {
     pub fn new(cfg: Config, db: Db) -> Self {
         let ci = Arc::new(GitHubCiVerifier::new(cfg.clone(), db.clone()));
         let webhook_scan = WebhookScan::new(cfg.clone(), db.clone());
-        Self { inner: Arc::new(HubInner { cfg, db, ci, webhook_scan }) }
+        let ledger_status = Arc::new(RwLock::new(None));
+        Self { inner: Arc::new(HubInner { cfg, db, ci, webhook_scan, ledger_status }) }
     }
 
     /// Mark this hub as the one serving deliveries: check the webhook
@@ -241,7 +251,24 @@ impl Hub {
     pub fn with_ci_verifier(self, ci: Arc<dyn CiVerifier>) -> Self {
         let (cfg, db) = (self.inner.cfg.clone(), self.inner.db.clone());
         let webhook_scan = self.inner.webhook_scan.clone();
-        Self { inner: Arc::new(HubInner { cfg, db, ci, webhook_scan }) }
+        let ledger_status = self.inner.ledger_status.clone();
+        Self { inner: Arc::new(HubInner { cfg, db, ci, webhook_scan, ledger_status }) }
+    }
+
+    /// Keep the outcome of a full ledger verify (`ua_store::ledger::verify`)
+    /// that just ran, for [`Hub::ledger_verified_within`].
+    pub(crate) fn record_ledger_verify(&self, ok: bool) {
+        if let Ok(mut g) = self.inner.ledger_status.write() {
+            *g = Some(LedgerStatus { at: Instant::now(), ok });
+        }
+    }
+
+    /// Whether the hub's ledger verified, from a full verify kept by
+    /// [`Hub::record_ledger_verify`] no older than `max_age`; `None` when
+    /// none was kept in this process or the kept one is older.
+    pub(crate) fn ledger_verified_within(&self, max_age: Duration) -> Option<bool> {
+        let g = self.inner.ledger_status.read().ok()?;
+        g.filter(|s| s.at.elapsed() <= max_age).map(|s| s.ok)
     }
 
     /// The GitHub webhook routes refused because another route shares

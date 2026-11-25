@@ -259,6 +259,24 @@ fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
+/// A local harness is a process the hub spawns on its own host, in a
+/// directory of the hub's filesystem: the default organization's. Another
+/// organization's caller is refused (`org_unsupported`) before the harness
+/// is looked up, before a task's recorded `worktree_path` is resolved and
+/// before any approval, so a path it recorded through `task_claim` is never
+/// touched. Routing to a node is checked by the node tools; a run with no
+/// harness spawns nothing.
+fn require_hub_org_for_harness(caller: &Caller) -> UaResult<()> {
+    if caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(UaError::denied(
+            "org_unsupported",
+            "a local harness runs as a process on the hub, which serves the default organization only; \
+             nothing was resolved, started or written",
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve and check the directory a harness runs in: absolute, existing,
 /// not the filesystem root and not inside the hub's home (`$UA_HOME`, which
 /// holds the database and run logs).
@@ -678,7 +696,11 @@ async fn dispatch_task(ctx: ToolCtx, a: TaskArgs) -> UaResult<Value> {
         return Err(refusal.error);
     }
     let cfg = ctx.hub.cfg().clone();
-    let harness = match a.harness.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let named = a.harness.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if named.is_some() {
+        require_hub_org_for_harness(&ctx.caller)?;
+    }
+    let harness = match named {
         Some(name) => Some((
             name.to_string(),
             cfg.harnesses
@@ -1343,6 +1365,9 @@ async fn resume(ctx: ToolCtx, a: RunArgs) -> UaResult<Value> {
         return Err(UaError::conflict(
             "dispatch resume failed: the run was routed to a node; dispatch the task to the node again",
         ));
+    }
+    if run.harness.is_some() {
+        require_hub_org_for_harness(&ctx.caller)?;
     }
     let cfg = ctx.hub.cfg().clone();
     let harness = match &run.harness {

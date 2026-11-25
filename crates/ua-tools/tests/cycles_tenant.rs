@@ -711,7 +711,8 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     let events = h.count("SELECT COUNT(*) FROM event_log");
     let approvals = h.count("SELECT COUNT(*) FROM approvals");
     let who = agent(UNKNOWN);
-    let guard = format!("unknown organization {UNKNOWN:?}; no autonomous cycle was changed");
+    // The registry refuses the organization before the tool runs.
+    let guard = format!("unknown organization {UNKNOWN:?}; nothing ran and nothing was written");
 
     let mut calls = writes(&a_id);
     calls.push(("start", json!({ "agent": "builder-1" })));
@@ -724,11 +725,11 @@ async fn an_unknown_organization_is_refused_before_any_write() {
     assert_eq!(h.count("SELECT COUNT(*) FROM event_log"), events);
     assert_eq!(h.count("SELECT COUNT(*) FROM approvals"), approvals);
 
-    // Reads in an unknown organization see nothing.
-    let l = h.ok(&who, "list", json!({})).await;
-    assert_eq!(l["cycles"], json!([]));
-    let e = h.manage(&who, "get", json!({ "cycle_id": a_id })).await.unwrap_err();
-    assert_eq!(e.to_string(), missing_cycle(&a_id));
+    // Reads in an unknown organization are refused the same way.
+    for (action, params) in [("list", json!({})), ("get", json!({ "cycle_id": a_id }))] {
+        let e = h.manage(&who, action, params).await.unwrap_err();
+        assert_eq!(reason(&e), "unknown_organization", "{action}: {e}");
+    }
 }
 
 // --- defence in depth --------------------------------------------------------------------------
