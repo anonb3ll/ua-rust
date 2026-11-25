@@ -928,9 +928,14 @@ async fn project_repo_bindings_are_for_operators_under_their_own_name() {
 
 // --- stale worktrees ------------------------------------------------------------
 
+/// Runs `git` for a test fixture. Auto-gc and auto-maintenance are off: after
+/// a commit, git may start a detached `gc --auto` / `maintenance run --auto`
+/// whose working directory is the worktree, and the cleanup's liveness scan
+/// then (correctly) reports that worktree in use, so the test flaked.
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
