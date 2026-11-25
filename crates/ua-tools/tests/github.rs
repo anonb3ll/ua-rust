@@ -432,14 +432,15 @@ async fn webhook_signatures_are_checked_and_replays_refused() {
     assert!(matches!(send(Some(good.clone()), "bad id!").await, Err(WebhookError::BadRequest(_))));
     assert_eq!(h.events("agent.github.webhook.received").await.len(), 1);
 
-    // Without a secret, everything is refused.
+    // Without a secret, everything is refused, with the same answer as a
+    // bad signature.
     let h2 = H::with(|c| c.github_webhook_secret_value = None).await;
     let r = receive(
         &h2.hub,
         WebhookDelivery { event: "ping", delivery_id: "d-2", signature: Some(&good), body: &body },
     )
     .await;
-    assert_eq!(r.unwrap_err(), WebhookError::NotConfigured);
+    assert_eq!(r.unwrap_err(), WebhookError::BadSignature);
 }
 
 #[tokio::test]
@@ -1579,7 +1580,11 @@ async fn deliveries_seen_before_the_upgrade_are_still_replays_after_it() {
         .read(|c| Ok(c.query_row("SELECT count(*) FROM inbound_deliveries", [], |r| r.get(0))?))
         .unwrap();
     assert_eq!(rows, 2);
-    // Replays of what the old hub saw are refused, by id and by body.
+    // Replays of what the old hub saw are refused, by id and by body. A hub
+    // opened with `Hub::open` does not serve, so it has not checked the
+    // webhook secrets for sharing and refuses every route until it does.
+    assert!(hub.shared_webhook_routes().is_none(), "only a serving hub checks at open");
+    hub.rescan_shared_webhook_secrets().await;
     let body = serde_json::to_vec(&ping).unwrap();
     let sig = signature_for(SECRET.as_bytes(), &body);
     for id in ["old-1", "new-id"] {
