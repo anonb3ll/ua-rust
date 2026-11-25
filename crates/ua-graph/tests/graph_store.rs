@@ -2233,3 +2233,105 @@ fn sql_deadline_enforcement_exact_ppr_scan_cap_skip_hubs_clamp_and_endpoint_node
     assert!(nbr_deadline.truncated, "neighbors must return truncated = true on deadline");
     assert!(nbr_deadline.next_cursor.is_none());
 }
+
+#[test]
+fn writer_deadline_slot_is_disarmed_after_cycle_check() {
+    let db = open_graph_db();
+    let t1 = ensure_org_node(&db, DEFAULT_ORG, NodeKind::Task, "wd-1");
+    let t2 = ensure_org_node(&db, DEFAULT_ORG, NodeKind::Task, "wd-2");
+    let t3 = ensure_org_node(&db, DEFAULT_ORG, NodeKind::Task, "wd-3");
+
+    // 1. Run a bounded cycle check on the writer connection with a tight 5 ms deadline
+    //    (both the succeeding path and the refused-cycle error path).
+    db.write(|tx| {
+        assert_edge(
+            tx,
+            AssertEdgeRequest {
+                org_id: DEFAULT_ORG.into(),
+                src_id: t1.id.clone(),
+                dst_id: t2.id.clone(),
+                kind: EdgeKind::DependsOn,
+                assertion_scope: String::new(),
+                state: EdgeState::Active,
+                weight: 1.0,
+                provenance: prov_agent("builder-1"),
+                valid_from: None,
+                valid_to: None,
+                meta_json: None,
+                scope: VisibilityScope::org_only(),
+                generic: false,
+                max_edges_per_org: 0,
+                max_live_edges_per_node: 0,
+                cycle_bounds: CycleCheckBounds { max_nodes: 1_000, max_edges: 5_000, deadline_ms: 5 },
+            },
+        )
+    })
+    .expect("first acyclic depends_on write succeeds");
+
+    let cyc_err = db
+        .write(|tx| {
+            assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: t2.id.clone(),
+                    dst_id: t1.id.clone(),
+                    kind: EdgeKind::DependsOn,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_agent("builder-1"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: false,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: CycleCheckBounds { max_nodes: 1_000, max_edges: 5_000, deadline_ms: 5 },
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(cyc_err.reason_code(), Some("cycle_detected"));
+
+    // 2. Sleep strictly past the 5 ms deadline used by the cycle checks above.
+    std::thread::sleep(std::time::Duration::from_millis(15));
+
+    // 3. A subsequent ordinary write on the same writer executing well over the 2,000-opcode
+    //    progress_handler cadence must succeed (fails with SQLITE_INTERRUPT if the writer
+    //    deadline slot was left armed).
+    let later = db
+        .write(|tx| {
+            let max_x: i64 = tx.query_row(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5000) \
+                 SELECT MAX(x) FROM c",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(max_x, 5_000);
+            assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: t2.id.clone(),
+                    dst_id: t3.id.clone(),
+                    kind: EdgeKind::DependsOn,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_agent("builder-1"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: false,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: CycleCheckBounds::default(),
+                },
+            )
+        })
+        .expect("later ordinary write past previous cycle-check deadline must succeed");
+    assert_eq!(later.dst_id, t3.id);
+}

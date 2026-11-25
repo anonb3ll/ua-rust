@@ -253,9 +253,9 @@ Following [memory.md](memory.md) §4, topical retirement (superseding,
 invalidating, or narrowing an asserting note) sets `valid_to` only on
 **topical** edges (`extends`, `mentions`, accepted `contradicts`, `links_to`,
 etc.). **Lineage** edges (`supersedes`, `derives`, `evidence`, `produces`,
-`executes`, `executed_by`, `approved_by`, `governed_by`, `promoted_from`) are
-never closed by topical retirement, keeping audit and provenance traces
-walkable.
+`executes`, `executed_by`, `approved_by`, `governed_by`, `reviewed_by`,
+`promoted_from`) are never closed by topical retirement, keeping audit and
+provenance traces walkable.
 
 **Mirror-close carve-out:** an authoritative domain column change that
 invalidates a mirrored edge (for example `memory_restore` clearing
@@ -422,6 +422,15 @@ to operate over `graph_edges`.
   2. `organization.v1.graph` (`Procedure` via
      `ua_store::org::tenant_part("organization.v1.graph", &["graph_nodes", "graph_edges"])`)
      — installs `*_org_exists` and `*_org_immutable`.
+  3. `graph.v2.counters` (`SchemaPart` in `ua-graph`) — creates
+     `graph_org_counts(org_id, node_count, edge_count)`, backfills existing org
+     totals, and installs `AFTER INSERT` triggers (`graph_nodes_count_ai`,
+     `graph_edges_count_ai`) so per-org node and edge quota checks run in O(1)
+     inside the write transaction.
+  4. `organization.v1.graph_counters` (`Procedure` via
+     `ua_store::org::tenant_part("organization.v1.graph_counters", &["graph_org_counts"])`)
+     — installs `graph_org_counts_org_exists` and
+     `graph_org_counts_org_immutable`.
 
 ### DDL (`graph.v1`)
 
@@ -749,7 +758,11 @@ the C1 PR):
 (16 MiB) and `PRAGMA wal_autocheckpoint = 4000` (16 MiB WAL threshold) on the
 **single writer connection only** (+14 MiB over SQLite's 2 MiB default, total
 across the hub). Read pool connections keep SQLite's default 2 MiB page cache
-and `mmap_size` is left unset.
+and `mmap_size` is left unset. Measured on the 100k-edge fixture with quotas
+enabled, stock SQLite writer defaults yield `8,223 edges/sec` batched insert and
+`3.89 ms` p95 (`27.53 ms` p99) single governed writes due to index cache spills
+and mid-burst checkpoints, versus `16,383 edges/sec` and `2.53 ms` p95
+(`2.86 ms` p99) with the 16 MiB writer-only budget.
 
 ## Security model
 
@@ -787,9 +800,12 @@ and `mmap_size` is left unset.
 - **Cycle immunity:** All traversals track visited node IDs in memory; cyclic
   subgraphs cannot cause infinite recursion or exponential blowup.
 - **Storage and payload caps:** Configurable per-organization quotas
-  (`graph_max_nodes_per_org`, `graph_max_edges_per_org`), JSON metadata byte
-  limits (`8 KiB` on nodes, `4 KiB` on edges), `external_id` length limit (256),
-  and standard policy rate limits on write tools.
+  (`graph_max_nodes_per_org`, `graph_max_edges_per_org`, enforced in O(1) via
+  `graph_org_counts`), per-node live-edge cap (`graph_max_live_edges_per_node`,
+  default `5,000`, counting live outgoing + incoming edges on both endpoints and
+  refusing with `node_edge_limit_exceeded`), JSON metadata byte limits (`8 KiB`
+  on nodes, `4 KiB` on edges), `external_id` length limit (256), and standard
+  policy rate limits on write tools.
 
 ### Who may create/mutate nodes and assert/retract edges
 
