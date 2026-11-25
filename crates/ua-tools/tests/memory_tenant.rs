@@ -634,9 +634,9 @@ async fn a_receipt_naming_another_organizations_note_is_never_replayed() {
     let id = ra["id"].as_str().unwrap().to_string();
     let rev = ra["revision"].as_str().unwrap_or("no-revision").to_string();
     h.sql(
-        "INSERT INTO idempotency_keys (key, tool, result_json, created_at) \
-         SELECT 'org:org-b/memory_save/builder-1/kb', tool, result_json, created_at FROM idempotency_keys \
-         WHERE key = 'memory_save/builder-1/ka'",
+        "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at) \
+         SELECT 'org-b', 'org:org-b/memory_save/builder-1/kb', tool, result_json, created_at \
+         FROM idempotency_keys WHERE key = 'memory_save/builder-1/ka'",
     )
     .unwrap();
     let before = (h.snapshot(), h.events());

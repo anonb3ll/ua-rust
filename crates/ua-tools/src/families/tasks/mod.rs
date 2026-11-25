@@ -621,11 +621,12 @@ pub(crate) fn emit(tx: &mut WriteTx<'_>, org: &str, channel: &str, payload: Valu
 
 pub(crate) use crate::families::plans::{ledger_label, ledger_text};
 
-/// The stored key of a client idempotency key. `idempotency_keys` is still a
-/// hub-wide table (its `(org_id, principal, key)` rebuild is a later change),
-/// so another organization's key is prefixed with its organization and can
-/// never replay the default organization's reply, or a third's. The default
-/// organization keeps the `<tool>:<key>` form other readers rely on.
+/// The stored key of a client idempotency key. `idempotency_keys` is keyed
+/// by `(org_id, key)` (`idempotency.v2.tenant_keys`) and every read filters
+/// on the caller's organization. Another organization's key text keeps its
+/// interim organization prefix as defence in depth, byte for byte as before
+/// the rebuild, so a retry in flight across the upgrade still replays. The
+/// default organization keeps the `<tool>:<key>` form other readers rely on.
 pub(crate) fn idem_key(org: &str, tool: &str, key: &str) -> String {
     if org == ua_core::DEFAULT_ORG { format!("{tool}:{key}") } else { format!("org:{org}/{tool}:{key}") }
 }
@@ -639,8 +640,8 @@ pub(crate) fn idempotent_replay(
 ) -> UaResult<Option<Value>> {
     let stored: Option<String> = conn
         .query_row(
-            "SELECT result_json FROM idempotency_keys WHERE key = ?1 AND tool = ?2",
-            [idem_key(org, tool, key), tool.to_string()],
+            "SELECT result_json FROM idempotency_keys WHERE org_id = ?1 AND key = ?2 AND tool = ?3",
+            [org.to_string(), idem_key(org, tool, key), tool.to_string()],
             |r| r.get(0),
         )
         .optional()?;
@@ -655,8 +656,8 @@ pub(crate) fn idempotent_record(
     result: &Value,
 ) -> UaResult<()> {
     tx.execute(
-        "INSERT INTO idempotency_keys (key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![idem_key(org, tool, key), tool, result.to_string(), now()],
+        "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![org, idem_key(org, tool, key), tool, result.to_string(), now()],
     )?;
     Ok(())
 }
