@@ -965,10 +965,16 @@ async fn node_register(ctx: ToolCtx, a: RegisterArgs) -> UaResult<Value> {
     // The node belongs to the registering caller's organization, for good
     // (`nodes_org_immutable`).
     let org = ctx.caller.org_id.clone();
+    let reserved = super::agents::Reserved::of(ctx.hub.cfg());
     ctx.hub
         .db()
         .write_async(move |tx| {
             super::node_queue::require_org(tx, &org)?;
+            // The owning label must be free for the caller's organization:
+            // another organization's agent label, or (outside the default
+            // organization) a configuration-reserved one, never owns a node
+            // here, so no label-keyed setting follows the node.
+            super::agents::require_label_free(tx, &reserved, &org, &agent)?;
             let existing: Option<RegisteredRow> = tx
                 .query_row(
                     "SELECT agent, retired_at, version, facts_json, org_id FROM nodes WHERE node = ?1",

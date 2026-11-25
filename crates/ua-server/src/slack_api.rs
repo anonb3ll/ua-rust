@@ -275,7 +275,10 @@ async fn execute(
     let id = AuthIdentity::in_default(identity.clone(), ActorKind::Human, true);
     let caller = caller_for(&state, &id, None, Transport::Slack);
     // Refused, like a static token, while a row of another organization
-    // holds the identity's label.
+    // holds the identity's label. Defence in depth: it cannot fire today,
+    // because a Slack identity is a configuration-reserved label
+    // (`agents::Reserved`), always the default organization's. It stays so
+    // a later change to the reservation cannot quietly let one through.
     let held = crate::auth::held_outside_default(&state, &identity).await;
     let (tool, outcome) = match slack::command_call(&parsed, &d.delivery_id) {
         _ if held => (

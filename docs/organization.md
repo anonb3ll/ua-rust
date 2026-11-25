@@ -441,7 +441,11 @@ here for memory columns, owners and defaults.
     the delegator's own organization**: `delegate` answers a `to_agent` that
     no agent has registered and one another organization's agent holds
     byte-for-byte alike, as `not_found` ("no agent in this organization"),
-    and creates nothing. This applies to the default organization too.
+    and creates nothing. This applies to the default organization too. The
+    match ignores letter case, as the label namespace does (an exact
+    spelling wins), and the delegation stores the **registered** spelling
+    as `to_agent`, the one the agent's claims and lists match: `Builder-1`
+    delegates to the registered `builder-1`.
     Policy authorizations, which carry no `org_id` yet, are reached only
     through their task's organization; delegations carry their own (below).
     (d) Task replies carry no `org_id`.
@@ -1133,7 +1137,9 @@ here for memory columns, owners and defaults.
   - **Hub recovery.** A default-organization lifecycle operator (`Authz`
     over `default`, which no other organization's caller holds) passes
     `any_org=true` to `agent_retire` and the new `agent_forget`: the agent
-    of whichever organization holds the label is retired (doing claims
+    of whichever organization's **row** holds the label (the rows, not the
+    configuration reservation, so a stale row another organization keeps
+    for a reserved label is reachable too) is retired (doing claims
     still refuse it; its tokens, OAuth sign-ins and session credentials are
     revoked), then forgotten (its agent row, lifecycle row and profile
     bindings deleted, so the label is free; its sessions, notes and revoked
@@ -1144,9 +1150,15 @@ here for memory columns, owners and defaults.
     another organization holds is refused as taken.
   - **Forget never revives a credential.** A retired agent's lifecycle row
     is what refuses its static configuration token, which cannot be
-    revoked. So `agent_forget` is refused (`agent_label_configured`) for a
-    label hub configuration names (the reserved labels below); the operator
-    removes it from configuration first. Refusing was chosen over a
+    revoked. So in the default organization `agent_forget` is refused
+    (`agent_label_configured`) for a label hub configuration names (the
+    reserved labels below); the operator removes it from configuration
+    first. Another organization's stale row for a reserved label, reached
+    only through hub recovery, is forgotten normally: that is what frees
+    the label for the default credential again. A forget is also refused
+    while the agent still owns a node in service (`agent_owns_nodes`): a
+    node is keyed by its owner's label, so it would pass to whoever
+    registers the label next; retire the nodes (`node_retire`) first. Refusing was chosen over a
     tombstone that `is_retired` would keep honouring: a tombstone leaves
     the label unusable for good, which is what forget exists to undo, and
     every credential path would have to read a second store. A forget also
@@ -1163,26 +1175,60 @@ here for memory columns, owners and defaults.
   - **Reserved labels** (the design below, "Reserved labels" and scenario
     17a). Every label hub configuration names is the default
     organization's: `human_identities`, `lifecycle_operators`, static
-    token labels, the `[profiles]` map, `oauth_identities`,
-    `oauth_client_credentials` identities, Slack identities, and the policy
-    file's role identities (`agent:<label>` or a bare name; a
-    `profile:<name>` entry names a profile) and `profile_defaults` keys,
-    compared without regard to case (`agents::Reserved`). The label
+    token labels, the `[profiles]` map, the `agent_scopes` (prod-action
+    scope) and `agent_workspaces` (sandbox root) maps, `revoked_agents`,
+    `oauth_identities`, `oauth_client_credentials` identities, Slack
+    identities, and the policy file's role identities (`agent:<label>` or a
+    bare name; a `profile:<name>` entry names a profile) and
+    `profile_defaults` keys, compared without regard to case
+    (`agents::Reserved`). Every other `Config` map or list is keyed by
+    something other than an agent label (harness, channel, check, project,
+    MCP server, Zulip or GitHub user names). Reserving the label-keyed maps
+    is what stops another organization's label from inheriting the default
+    organization's settings for it: its own `agent_workspaces` root, or a
+    prod scope that passes the merge or delete gate. While the policy file
+    cannot be read or parsed its role labels are unknown, so the set fails
+    closed: outside the default organization a label the organization does
+    not already hold is refused (`policy_unavailable`) for registration,
+    token issue, `session_start` and heartbeat, until the file is fixed;
+    a label it already holds keeps working. The label
     namespace (`label_org`, `require_label_free`, `held_outside_default`)
     treats such a label as held by `default`: another organization's
     heartbeat, `session_start`, profile binding and token issue for it are
     refused as taken; a managed token or session credential of another
     organization for it never authenticates; and the default
     organization's static token, OAuth grant, Control Center session and
-    Slack identity for it are never locked out. **Not yet built** from the
+    Slack identity for it always authenticate. **Not yet built** from the
     design: who inside the default organization may create a reserved
     label's row (any default writer still may), and the `system_doctor`
     `MISCONFIGURED` report for a label added to configuration while
     another organization already holds a row for it. Such a row (only
-    possible if it predates the reservation) is inert instead: its tokens
-    and credentials are refused and its writers are refused as taken; to
-    remove it, take the label out of configuration, recover it with
-    `any_org`, then add it back.
+    possible if it predates the reservation) is **not** harmless: its own
+    tokens and credentials are refused and its writers are refused as
+    taken, but `agents.label` is the table's key, so while it exists the
+    default credential for the label records nothing either
+    (`session_start` is refused `agent_label_blocked` and `agent_heartbeat`
+    answers `recorded: false`). A default-organization lifecycle operator
+    removes it with hub recovery, `agent_retire` then `agent_forget`, both
+    with `any_org=true`, without touching configuration. Between the two
+    the label reads as retired hub-wide (`is_retired` is not organization
+    aware), so the default credential is refused until the forget.
+  - **No workspace outside the default organization yet.** The hub's
+    workspace root and read roots are the default organization's. Every
+    workspace tool resolves its sandbox through `workspace::sandbox`
+    (`fs_*`, `run_cmd`, `run_cmd_check`, `git_*`, the worktree tools, the
+    code index, lint, media and dev-server tools, export's workspace
+    target), and outside the default organization it is refused
+    (`org_unsupported`) before any filesystem access. An `agent_workspaces`
+    entry never applies there: its key is a reserved label, the default
+    organization's, even when another organization's caller carries the
+    same label text. The tools that read the
+    hub workspace directly fail the same way (`skill_registry` publish and
+    drift, and the `security_audit` and `skill_review` targets), `capability_catalog` lists no
+    workspace skills to another organization, and an autonomous cycle of
+    another organization is held for a human before its worktree is read
+    or the validation command runs. So until per-organization workspaces
+    exist, another organization has no hub filesystem at all.
   - **No human or operator path outside the default organization yet.**
     Human identities and lifecycle operators are hub configuration, the
     default organization's, and no resolver produces a verified human of

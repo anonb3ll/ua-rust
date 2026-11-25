@@ -575,24 +575,29 @@ fn create(ctx: &ToolCtx, a: DelegateArgs) -> UaResult<Value> {
         crate::families::tasks::require_org(tx, &org)?;
         // A delegation targets only a registered agent of the delegator's
         // own organization (owner decision): an `agents` row in this
-        // organization with exactly this label, the spelling its claims
-        // match. A label no agent has registered and a label another
-        // organization's agent holds get the same answer, built from the
-        // requested label alone, so neither reveals whether the label
-        // exists elsewhere.
-        let registered = tx
+        // organization whose label matches without regard to case (the
+        // label namespace is case-insensitive), an exact spelling first.
+        // The registered spelling is what is stored as `to_agent`, since
+        // that is the spelling the agent's claims and lists match. A label
+        // no agent has registered and a label another organization's agent
+        // holds get the same answer, built from the requested label alone,
+        // so neither reveals whether the label exists elsewhere.
+        let registered: Option<String> = tx
             .query_row(
-                "SELECT 1 FROM agents WHERE org_id = ?1 AND label = ?2",
+                "SELECT label FROM agents WHERE org_id = ?1 AND label = ?2 COLLATE NOCASE \
+                 ORDER BY (label = ?2) DESC, label LIMIT 1",
                 params![org, to_agent],
-                |_| Ok(()),
+                |r| r.get(0),
             )
-            .optional()?
-            .is_some();
-        if !registered {
+            .optional()?;
+        let Some(to_agent) = registered else {
             return Err(UaError::not_found(format!(
                 "no agent {to_agent:?} in this organization; a delegation targets a registered agent of the \
                  delegator's organization. Nothing was created"
             )));
+        };
+        if to_agent.eq_ignore_ascii_case(&from_agent) {
+            return Err(UaError::invalid("from_agent and to_agent must differ: you cannot delegate to yourself"));
         }
         let ts = ua_core::time::now();
         let (parent_untrusted, parent_project) = match a.parent_task_id {

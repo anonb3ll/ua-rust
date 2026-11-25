@@ -43,9 +43,13 @@
 //! history in its organization. It first revokes, again, every managed
 //! token, OAuth sign-in and session credential issued for the label since
 //! the retire, so a credential minted after the retire never comes back to
-//! life with the label. It is refused for a label hub configuration names
-//! ([`agents::Reserved`]: a static token, `[profiles]`, `oauth_identities`
-//! and the rest): the retired lifecycle row is the only thing that keeps a
+//! life with the label. It is refused while the agent still owns a node in
+//! service (`agent_owns_nodes`; retire the nodes first), since a node is
+//! keyed by its owner's label and would pass to whoever registers it next.
+//! In the default organization it is refused for a label hub configuration
+//! names ([`agents::Reserved`]: a static token, `[profiles]`,
+//! `agent_scopes`, `agent_workspaces`, `oauth_identities` and the rest):
+//! the retired lifecycle row is the only thing that keeps a
 //! static configuration token, which cannot be revoked, from
 //! authenticating, so such a label is forgotten only after the operator
 //! removes it from configuration. Refusing was chosen over a tombstone
@@ -63,7 +67,14 @@
 //! label any organization holds: `agent_retire` and `agent_forget` with
 //! `any_org=true` act in the agent's own organization through the same code,
 //! and another organization's agent answers only
-//! `{agent, org_id, changed, retired or forgotten, hub_recovery}`. Events
+//! `{agent, org_id, changed, retired or forgotten, hub_recovery}`. Hub
+//! recovery finds the organization from the rows, not the configuration
+//! reservation, so it also reaches another organization's stale row for a
+//! reserved label (one made before the reservation) and may retire and
+//! forget it; until it does, that row keeps the default credential for the
+//! label from recording anything (`agent_label_blocked`). Between that
+//! retire and the forget the label reads as retired hub-wide, so the
+//! default credential is refused until the forget. Events
 //! about another organization's agent carry no label, reason or actor
 //! (`ORG-EVENT-DEFAULT`, through `agents::emit`).
 
@@ -632,10 +643,15 @@ fn hub_recovery(ctx: &ToolCtx, any_org: Option<bool>, verb: Verb) -> UaResult<bo
 }
 
 /// The organization a change works in: the caller's own, or under hub
-/// recovery the one holding `label` (the caller's own when none does, so an
-/// unknown label answers as it always has). Outside hub recovery a label
-/// another organization holds is refused as taken: its agent is not the
-/// caller's to change, and the label namespace already shows that it is held.
+/// recovery the one whose **row** holds `label` (the caller's own when none
+/// does, so an unknown label answers as it always has). Hub recovery reads
+/// the rows, not the configuration reservation, so it reaches a stale row
+/// another organization keeps for a configuration-reserved label (one made
+/// before the reservation), which would otherwise lock the default
+/// credential for that label out of every write. Outside hub recovery a
+/// label another organization holds is refused as taken: its agent is not
+/// the caller's to change, and the label namespace already shows that it is
+/// held.
 fn action_org(
     c: &Connection,
     reserved: &agents::Reserved,
@@ -643,8 +659,10 @@ fn action_org(
     label: &str,
     hub: bool,
 ) -> UaResult<String> {
+    if hub {
+        return Ok(agents::row_label_org(c, label)?.unwrap_or_else(|| caller_org.to_string()));
+    }
     match agents::label_org(c, reserved, label)? {
-        Some(held) if hub => Ok(held),
         Some(held) if held != caller_org => Err(agents::label_taken(label)),
         _ => Ok(caller_org.to_string()),
     }
@@ -889,14 +907,20 @@ fn forget(
     reason: &str,
     current: Option<&Row>,
 ) -> UaResult<Changed> {
-    if reserved.contains(label) {
+    // The refusal protects the default organization's configured
+    // credential for the label. Another organization's row for a reserved
+    // label (reached only through hub recovery) is a stale squat on it, and
+    // forgetting that row is exactly what frees the label for the default
+    // organization's credential again.
+    if org == ua_core::DEFAULT_ORG && reserved.contains(label) {
         return Err(UaError::conflict_code(
             "agent_label_configured",
             format!(
-                "{label:?} is named in hub configuration (a static token, [profiles], oauth_identities, \
-                 human_identities, lifecycle_operators, Slack identities or a policy role); its retired \
-                 record is what keeps a configured credential refused. Remove it from configuration, then \
-                 forget it. Nothing was changed"
+                "{label:?} is named in hub configuration (a static token, [profiles], agent_scopes, \
+                 agent_workspaces, revoked_agents, oauth_identities, human_identities, \
+                 lifecycle_operators, Slack identities or a policy role); its retired record is what keeps \
+                 a configured credential refused. Remove it from configuration, then forget it. Nothing \
+                 was changed"
             ),
         ));
     }
@@ -909,6 +933,35 @@ fn forget(
         ));
     }
     let stored = current.map_or(label.to_string(), |r| r.agent.clone());
+    // A node is keyed by the label that owns it. Forgetting the label while
+    // it still owns a node in service would hand that node to whoever
+    // registers the label next (in any organization), so the nodes are
+    // retired first, deliberately, by an operator.
+    let nodes: Vec<String> = tx
+        .prepare(
+            "SELECT node FROM nodes WHERE org_id = ?1 AND agent = ?2 COLLATE NOCASE AND retired_at IS NULL \
+             ORDER BY node LIMIT 21",
+        )?
+        .query_map(params![org, stored], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if !nodes.is_empty() {
+        let more = if nodes.len() > 20 { " and more" } else { "" };
+        let shown = if org == ua_core::DEFAULT_ORG {
+            format!(" ({}{more})", nodes.iter().take(20).cloned().collect::<Vec<_>>().join(", "))
+        } else {
+            String::new()
+        };
+        return Err(UaError::conflict_code(
+            "agent_owns_nodes",
+            format!(
+                "cannot forget {stored:?}: it still owns {}{} node(s) in service{shown}. Retire them first \
+                 (node_retire); forgetting the label would hand them to whoever registers it next. Nothing \
+                 was changed",
+                nodes.len().min(20),
+                if nodes.len() > 20 { "+" } else { "" },
+            ),
+        ));
+    }
     let spellings: Vec<String> = tx
         .prepare("SELECT label FROM agents WHERE org_id = ?1 AND label = ?2 COLLATE NOCASE")?
         .query_map(params![org, stored], |r| r.get(0))?

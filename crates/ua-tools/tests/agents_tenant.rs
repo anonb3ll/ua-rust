@@ -886,6 +886,21 @@ async fn a_delegation_targets_only_a_registered_agent_of_the_delegators_organiza
     // B's agent sees its own delegation.
     let mine = h.ok(&agent(B_PEER, ORG_B), "delegate_list", json!({})).await;
     assert!(mine.to_string().contains(B_PEER), "{mine}");
+    // The target matches without regard to case, as the label namespace
+    // does, and the registered spelling is what is stored.
+    h.ok(&agent(A_DEVICE, DEFAULT_ORG), "agent_heartbeat", json!({})).await;
+    h.ok(&lead_a, "delegate", json!({ "to_agent": "Builder-1", "task_spec": SPEC })).await;
+    assert_eq!(
+        h.count(&format!(
+            "SELECT COUNT(*) FROM delegations WHERE org_id = 'default' AND to_agent = '{A_DEVICE}'"
+        )),
+        1
+    );
+    assert_eq!(h.count("SELECT COUNT(*) FROM delegations WHERE to_agent = 'Builder-1'"), 0);
+    // A case variant of the delegator itself is still a self-delegation.
+    let e =
+        h.call(&lead_a, "delegate", json!({ "to_agent": A_LEAD.to_uppercase(), "task_spec": SPEC })).await;
+    assert!(e.is_err(), "{e:?}");
 }
 
 #[tokio::test]
@@ -1182,6 +1197,194 @@ async fn configuration_reserved_labels_belong_to_the_default_organization() {
     // The default organization registers its configured labels as before.
     h.ok(&agent("deploy-bot", DEFAULT_ORG), "agent_heartbeat", json!({})).await;
     h.ok(&agent("profiled-bot", DEFAULT_ORG), "session_start", json!({ "kind": "interactive" })).await;
+}
+
+/// The label-keyed settings (`agent_scopes`, `agent_workspaces`,
+/// `revoked_agents`) are reserved like the rest of configuration, so another
+/// organization's agent never takes the label and inherits the setting: a
+/// workspace root (`ws-bot` → the hub's own directory) or a prod scope
+/// (`scoped-bot` → merge).
+#[tokio::test]
+async fn label_keyed_settings_are_reserved_and_never_reach_another_organization() {
+    let marker = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let m2 = marker.clone();
+    let h = H::with(move |cfg, dir| {
+        let ws = dir.join("ws-bot-root");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("hub-only-file-not-real.txt"), "x").unwrap();
+        *m2.lock().unwrap() = Some(ws.clone());
+        cfg.agent_scopes.insert("scoped-bot".into(), "merge".into());
+        cfg.agent_workspaces.insert("ws-bot".into(), ws.to_string_lossy().into_owned());
+        cfg.revoked_agents = vec!["revoked-bot".into()];
+    });
+    let ws = marker.lock().unwrap().clone().unwrap();
+    let reserved = ua_tools::families::agents::Reserved::of(h.hub.cfg());
+    let labels = ["scoped-bot", "ws-bot", "revoked-bot"];
+    for l in labels {
+        assert!(reserved.contains(l) && reserved.contains(&l.to_uppercase()), "{l}");
+    }
+    let before = h.snapshot();
+    for l in labels {
+        for label in [l.to_string(), l.to_uppercase()] {
+            let b = agent(&label, ORG_B);
+            for (tool, args) in [
+                ("agent_heartbeat", json!({})),
+                ("session_start", json!({ "kind": "interactive" })),
+                ("profile_activate", json!({ "profile": "research" })),
+                ("node_register", json!({ "node": format!("{label}-node"), "facts": facts(B_ROOT) })),
+            ] {
+                let e = h.call(&b, tool, args).await.unwrap_err();
+                assert_eq!(reason(&e), "agent_label_taken", "{label}: {tool}: {e:?}");
+            }
+            let e = h
+                .call(
+                    &unreachable_b_human("b-human-not-real"),
+                    "agent_token_issue",
+                    json!({ "agent_label": label, "value": "r".repeat(40) }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(reason(&e), "agent_label_taken", "{label}: {e:?}");
+        }
+    }
+    assert_eq!(h.snapshot(), before, "nothing written");
+    assert_eq!(h.count("SELECT COUNT(*) FROM nodes"), 0);
+    // A caller of organization B carrying the label text (no resolver makes
+    // one) never gets the default organization's workspace root for it.
+    let b_ws = agent("ws-bot", ORG_B);
+    for (tool, args) in [
+        ("fs_list", json!({ "path": "." })),
+        ("fs_list", json!({ "path": ws.to_string_lossy() })),
+        ("run_cmd_check", json!({ "command": "ls" })),
+    ] {
+        let e = h.call(&b_ws, tool, args.clone()).await.unwrap_err();
+        assert_eq!(reason(&e), "org_unsupported", "{tool}({args}): {e:?}");
+        assert!(!e.to_string().contains("hub-only-file-not-real"), "{e:?}");
+    }
+    // The default organization's agent keeps its root.
+    let listed = h.ok(&agent("ws-bot", DEFAULT_ORG), "fs_list", json!({ "path": "." })).await;
+    assert!(listed.to_string().contains("hub-only-file-not-real"), "{listed}");
+    // And none of them is forgotten while configuration names it.
+    let fleet = agent("fleet-bot", DEFAULT_ORG);
+    for l in labels {
+        h.ok(&agent(l, DEFAULT_ORG), "agent_heartbeat", json!({})).await;
+        h.manage(&fleet, "agent_retire", retire_args(l)).await.unwrap();
+        let e = h.manage(&fleet, "agent_forget", retire_args(l)).await.unwrap_err();
+        assert_eq!(reason(&e), "agent_label_configured", "{l}: {e:?}");
+        assert!(e.to_string().contains("agent_scopes"), "{e:?}");
+    }
+}
+
+/// While the policy file cannot be parsed its role labels are unknown, so
+/// nothing lets another organization take a label: the policy gate refuses
+/// every governed call, and the label check itself fails closed for a label
+/// that organization does not already hold (`agents::require_label_free`,
+/// covered by its unit test, for the paths no gate stands in front of).
+#[tokio::test]
+async fn an_unreadable_policy_file_fails_closed_for_new_labels_outside_the_default_organization() {
+    let path = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let p2 = path.clone();
+    let h = H::with(move |cfg, dir| {
+        let policy = dir.join("policy.yaml");
+        std::fs::write(&policy, "rules: []\n").unwrap();
+        *p2.lock().unwrap() = Some(policy.clone());
+        cfg.policy_file = Some(policy);
+    });
+    let b = agent(B_AGENT, ORG_B);
+    h.ok(&b, "agent_heartbeat", json!({})).await;
+    let policy = path.lock().unwrap().clone().unwrap();
+    // Unparseable YAML, and a different length so the cache reloads it.
+    std::fs::write(&policy, "rules: [ this is : not : yaml\n  - {{{{\n").unwrap();
+    let reserved = ua_tools::families::agents::Reserved::of(h.hub.cfg());
+    assert!(reserved.policy_unreadable());
+    // The agent tables only: a refused governed call may ledger its refusal.
+    let tables = || h.snapshot().rsplit_once('\n').unwrap().0.to_string();
+    let before = tables();
+    let newcomer = agent("kite-newcomer-not-real", ORG_B);
+    for (tool, args) in [("agent_heartbeat", json!({})), ("session_start", json!({ "kind": "interactive" }))]
+    {
+        let e = h.call(&newcomer, tool, args).await.unwrap_err();
+        assert_eq!(reason(&e), "policy_unavailable", "{tool}: {e:?}");
+    }
+    let e = h
+        .call(
+            &unreachable_b_human("b-human-not-real"),
+            "agent_token_issue",
+            json!({ "agent_label": "kite-newcomer-not-real", "value": "n".repeat(40) }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&e), "policy_unavailable", "{e:?}");
+    assert_eq!(tables(), before, "nothing written");
+    // Once the file is fixed, the label check admits B's label again.
+    std::fs::write(&policy, "rules: []\n# fixed\n").unwrap();
+    assert!(!ua_tools::families::agents::Reserved::of(h.hub.cfg()).policy_unreadable());
+    h.ok(&b, "agent_heartbeat", json!({})).await;
+}
+
+/// Forgetting a label while it still owns a node in service would hand the
+/// node to whoever registers the label next, so it is refused until the
+/// nodes are retired.
+#[tokio::test]
+async fn forget_is_refused_while_the_agent_owns_a_node_in_service() {
+    let h = H::new();
+    let fleet = agent("fleet-bot", DEFAULT_ORG);
+    let owner = agent("node-owner-bot", DEFAULT_ORG);
+    h.ok(&owner, "node_register", json!({ "node": "owned-node-a", "facts": facts(A_ROOT) })).await;
+    h.manage(&fleet, "agent_retire", retire_args("node-owner-bot")).await.unwrap();
+    let before = h.snapshot();
+    let e = h.manage(&fleet, "agent_forget", retire_args("node-owner-bot")).await.unwrap_err();
+    assert_eq!(reason(&e), "agent_owns_nodes", "{e:?}");
+    assert!(e.to_string().contains("owned-node-a"), "{e:?}");
+    assert_eq!(h.snapshot(), before, "nothing changed");
+    h.manage(&operator(), "node_retire", json!({ "node": "owned-node-a", "reason": "decommissioned" }))
+        .await
+        .unwrap();
+    let out = h.manage(&fleet, "agent_forget", retire_args("node-owner-bot")).await.unwrap();
+    assert_eq!(out["forgotten"], true, "{out}");
+}
+
+/// Every workspace tool refuses another organization's caller before any
+/// filesystem access: the hub workspace is the default organization's.
+#[tokio::test]
+async fn workspace_tools_refuse_another_organization_before_touching_the_filesystem() {
+    let root = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let r2 = root.clone();
+    let h = H::with(move |cfg, dir| {
+        let ws = dir.join("hub-workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("hub-only-file-not-real.txt"), "x").unwrap();
+        *r2.lock().unwrap() = Some(ws.clone());
+        cfg.workspace = Some(ws);
+    });
+    let ws = root.lock().unwrap().clone().unwrap();
+    let b = agent(B_AGENT, ORG_B);
+    let listing = || {
+        let mut v: Vec<String> = std::fs::read_dir(&ws)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let before = listing();
+    for (tool, args) in [
+        ("fs_list", json!({ "path": "." })),
+        ("fs_read", json!({ "path": "hub-only-file-not-real.txt" })),
+        ("fs_write", json!({ "path": "b-wrote-this-not-real.txt", "content": "y" })),
+        ("fs_search", json!({ "pattern": "x" })),
+        ("run_cmd_check", json!({ "command": "ls" })),
+        ("run_cmd", json!({ "command": "touch b-ran-this-not-real.txt" })),
+        ("git_diff_staged", json!({})),
+    ] {
+        let e = h.call(&b, tool, args.clone()).await.unwrap_err();
+        assert_eq!(reason(&e), "org_unsupported", "{tool}({args}): {e:?}");
+        assert!(!e.to_string().contains("hub-only-file-not-real"), "{tool}: {e:?}");
+    }
+    assert_eq!(listing(), before, "nothing was written or run");
+    // The default organization's caller still works there.
+    let listed = h.ok(&agent(A_AGENT, DEFAULT_ORG), "fs_list", json!({ "path": "." })).await;
+    assert!(listed.to_string().contains("hub-only-file-not-real"), "{listed}");
 }
 
 #[tokio::test]

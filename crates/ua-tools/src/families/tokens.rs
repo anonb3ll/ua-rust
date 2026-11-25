@@ -190,12 +190,17 @@ pub fn resolve_managed_token(
 /// into another organization.
 ///
 /// A configuration-reserved label ([`crate::families::agents::Reserved`]) is
-/// always the default organization's, so it is never held elsewhere and the
-/// default credential for it is never locked out. No writer lets another
-/// organization register, bind or hold a token for such a label; a row of
-/// another organization that predates the reservation is inert (its managed
-/// tokens and session credentials are refused, its writers are refused as a
-/// taken label) until an operator removes it with hub recovery.
+/// always the default organization's, so the default credential for it
+/// always **authenticates**, and no writer lets another organization
+/// register, bind or hold a token for such a label. A row of another
+/// organization that predates the reservation is not harmless, though: its
+/// managed tokens and session credentials are refused and its own writers
+/// are refused as a taken label, but `agents.label` is the table's key, so
+/// while the row exists the default credential cannot record anything for
+/// the label either (`session_start` is refused `agent_label_blocked`, and
+/// `agent_heartbeat` answers `recorded: false`). A default-organization
+/// lifecycle operator removes it with hub recovery (`agent_retire`, then
+/// `agent_forget`, both with `any_org=true`).
 pub fn held_outside_default(
     c: &rusqlite::Connection,
     reserved: &crate::families::agents::Reserved,

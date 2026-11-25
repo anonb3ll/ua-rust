@@ -535,12 +535,14 @@ async fn two_organizations_hold_the_same_skill_independently() {
     assert_eq!(r_b["skills"].as_array().unwrap().len(), 1, "{r_b}");
     assert_eq!(r_b["skills"][0]["content"], "org b body");
 
-    // Drift compares with the caller's organization's registry only.
+    // Drift compares the hub workspace with the caller's organization's
+    // registry. The hub workspace is the default organization's
+    // (`workspace::sandbox`), so another organization's drift is refused
+    // before it is read.
     let drift = h.ok(&ops(DEFAULT_ORG), "drift", json!({ "surface_dir": "skills" })).await;
     assert_eq!(drift["synced"].as_array().unwrap().len(), 2, "{drift}");
-    let drift_b = h.ok(&device(ORG_B), "drift", json!({ "surface_dir": "skills" })).await;
-    assert_eq!(drift_b["stale"][0]["name"], "review-diff", "{drift_b}");
-    assert_eq!(drift_b["unregistered"][0]["name"], "only-default", "{drift_b}");
+    let e = h.call(&device(ORG_B), "drift", json!({ "surface_dir": "skills" })).await.unwrap_err();
+    assert_eq!(e.reason_code(), Some("org_unsupported"), "{e:?}");
 
     // B's staged copy is invisible to the default organization.
     let e = h.call(&ops(DEFAULT_ORG), "publish", json!({ "staging_id": "sk-org-b" })).await.unwrap_err();

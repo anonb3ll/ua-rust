@@ -262,7 +262,11 @@ pub async fn authenticate(State(state): State<AppState>, mut req: Request, next:
         }
         // A Control Center session is a configured human, the default
         // organization's: refused, like a static token, while a row of
-        // another organization holds its label.
+        // another organization holds its label. Defence in depth: it cannot
+        // fire today, because a human identity is a configuration-reserved
+        // label (`agents::Reserved`), which `held_outside_default` always
+        // answers as the default organization's. It stays so a later change
+        // to the reservation cannot quietly let such a session in.
         if held_outside_default(&state, &session.label).await {
             return unauthorized(&state, Some("invalid_token"), "session refused");
         }

@@ -3,10 +3,14 @@
 //! a managed token resolves to its own organization, which must be its
 //! agent's, and a static token, which is hub configuration, resolves to the
 //! default organization. A static token's label is reserved for the default
-//! organization, so another organization's row for it never locks the
-//! static token out, and a managed token of another organization for it
-//! never authenticates. Retiring then forgetting an agent never brings a
-//! static or managed token back. Every value here is fake.
+//! organization, so the static token always authenticates and a managed
+//! token of another organization for it never does. A stale row of another
+//! organization for the label (only SQL can make one) still keeps the
+//! static token from recording anything (`agents.label` is the table's
+//! key): `session_start` is refused and `agent_heartbeat` answers
+//! `recorded: false` until hub recovery (`any_org`) retires and forgets that
+//! row. Retiring then forgetting an agent never brings a static or managed
+//! token back. Every value here is fake.
 
 mod common;
 
@@ -49,7 +53,8 @@ fn digest(v: &str) -> String {
 fn hub() -> TestHub {
     let mut cfg = common::config();
     cfg.oauth_enabled = false;
-    cfg.agent_tokens = Some(SecretString::from(format!("squatted-label:{STATIC_TOKEN}")));
+    cfg.agent_tokens =
+        Some(SecretString::from(format!("squatted-label:{STATIC_TOKEN},operator:{OPERATOR_TOKEN}")));
     let hub = TestHub::new(cfg);
     sql(
         &hub,
@@ -107,8 +112,8 @@ async fn a_token_whose_organization_is_not_its_agents_is_refused() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     // A static token is the default organization's and its label is
     // reserved: another organization's row for it (only SQL can make one)
-    // does not lock it out, and a managed token of that organization for
-    // the reserved label never authenticates.
+    // does not stop it authenticating, and a managed token of that
+    // organization for the reserved label never authenticates.
     let resp = call(&hub, STATIC_TOKEN, "session_list", json!({})).await;
     assert_eq!(resp.status(), StatusCode::OK);
     sql(
@@ -123,6 +128,79 @@ async fn a_token_whose_organization_is_not_its_agents_is_refused() {
     assert_eq!(call(&hub, STATIC_TOKEN, "session_list", json!({})).await.status(), StatusCode::OK);
     // The well-formed tokens still do.
     assert_eq!(call(&hub, A_TOKEN, "session_list", json!({})).await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_stale_row_of_another_organization_blocks_writes_until_hub_recovery() {
+    let hub = hub();
+    // The static token authenticates, but the org-B row holds the agents
+    // key: nothing can be recorded for the label, and both calls say so.
+    let resp = call(&hub, STATIC_TOKEN, "session_start", json!({ "kind": "interactive" })).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = json_body(resp).await;
+    assert_eq!(body["reason_code"], "agent_label_blocked", "{body}");
+    assert!(!body.to_string().contains(ORG_B), "{body}");
+    let resp = call(&hub, STATIC_TOKEN, "agent_heartbeat", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["recorded"], false, "{body}");
+    assert_eq!(body["reason_code"], "agent_label_blocked", "{body}");
+    assert_eq!(text(&hub, "SELECT CAST(COUNT(*) AS TEXT) FROM agent_sessions"), "0");
+    assert_eq!(text(&hub, "SELECT org_id FROM agents WHERE label = 'squatted-label'"), ORG_B);
+    assert_eq!(
+        text(&hub, "SELECT CAST(COUNT(*) AS TEXT) FROM event_log WHERE channel = 'agent.agent.registered'"),
+        "0",
+        "no registration is ledgered for a write that did not happen"
+    );
+    // Without any_org a default operator's lifecycle action is refused.
+    let resp = manage(&hub, "agent_retire", json!({ "agent": "squatted-label", "reason": "stale" })).await;
+    assert_ne!(resp.status(), StatusCode::OK);
+    // Hub recovery reaches the stale row (by its rows, not the reservation)
+    // and retires, then forgets it.
+    let resp = manage(
+        &hub,
+        "agent_retire",
+        json!({ "agent": "squatted-label", "reason": "stale", "any_org": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        (body["org_id"].as_str(), body["hub_recovery"].as_bool()),
+        (Some(ORG_B), Some(true)),
+        "{body}"
+    );
+    let resp = manage(
+        &hub,
+        "agent_forget",
+        json!({ "agent": "squatted-label", "reason": "stale", "any_org": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["forgotten"], true, "{body}");
+    // The default credential records again.
+    let resp = call(&hub, STATIC_TOKEN, "session_start", json!({ "kind": "interactive" })).await;
+    assert_eq!(resp.status(), StatusCode::OK, "{}", json_body(resp).await);
+    let body = json_body(call(&hub, STATIC_TOKEN, "agent_heartbeat", json!({})).await).await;
+    assert_eq!(body["recorded"], true, "{body}");
+    assert_eq!(text(&hub, "SELECT org_id FROM agents WHERE label = 'squatted-label'"), "default");
+    // The default organization's own record of the reserved label is still
+    // never forgotten.
+    let resp = manage(
+        &hub,
+        "agent_retire",
+        json!({ "agent": "squatted-label", "reason": "again", "any_org": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = manage(
+        &hub,
+        "agent_forget",
+        json!({ "agent": "squatted-label", "reason": "again", "any_org": true }),
+    )
+    .await;
+    assert_eq!(json_body(resp).await["reason_code"], "agent_label_configured");
 }
 
 async fn manage(

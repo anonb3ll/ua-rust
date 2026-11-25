@@ -367,12 +367,14 @@ async fn capability_catalog(ctx: ToolCtx, a: CatalogArgs) -> UaResult<Value> {
         })
         .await?;
     let cfg2 = cfg.clone();
+    // Skills are read from the hub workspace, the default organization's.
+    let hub_workspace = ctx.caller.org_id == ua_core::DEFAULT_ORG;
     let (workflows, skills_found) = blocking(move || {
         let wf: Vec<Value> = super::workflows::engine::list_definitions(&cfg2)
             .into_iter()
             .map(|w| json!({ "name": w["name"], "description": w["description"] }))
             .collect();
-        Ok((wf, skills(&cfg2.workspace_root())))
+        Ok((wf, if hub_workspace { skills(&cfg2.workspace_root()) } else { Vec::new() }))
     })
     .await?;
     let clis = cfg.shell_allowlist();

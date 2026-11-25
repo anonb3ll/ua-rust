@@ -515,6 +515,18 @@ async fn each_command_maps_to_a_call_its_tool_accepts() {
     let coordinator = Caller { profile: Profile::Coordinator, ..caller() };
     let task = e.call("task_add", json!({ "title": "existing" })).await.unwrap();
     let id = task["id"].as_i64().unwrap();
+    // `/assign` delegates, and a delegation targets a registered agent of
+    // the delegator's organization: an unregistered target is refused with
+    // a reply that says so.
+    let parsed = slack::parse_slack_command("assign builder-2 review the slack route").unwrap();
+    let call = slack::command_call(&parsed, "1.2.u").unwrap().unwrap();
+    let out = e.reg.call(&e.hub, &coordinator, call.tool, call.args.clone()).await;
+    let reply = slack::reply_text("assign", "operator", &out);
+    assert!(reply.starts_with("Refused (not_found):") && reply.contains("no agent"), "{reply}");
+    assert!(reply.contains("builder-2") && reply.contains("registered agent"), "{reply}");
+    // Register the target, as its first heartbeat does.
+    let target = Caller { label: "builder-2".into(), session_key: Some("s2".into()), ..caller() };
+    e.reg.call(&e.hub, &target, "agent_heartbeat", json!({})).await.unwrap();
     for text in [
         "task write the report".to_string(),
         format!("progress task-{id} halfway"),

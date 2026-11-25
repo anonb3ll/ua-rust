@@ -216,12 +216,14 @@ fn non_test_callers_and_events_are_in_the_default_organization() {
     assert!(files.len() > 100, "found only {} source files", files.len());
     // A sanity floor for the scanner, not a quota. Families route their
     // events through an `emit` helper as often as they build an
-    // `EventInput` in place, so both spellings count.
+    // `EventInput` in place, so both spellings count; an `fn emit(`
+    // definition is not a call.
     let events: usize = files
         .iter()
         .map(|(_, s)| {
             let m = without_tests(s);
-            find_all(&m, "EventInput::new(").count() + find_all(&m, "emit(").count()
+            let emits = find_all(&m, "emit(").count().saturating_sub(find_all(&m, "fn emit(").count());
+            find_all(&m, "EventInput::new(").count() + emits
         })
         .sum();
     assert!(events > 100, "found only {events} EventInput::new and emit( calls outside tests");

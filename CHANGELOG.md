@@ -584,16 +584,32 @@ from its commit history.
   session credentials and idle-session wakes run per organization, and
   `node_reassign` reads `agents.org_id`. A delegation must target a
   registered agent of the delegator's organization (see Behaviour
-  changes). Labels hub configuration names (human identities, lifecycle
-  operators, static tokens, `[profiles]`, OAuth and Slack identities,
-  policy role identities) are reserved for the default organization: no
-  other organization can register, bind or hold a token for one, and the
-  default credential for it is never locked out. `agent_forget` revokes
-  every credential issued since the retire and is refused for a
-  configured label (`agent_label_configured`), whose retired row is what
-  keeps its static token refused; it never deletes a second spelling of
-  the label (`agent_label_ambiguous`). Lifecycle stops act in the agent's
-  organization only. Device acceptance,
+  changes); the target matches without regard to case and the registered
+  spelling is stored. Labels hub configuration names (human identities,
+  lifecycle operators, static tokens, `[profiles]`, `agent_scopes`,
+  `agent_workspaces`, `revoked_agents`, OAuth and Slack identities, policy
+  role identities) are reserved for the default organization: no other
+  organization can register, bind or hold a token for one, so none
+  inherits a label-keyed setting, and the default credential for it always
+  authenticates. While the policy file is unreadable, another organization
+  cannot register or get a token for a label it does not already hold
+  (`policy_unavailable`). A stale row of another organization for a
+  reserved label (one older than the reservation) still blocks the default
+  credential's writes: `session_start` is refused `agent_label_blocked`
+  and `agent_heartbeat` answers `recorded: false`, until hub recovery
+  (`agent_retire` and `agent_forget` with `any_org=true`), which reaches
+  that row, removes it. `agent_forget` revokes every credential issued
+  since the retire and is refused for a configured label in the default
+  organization (`agent_label_configured`), whose retired row is what keeps
+  its static token refused, and while the agent owns a node in service
+  (`agent_owns_nodes`); it never deletes a second spelling of the label
+  (`agent_label_ambiguous`). Lifecycle stops act in the agent's
+  organization only. Workspace tools (`fs_*`, `run_cmd*`, `git_*` and the
+  rest), `skill_registry` publish and drift, and the `security_audit` and
+  `skill_review` targets are refused
+  (`org_unsupported`) outside the default organization before any
+  filesystem access, and another organization's autonomous cycle is held
+  before its worktree is read. Device acceptance,
   command notices and learning-proposal and drop-file writes into the hub's
   shared vault and workspace stay default-organization only. Events about
   another organization's agents and sessions keep only ids, states and

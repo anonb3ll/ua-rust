@@ -180,18 +180,26 @@ pub(crate) fn require_org(c: &Connection, org: &str) -> UaResult<()> {
 
 /// The labels hub configuration names: `human_identities`,
 /// `lifecycle_operators`, static `agent_tokens` labels, the `[profiles]` map,
-/// `oauth_identities`, `oauth_client_credentials` identities, Slack
-/// identities, and the policy file's role identities and `profile_defaults`
-/// keys. They are **reserved** for the default organization
-/// (`docs/organization.md`, "Reserved labels"): the configuration's trust is
-/// the default organization's, so another organization may never register,
-/// bind, or hold a token for such a label, in any letter case, and the
-/// default organization's static token, OAuth grant or human sign-in for it
-/// is never locked out by another organization. Compared without regard to
-/// case. A policy file that cannot be read adds nothing here; the policy
-/// gate already refuses every governed call while it is broken.
+/// `agent_scopes` (prod-action scopes), `agent_workspaces` (sandbox roots),
+/// `revoked_agents`, `oauth_identities`, `oauth_client_credentials`
+/// identities, Slack identities, and the policy file's role identities and
+/// `profile_defaults` keys. They are **reserved** for the default
+/// organization (`docs/organization.md`, "Reserved labels"): the
+/// configuration's trust is the default organization's, so another
+/// organization may never register, bind, or hold a token for such a label,
+/// in any letter case, and so never inherits a label-keyed setting (a
+/// workspace root, a prod scope, a profile). Compared without regard to case.
+///
+/// A policy file that cannot be read or parsed contributes no role labels,
+/// so the set is then incomplete: [`Reserved::policy_unreadable`] is set and
+/// [`require_label_free`] fails closed for every other organization (no new
+/// label is registered, bound or given a token there until the file is
+/// fixed; a label that organization already holds keeps working).
 #[derive(Debug, Clone, Default)]
-pub struct Reserved(std::collections::BTreeSet<String>);
+pub struct Reserved {
+    labels: std::collections::BTreeSet<String>,
+    policy_unreadable: bool,
+}
 
 impl Reserved {
     /// The reserved labels of `cfg`, read now (the policy file is reloaded
@@ -207,10 +215,15 @@ impl Reserved {
         ua_org::authz::authority_labels(cfg).for_each(&mut add);
         cfg.static_tokens().iter().for_each(|(l, _)| add(l));
         cfg.profiles.keys().for_each(|l| add(l));
+        cfg.agent_scopes.keys().for_each(|l| add(l));
+        cfg.agent_workspaces.keys().for_each(|l| add(l));
+        cfg.revoked_agents.iter().for_each(|l| add(l));
         cfg.oauth_identities.iter().for_each(|l| add(l));
         cfg.oauth_client_credentials().iter().for_each(|(_, _, l)| add(l));
         cfg.slack_identities.iter().for_each(|i| add(&i.identity));
-        if let Some(Ok(policy)) = cfg.policy_file.as_deref().map(crate::policy::load) {
+        let policy = cfg.policy_file.as_deref().map(crate::policy::load);
+        let policy_unreadable = matches!(policy, Some(Err(_)));
+        if let Some(Ok(policy)) = policy {
             // A role entry is an identity (`agent:<label>` or a bare name,
             // which may also be a profile) or a profile (`profile:<name>`).
             for role in policy.rules.iter().flat_map(|r| &r.roles) {
@@ -220,12 +233,18 @@ impl Reserved {
             }
             policy.profile_defaults.keys().for_each(|l| add(l));
         }
-        Self(labels)
+        Self { labels, policy_unreadable }
     }
 
     /// Whether configuration names `label`, in any letter case.
     pub fn contains(&self, label: &str) -> bool {
-        self.0.contains(&label.trim().to_ascii_lowercase())
+        self.labels.contains(&label.trim().to_ascii_lowercase())
+    }
+
+    /// Whether the policy file is configured but could not be read or
+    /// parsed, so its role labels are missing from this set.
+    pub fn policy_unreadable(&self) -> bool {
+        self.policy_unreadable
     }
 }
 
@@ -243,8 +262,10 @@ pub(crate) fn label_org(c: &Connection, reserved: &Reserved, label: &str) -> UaR
     row_label_org(c, label)
 }
 
-/// [`label_org`] from the database rows alone, configuration aside.
-fn row_label_org(c: &Connection, label: &str) -> UaResult<Option<String>> {
+/// [`label_org`] from the database rows alone, configuration aside. Hub
+/// recovery reads this, so it can reach another organization's stale row
+/// for a configuration-reserved label.
+pub(crate) fn row_label_org(c: &Connection, label: &str) -> UaResult<Option<String>> {
     for sql in [
         "SELECT org_id FROM agents WHERE label = ?1 COLLATE NOCASE ORDER BY (label = ?1) DESC LIMIT 1",
         "SELECT org_id FROM agent_lifecycle WHERE agent = ?1",
@@ -279,13 +300,34 @@ pub(crate) fn foreign_label(c: &Connection, reserved: &Reserved, org: &str, labe
 
 /// Refuse `label` when another organization's agent holds it, or when it is
 /// a configuration-reserved label and `org` is not the default organization.
+/// While the policy file cannot be read ([`Reserved::policy_unreadable`]),
+/// the reserved set may be missing labels, so outside the default
+/// organization a label `org` does not already hold is refused
+/// (`policy_unavailable`): fail closed rather than let another organization
+/// take a label the broken file may name.
 pub(crate) fn require_label_free(
     c: &Connection,
     reserved: &Reserved,
     org: &str,
     label: &str,
 ) -> UaResult<()> {
-    if foreign_label(c, reserved, org, label)? { Err(label_taken(label)) } else { Ok(()) }
+    if foreign_label(c, reserved, org, label)? {
+        return Err(label_taken(label));
+    }
+    if reserved.policy_unreadable()
+        && org != ua_core::DEFAULT_ORG
+        && row_label_org(c, label)?.as_deref() != Some(org)
+    {
+        return Err(UaError::denied(
+            "policy_unavailable",
+            format!(
+                "the policy file cannot be read, so the labels it reserves are unknown; agent label \
+                 {label:?} cannot be registered, bound or given a token in this organization until it \
+                 is fixed. Nothing was changed"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Append an agents-family event about a row of organization `org`.
@@ -456,12 +498,28 @@ fn open_marks() -> String {
     OPEN_STATUSES.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",")
 }
 
+/// What [`touch_agent`] wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Touched {
+    /// The agent's row was created (and its first sighting ledgered).
+    Created,
+    /// The existing row's `last_seen` moved.
+    Updated,
+    /// Nothing was written: another organization's row holds the label
+    /// (`agents.label` is the table's key), which only happens for a
+    /// configuration-reserved label whose stale row predates the
+    /// reservation. A default-organization lifecycle operator clears it with
+    /// hub recovery (`agent_retire`, then `agent_forget`, with `any_org`).
+    Blocked,
+}
+
 /// Record that `label`, an agent of organization `org`, was alive just now.
-/// Returns true when this created the agent's row; the first sighting is
-/// written to the ledger, later heartbeats are not (they only move
-/// `last_seen`). A label another organization holds is refused
-/// ([`label_taken`]) before anything is written: one organization never
-/// moves, revives or reads another's agent row.
+/// The first sighting is written to the ledger, later heartbeats are not
+/// (they only move `last_seen`). A label another organization holds is
+/// refused ([`label_taken`]) before anything is written: one organization
+/// never moves, revives or reads another's agent row. A reserved label
+/// whose stale row is in another organization passes that check but cannot
+/// be written ([`Touched::Blocked`]); the caller reports it honestly.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn touch_agent(
     tx: &mut WriteTx<'_>,
@@ -473,7 +531,7 @@ pub(crate) fn touch_agent(
     host: Option<&str>,
     version: Option<&str>,
     verified_self: bool,
-) -> UaResult<bool> {
+) -> UaResult<Touched> {
     require_org(tx, org)?;
     require_label_free(tx, reserved, org, label)?;
     let existed: bool = tx
@@ -481,7 +539,7 @@ pub(crate) fn touch_agent(
         .optional()?
         .is_some();
     let ts = ua_core::time::now();
-    tx.execute(
+    let n = tx.execute(
         "INSERT INTO agents (org_id, label, kind, host, known, first_seen, last_seen, last_seen_via, version, \
          created_at, updated_at, meta) \
          VALUES (?8, ?1, COALESCE(?2, 'unknown'), ?3, ?4, ?5, ?5, ?6, ?7, ?5, ?5, '{}') \
@@ -497,6 +555,9 @@ pub(crate) fn touch_agent(
          WHERE agents.org_id = excluded.org_id",
         params![label, kind, host, i64::from(verified_self), ts, via, version, org],
     )?;
+    if n == 0 {
+        return Ok(Touched::Blocked);
+    }
     if !existed {
         emit(
             tx,
@@ -507,7 +568,21 @@ pub(crate) fn touch_agent(
             Some(format!("agent.registered:{label}")),
         )?;
     }
-    Ok(!existed)
+    Ok(if existed { Touched::Updated } else { Touched::Created })
+}
+
+/// The refusal of a write for a configuration-reserved label whose stale
+/// row is in another organization ([`Touched::Blocked`]).
+pub(crate) fn label_blocked(label: &str) -> UaError {
+    UaError::conflict_code(
+        "agent_label_blocked",
+        format!(
+            "agent label {label:?} is still held by a stale agent row elsewhere (made before hub \
+             configuration reserved the label), so nothing can be recorded for it. A default-organization \
+             lifecycle operator clears it with coordination_manage agent_retire then agent_forget, both \
+             with any_org=true. Nothing was changed"
+        ),
+    )
 }
 
 /// Mark open sessions with no heartbeat for [`SESSION_ABANDON_MINUTES`] as
@@ -1006,7 +1081,7 @@ async fn heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
     ctx.hub
         .db()
         .write_async(move |tx| {
-            touch_agent(
+            let touched = touch_agent(
                 tx,
                 &reserved,
                 &org,
@@ -1017,14 +1092,20 @@ async fn heartbeat(ctx: ToolCtx, a: HeartbeatArgs) -> UaResult<Value> {
                 clean(a.version.as_deref()).as_deref(),
                 verified_self,
             )?;
+            let recorded = touched != Touched::Blocked;
             let row = get_agent(tx, &org, &label)?.unwrap_or_else(|| json!({}));
-            Ok(json!({
+            let mut out = json!({
                 "agent": label,
-                "recorded": true,
-                "host_recorded": host.is_some(),
+                "recorded": recorded,
+                "host_recorded": recorded && host.is_some(),
                 "status": row["status"],
                 "known": row["known"],
-            }))
+            });
+            if !recorded {
+                out["reason_code"] = json!("agent_label_blocked");
+                out["detail"] = json!(label_blocked(&label).to_string());
+            }
+            Ok(out)
         })
         .await
 }
@@ -1134,6 +1215,20 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
         .write_async(move |tx| {
             require_org(tx, &org)?;
             require_label_free(tx, &reserved, &org, &label)?;
+            // A reserved label whose stale row is in another organization
+            // passes the check above, but the session's parent trigger and
+            // the agents key would refuse it: say why, before any write.
+            let blocked = tx
+                .query_row(
+                    "SELECT 1 FROM agents WHERE label = ?1 COLLATE NOCASE AND org_id != ?2 LIMIT 1",
+                    params![label, org],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if blocked {
+                return Err(label_blocked(&label));
+            }
             reap(tx)?;
             if let Some(tid) = task_id {
                 let found = tx
@@ -1203,7 +1298,11 @@ async fn session_start(ctx: ToolCtx, a: SessionStartArgs) -> UaResult<Value> {
                     (id, true, None)
                 }
             };
-            touch_agent(tx, &reserved, &org, &label, "session_start", None, host.as_deref(), None, verified_self)?;
+            let touched =
+                touch_agent(tx, &reserved, &org, &label, "session_start", None, host.as_deref(), None, verified_self)?;
+            if touched == Touched::Blocked {
+                return Err(label_blocked(&label));
+            }
             if created {
                 emit(
                     tx,
@@ -1544,4 +1643,46 @@ pub fn register(r: &mut Registry) {
         )
         .family("agents"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// While the policy file cannot be parsed, the reserved set is missing
+    /// its role labels, so outside the default organization a label the
+    /// organization does not already hold is refused; a held one, and the
+    /// default organization, are not. Fake values only.
+    #[test]
+    fn an_unreadable_policy_file_fails_closed_for_new_labels_outside_the_default_organization() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("policy.yaml");
+        std::fs::write(&policy, "rules: [ not : yaml : {{\n").unwrap();
+        let mut cfg = ua_core::Config::for_home(dir.path().join("home"));
+        cfg.policy_file = Some(policy);
+        let hub = crate::Hub::in_memory(cfg).unwrap();
+        hub.db()
+            .write(|tx| {
+                tx.execute_batch(
+                    "INSERT INTO orgs (id, slug, display_name, status, allowed_profiles, created_at)
+                         VALUES ('org-b', 'org-b', 'Org', 'active', '[\"developer\"]', 't0');
+                     INSERT INTO agents (org_id, label, created_at, updated_at)
+                         VALUES ('org-b', 'held-b-not-real', 't0', 't0');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let reserved = Reserved::of(hub.cfg());
+        assert!(reserved.policy_unreadable());
+        hub.db()
+            .read(|c| {
+                let e = require_label_free(c, &reserved, "org-b", "new-b-not-real").unwrap_err();
+                assert_eq!(e.reason_code(), Some("policy_unavailable"), "{e:?}");
+                require_label_free(c, &reserved, "org-b", "held-b-not-real").unwrap();
+                require_label_free(c, &reserved, "org-b", "HELD-B-NOT-REAL").unwrap();
+                require_label_free(c, &reserved, ua_core::DEFAULT_ORG, "new-a-not-real").unwrap();
+                Ok(())
+            })
+            .unwrap();
+    }
 }

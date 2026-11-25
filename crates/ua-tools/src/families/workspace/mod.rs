@@ -79,9 +79,31 @@ fn expand_tilde(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
+/// The refusal of a hub workspace path to another organization's caller.
+pub(crate) fn workspace_org_unsupported() -> UaError {
+    UaError::denied(
+        "org_unsupported",
+        "the hub workspace belongs to the default organization, and this organization has no workspace \
+         configured; no file was read or written and no command ran",
+    )
+}
+
 /// Resolve the caller's sandbox, honouring a per-agent workspace override.
+///
+/// The hub's own workspace root (`cfg.workspace_root()`), its read roots
+/// and every `agent_workspaces` entry are the default organization's: an
+/// `agent_workspaces` key is a configuration-reserved label
+/// (`agents::Reserved`), which only the default organization may hold, so
+/// an entry never names another organization's agent even when the label
+/// text matches. Outside the default organization every workspace tool is
+/// therefore refused (`org_unsupported`) here, before any filesystem
+/// access, until per-organization workspaces exist. Every workspace tool
+/// resolves its roots through this function.
 pub(crate) fn sandbox(ctx: &ToolCtx) -> UaResult<Sandbox> {
     let cfg = ctx.hub.cfg();
+    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
+        return Err(workspace_org_unsupported());
+    }
     let configured = match cfg.agent_workspaces.get(&ctx.caller.label) {
         Some(v) if v.trim().eq_ignore_ascii_case("deny") => {
             return Err(UaError::denied(
