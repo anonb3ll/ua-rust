@@ -222,6 +222,10 @@ pub fn schema_parts() -> Vec<Part> {
     // After the node parts: the triggers read `nodes` and `node_dispatch`.
     parts.push(families::agents::TENANT_PART.into());
     parts.push(families::agents::ORG_SCOPE.into());
+    // The evidence key store and checkpoint table. Public keys only; the hub
+    // never holds a private key (docs/evidence-export.md, S2). Self-contained
+    // beyond its own `evidence_key` foreign key.
+    parts.push(ua_store::evidence::KEY_STORE_PART.into());
     // Org-scoped Git skill source allowlist (born tenant-scoped; D2a).
     parts.push(families::skill_sources::SCHEMA.into());
     parts.push(families::skill_sources::TENANT_PART.into());

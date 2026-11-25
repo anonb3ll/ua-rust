@@ -131,5 +131,6 @@ idempotency.v2.tenant_keys
 organization.v1.tools.idempotency
 organization.v1.tools.agents
 agents.v2.org_scope
+evidence_key_store.v1
 skill_sources.v1
 organization.v1.tools.skill_sources
