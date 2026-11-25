@@ -4,6 +4,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
@@ -28,20 +29,19 @@ fn directory(path: &Path) -> rustix::io::Result<OwnedFd> {
     Ok(fd)
 }
 
-fn file_error(e: Errno) -> UaError {
+fn file_error(e: impl std::fmt::Display) -> UaError {
     UaError::denied("deliverable_file_unavailable", format!("cannot access the deliverable file safely: {e}"))
 }
 
 fn limited_read(file: &File, max_links: u64) -> UaResult<Vec<u8>> {
-    let stat = fs::fstat(file).map_err(file_error)?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || u64::from(stat.st_nlink) > max_links
-    {
+    let meta = file.metadata().map_err(file_error)?;
+    if !meta.is_file() || meta.nlink() > max_links {
         return Err(UaError::denied(
             "unsafe_deliverable_file",
             "a deliverable must be a regular file without other links",
         ));
     }
-    if stat.st_size > MAX_BYTES as i64 {
+    if meta.len() > MAX_BYTES as u64 {
         return Err(UaError::invalid("deliverable file exceeds 1 MiB"));
     }
     let mut bytes = Vec::new();
