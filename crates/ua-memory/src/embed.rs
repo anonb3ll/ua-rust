@@ -311,7 +311,7 @@ impl VectorIndex for BruteForceIndex {
         k: usize,
     ) -> UaResult<Vec<(String, f32)>> {
         let sql = format!(
-            "SELECT e.note_id, e.embedding FROM memory_embeddings e \
+            "SELECT e.note_id, e.embedding, m.seq FROM memory_embeddings e \
              JOIN memory m ON m.id = e.note_id AND m.org_id = e.org_id \
              WHERE e.model = ? AND e.dim = ? AND {}",
             filter.sql
@@ -320,21 +320,23 @@ impl VectorIndex for BruteForceIndex {
         p.extend(filter.params.iter().cloned());
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(p), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?))
         })?;
         let mut hits = Vec::new();
         for row in rows {
-            let (id, blob) = row?;
+            let (id, blob, seq) = row?;
             let sim = cosine(query, &from_blob(&blob));
             if sim >= min_similarity {
-                hits.push((id, sim));
+                hits.push((id, sim, seq));
             }
         }
+        // Equal similarities break on insertion order, not the random note
+        // id, so the top-k cut keeps the same notes on every run.
         hits.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.2.cmp(&b.2))
         });
         hits.truncate(k);
-        Ok(hits)
+        Ok(hits.into_iter().map(|(id, sim, _)| (id, sim)).collect())
     }
 
     fn similarities(

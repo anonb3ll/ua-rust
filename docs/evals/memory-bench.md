@@ -39,9 +39,19 @@ failing query cannot quietly raise a class mean.
 
 ### Hard negatives
 
-Every negative shares terms with its query, so lexical search could return it
+Every negative shares terms with its query
 (`fixture_negatives_share_their_query_terms` checks this). Each one tests a
-specific mechanism:
+specific mechanism. There are two kinds:
+
+- **Phrase guards** (`exact-noise`, `long-noise`). A single-token query is
+  matched as one phrase with no OR fallback, so these notes are never returned
+  while phrase matching holds. Each one contains every word of its query
+  (`phrase_negatives_hold_every_query_word`), so a word-bag match returns it
+  and fails the class. With the AND query split into words, exact-term fell to
+  0.5 and long-document to 0.
+- **Reachable negatives** (`exact-near`, `para-stem-near`, the temporal and
+  superseded versions). Lexical search retrieves them, or would without the
+  filter that the row names.
 
 | Query | Negative | Kept out by |
 |---|---|---|
@@ -105,15 +115,22 @@ channels.
 ### Determinism
 
 - The clock is fixed. Search reads `Config.clock` for the recency leg, the
-  prior's age discount and expiry, and save stamps `created_at` and
-  `updated_at` from it. The bench sets it to `BENCH_NOW`
+  prior's age discount and expiry. Save, delete and restore stamp
+  `created_at`, `updated_at` and the captured version's `recorded_at` from
+  it. The `memory_versions_capture` trigger writes SQLite's wall clock, and
+  its SQL is locked in a merged schema part, so the write path restamps the
+  new version in the same transaction. `tests/clock.rs` pins save, delete,
+  restore, feedback, version history and both maintenance reports to fixed
+  clocks. The bench sets it to `BENCH_NOW`
   (`2026-03-01T00:00:00+00:00`) and prints it as `clock` in the report. A
   hub always uses the wall clock.
 - Search breaks score ties on title, then insertion order (the `memory`
-  rowid), not the random note id. The lexical leg's `LIMIT` also breaks bm25
-  ties on insertion order. `crates/ua-memory/tests/order.rs` checks both that tied notes
-  come back in save order and that a fixture with no ties keeps the order and
-  scores recorded before this change.
+  rowid), not the random note id. The lexical leg's `LIMIT` and the semantic
+  leg's top-50 cut also break ties on insertion order.
+  `crates/ua-memory/tests/order.rs` checks that tied notes come back in save
+  order (lexically, and semantically with a constant test embedder), and that
+  a fixture with no ties keeps the order and scores recorded before this
+  change, on a fixed clock.
 - `crates/ua-memory/tests/bench.rs` runs the fixture twice and requires
   byte-identical JSON.
 

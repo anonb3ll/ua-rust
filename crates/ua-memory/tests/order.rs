@@ -16,9 +16,11 @@ fn db() -> Db {
     Db::open_in_memory(&parts).unwrap()
 }
 
+/// A fixed clock: every note here is saved and searched at the same instant.
 fn cfg() -> Config {
     let mut cfg = Config::for_home(std::env::temp_dir());
     cfg.embed_model = "lexical-only-order-test-model".into();
+    cfg.clock = ua_core::time::Clock::fixed("2026-03-01T00:00:00+00:00").unwrap();
     cfg
 }
 
@@ -114,7 +116,8 @@ async fn non_tied_order_is_unchanged_by_the_tie_break() {
     }
 }
 
-/// Recorded at 3568b28, before the tie-break change.
+/// Recorded at 3568b28, before the tie-break change (on the wall clock; the
+/// fixed clock leaves them unchanged).
 const GOLDEN_ORDER: [&str; 6] =
     ["b-and-strong", "d-and-weak", "c-or-strong", "f-amber-only", "a-or-weak", "e-and-old"];
 const GOLDEN_SCORES: [f64; 6] = [
@@ -142,4 +145,45 @@ async fn search_reads_the_injected_clock() {
     cfg.clock = ua_core::time::Clock::fixed("2027-01-16T00:00:00+00:00").unwrap();
     let e = explain(ranked(&db, &cfg, "kiln").await);
     assert_eq!(e["prior"], ua_memory::rank::PRIOR_MIN, "{e}");
+}
+
+/// Every text embeds to the same vector, so every note ties on similarity.
+struct ConstantEmbedder;
+
+impl ua_memory::Embedder for ConstantEmbedder {
+    fn model(&self) -> &str {
+        "constant-vector-order-test-model"
+    }
+
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ua_memory::EmbedError> {
+        Ok(texts.iter().map(|_| vec![0.6, 0.8]).collect())
+    }
+}
+
+/// The semantic leg keeps its top 50 (`SEMANTIC_TOP_K`). With 55 notes tied
+/// on similarity, the cut keeps the first 50 saved, in save order; a random
+/// note-id tie-break would keep a random 50.
+#[tokio::test]
+async fn semantic_ties_break_on_insertion_order() {
+    ua_memory::register_embedder(std::sync::Arc::new(ConstantEmbedder));
+    let db = db();
+    let mut cfg = cfg();
+    cfg.embed_model = "constant-vector-order-test-model".into();
+    let mut saved = Vec::new();
+    for i in 0..55 {
+        saved.push(put(&db, &cfg, "Same title", &format!("Unrelated text number {i}."), None).await);
+    }
+    // No lexical match: only the semantic leg returns candidates.
+    let hits = search::search(
+        &db,
+        &cfg,
+        ua_core::DEFAULT_ORG,
+        SearchRequest { query: "zyxwvut".into(), limit: Some(50), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    assert_eq!(hits["retrieval"]["mode"], "hybrid", "{}", hits["retrieval"]);
+    let ids: Vec<&str> =
+        hits["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, saved[..50].iter().map(String::as_str).collect::<Vec<_>>());
 }

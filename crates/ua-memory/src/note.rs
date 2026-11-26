@@ -568,6 +568,28 @@ pub(crate) fn superseded_notes(conn: &Connection, org: &str, id: &str) -> UaResu
 /// insert and do not read the status, so a write with nothing to insert (an
 /// update, a soft delete) or a suspended organization's insert would
 /// otherwise pass.
+/// The newest version captured in `memory_versions` for note `id` (0 for none).
+pub(crate) fn last_version(conn: &Connection, org: &str, id: &str) -> UaResult<i64> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM memory_versions WHERE note_id = ?1 AND org_id = ?2",
+        params![id, org],
+        |r| r.get(0),
+    )?)
+}
+
+/// Restamp `recorded_at` on versions of note `id` captured after `since` with
+/// `ts`, the injected clock's now. The `memory_versions_capture` trigger
+/// stamps SQLite's wall clock, and its SQL is checksum-locked in a merged
+/// schema part, so the write path corrects it in the same transaction:
+/// history then agrees with `updated_at` under a fixed clock.
+pub(crate) fn stamp_versions(conn: &Connection, org: &str, id: &str, since: i64, ts: &str) -> UaResult<()> {
+    conn.execute(
+        "UPDATE memory_versions SET recorded_at = ?1 WHERE note_id = ?2 AND org_id = ?3 AND version > ?4",
+        params![ts, id, org, since],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn require_org(conn: &Connection, org: &str) -> UaResult<()> {
     let status: Option<String> =
         conn.query_row("SELECT status FROM orgs WHERE id = ?1", [org], |r| r.get(0)).optional()?;

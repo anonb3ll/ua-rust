@@ -721,8 +721,17 @@ async fn search_keys(
 }
 
 async fn run_fixture() -> UaResult<Value> {
-    let corpus = parse_corpus(CORPUS)?;
-    let floor = parse_floor(FLOOR)?;
+    let scratch = Scratch::new("fixture")?;
+    run_fixture_with(CORPUS, FLOOR, &scratch).await
+}
+
+/// The fixture run over a corpus and floor (the checked-in ones outside
+/// tests), with its databases under `scratch`. Each query's copy is removed
+/// when the query finishes; only the base corpus database stays until
+/// `scratch` drops.
+async fn run_fixture_with(corpus_raw: &str, floor_raw: &str, scratch: &Scratch) -> UaResult<Value> {
+    let corpus = parse_corpus(corpus_raw)?;
+    let floor = parse_floor(floor_raw)?;
     if floor.k != RECALL_K {
         return Err(UaError::internal(format!(
             "bench/floor.json k is {}, the harness scores @{RECALL_K}",
@@ -740,7 +749,6 @@ async fn run_fixture() -> UaResult<Value> {
         }
     }
 
-    let scratch = Scratch::new("fixture")?;
     let cfg = bench_config(&scratch.dir);
     let base = scratch.sub("corpus")?.join("corpus.db");
     let ids = {
@@ -1344,6 +1352,81 @@ mod tests {
         let q = corpus.queries.iter().find(|q| q.id == "para-stem").unwrap();
         let must = words(&text(&q.must[0]));
         assert!(words(&q.query).iter().all(|w| !must.contains(w)), "{}", q.query);
+    }
+
+    /// `exact-noise` and `long-noise` guard phrase matching. A single-token
+    /// query is one phrase with no OR fallback, so they are never returned
+    /// while phrases hold. Each holds every word of its query, so a word-bag
+    /// match would return it and fail the class.
+    #[test]
+    fn phrase_negatives_hold_every_query_word() {
+        let corpus = parse_corpus(CORPUS).unwrap();
+        let mut checked = 0;
+        for q in corpus.queries.iter().filter(|q| q.query.split_whitespace().count() == 1) {
+            for key in &q.must_not {
+                let n = corpus.notes.iter().find(|n| &n.key == key).unwrap();
+                let have = words(&format!("{} {}", n.title, n.content));
+                for w in words(&q.query) {
+                    assert!(have.contains(&w), "{}: {key} lacks {w:?}", q.id);
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 2, "{checked}");
+    }
+
+    fn reasons(report: &Value) -> Vec<String> {
+        report["floor"]["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["reason"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fixture_queries_remove_their_database_copies() {
+        let scratch = Scratch::new("fixture-test").unwrap();
+        let report = run_fixture_with(CORPUS, FLOOR, &scratch).await.unwrap();
+        assert_eq!(report["floor"]["ok"], json!(true), "{report}");
+        let left: Vec<String> = std::fs::read_dir(&scratch.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["corpus"]);
+    }
+
+    #[tokio::test]
+    async fn a_floor_n_that_differs_from_the_corpus_fails_the_floor() {
+        let mut floor: Value = serde_json::from_str(FLOOR).unwrap();
+        for row in floor["classes"].as_array_mut().unwrap() {
+            if row["class"] == "temporal" {
+                row["n"] = json!(4);
+            }
+        }
+        let scratch = Scratch::new("fixture-test").unwrap();
+        let report = run_fixture_with(CORPUS, &floor.to_string(), &scratch).await.unwrap();
+        assert_eq!(report["floor"]["ok"], json!(false));
+        assert_eq!(reasons(&report), ["bench/floor.json records n=4 but the corpus has 3 queries"]);
+    }
+
+    #[tokio::test]
+    async fn an_outranked_note_that_is_not_retrieved_fails_the_floor() {
+        let mut corpus: Value = serde_json::from_str(CORPUS).unwrap();
+        for q in corpus["queries"].as_array_mut().unwrap() {
+            if q["id"] == "exact-title" {
+                q["outranked"].as_array_mut().unwrap().push(json!("para-auto"));
+            }
+        }
+        let scratch = Scratch::new("fixture-test").unwrap();
+        let report = run_fixture_with(&corpus.to_string(), FLOOR, &scratch).await.unwrap();
+        assert_eq!(report["floor"]["ok"], json!(false));
+        assert_eq!(
+            reasons(&report),
+            ["outranked note para-auto was not retrieved, so it no longer tests ranking"]
+        );
+        // The query itself still scores: only the vacuity check fails.
+        assert_eq!(report["classes"][0]["recall_at_5"], json!(1.0));
     }
 
     #[test]

@@ -53,11 +53,13 @@ pub async fn delete(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRes
         tags.dedup();
         // The row stays: the tombstone keeps the text, the version
         // history keeps the prior state, and memory_restore undoes it.
+        let since = note::last_version(tx, &org, &id)?;
         tx.execute(
             "UPDATE memory SET content = ?1, tags = ?2, updated_at = ?3, updated_by = ?4 \
              WHERE id = ?5 AND org_id = ?6",
             params![tombstone.trim_start_matches('\n'), json_text(&tags), ts, actor, id, org],
         )?;
+        note::stamp_versions(tx, &org, &id, since, &ts)?;
         emit(
             tx,
             &org,
@@ -155,11 +157,13 @@ pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRe
             tags.dedup();
             // A restored broadcast note is a broadcast again.
             assert_privileged(&caller, &tags, None)?;
+            let since = note::last_version(tx, &org, &id)?;
             tx.execute(
                 "UPDATE memory SET content = ?1, tags = ?2, updated_at = ?3, updated_by = ?4 \
                  WHERE id = ?5 AND org_id = ?6",
                 params![content, json_text(&tags), ts, actor, id, org],
             )?;
+            note::stamp_versions(tx, &org, &id, since, &ts)?;
             emit(
                 tx,
                 &org,

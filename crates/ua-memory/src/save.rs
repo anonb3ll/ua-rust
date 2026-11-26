@@ -568,6 +568,7 @@ fn update(tx: &mut WriteTx<'_>, caller: &Caller, p: Prepared, id: &str, ts: &str
     let final_expires =
         if p.clear_expires_at { None } else { p.expires_at.clone().or_else(|| old.expires_at.clone()) };
 
+    let since = note::last_version(tx, org, id)?;
     tx.execute(
         "UPDATE memory SET content = ?1, title = ?2, tags = ?3, updated_at = ?4, updated_by = ?5, salience = ?6, \
          confidence = ?7, expires_at = ?8, epistemic = ?9, evidence = ?10, valid_from = ?11, contradicts = ?12 \
@@ -589,6 +590,7 @@ fn update(tx: &mut WriteTx<'_>, caller: &Caller, p: Prepared, id: &str, ts: &str
             org
         ],
     )?;
+    note::stamp_versions(tx, org, id, since, ts)?;
     let saved = note::require(tx, org, id)?;
     let revision = saved.revision();
     emit(

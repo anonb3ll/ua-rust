@@ -78,8 +78,11 @@ Facts the first draft did not record:
 - **The clock is injected.** Every memory operation reads `Config.clock`
   (`ua_core::time::Clock`): search, list and get, `similar_notes`,
   `maintenance.rs` (`days_ago`), `save.rs` and `lifecycle.rs`. A hub uses the
-  wall clock; tests and the retrieval bench fix it. Ledger event timestamps
-  still come from `ua-store`.
+  wall clock; tests and the retrieval bench fix it. The
+  `memory_versions_capture` trigger still writes SQLite's wall clock into
+  `recorded_at`; its schema part is checksum-locked, so the write path
+  restamps the captured version from `Config.clock` in the same transaction.
+  Ledger event timestamps still come from `ua-store`.
 
 A note on the honest ceiling: this ranker is competitive. The claim that the
 result is "as good as or better than a leading memory system" is currently
