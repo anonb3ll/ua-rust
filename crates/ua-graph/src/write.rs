@@ -14,8 +14,9 @@ use ulid::Ulid;
 
 use crate::types::{
     ASSERTION_SCOPE_MAX_BYTES, AssertedByKind, DISPLAY_LABEL_MAX_BYTES, EDGE_META_MAX_BYTES,
-    EXTERNAL_ID_MAX_BYTES, EdgeKind, EdgeState, NODE_META_MAX_BYTES, NodeKind, OwnerType, PrincipalId,
-    Provenance, SourceKind, Visibility, encode_meta_json, normalize_timestamp,
+    EXTERNAL_ID_MAX_BYTES, EdgeKind, EdgeState, NODE_META_MAX_BYTES, NodeKind, OWNER_ID_MAX_BYTES, OwnerType,
+    PrincipalId, Provenance, SourceKind, TEAM_ID_MAX_BYTES, Visibility, encode_meta_json,
+    normalize_timestamp,
 };
 
 /// Ledger channel for node creation.
@@ -283,6 +284,19 @@ pub fn check_acyclic<R: GraphRead>(
     }
 }
 
+fn validate_optional_id(val: Option<&str>, field: &str, max_bytes: usize) -> UaResult<()> {
+    if let Some(raw) = val {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || raw.len() > max_bytes {
+            return Err(UaError::invalid(format!("{field} must be 1-{max_bytes} bytes")));
+        }
+        if raw.chars().any(char::is_control) {
+            return Err(UaError::invalid(format!("{field} must not contain control characters")));
+        }
+    }
+    Ok(())
+}
+
 /// Domain-only internal primitive: create a `graph_nodes` row if
 /// `(org_id, kind, external_id)` is absent, and touch nothing if it already
 /// exists. Never exposed as a public tool (`docs/graph.md`, Security model §1).
@@ -308,6 +322,8 @@ pub fn graph_node_ensure<R: GraphRepo>(
             "display_label must be at most {DISPLAY_LABEL_MAX_BYTES} bytes"
         )));
     }
+    validate_optional_id(req.team_id.as_deref(), "team_id", TEAM_ID_MAX_BYTES)?;
+    validate_optional_id(req.owner_id.as_deref(), "owner_id", OWNER_ID_MAX_BYTES)?;
     match req.visibility {
         Visibility::Team => {
             if req.team_id.as_deref().map(str::trim).is_none_or(str::is_empty) {
@@ -743,6 +759,8 @@ pub fn graph_node_update<R: GraphRepo>(
             "display_label must be at most {DISPLAY_LABEL_MAX_BYTES} bytes"
         )));
     }
+    validate_optional_id(new_team_id.as_deref(), "team_id", TEAM_ID_MAX_BYTES)?;
+    validate_optional_id(new_owner_id.as_deref(), "owner_id", OWNER_ID_MAX_BYTES)?;
     match new_visibility {
         Visibility::Team => {
             if new_team_id.as_deref().map(str::trim).is_none_or(str::is_empty) {

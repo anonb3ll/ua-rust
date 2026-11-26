@@ -839,9 +839,25 @@ session profile:
      `graph_edge_update_weight` updates `graph_edges.weight` on live edges and
      appends `agent.graph.edge_updated` in the same write transaction. A
      workspace source-scan guard (`crates/ua-graph/tests/update_guard.rs`)
-     forbids any `UPDATE graph_nodes` / `UPDATE graph_edges` outside
-     `crates/ua-store/src/graph.rs` and any direct call to the low-level
-     `GraphRepo` update methods outside `crates/ua-graph/src/write.rs`.
+     enforces:
+     - an explicit file allowlist (`DOMAIN_UPDATE_CALL_ALLOWLIST`, empty in C2
+       slice 1; each C2 domain consumer adds itself in its own PR, and
+       `families/graph_store.rs` and `ua-server` are permanently forbidden) for
+       calling `graph_node_update` / `graph_edge_update_weight`;
+     - no direct calls to `GraphRepo::update_node_mutable` /
+       `update_edge_weight` outside `crates/ua-graph/src/write.rs` and
+       `crates/ua-store/src/graph.rs`;
+     - no `UPDATE`, `INSERT OR REPLACE`, `REPLACE INTO`, or
+       `ON CONFLICT ... DO UPDATE` targeting `graph_nodes`, `graph_edges`, or
+       `graph_org_counts` (across unquoted, single/double/backtick/bracket
+       quoting and any schema prefix) outside their exact sanctioned sites in
+       `crates/ua-store/src/graph.rs` and `crates/ua-graph/src/schema.rs`;
+     - no `format!` literals with a dynamic `{...}` table slot in `UPDATE` or
+       `REPLACE` statements across crates that use the graph tables.
+     *(Static-scan limit: arbitrary runtime SQL string concatenation outside
+     `format!` cannot be caught statically; SQLite immutability and no-delete
+     triggers still protect identity, provenance, and row retention at the
+     database layer, while code review guards against dynamic SQL builders.)*
    Both node creation and every mutable-field update (`visibility`, `team_id`,
    `owner_type`, `owner_id`, `display_label`, `meta_json`, `archived_at`) are
    domain-owned per node kind — `visibility`, `owner_*`, and `team_id` change

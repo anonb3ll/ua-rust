@@ -2783,6 +2783,59 @@ fn graph_node_update_records_same_tx_event_rolls_back_atomically_and_keeps_ident
         .unwrap_err();
     assert_eq!(future_arch.code(), "invalid_argument");
     assert_eq!(future_arch.reason_code(), Some("future_archived_at"));
+
+    // 6. Length and control-character limits on team_id and owner_id (both update and ensure).
+    let long_id = "x".repeat(129);
+    for (bad_team, bad_owner) in [
+        (FieldPatch::Set(long_id.clone()), FieldPatch::Unchanged),
+        (FieldPatch::Set("bad\nteam".into()), FieldPatch::Unchanged),
+        (FieldPatch::Set("bad\x00team".into()), FieldPatch::Unchanged),
+        (FieldPatch::Unchanged, FieldPatch::Set(long_id.clone())),
+        (FieldPatch::Unchanged, FieldPatch::Set("bad\x1bowner".into())),
+    ] {
+        let err = db
+            .write(|tx| {
+                graph_node_update(
+                    tx,
+                    UpdateNodeRequest {
+                        org_id: DEFAULT_ORG.into(),
+                        node_id: orig.id.clone(),
+                        actor: PrincipalId::new("operator-1").unwrap(),
+                        actor_kind: AssertedByKind::Person,
+                        visibility: None,
+                        team_id: bad_team,
+                        owner_type: FieldPatch::Unchanged,
+                        owner_id: bad_owner,
+                        display_label: FieldPatch::Unchanged,
+                        meta_json: None,
+                        archived_at: FieldPatch::Unchanged,
+                    },
+                )
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "invalid_argument");
+    }
+    let bad_ensure_team = db
+        .write(|tx| {
+            graph_node_ensure(
+                tx,
+                EnsureNodeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    kind: NodeKind::MemoryNote,
+                    external_id: "bad-tid-ensure".into(),
+                    display_label: None,
+                    visibility: Visibility::Team,
+                    team_id: Some(long_id),
+                    owner_type: None,
+                    owner_id: None,
+                    provenance: prov_agent("builder-1"),
+                    meta_json: None,
+                    max_nodes_per_org: 0,
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(bad_ensure_team.code(), "invalid_argument");
 }
 
 #[test]
