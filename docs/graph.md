@@ -816,7 +816,13 @@ and mid-burst checkpoints, versus `16,383 edges/sec` and `2.53 ms` p95
   default `5,000`, counting live outgoing + incoming edges on both endpoints and
   refusing with `node_edge_limit_exceeded`), JSON metadata byte limits (`8 KiB`
   on nodes, `4 KiB` on edges), `external_id` length limit (256), and standard
-  policy rate limits on write tools.
+  policy rate limits on write tools. **Known limit:** `graph_org_counts.edge_count`
+  is monotonic across all historical rows (because `graph_edges` rows are closed
+  with `valid_to` and never deleted), so repeated add/retract churn on
+  dependencies, goal links, or other edges counts permanently toward the
+  `2,000,000` per-org `graph_max_edges_per_org` cap; operators with high edge
+  churn can raise `graph_max_edges_per_org` until a live-edge quota or archival
+  split is added.
 
 ### Who may create/mutate nodes and assert/retract edges
 
