@@ -136,6 +136,9 @@ pub fn start_slack_socket(state: &AppState, ct: &CancellationToken) {
 
 /// Serve HTTP until `ct` is cancelled.
 pub async fn serve_http(state: AppState, ct: CancellationToken) -> anyhow::Result<()> {
+    // Refuse before sweeping Slack commands or binding a port if unauthenticated
+    // mode is configured on a multi-organization database.
+    auth::check_auth_policy(&state.hub)?;
     let bind = state.hub.cfg().bind;
     // Before anything is served: Slack commands admitted before the hub last
     // stopped, with no recorded outcome, are ledgered (outcome unknown).

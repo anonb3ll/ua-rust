@@ -57,8 +57,8 @@ Checks performed:
 1. `owner`: confirms effective UID owns `$UA_HOME` on Unix (prevents mixed root/service-user state).
 2. `config`: loads effective config layers (`$UA_CONFIG` / `$UA_HOME/config.toml` + `UA_*` env).
 3. `permissions`: verifies `$UA_HOME`, active config file, and `ua.db` are owner-only (`mode & 0o077 == 0` on Unix; `0644` warns).
-4. `auth_lockout`: ensures `enforce_auth = true` has at least one static or active database token.
-5. `origin_security`: checks loopback bind (unless `--allow-non-loopback` with auth enforced), `insecure_origin_warning`, and refuses non-loopback binds with `enforce_auth = false`.
+4. `auth_lockout`: ensures `enforce_auth = true` has at least one static or active database token, and fails when `enforce_auth = false` while `orgs` holds any organization other than `default` (active or suspended) or is unreadable.
+5. `origin_security`: checks loopback bind (unless `--allow-non-loopback` with auth enforced), `insecure_origin_warning`, refuses non-loopback binds with `enforce_auth = false`, and fails even on loopback when `enforce_auth = false` and a second organization exists (active or suspended) or `orgs` is unreadable.
 6. `cargo_config`: runs `cargo_config_warning` across configured workspace roots.
 7. `policy_file`: validates the fail-closed YAML policy via `policy::load`.
 8. `database`: opens the DB strictly read-only (`query_only = ON`) and checks `PRAGMA quick_check`, `PRAGMA foreign_key_check`, `journal_mode=wal`, and WAL size (`> 64 MiB` warns).
