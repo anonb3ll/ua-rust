@@ -124,11 +124,16 @@ The hub never checks out a Git working tree for an external skill repository.
     depth 8, and 256 KiB supporting approval text cap.
 - **Path, symlink, and mode rules (matching D1):**
   - Symlinks (`120000`) and non-regular blob modes are refused.
-  - Only canonical relative POSIX paths inside the skill directory are
-    accepted: no `..`, `.`, leading `.` hidden files/directories, backslashes,
-    colons, control characters, nested `SKILL.md` directories, or
-    case-insensitive / Unicode NFC collisions (`docs/skills.md`,
-    *Path and safety rules*).
+  - `allowed_subpaths` entries are normalized repository-relative prefixes up to
+    512 bytes; leading-dot repo directories (such as `.claude/skills`) are
+    permitted as repository-level prefixes while `.`, `..`, `.git`, backslashes,
+    colons, control characters, and hidden/bidi Unicode code points are refused.
+  - Only canonical relative POSIX paths inside a skill directory are accepted:
+    no `..`, `.`, leading `.` hidden files/directories, backslashes, colons,
+    control characters, hidden/bidi Unicode code points, nested `SKILL.md`
+    directories, or case-insensitive / Unicode NFC collisions (`docs/skills.md`,
+    *Path and safety rules*). `source_discover` fails closed if any entry under a
+    candidate package violates these path or mode rules.
   - Executable bits (`100755`) are normalized to `0o644` and never honoured.
     Nothing executes at fetch, stage, import, publish, or install time.
 

@@ -24,7 +24,8 @@
 //!   into `skill_publish_staging` with `git:<canonical_url>@<sha>:<path>`
 //!   provenance, and parks the D1 publish approval (with member diff on upgrade).
 //!
-//! `yank` and catalog `install` arrive in slice D2c.
+//! Version `yank` and catalog `install` live alongside the registry core in
+//! [`super::skill_registry`].
 
 pub mod fetch;
 pub mod plumbing;
@@ -35,7 +36,6 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
-use ua_org::authz::{Authority, Authz};
 use ua_store::{Procedure, SchemaPart};
 
 use self::fetch::{
@@ -47,7 +47,9 @@ use self::plumbing::{
 };
 use super::agents::verified;
 use super::plans::ledger_text;
-use super::skill_registry::{check_name, emit, frontmatter, gate_pass, operator, pending, stage_members};
+use super::skill_registry::{
+    check_name, emit, frontmatter, gate_pass, human_operator, operator, pending, stage_members,
+};
 use super::skills::review_in_memory;
 use crate::registry::ToolCtx;
 
@@ -207,33 +209,6 @@ fn source_row(r: &Row<'_>) -> rusqlite::Result<SourceRow> {
         "revoke_reason": r.get::<_, Option<String>>(13)?,
     });
     Ok(SourceRow { id, canonical_url, tracking_ref, pinned_sha, allowed_subpaths, status, public })
-}
-
-/// Human operator authority check for `skill_sources` mutations
-/// (`docs/skill-sources.md` §1): requires an existing org in `orgs`, a verified
-/// identity, and [`Authority::Operator`] (human-only; never an agent or
-/// lifecycle operator).
-fn human_operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
-    let org = ctx.caller.org_id.as_str();
-    let known = ctx
-        .hub
-        .db()
-        .read(|c| Ok(c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?))?;
-    if known.is_none() {
-        return Err(UaError::invalid(format!(
-            "unknown organization {org:?}; skill sources were not changed"
-        )));
-    }
-    let who = verified(&ctx.caller).map(str::to_string).ok_or_else(|| {
-        UaError::denied("identity_required", "managing skill sources requires an authenticated identity")
-    })?;
-    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], org) {
-        return Err(UaError::denied(
-            "operator_required",
-            format!("{what} requires a human operator of this organization"),
-        ));
-    }
-    Ok(who)
 }
 
 fn load_source(c: &Connection, org: &str, id: &str) -> UaResult<Option<SourceRow>> {

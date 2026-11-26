@@ -235,6 +235,10 @@ pub fn schema_parts() -> Vec<Part> {
     parts.push(families::skill_registry::SOURCE_ID_SCHEMA.into());
     // Shared tenant-scoped graph store (`ua-graph`, born tenant-scoped; C1).
     parts.extend(families::graph_store::schema_parts());
+    // Permanent per-org skill version yanks (`skill_version_yanks`, born
+    // tenant-scoped; D2c).
+    parts.push(families::skill_registry::YANKS_SCHEMA.into());
+    parts.push(families::skill_registry::YANKS_TENANT_PART.into());
     parts
 }
 

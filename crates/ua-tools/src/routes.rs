@@ -337,8 +337,9 @@ pub const MANAGERS: &[Manager] = &[
             ("source_refresh", Own),
             ("source_discover", Own),
             ("source_import", Own),
+            ("yank", Own),
             ("catalog", Refused),
-            ("install", Refused),
+            ("install", Own),
             ("team_install", Refused),
             ("starter_preview", Refused),
             ("starter_install", Refused),
@@ -857,6 +858,8 @@ mod tests {
             Some("skill_registry:source_refresh")
         );
         assert_eq!(gate("skill_registry", "source_import").as_deref(), Some("skill_registry:source_import"));
+        assert_eq!(gate("skill_registry", "yank").as_deref(), Some("skill_registry:yank"));
+        assert_eq!(gate("skill_registry", "install").as_deref(), Some("skill_registry:install"));
         assert_eq!(gate("skill_registry", "source_unknown"), None);
         assert_eq!(gate("coordination_manage", " agent_list").as_deref(), Some("agent_list"));
         // The standalone payload is `params`; an own key binds the call.
