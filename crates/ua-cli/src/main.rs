@@ -603,6 +603,10 @@ async fn run_cmd(cli: Cli, held: &mut Held) -> anyhow::Result<ExitCode> {
                             // Poll the bound repositories' open pull requests when no webhook
                             // can reach this hub (github_poll_interval_s; 0 = off).
                             background.extend(ua_tools::families::github::spawn_poller(&hub, ct.clone()));
+                            // Automatically backfill missing or stale memory vectors/chunks on
+                            // startup (e.g. after an upgrade or identity change) and periodically
+                            // thereafter, strictly per active organization.
+                            background.extend(ua_tools::families::memory::spawn_backfill(&hub, ct.clone()));
                             // Routine fires a previous process left mid-workflow or unstarted.
                             let h = hub.clone();
                             background.push(tokio::spawn(async move {

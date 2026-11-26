@@ -46,7 +46,10 @@ pub use embed::{
     VectorIndex, embed_batch, embedder_for, embedder_for_org, embedder_for_with_remote_flag, local_embedder,
     org_allows_remote_embedder, register_embedder, register_http_embedder_factory, vector_identity,
 };
-pub use maintenance::{BackfillReport, backfill_embeddings};
+pub use maintenance::{
+    BackfillReport, EmbeddingCounts, MAX_BACKFILL_BATCHES_PER_PASS, backfill_all_orgs_step,
+    backfill_embeddings, backfill_embeddings_capped, embedding_freshness_counts,
+};
 pub use note::{Filter, mark_untrusted};
 /// The ORG-EVENT-DEFAULT rule for memory events, exposed so `ua-tools` can
 /// test it against its own copy; not an API for other callers.

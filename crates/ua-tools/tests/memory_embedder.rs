@@ -461,3 +461,177 @@ async fn model_fetch_verifies_sha256_and_rejects_corruption() {
     assert!(!status.present);
     assert!(status.detail.contains("ua memory models fetch"), "{status:?}");
 }
+
+/// `system_doctor`'s embedded count excludes stale vectors (wrong identity,
+/// imported rows, or mismatched `content_sha`) and reports them as stale until
+/// backfill re-embeds them.
+#[tokio::test]
+async fn doctor_embedded_count_excludes_stale_vectors_until_backfill() {
+    let app = Router::new()
+        .route("/api/show", post(|| async { Json(json!({ "digest": "sha256:doc-rev-1" })) }))
+        .route(
+            "/api/embed",
+            post(|Json(body): Json<Value>| async move {
+                let n = body["input"].as_array().unwrap().len();
+                Json(json!({ "embeddings": vec![vec![1.0f32, 0.0]; n] }))
+            }),
+        );
+    let (addr, _srv) = bind_axum(app).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path());
+    cfg.memory.embedder = "ollama".into();
+    cfg.memory.ollama_model = "nomic-embed-text".into();
+    cfg.memory.ollama_url = format!("http://{addr}");
+
+    let hub = Hub::in_memory(cfg).unwrap();
+    let reg = builtin_registry();
+    let caller = agent("builder-1", DEFAULT_ORG);
+
+    // Plant two live notes with stale embeddings: one imported, one with an
+    // outdated content_sha under the active Ollama identity.
+    let vec_bytes: Vec<u8> = [1.0f32, 0.0f32].iter().flat_map(|f| f.to_le_bytes()).collect();
+    hub.db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO memory (id, org_id, title, content, tags, created_at, updated_at) VALUES \
+                 ('n-imp', 'default', 'Imported', 'imported body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'), \
+                 ('n-sha', 'default', 'Edited', 'edited body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO memory_embeddings (org_id, note_id, model, dim, embedding, content_sha, updated_at) VALUES \
+                 ('default', 'n-imp', 'import:bge-small', 2, ?1, '', '2026-01-01T00:00:00+00:00'), \
+                 ('default', 'n-sha', 'ollama:nomic-embed-text@sha256:doc-rev-1', 2, ?1, 'stale-sha', '2026-01-01T00:00:00+00:00')",
+                [&vec_bytes],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let doc_before = reg.call(&hub, &caller, "system_doctor", json!({})).await.unwrap();
+    let row_before = doc_before["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["capability"] == "semantic_search")
+        .unwrap();
+    let detail_before = row_before["detail"].as_str().unwrap();
+    assert!(
+        detail_before.contains("0 of 2 notes embedded (2 stale)"),
+        "doctor must exclude stale vectors from embedded count: {detail_before}"
+    );
+
+    // Backfill re-embeds both; doctor now reports 2 of 2 embedded and no stale count.
+    let maint = reg.call(&hub, &caller, "recall_maintenance", json!({})).await.unwrap();
+    assert_eq!(maint["embeddings"]["notes_embedded"], 2, "{maint}");
+
+    let doc_after = reg.call(&hub, &caller, "system_doctor", json!({})).await.unwrap();
+    let row_after = doc_after["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["capability"] == "semantic_search")
+        .unwrap();
+    let detail_after = row_after["detail"].as_str().unwrap();
+    assert!(
+        detail_after.contains("2 of 2 notes embedded") && !detail_after.contains("stale"),
+        "after backfill, doctor should report 2 of 2 fresh: {detail_after}"
+    );
+}
+
+/// Startup background backfill automatically re-embeds stale/missing notes
+/// across every active organization (strictly per org), skips suspended orgs,
+/// and stops cleanly on cancellation.
+#[tokio::test]
+async fn startup_backfill_automatically_reembeds_active_orgs_and_skips_suspended() {
+    let app = Router::new()
+        .route("/api/show", post(|| async { Json(json!({ "digest": "sha256:startup-rev" })) }))
+        .route(
+            "/api/embed",
+            post(|Json(body): Json<Value>| async move {
+                let n = body["input"].as_array().unwrap().len();
+                Json(json!({ "embeddings": vec![vec![1.0f32, 0.0]; n] }))
+            }),
+        );
+    let (addr, _srv) = bind_axum(app).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path());
+    cfg.memory.embedder = "off".into();
+    let hub_off = Hub::in_memory(cfg.clone()).unwrap();
+    assert!(
+        ua_tools::families::memory::spawn_backfill(&hub_off, tokio_util::sync::CancellationToken::new())
+            .is_none(),
+        "embedder = off should not spawn a background backfill task"
+    );
+
+    cfg.memory.embedder = "ollama".into();
+    cfg.memory.ollama_model = "nomic-embed-text".into();
+    cfg.memory.ollama_url = format!("http://{addr}");
+    let hub = Hub::in_memory(cfg).unwrap();
+
+    // Seed active second org and suspended org, plus stale/missing notes in all three.
+    hub.db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, status, allowed_profiles, created_at) VALUES \
+                 ('org-active', 'org-active', 'Org Active', 'active', '[\"developer\"]', '2026-01-01T00:00:00+00:00'), \
+                 ('org-suspended', 'org-suspended', 'Org Suspended', 'suspended', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO memory (id, org_id, title, content, tags, created_at, updated_at) VALUES \
+                 ('n-def', 'default', 'Default', 'default body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'), \
+                 ('n-act', 'org-active', 'Active', 'active body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'), \
+                 ('n-sus', 'org-suspended', 'Suspended', 'suspended body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let ct = tokio_util::sync::CancellationToken::new();
+    let handle = ua_tools::families::memory::spawn_backfill(&hub, ct.clone()).expect("spawns backfill");
+
+    // Wait briefly for the startup pass to embed both active orgs automatically.
+    let mut embedded_active = 0i64;
+    for _ in 0..40 {
+        embedded_active = hub
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM memory_embeddings \
+                     WHERE model = 'ollama:nomic-embed-text@sha256:startup-rev' \
+                       AND content_sha <> '' \
+                       AND org_id IN ('default', 'org-active')",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        if embedded_active == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(embedded_active, 2, "startup backfill must automatically embed all active orgs");
+
+    let embedded_suspended: i64 = hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE org_id = 'org-suspended'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(embedded_suspended, 0, "suspended orgs must never be backfilled");
+
+    ct.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .expect("backfill task exits promptly on cancellation")
+        .expect("backfill task does not panic");
+}

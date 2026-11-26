@@ -231,6 +231,62 @@ pub fn embedder_for(cfg: &Config) -> Arc<dyn Embedder> {
     embedder_for_with_remote_flag(cfg, false)
 }
 
+/// Purely local (zero-network, zero-model-load) rule for which stored
+/// `memory_embeddings.model` / `memory_chunks.model` values count as fresh for
+/// `cfg` in read-only diagnostics such as `system_doctor`.
+pub(crate) enum IdentityMatch {
+    Exact(String),
+    Prefix(String),
+    None,
+}
+
+impl IdentityMatch {
+    pub(crate) fn matches(&self, model: &str) -> bool {
+        match self {
+            Self::Exact(want) => model == want,
+            Self::Prefix(prefix) => model.starts_with(prefix),
+            Self::None => false,
+        }
+    }
+}
+
+pub(crate) fn expected_identity_rule(cfg: &Config) -> IdentityMatch {
+    if let Ok(reg) = registry().lock()
+        && let Some(e) = reg.get(&cfg.embed_model)
+    {
+        return if e.available() { IdentityMatch::Exact(e.identity()) } else { IdentityMatch::None };
+    }
+    match cfg.memory.embedder.trim().to_ascii_lowercase().as_str() {
+        "off" => IdentityMatch::None,
+        "openai_compat" => {
+            if cfg.memory.openai_compat_url.is_none() {
+                return IdentityMatch::None;
+            }
+            let model = cfg
+                .memory
+                .openai_compat_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(cfg.embed_model.as_str());
+            IdentityMatch::Exact(vector_identity("openai_compat", model, "remote"))
+        }
+        "ollama" => {
+            let model = cfg.memory.ollama_model.trim();
+            if model.is_empty() {
+                IdentityMatch::None
+            } else {
+                IdentityMatch::Prefix(format!("ollama:{model}@"))
+            }
+        }
+        // `local` or `auto`: pinned local ONNX identity when known.
+        _ => match super::models::lookup_pinned_model(&cfg.embed_model) {
+            Some(spec) => IdentityMatch::Exact(vector_identity("local", spec.canonical_id, spec.revision)),
+            None => IdentityMatch::None,
+        },
+    }
+}
+
 /// Resolve the embedder for organization `org`, reading `orgs.allow_remote_embedder`
 /// from `db` so note text and queries never leave the machine unless `org`
 /// explicitly opted in. Runs off the async worker thread because HTTP backends

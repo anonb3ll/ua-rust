@@ -396,6 +396,103 @@ pub async fn backfill_embeddings_capped(
     Ok(report)
 }
 
+/// Freshness breakdown of live memory notes for an organization, computed
+/// without network calls or model loading (for `system_doctor`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbeddingCounts {
+    /// Live (non-deleted, non-superseded) notes in the organization.
+    pub live_notes: i64,
+    /// Live notes whose single vector and every expected chunk vector match
+    /// both the active vector identity and the note's current `content_sha`.
+    pub fresh_embedded: i64,
+    /// Live notes that have a `memory_embeddings` row, but it is stale
+    /// (imported, wrong identity, mismatched `content_sha`, or missing/stale
+    /// chunks) and therefore excluded from semantic scoring.
+    pub stale_embedded: i64,
+}
+
+/// Count live notes, fresh (scorable) embeddings, and stale embeddings for
+/// organization `org` using `cfg`'s active vector identity rule. Never loads a
+/// model or touches the network.
+pub fn embedding_freshness_counts(
+    conn: &rusqlite::Connection,
+    org: &str,
+    cfg: &Config,
+) -> UaResult<EmbeddingCounts> {
+    let rule = embed::expected_identity_rule(cfg);
+    let mut counts = EmbeddingCounts::default();
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.title, m.content, e.model, e.content_sha \
+         FROM memory m \
+         LEFT JOIN memory_embeddings e ON e.note_id = m.id AND e.org_id = m.org_id \
+         WHERE m.org_id = ?1 \
+           AND m.superseded_by IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM json_each(m.tags) WHERE value = ?2)",
+    )?;
+    let mut chunk_stmt = conn.prepare(
+        "SELECT COUNT(*), \
+                COALESCE(SUM(CASE WHEN model = ?3 AND content_sha = ?4 THEN 1 ELSE 0 END), 0) \
+         FROM memory_chunks \
+         WHERE org_id = ?1 AND note_id = ?2",
+    )?;
+    let rows = stmt.query_map(params![org, DELETED_TAG], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, title, content, emb_model, emb_sha) = row?;
+        counts.live_notes += 1;
+        let Some(model) = emb_model else {
+            continue;
+        };
+        let text = embed_text(title.as_deref(), &content);
+        let sha = text_sha(&text);
+        let single_fresh = rule.matches(&model) && emb_sha.as_deref() == Some(sha.as_str());
+        if !single_fresh {
+            counts.stale_embedded += 1;
+            continue;
+        }
+        let expected_chunks = chunks::chunk_text(&text).len() as i64;
+        let (total_chunks, fresh_chunks): (i64, i64) =
+            chunk_stmt.query_row(params![org, &id, &model, &sha], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        if total_chunks == expected_chunks && fresh_chunks == expected_chunks {
+            counts.fresh_embedded += 1;
+        } else {
+            counts.stale_embedded += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// Run one bounded backfill step across every active organization, resolving
+/// each organization's embedder independently (honoring its own
+/// `orgs.allow_remote_embedder` setting) and never touching suspended orgs.
+pub async fn backfill_all_orgs_step(
+    db: &Db,
+    cfg: &Config,
+    max_batches_per_org: usize,
+) -> UaResult<Vec<(String, BackfillReport)>> {
+    let orgs: Vec<String> = db
+        .read_async(|c| {
+            let mut stmt =
+                c.prepare("SELECT id FROM orgs WHERE status = 'active' ORDER BY id = ?1 DESC, id")?;
+            let rows = stmt.query_map([ua_core::DEFAULT_ORG], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await?;
+    let mut reports = Vec::with_capacity(orgs.len());
+    for org in orgs {
+        let rep = backfill_embeddings_capped(db, cfg, &org, Some(max_batches_per_org)).await?;
+        reports.push((org, rep));
+    }
+    Ok(reports)
+}
+
 /// Organization `org`'s stale (old, never recalled, salience <= 0.5) and
 /// low-confidence notes, plus a best-effort embedding backfill pass in batches
 /// of [`BACKFILL_BATCH`] (8) notes. Refuses `dry_run = false`: it never

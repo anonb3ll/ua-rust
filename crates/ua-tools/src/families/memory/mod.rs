@@ -29,7 +29,10 @@ pub use ua_memory::embed::{
     BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embed_batch, embedder_for,
     embedder_for_org, register_embedder, vector_identity,
 };
-pub use ua_memory::maintenance::{BackfillReport, backfill_embeddings};
+pub use ua_memory::maintenance::{
+    BackfillReport, EmbeddingCounts, MAX_BACKFILL_BATCHES_PER_PASS, backfill_all_orgs_step,
+    backfill_embeddings, backfill_embeddings_capped, embedding_freshness_counts,
+};
 pub(crate) use ua_memory::mark_untrusted;
 pub use ua_memory::models;
 pub use ua_memory::schema::{
@@ -469,6 +472,74 @@ fn register_maintenance(r: &mut Registry) {
         // Backfills missing/stale derived vector indexes; never modifies or deletes notes.
         .side_effects(|_| true),
     );
+}
+
+/// Periodic interval between background embedding backfill checks when the
+/// server is idle (after startup catch-up completes).
+const BACKFILL_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+/// Brief pause between consecutive bounded startup catch-up passes so large
+/// post-upgrade backfills yield to interactive writes.
+const BACKFILL_CATCHUP_YIELD: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Spawn the server's background embedding backfill task.
+///
+/// On startup, runs bounded per-organization catch-up passes (strictly per org
+/// under each org's own `allow_remote_embedder` flag; never touching suspended
+/// orgs or downloading models) so an upgraded hub whose prior vectors became
+/// stale automatically re-embeds without requiring a manual `recall_maintenance`
+/// call. Afterward, ticks periodically until `ct` is cancelled.
+pub fn spawn_backfill(
+    hub: &crate::Hub,
+    ct: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if hub.cfg().memory.embedder.trim().eq_ignore_ascii_case("off") {
+        return None;
+    }
+    let hub = hub.clone();
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(BACKFILL_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = ct.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            // Drain stale vectors in bounded passes, yielding briefly between
+            // passes so interactive writes are never starved.
+            loop {
+                if ct.is_cancelled() {
+                    return;
+                }
+                match backfill_all_orgs_step(hub.db(), hub.cfg(), MAX_BACKFILL_BATCHES_PER_PASS).await {
+                    Ok(reports) => {
+                        let total_notes: usize = reports.iter().map(|(_, r)| r.notes_embedded).sum();
+                        let total_chunks: usize = reports.iter().map(|(_, r)| r.chunks_written).sum();
+                        if total_notes > 0 {
+                            tracing::info!(
+                                notes_embedded = total_notes,
+                                chunks_written = total_chunks,
+                                "memory background backfill completed pass"
+                            );
+                        }
+                        let any_more = reports.iter().any(|(_, r)| r.has_more && !r.stopped_unavailable);
+                        if !any_more {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "memory background backfill failed");
+                        break;
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    _ = ct.cancelled() => return,
+                    _ = tokio::time::sleep(BACKFILL_CATCHUP_YIELD) => {}
+                }
+            }
+        }
+    }))
 }
 
 #[cfg(test)]
