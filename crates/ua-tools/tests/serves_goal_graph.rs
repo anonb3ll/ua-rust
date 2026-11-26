@@ -300,8 +300,10 @@ async fn another_organization_stays_on_task_goal_links() {
 }
 
 /// A database written before the part: its default links are copied onto
-/// edges as imports (counted), the rows stay, the old table is frozen for
-/// the default organization, and organization B's link is untouched.
+/// edges as imports (counted), the part deletes no row, the old table is
+/// frozen for the default organization, and organization B's link is
+/// untouched. A row whose task already has a live edge, or whose task is
+/// another organization's, is skipped and counted.
 #[tokio::test]
 async fn the_upgrade_copies_default_links_onto_edges_and_freezes_the_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -315,7 +317,8 @@ async fn the_upgrade_copies_default_links_onto_edges_and_freezes_the_table() {
             tx.execute_batch(&format!(
                 "INSERT INTO tasks (id, org_id, title, project, created_at, updated_at) VALUES
                      (1, 'default', 'One', 'web', 'x', 'x'), (2, 'default', 'Two', 'web', 'x', 'x'),
-                     (3, 'org-b', 'Three', 'web', 'x', 'x'), (4, 'org-b', 'Four', 'web', 'x', 'x');
+                     (3, 'org-b', 'Three', 'web', 'x', 'x'), (4, 'org-b', 'Four', 'web', 'x', 'x'),
+                     (5, 'default', 'Five', 'web', 'x', 'x');
                  INSERT INTO goals (id, org_id, title, project, created_at, updated_at) VALUES
                      (1, 'default', 'Root', 'web', 'x', 'x');
                  INSERT INTO goals (id, org_id, title, project, parent_goal_id, created_at, updated_at) VALUES
@@ -324,7 +327,18 @@ async fn the_upgrade_copies_default_links_onto_edges_and_freezes_the_table() {
                      ('default', 1, 2, 'lead-1', '{OLD_LINKED_AT}'), ('default', 2, 1, NULL, 'not a time'),
                      ('org-b', 3, 3, 'b-agent', '{OLD_LINKED_AT}');
                  DROP TRIGGER task_goal_links_org_parent;
-                 INSERT INTO task_goal_links (org_id, task_id, goal_id, linked_at) VALUES ('default', 4, 1, 'x');"
+                 INSERT INTO task_goal_links (org_id, task_id, goal_id, linked_at) VALUES ('default', 4, 1, 'x');
+                 INSERT INTO task_goal_links (org_id, task_id, goal_id, linked_at) VALUES ('default', 5, 2, 'x');
+                 INSERT INTO graph_nodes (id, org_id, kind, external_id, asserted_by, asserted_by_kind, source_kind,
+                     source_ref, created_at, updated_at) VALUES
+                     ('N5', 'default', 'task', '5', 'system', 'system', 'import', 'import:pre', '{OLD_LINKED_AT}',
+                      '{OLD_LINKED_AT}'),
+                     ('G1', 'default', 'goal', '1', 'system', 'system', 'import', 'import:pre', '{OLD_LINKED_AT}',
+                      '{OLD_LINKED_AT}');
+                 INSERT INTO graph_edges (id, org_id, src_id, dst_id, kind, asserted_by, asserted_by_kind, asserted_at,
+                     source_kind, source_ref, valid_from) VALUES
+                     ('E5', 'default', 'N5', 'G1', 'serves_goal', 'system', 'system', '{OLD_LINKED_AT}', 'import',
+                      'import:pre', '{OLD_LINKED_AT}');"
             ))?;
             Ok(())
         })
@@ -336,10 +350,14 @@ async fn the_upgrade_copies_default_links_onto_edges_and_freezes_the_table() {
     }
     let h = H::of(Hub::open(cfg).unwrap(), dir);
 
-    // Copied: tasks 1 and 2. Skipped: task 4 (another organization's task).
+    // Copied: tasks 1 and 2. Skipped: task 4 (another organization's task)
+    // and task 5 (its live edge to goal 1 predates the part and wins).
     assert_eq!(h.edges(1), ["2:1"]);
     assert_eq!(h.edges(2), ["1:1"]);
     assert_eq!(h.edges(4), Vec::<String>::new());
+    assert_eq!(h.edges(5), ["1:1"]);
+    let v = h.goal_ok(&agent(DEFAULT_ORG), "ancestry", json!({ "task_id": 5 })).await;
+    assert_eq!(v["goal_id"], 1, "the legacy row is hidden behind the live edge: {v}");
     let e1 = h
         .text(
             "SELECT e.asserted_by || '|' || e.asserted_by_kind || '|' || e.source_kind || '|' || e.source_ref || \
@@ -359,18 +377,24 @@ async fn the_upgrade_copies_default_links_onto_edges_and_freezes_the_table() {
         "no ledger event"
     );
     // Nothing dropped: every legacy row is still there.
-    assert_eq!(h.count("SELECT COUNT(*) FROM task_goal_links"), 4);
+    assert_eq!(h.count("SELECT COUNT(*) FROM task_goal_links"), 5);
     // The counts are recorded in the part's audit SQL and by the doctor.
+    let want = json!({
+        "total": 4,
+        "copied": 2,
+        "skipped_total": 2,
+        "skipped": { "already_linked": 1, "missing_task": 1 },
+        "skipped_rows": [{ "task_id": 4, "reason": "missing_task" }, { "task_id": 5, "reason": "already_linked" }],
+    });
     let audit =
         h.text(&format!("SELECT generated_sql FROM schema_procedures WHERE name = '{PART}'")).unwrap();
-    assert!(audit.contains("task_goal_links default rows: 2 copied, 1 skipped"), "{audit}");
-    let db = h.ok(&operator(), "system_doctor", json!({})).await["database"].clone();
-    assert_eq!(db["serves_goal_links_copied_at_upgrade"], 2, "{db}");
-    assert_eq!(db["serves_goal_links_not_copied"], 1, "{db}");
+    assert!(audit.contains(&format!("goals.v3.serves_goal_graph summary: {want}")), "{audit}");
+    let doctor = h.ok(&operator(), "system_doctor", json!({})).await;
+    assert_eq!(doctor["database"]["serves_goal_migration"], want, "{doctor}");
     let db_b =
         h.ok(&Caller { org_id: ORG_B.into(), ..operator() }, "system_doctor", json!({})).await["database"]
             .clone();
-    assert!(db_b["serves_goal_links_copied_at_upgrade"].is_null(), "{db_b}");
+    assert!(db_b["serves_goal_migration"].is_null(), "{db_b}");
 
     // The tools read the copied links.
     let a = agent(DEFAULT_ORG);
@@ -404,4 +428,33 @@ async fn the_upgrade_copies_default_links_onto_edges_and_freezes_the_table() {
     }
     // Organization B's rows are not frozen.
     h.sql("UPDATE task_goal_links SET linked_by = 'b-other' WHERE task_id = 3").unwrap();
+}
+
+/// An unverified caller's claimed label is recorded as an agent, never as
+/// the hub: a claimed `system` is refused in the default organization and
+/// writes nothing, while organization B (no principal recorded) is unchanged.
+#[tokio::test]
+async fn a_claimed_label_never_records_the_hub() {
+    let h = H::new();
+    let local = Caller::local("local-dev", Transport::Cli);
+    let a = agent(DEFAULT_ORG);
+    let g = h.add_goal(&a, "Goal", None).await;
+    let t = h.task(&a, "Task").await;
+
+    let before = (h.count("SELECT COUNT(*) FROM graph_edges"), h.count("SELECT COUNT(*) FROM event_log"));
+    let e =
+        h.goal(&local, "link", json!({ "task_id": t, "goal_id": g, "author": "System" })).await.unwrap_err();
+    assert_eq!(e.reason_code(), Some("reserved_principal_id"), "{e}");
+    assert_eq!(
+        (h.count("SELECT COUNT(*) FROM graph_edges"), h.count("SELECT COUNT(*) FROM event_log")),
+        before
+    );
+
+    h.goal_ok(&local, "link", json!({ "task_id": t, "goal_id": g, "author": "night-agent" })).await;
+    assert_eq!(
+        h.text("SELECT asserted_by || '|' || asserted_by_kind FROM graph_edges WHERE kind = 'serves_goal'")
+            .unwrap(),
+        "night-agent|agent"
+    );
+    assert_eq!(h.count("SELECT COUNT(*) FROM graph_edges WHERE asserted_by_kind = 'system'"), 0);
 }

@@ -36,6 +36,10 @@ pub const CYCLE_CHECK_MAX_NODES: usize = 1_000;
 pub const CYCLE_CHECK_MAX_EDGES: usize = 5_000;
 /// Wall-clock deadline (ms) for one write-time acyclicity check.
 pub const CYCLE_CHECK_DEADLINE_MS: u64 = 50;
+/// Sentinel `deadline_ms` value that disables the wall-clock deadline while
+/// keeping deterministic node and edge caps (used by schema migrations and
+/// bulk imports so slow disks never non-deterministically skip legacy rows).
+pub const CYCLE_CHECK_NO_DEADLINE_MS: u64 = u64::MAX;
 
 /// Bounds governing one write-time acyclicity check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +68,14 @@ impl CycleCheckBounds {
                 deadline_ms: CYCLE_CHECK_DEADLINE_MS,
             },
         }
+    }
+
+    /// Migration / import bounds: keeps the deterministic node and edge caps
+    /// while lifting the wall-clock deadline.
+    pub const fn for_import(kind: EdgeKind) -> Self {
+        let mut b = Self::for_kind(kind);
+        b.deadline_ms = CYCLE_CHECK_NO_DEADLINE_MS;
+        b
     }
 }
 
@@ -113,6 +125,18 @@ impl CycleCheckPolicy {
             goal_parent: bounds,
             delegates_to: bounds,
             escalates_to: bounds,
+        }
+    }
+
+    /// Migration / import policy: keeps every edge kind's deterministic node
+    /// and edge caps while lifting the wall-clock deadline.
+    pub const fn for_import() -> Self {
+        Self {
+            depends_on: CycleCheckBounds::for_import(EdgeKind::DependsOn),
+            subtask_of: CycleCheckBounds::for_import(EdgeKind::SubtaskOf),
+            goal_parent: CycleCheckBounds::for_import(EdgeKind::GoalParent),
+            delegates_to: CycleCheckBounds::for_import(EdgeKind::DelegatesTo),
+            escalates_to: CycleCheckBounds::for_import(EdgeKind::EscalatesTo),
         }
     }
 
@@ -245,14 +269,20 @@ pub fn check_acyclic<R: GraphRead>(
             format!("edge {kind} from {src_id} to itself would create a cycle"),
         ));
     }
+    let no_deadline = bounds.deadline_ms == CYCLE_CHECK_NO_DEADLINE_MS;
     let started = Instant::now();
-    let deadline = Duration::from_millis(bounds.deadline_ms);
-    if bounds.deadline_ms == 0 || started.elapsed() >= deadline {
-        return Err(UaError::invalid_code(
-            "cycle_check_bound_exceeded",
-            format!("acyclicity check for {kind} exceeded deadline of {} ms", bounds.deadline_ms),
-        ));
-    }
+    let deadline_at = if no_deadline {
+        started + Duration::from_secs(86_400 * 365)
+    } else {
+        let deadline = Duration::from_millis(bounds.deadline_ms);
+        if bounds.deadline_ms == 0 || started.elapsed() >= deadline {
+            return Err(UaError::invalid_code(
+                "cycle_check_bound_exceeded",
+                format!("acyclicity check for {kind} exceeded deadline of {} ms", bounds.deadline_ms),
+            ));
+        }
+        started + deadline
+    };
     let outcome = repo.bounded_acyclic_reach(
         org_id,
         src_id,
@@ -260,9 +290,9 @@ pub fn check_acyclic<R: GraphRead>(
         kind.as_str(),
         bounds.max_nodes,
         bounds.max_edges,
-        started + deadline,
+        deadline_at,
     )?;
-    if started.elapsed() >= deadline {
+    if !no_deadline && Instant::now() >= deadline_at {
         return Err(UaError::invalid_code(
             "cycle_check_bound_exceeded",
             format!("acyclicity check for {kind} exceeded deadline of {} ms", bounds.deadline_ms),

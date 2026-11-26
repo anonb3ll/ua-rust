@@ -792,7 +792,6 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
 async fn delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
     let by = ctx.caller.label.clone();
     let org = ctx.caller.org_id.clone();
-    let actor = super::goal_links::graph_actor(&ctx.caller, &by);
     ctx.hub
         .db()
         .write_async(move |tx| {
@@ -804,9 +803,10 @@ async fn delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
             if org != ua_core::DEFAULT_ORG {
                 drop_orphaned_task_rows(tx, &org, &subtree)?;
             }
+            graph::retract_task_dependencies_for_subtree(tx, &org, &subtree)?;
             // A deleted task stops serving its goal: its live `serves_goal`
             // edge is closed (the old table's rows go by cascade).
-            super::goal_links::close_for_deleted_tasks(tx, &org, &subtree, actor)?;
+            super::goal_links::close_for_deleted_tasks(tx, &org, &subtree)?;
             let n = tx.execute("DELETE FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, a.id])?;
             let children = subtree.len() - 1;
             emit(tx, &org, "agent.task.deleted", json!({ "task_id": a.id, "subtree": subtree }), &by)?;

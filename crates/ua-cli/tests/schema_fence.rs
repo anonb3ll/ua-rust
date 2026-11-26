@@ -78,6 +78,18 @@ fn a_database_from_a_newer_build_is_refused_for_serving_and_writing() {
     assert_refused(&ua(&home).args(["token", "issue", "agent-1"]).output().unwrap(), "ua token issue");
     assert_refused(&ua(&home).args(["tools", "--names"]).output().unwrap(), "ua tools");
     assert_refused(&ua(&home).args(["login-link", "operator"]).output().unwrap(), "ua login-link");
+    assert_refused(&ua(&home).args(["evidence", "key-list"]).output().unwrap(), "ua evidence key-list");
+    assert_refused(
+        &ua(&home).args(["evidence", "verify", "--checkpoint", "cp-1"]).output().unwrap(),
+        "ua evidence verify",
+    );
+    // Offline evidence commands do not open the hub database, so they still run.
+    let offline_key = root.path().join("offline.key");
+    let keygen = ua(&home)
+        .args(["evidence", "key-generate", "--out", offline_key.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(keygen.status.success(), "ua evidence key-generate: {}", text(&keygen.stderr));
     let source = root.path().join("no-such-source.db");
     let import =
         ua(&home).args(["import", "python-hub", "--from", source.to_str().unwrap()]).output().unwrap();

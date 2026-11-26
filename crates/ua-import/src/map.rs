@@ -50,10 +50,13 @@ pub(crate) enum Kind {
     /// because `dispatch_runs` are not imported. Legacy tasks are imported
     /// into the default organization.
     Tasks,
-    /// Task dependencies, comments, comment threads, workflow records,
-    /// checks and hold members: imported into the default organization, with
-    /// their tasks.
+    /// Task comments, comment threads, workflow records, checks and hold
+    /// members: imported into the default organization, with their tasks.
     TaskChildren,
+    /// Legacy `task_dependencies` rows: imported directly into
+    /// `graph_edges(kind = 'depends_on')` (because `task_dependencies` is
+    /// frozen read-only under C2a) in the default organization.
+    TaskDependencies,
     /// Task subtree holds: require valid `status` and refuse duplicate active
     /// holds. Imported into the default organization.
     TaskHolds,
@@ -103,6 +106,7 @@ impl Kind {
             Kind::GraphCanvas
                 | Kind::Tasks
                 | Kind::TaskChildren
+                | Kind::TaskDependencies
                 | Kind::TaskHolds
                 | Kind::SkillRegistry
                 | Kind::ProjectRepoBindings
@@ -162,7 +166,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     },
     TableMap {
         refs: &[TASK_REF, Ref { col: "depends_on_task_id", table: "tasks", key: "id" }],
-        kind: Kind::TaskChildren,
+        kind: Kind::TaskDependencies,
         ..plain("task_dependencies")
     },
     TableMap { refs: &[TASK_REF], kind: Kind::TaskChildren, ..plain("task_comment_threads") },

@@ -1012,13 +1012,16 @@ struct DbFacts {
     /// left no ledger event, so the doctor reports them. Default-organization
     /// readers only.
     harness_approvals_expired_at_upgrade: Option<i64>,
-    /// `(copied, not copied)`: the default organization's `task_goal_links`
-    /// rows `goals.v3.serves_goal_graph` copied onto `serves_goal` graph
-    /// edges, and those still served from the old table
-    /// (`families::tasks::goal_links::legacy_link_counts`). A schema part
-    /// cannot append to the ledger, so the doctor reports them.
-    /// Default-organization readers only.
-    serves_goal_legacy_links: Option<(i64, i64)>,
+    /// Migration counts recorded by `tasks.v3.depends_on_graph`
+    /// (`families::tasks::depends_on_migration_summary`): copied and skipped
+    /// `task_dependencies` rows. Default-organization readers only.
+    depends_on_migration: Option<Value>,
+    /// Migration counts recorded by `goals.v3.serves_goal_graph`
+    /// (`families::tasks::serves_goal_migration_summary`): copied and skipped
+    /// default-organization `task_goal_links` rows. A schema part cannot
+    /// append to the ledger, so the doctor reports them. Default-organization
+    /// readers only.
+    serves_goal_migration: Option<Value>,
 }
 
 /// Database facts for `system_doctor`. The memory counts and the fleet are
@@ -1081,8 +1084,11 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
         harness_approvals_expired_at_upgrade: (org == ua_core::DEFAULT_ORG)
             .then(|| crate::families::harness_config::upgrade_expired_approvals(c).ok())
             .flatten(),
-        serves_goal_legacy_links: (org == ua_core::DEFAULT_ORG)
-            .then(|| crate::families::tasks::goal_links::legacy_link_counts(c).ok())
+        depends_on_migration: (org == ua_core::DEFAULT_ORG)
+            .then(|| crate::families::tasks::depends_on_migration_summary(c))
+            .flatten(),
+        serves_goal_migration: (org == ua_core::DEFAULT_ORG)
+            .then(|| crate::families::tasks::serves_goal_migration_summary(c))
             .flatten(),
     })
 }
@@ -1427,12 +1433,26 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
              no ledger event)"
         ));
     }
-    // Informational: legacy goal links the graph upgrade did not copy are
-    // still served from `task_goal_links` until they are unlinked.
-    if let Some((_, n)) = facts.serves_goal_legacy_links.filter(|(_, n)| *n > 0) {
+    if let Some(ref summary) = facts.depends_on_migration
+        && let Some(skipped) = summary.get("skipped_total").and_then(Value::as_u64).filter(|n| *n > 0)
+    {
+        let copied = summary.get("copied").and_then(Value::as_u64).unwrap_or(0);
         detail.push_str(&format!(
-            "; {n} default-organization task goal link(s) not copied onto serves_goal graph edges (still served \
-             from task_goal_links)"
+            "; tasks.v3.depends_on_graph migrated {copied} dependency edge(s) and skipped {skipped} row(s) \
+             (kept in task_dependencies)"
+        ));
+    }
+    // Informational: a skipped legacy goal link stays in `task_goal_links`,
+    // where no one is served it (its task or goal is not the default
+    // organization's) or the task's live edge hides it.
+    if let Some(ref summary) = facts.serves_goal_migration
+        && let Some(skipped) = summary.get("skipped_total").and_then(Value::as_u64).filter(|n| *n > 0)
+    {
+        let copied = summary.get("copied").and_then(Value::as_u64).unwrap_or(0);
+        detail.push_str(&format!(
+            "; goals.v3.serves_goal_graph copied {copied} task goal link(s) onto serves_goal edges and skipped \
+             {skipped} (kept in task_goal_links, not served: task or goal outside the default organization, or \
+             hidden behind the task's live edge)"
         ));
     }
     let stats = json!({
@@ -1445,8 +1465,8 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
         "quick_check": facts.quick_check,
         "idempotency_keys_unplaced": facts.idempotency_unplaced,
         "harness_config_approvals_expired_at_upgrade": facts.harness_approvals_expired_at_upgrade,
-        "serves_goal_links_copied_at_upgrade": facts.serves_goal_legacy_links.map(|(c, _)| c),
-        "serves_goal_links_not_copied": facts.serves_goal_legacy_links.map(|(_, n)| n),
+        "depends_on_migration": facts.depends_on_migration,
+        "serves_goal_migration": facts.serves_goal_migration,
     });
     (finding("database", status, detail, "UA_DB_PATH"), stats)
 }

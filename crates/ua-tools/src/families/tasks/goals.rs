@@ -362,7 +362,7 @@ fn link(
     org: &str,
     p: LinkParams,
     who: &str,
-    actor: (ua_graph::PrincipalId, ua_graph::AssertedByKind),
+    actor: goal_links::Actor,
     caps: GraphCaps,
 ) -> UaResult<Value> {
     require_org(tx, org)?;
@@ -398,7 +398,7 @@ fn unlink(
     org: &str,
     p: LinkParams,
     who: &str,
-    actor: (ua_graph::PrincipalId, ua_graph::AssertedByKind),
+    actor: goal_links::Actor,
 ) -> UaResult<Value> {
     require_org(tx, org)?;
     if task_object(tx, org, p.task_id)?.is_none() {

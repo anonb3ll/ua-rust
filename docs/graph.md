@@ -6,8 +6,9 @@ document is the review gate for the shared graph store before any code lands.
 Its companions are [organization.md](organization.md), [memory.md](memory.md),
 [deliverables.md](deliverables.md), and [evidence-export.md](evidence-export.md).
 
-C2 progress: slice 1 (domain-only node and edge-weight updates) and slice b
-(the default organization's `task_goal_links` on `serves_goal` edges,
+C2 progress: slice 1 (domain-only node and edge-weight updates), C2a
+(`task_dependencies` on `depends_on` edges) and C2b (the default
+organization's `task_goal_links` on `serves_goal` edges,
 [C2 slice b](#c2-slice-b-task_goal_links--serves_goal)) have landed.
 
 ## Why one graph store
@@ -654,8 +655,8 @@ tables, tool contracts, and tests remain untouched until C2.
 
 | Existing surface | Location | Current role | C1 | C2+ disposition |
 | --- | --- | --- | --- | --- |
-| `task_dependencies` | `crates/ua-tools/src/families/core_schema.rs:46`, `tasks/graph.rs` | Explicit task prerequisite DAG (`dependency_add`, `dependency_list`, `dependency_remove`) with CTE cycle check and creator-only delete. | Unchanged | **Move in C2** to `graph_edges(kind = 'depends_on')`, written directly (not mirrored) behind `dependency_*`. **Explicit contract change:** JSON shapes and `cycle_detected` stay identical, but a dependency subgraph exceeding `1,000` reachable nodes / `5,000` reachable edges / `50 ms` from the new edge now returns `invalid_argument` (`cycle_check_bound_exceeded`) where today's CTE has no bound (retrying helps only for the 50 ms deadline; node/edge caps are deterministic). **Sequencing:** in non-default organizations, `dependency_*` waits for `#2790`, because there is no immutable principal ID yet and stamping `'system'` would lose the creator identity that creator-only delete relies on. |
-| `task_goal_links` | `crates/ua-tools/src/families/tasks/mod.rs:93`, `tasks/goals.rs`, `tasks/goal_links.rs` | Single goal a task serves (`goal_manage` `link`/`unlink`/`ancestry`). | Unchanged | **Moved in C2 slice b (default organization only)** to `graph_edges(kind = 'serves_goal')`, written directly (not mirrored), keeping N:1 uniqueness via `idx_graph_edges_single_out_live` and the `goal_manage` contract. `goals.v3.serves_goal_graph` copies the default organization's rows as imports and freezes the table for that organization. **Non-default organizations stay on `task_goal_links` until #2790** (same reason as `dependency_*`: no immutable principal ID, and `'system'` would lose who linked the task). See [C2 slice b](#c2-slice-b-task_goal_links--serves_goal). |
+| `task_dependencies` | `crates/ua-tools/src/families/core_schema.rs:46`, `tasks/graph.rs` | Explicit task prerequisite DAG (`dependency_add`, `dependency_list`, `dependency_remove`), `task_list(frontier=true)`, and `continuity` queue readiness. | Unchanged | **Moved in C2a (`tasks.v3.depends_on_graph`)** for the default organization to `graph_edges(kind = 'depends_on')`, written directly (not mirrored) behind `dependency_*`. Default-org rows of `task_dependencies` are kept **frozen read-only** (not dropped) with default-org write-blocking triggers (`task_dependencies_frozen_insert`, `task_dependencies_frozen_update`, `task_dependencies_frozen_delete`, permitting `ON DELETE CASCADE` when a parent task is deleted). Existing default-org rows are copied into `graph_edges` with task nodes ensured through `graph_node_ensure` and `source_kind = 'import'` (lifting the 50 ms wall-clock deadline during migration/import while keeping deterministic node/edge caps); copied and skipped counts (with row IDs and reasons) are recorded in `schema_procedures` and surfaced by `system_doctor`. `dependency_remove` closes live edges with `valid_to = now` (never deletes) and enforces creator-only retraction against `asserted_by`. `dependency_id` allocation honors `task_dependencies`, `graph_edges`, and `sqlite_sequence` so deleted legacy ids are never reused. **Explicit contract change:** JSON shapes and `cycle_detected` stay identical, while a default-org dependency subgraph exceeding `1,000` reachable nodes / `5,000` reachable edges / `50 ms` (`CycleCheckPolicy`) returns `invalid_argument` (`cycle_check_bound_exceeded`). **Sequencing:** non-default organizations stay entirely on `task_dependencies` (add, list, remove, frontier, and readiness) until `#2790` supplies immutable principal IDs. |
+| `task_goal_links` | `crates/ua-tools/src/families/tasks/mod.rs:93`, `tasks/goals.rs`, `tasks/goal_links.rs` | Single goal a task serves (`goal_manage` `link`/`unlink`/`ancestry`). | Unchanged | **Moved in C2 slice b (default organization only)** to `graph_edges(kind = 'serves_goal')`, written directly (not mirrored), keeping N:1 uniqueness via `idx_graph_edges_single_out_live` and the `goal_manage` contract. `goals.v3.serves_goal_graph` copies the default organization's rows as imports and freezes the table for that organization. **Explicit contract change:** replies and errors stay identical, but linking now honours `graph_max_live_edges_per_node` (default `5,000`, counted on the goal node), so a goal with 5,000 live tasks refuses another link (`node_edge_limit_exceeded`) where the old table had no limit; the upgrade copy ignores every cap, so a goal already over 5,000 linked tasks after the upgrade refuses new links until some are unlinked (`graph_max_nodes_per_org` / `graph_max_edges_per_org` apply too, with closed edges counting toward the latter; see the known limit under [Bounded traversal against DoS](#bounded-traversal-against-dos)). **Non-default organizations stay on `task_goal_links` until #2790** (same reason as `dependency_*`: no immutable principal ID, and `'system'` would lose who linked the task). See [C2 slice b](#c2-slice-b-task_goal_links--serves_goal). |
 | `goals.parent_goal_id` | `crates/ua-tools/src/families/tasks/mod.rs:84` | Why-chain tree column (max depth 8). | Unchanged | **Stays** authoritative on `goals`; optional read-only mirror to `goal_parent` in C2 if cross-domain traversals need it. |
 | `graph_canvas_scenes`, `graph_canvas_revisions` | `crates/ua-tools/src/families/graph.rs` | Excalidraw scene blob store + deterministic parser emitting `task_suggestions` and `dependency_suggestions` (**proposals only**). | Unchanged | **Stays as-is.** Canvas scenes are visual documents, never an authoritative edge store. Post-C2 UI/tools may render a `ua-graph` subgraph onto a board, while human-approved proposals still create real edges through domain tools. |
 | `memory_entities`, `memory_links` | `crates/ua-tools/src/families/export.rs:586` (`GRAPH_TABLES`), [memory.md](memory.md) §4–§5 | Do not exist in `crates/` today; `export.rs` checks `has_table()` for Python-hub migration manifests. | Unchanged | **No separate tables (`graph.v1` is the only edge store).** `memory.md` §4's model stands while its storage section is superseded by `graph_nodes` / `graph_edges` (amended in Memory v2 `#2799`, not C2). Memory §4 entity/link writes go through `GraphRepo` once C1 lands; `export.rs::GRAPH_TABLES` reads from `ua-graph` (or a compatibility view). |
@@ -697,31 +698,45 @@ Landed. The decisions, as built (`crates/ua-tools/src/families/tasks/goal_links.
   `agent.graph.edge_asserted` and `agent.graph.edge_retracted`, in the same
   transaction; they are different channels, so no `agent.goal.*` count
   moves. A refused link writes nothing.
-- **Limits.** Linking honours `graph_max_nodes_per_org`,
-  `graph_max_edges_per_org` and `graph_max_live_edges_per_node`. The last is
-  a contract change at scale: a goal with 5,000 live tasks (the default
-  cap) refuses another link (`node_edge_limit_exceeded`).
-- **Migration.** `goals.v3.serves_goal_graph` (a procedure part, after the
-  graph parts) copies each default-organization `task_goal_links` row whose
-  task and goal are the default organization's onto a `system` import edge
+- **Limits (explicit contract change).** Linking honours
+  `graph_max_nodes_per_org`, `graph_max_edges_per_org` and
+  `graph_max_live_edges_per_node`. The last is a contract change at scale: a
+  goal with 5,000 live tasks (the default cap) refuses another link
+  (`node_edge_limit_exceeded`). The upgrade copy applies no cap, so a goal
+  already over the cap refuses new links until tasks are unlinked.
+  `graph_org_counts.edge_count` counts closed edges too, so link/unlink churn
+  counts toward `graph_max_edges_per_org` permanently (the known limit under
+  [Bounded traversal against DoS](#bounded-traversal-against-dos)).
+- **Migration.** `goals.v3.serves_goal_graph` (a procedure part, after
+  `tasks.v3.depends_on_graph`) copies each default-organization
+  `task_goal_links` row whose task and goal are the default organization's
+  and whose task has no live edge, through `MigrationGraph`
+  (`graph_node_ensure` and `assert_edge`, no ledger event, no caps,
+  `CycleCheckPolicy::for_import()`), onto a `system` import edge
   (`source_kind = 'import'`, `source_ref = 'import:task_goal_links:<task_id>'`,
   `valid_from` the row's `linked_at` when it is a timestamp no later than
-  now, `meta_json.linked_by`), creating import nodes as needed. It writes no
-  ledger event (a schema part cannot), drops no row, records
-  `<n> copied, <m> skipped` in its audit SQL (`schema_procedures`), and
-  `system_doctor` reports `database.serves_goal_links_copied_at_upgrade` and
-  `database.serves_goal_links_not_copied` (the latter also in the `database`
-  detail when non-zero) to default-organization readers.
+  now, else the import time with the raw value in `meta_json.legacy_linked_at`;
+  `meta_json.linked_by`). It deletes no row and records a summary (total,
+  copied, skipped by reason `missing_task` / `missing_goal` /
+  `already_linked`, and the skipped task ids) in its audit SQL
+  (`schema_procedures`); `system_doctor` reports it as
+  `database.serves_goal_migration` (and in the `database` detail when rows
+  were skipped) to default-organization readers.
 - **Old table.** The same part installs `task_goal_links_default_frozen`
   (refuses a new default-organization row for a default-organization task;
   a row naming another organization's task is already refused by
   `task_goal_links_org_parent`) and `task_goal_links_default_frozen_update`
   (refuses changing a default-organization row's task, goal, `linked_by` or
-  `linked_at`). The copied rows stay as an archive; a row the part skipped is
-  still served from the old table until it is unlinked, and `unlink` removes
-  the task's legacy row along with closing its edge. `ua import python-hub`
-  writes legacy links as import edges (`source_ref = 'import:<source hash>'`)
-  instead of rows.
+  `linked_at`). The part deletes no row, but the rows are not a permanent
+  archive: `unlink` removes the task's legacy row along with closing its
+  edge, and deleting the task cascades it (the closed edge keeps the
+  history). A skipped row is served to no one when its task or goal is not
+  the default organization's, and is hidden behind the task's live edge when
+  it had one; reads fall back to the old table only for a default task with
+  no live edge (none on a database that applied the parts in order).
+  `ua import python-hub` writes legacy links the same way
+  (`source_ref = 'import:<source hash>'`) instead of rows, and refuses up
+  front a target where a task it would link already has a live edge.
 - **No node updates.** Nothing here calls `graph_node_update`, so
   `DOMAIN_UPDATE_CALL_ALLOWLIST` stays empty.
 
@@ -884,7 +899,13 @@ and mid-burst checkpoints, versus `16,383 edges/sec` and `2.53 ms` p95
   default `5,000`, counting live outgoing + incoming edges on both endpoints and
   refusing with `node_edge_limit_exceeded`), JSON metadata byte limits (`8 KiB`
   on nodes, `4 KiB` on edges), `external_id` length limit (256), and standard
-  policy rate limits on write tools.
+  policy rate limits on write tools. **Known limit:** `graph_org_counts.edge_count`
+  is monotonic across all historical rows (because `graph_edges` rows are closed
+  with `valid_to` and never deleted), so repeated add/retract churn on
+  dependencies, goal links, or other edges counts permanently toward the
+  `2,000,000` per-org `graph_max_edges_per_org` cap; operators with high edge
+  churn can raise `graph_max_edges_per_org` until a live-edge quota or archival
+  split is added.
 
 ### Who may create/mutate nodes and assert/retract edges
 
@@ -990,7 +1011,7 @@ session profile:
 | --- | --- | --- |
 | **C0** | This document (`docs/graph.md`). | CTO design read + independent diff read. No code. |
 | **C1** | `GraphRepo` (SQLite) in `ua-store`, `crates/ua-graph`, `graph.v1` + `organization.v1.graph`, `org_classification.rs` entry, governed tools (`graph_node_get`, `graph_neighbors`, `graph_traverse`, `graph_shortest_path`, `graph_expand`, `graph_edge_assert`, `graph_edge_retract`), internal `graph_node_ensure`, isolation & DoS tests, benchmark harness meeting [Benchmark floor](#benchmark-floor-c1-acceptance-gate). | Independent review + benchmark floor + CI/Cloud Build green. |
-| **C2** | Consumer migrations, one PR per consumer: `task_dependencies`, `task_goal_links` (**landed**, slice b, default organization only), Memory §4/§5 graph leg on `GraphRepo`, optional `vault_query` indexed PPR, `team_specs` topology projection. | Per-consumer parity + isolation tests. |
+| **C2** | Consumer migrations, one PR per consumer: C2 slice 1 (landed: `graph_node_update`, `graph_edge_update_weight`, workspace update guard), **C2a (landed: `task_dependencies` → `depends_on`, frozen legacy table)**, **C2b (landed: `task_goal_links` → `serves_goal`, default organization only)**, Memory §4/§5 graph leg on `GraphRepo`, optional `vault_query` indexed PPR, `team_specs` topology projection. | Per-consumer parity + isolation tests. |
 | **C3** | Dependency-driven workflow graph runner replacing YAML workflow engine and LangGraph surface. | Separate design amendment before code. |
 
 **What C1 must not do:** no consumer rewrites, no `graph.links.v1`, no
