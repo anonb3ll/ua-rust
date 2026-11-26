@@ -4,6 +4,7 @@ pub mod backup;
 pub mod doctor;
 pub mod evidence;
 pub mod init;
+pub mod memory_models;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};

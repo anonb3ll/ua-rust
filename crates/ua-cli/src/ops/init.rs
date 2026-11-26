@@ -47,6 +47,9 @@ pub struct InitArgs {
     /// Overwrite an existing config.toml or policy.yaml (saves `.bak-*` copies first).
     #[arg(long)]
     pub force: bool,
+    /// Skip downloading the pinned local embedding model (for air-gapped init).
+    #[arg(long)]
+    pub no_fetch_model: bool,
     /// Print structured JSON instead of a human summary.
     #[arg(long)]
     pub json: bool,
@@ -84,6 +87,8 @@ pub struct InitReport {
     pub detected_harnesses: Vec<DetectedHarness>,
     pub mcp_snippets: McpSnippets,
     pub issued_token: Option<IssuedToken>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_fetch: Option<String>,
 }
 
 fn toml_string(s: &str) -> String {
@@ -240,8 +245,40 @@ impl Drop for TempConfigGuard {
 
 /// `allow_newer_schema`: open a database written by a newer build anyway when
 /// minting the initial token (`--allow-newer-schema`), as the other commands do.
-pub fn run(args: InitArgs, explicit_config: Option<&Path>, allow_newer_schema: bool) -> anyhow::Result<()> {
-    run_inner(args, explicit_config, None, allow_newer_schema)
+pub async fn run(
+    args: InitArgs,
+    explicit_config: Option<&Path>,
+    allow_newer_schema: bool,
+) -> anyhow::Result<()> {
+    let fetch_model = !args.no_fetch_model
+        && ua_tools::BUILD_FEATURES.iter().any(|f| f.feature == "embeddings" && f.enabled);
+    let report = run_inner(args, explicit_config, None, allow_newer_schema)?;
+    if fetch_model {
+        let cfg_home = PathBuf::from(&report.home);
+        let default_model = Config::default().embed_model;
+        match ua_tools::families::memory::models_fetch::fetch_local_model(&cfg_home, &default_model, false)
+            .await
+        {
+            Ok(fetched) => {
+                if !report.json_printed {
+                    println!("  model:     {}@{} (verified)", fetched.model, fetched.revision);
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: could not fetch local embedding model {default_model} ({err}); \
+                     run `ua memory models fetch` when online"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct InitOutcome {
+    home: String,
+    json_printed: bool,
 }
 
 fn run_inner(
@@ -249,7 +286,7 @@ fn run_inner(
     explicit_config: Option<&Path>,
     before_config_write: Option<&dyn Fn() -> anyhow::Result<()>>,
     allow_newer_schema: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<InitOutcome> {
     let operator = args.operator.trim().to_string();
     if operator.is_empty() {
         bail!("--operator label must not be empty");
@@ -412,6 +449,7 @@ fn run_inner(
         detected_harnesses,
         mcp_snippets,
         issued_token,
+        model_fetch: None,
     };
 
     if args.json {
@@ -448,7 +486,7 @@ fn run_inner(
         println!("\nMCP Streamable HTTP: {}", report.mcp_snippets.http_url);
         println!("MCP stdio:           {}", report.mcp_snippets.stdio_command);
     }
-    Ok(())
+    Ok(InitOutcome { home: report.home, json_printed: args.json })
 }
 
 #[cfg(test)]
@@ -464,6 +502,7 @@ mod tests {
             agent: agent.map(str::to_string),
             with_policy,
             force,
+            no_fetch_model: true,
             json: true,
         }
     }

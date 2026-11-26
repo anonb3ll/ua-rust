@@ -97,6 +97,8 @@ enum Cmd {
     Doctor(ops::doctor::DoctorArgs),
     /// Manage evidence signing keys and checkpoint signatures.
     Evidence(ops::evidence::EvidenceArgs),
+    /// Manage memory subsystem assets (pinned local embedding models).
+    Memory(ops::memory_models::MemoryArgs),
     /// Take a verified, consistent SQLite snapshot of the hub database (safe while serving).
     Backup(ops::backup::BackupArgs),
     /// Verify and atomically restore a hub database snapshot (requires hub to be stopped).
@@ -461,7 +463,7 @@ async fn run_cmd(cli: Cli, held: &mut Held) -> anyhow::Result<ExitCode> {
     let allow_newer = || allow_newer_schema(allow_newer_flag, allow_newer_var.clone());
     match cli.cmd {
         Cmd::Init(args) => {
-            ops::init::run(args, explicit_config.as_deref(), allow_newer()?)?;
+            ops::init::run(args, explicit_config.as_deref(), allow_newer()?).await?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Doctor(args) => ops::doctor::run(args, explicit_config.as_deref()),
@@ -492,6 +494,10 @@ async fn run_cmd(cli: Cli, held: &mut Held) -> anyhow::Result<ExitCode> {
             match cmd {
                 Cmd::Config => {
                     println!("{}", serde_json::to_string_pretty(&cfg)?);
+                    Ok(ExitCode::SUCCESS)
+                }
+                Cmd::Memory(args) => {
+                    ops::memory_models::run(&cfg, args).await?;
                     Ok(ExitCode::SUCCESS)
                 }
                 Cmd::Import { cmd: ImportCmd::PythonHub { from, dry_run, drop_org_scope } } => {
@@ -717,6 +723,7 @@ async fn run_cmd(cli: Cli, held: &mut Held) -> anyhow::Result<ExitCode> {
                         Cmd::Init(_)
                         | Cmd::Doctor(_)
                         | Cmd::Config
+                        | Cmd::Memory(_)
                         | Cmd::Import { .. }
                         | Cmd::Backup(_)
                         | Cmd::Restore(_) => unreachable!(),

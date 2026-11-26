@@ -1389,9 +1389,60 @@ fn build_features_check() -> Value {
     }
 }
 
-fn embeddings_check(facts: &DbFacts) -> Value {
-    let gate = "cargo feature `embeddings`, UA_EMBED_MODEL";
+fn embeddings_check(cfg: &Config, facts: &DbFacts) -> Value {
+    let gate = "cargo feature `embeddings`, [memory].embedder, UA_EMBED_MODEL";
+    let mode = cfg.memory.embedder.as_str();
+    if mode == "off" {
+        return finding(
+            "semantic_search",
+            DORMANT,
+            "memory.embedder is off; memory search is lexical (FTS5) only",
+            gate,
+        );
+    }
+    if mode == "ollama" {
+        return finding(
+            "semantic_search",
+            LIVE,
+            format!(
+                "configured for Ollama model {:?} at {}; {} of {} notes embedded",
+                cfg.memory.ollama_model, cfg.memory.ollama_url, facts.embedded, facts.notes
+            ),
+            gate,
+        );
+    }
+    if mode == "openai_compat" {
+        if cfg.memory.openai_compat_url.is_none() {
+            return finding(
+                "semantic_search",
+                MISCONFIGURED,
+                "memory.embedder = \"openai_compat\" requires memory.openai_compat_url",
+                gate,
+            );
+        }
+        return finding(
+            "semantic_search",
+            LIVE,
+            format!(
+                "configured for openai_compat endpoint (UA_EMBED_API_KEY set: {}); {} of {} notes embedded",
+                cfg.embed_api_key().is_some(),
+                facts.embedded,
+                facts.notes
+            ),
+            gate,
+        );
+    }
+    // `local` or `auto`: check local ONNX readiness without ever downloading.
     if !ua_memory::EMBEDDINGS_ENABLED {
+        if mode == "local" {
+            return finding(
+                "semantic_search",
+                DEGRADED,
+                "memory.embedder = \"local\" requested, but binary was built without the `embeddings` feature; \
+                 search is lexical-only",
+                gate,
+            );
+        }
         return finding(
             "semantic_search",
             DORMANT,
@@ -1399,23 +1450,66 @@ fn embeddings_check(facts: &DbFacts) -> Value {
             gate,
         );
     }
-    let missing = facts.notes - facts.embedded;
-    if facts.notes == 0 {
-        finding("semantic_search", DORMANT, "no memory notes to embed yet", gate)
-    } else if missing > 0 {
-        finding(
+    match ua_memory::models::check_local_model_presence(&cfg.home, &cfg.embed_model) {
+        ua_memory::models::LocalModelPresence::UnknownModel { requested } => finding(
             "semantic_search",
-            MISCONFIGURED,
-            format!("{missing} of {} notes have no embedding", facts.notes),
+            DEGRADED,
+            format!(
+                "local embedding model {requested:?} is not a pinned local model; search is lexical-only"
+            ),
             gate,
-        )
-    } else {
-        finding(
+        ),
+        ua_memory::models::LocalModelPresence::Missing { spec, missing_or_wrong_size, .. } => finding(
             "semantic_search",
-            UNKNOWN,
-            format!("all {} notes are embedded; model readiness in this process is unverified", facts.notes),
+            DEGRADED,
+            format!(
+                "local embedding model {}@{} is not fetched ({}); run `ua memory models fetch` (or `ua init`); \
+                 search is lexical-only",
+                spec.canonical_id,
+                &spec.revision[..12.min(spec.revision.len())],
+                missing_or_wrong_size.join(", ")
+            ),
             gate,
-        )
+        ),
+        ua_memory::models::LocalModelPresence::Present { spec, .. } => {
+            let missing = facts.notes - facts.embedded;
+            if facts.notes == 0 {
+                finding(
+                    "semantic_search",
+                    LIVE,
+                    format!(
+                        "local model {}@{} present; no memory notes yet",
+                        spec.canonical_id,
+                        &spec.revision[..12.min(spec.revision.len())]
+                    ),
+                    gate,
+                )
+            } else if missing > 0 {
+                finding(
+                    "semantic_search",
+                    DEGRADED,
+                    format!(
+                        "local model {}@{} present; {missing} of {} notes lack embeddings (run recall_maintenance)",
+                        spec.canonical_id,
+                        &spec.revision[..12.min(spec.revision.len())],
+                        facts.notes
+                    ),
+                    gate,
+                )
+            } else {
+                finding(
+                    "semantic_search",
+                    LIVE,
+                    format!(
+                        "local model {}@{} present; all {} notes embedded",
+                        spec.canonical_id,
+                        &spec.revision[..12.min(spec.revision.len())],
+                        facts.notes
+                    ),
+                    gate,
+                )
+            }
+        }
     }
 }
 
@@ -2054,7 +2148,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         }),
         hub_resource_check(&ctx.caller, "search_provider", SEARCH_GATE, || search_check(reg)),
         build_features_check(),
-        embeddings_check(&facts),
+        embeddings_check(cfg, &facts),
         ledger_row,
         db_row,
         match &facts.schema_compat {

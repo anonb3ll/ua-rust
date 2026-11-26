@@ -14,10 +14,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use ua_core::{Config, UaResult};
+use ua_store::Db;
 
 use super::chunks;
+#[cfg(any(feature = "embeddings", feature = "embeddings-dynamic"))]
+use super::models;
 use super::note::{Filter, embed_text, text_sha};
 
 /// Format a canonical vector identity (`backend:model@revision`) stored in
@@ -113,6 +116,40 @@ fn registry() -> &'static EmbedderMap {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Request passed to the HTTP embedder factory registered by `ua-tools`
+/// (which owns the `ua-ingress` dependency).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpEmbedderRequest {
+    /// Auto mode fallback: probe ONLY a loopback Ollama server serving `ollama_model`.
+    AutoLoopbackOllama,
+    /// Explicit `[memory] embedder = "ollama"`. Remote endpoints allowed only when `allow_remote`.
+    ExplicitOllama { allow_remote: bool },
+    /// Explicit `[memory] embedder = "openai_compat"`. Remote endpoints allowed only when `allow_remote`.
+    ExplicitOpenAiCompat { allow_remote: bool },
+}
+
+/// Pluggable factory for HTTP-backed embedders (`ollama`, `openai_compat`),
+/// registered by `ua-tools` so `ua-memory` stays free of HTTP/network deps.
+pub type HttpEmbedderFactory =
+    Arc<dyn Fn(&Config, HttpEmbedderRequest) -> Option<Arc<dyn Embedder>> + Send + Sync>;
+
+fn http_factory_slot() -> &'static Mutex<Option<HttpEmbedderFactory>> {
+    static SLOT: OnceLock<Mutex<Option<HttpEmbedderFactory>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Register the HTTP embedder factory used for `ollama` and `openai_compat`.
+pub fn register_http_embedder_factory(factory: HttpEmbedderFactory) {
+    if let Ok(mut guard) = http_factory_slot().lock() {
+        *guard = Some(factory);
+    }
+}
+
+fn call_http_factory(cfg: &Config, req: HttpEmbedderRequest) -> Option<Arc<dyn Embedder>> {
+    let factory = http_factory_slot().lock().ok()?.clone()?;
+    factory(cfg, req)
+}
+
 /// Use `embedder` for its model name from now on, in this process.
 pub fn register_embedder(embedder: Arc<dyn Embedder>) {
     if let Ok(mut reg) = registry().lock() {
@@ -120,27 +157,98 @@ pub fn register_embedder(embedder: Arc<dyn Embedder>) {
     }
 }
 
-/// The embedder for the configured model (`cfg.embed_model`).
-pub fn embedder_for(cfg: &Config) -> Arc<dyn Embedder> {
-    let model = cfg.embed_model.clone();
-    #[allow(unused_mut)]
-    let Ok(mut reg) = registry().lock() else {
-        return Arc::new(NoopEmbedder::new(model));
-    };
-    if let Some(e) = reg.get(&model) {
+/// Whether organization `org` has `allow_remote_embedder` enabled. Fails closed
+/// (`false`) if the organization row is missing or unreadable.
+pub fn org_allows_remote_embedder(conn: &Connection, org: &str) -> bool {
+    conn.query_row("SELECT allow_remote_embedder FROM orgs WHERE id = ?1", [org], |r| r.get::<_, i64>(0))
+        .optional()
+        .ok()
+        .flatten()
+        .is_some_and(|v| v != 0)
+}
+
+/// Resolve the local ONNX embedder when compiled in AND its pinned model files
+/// are already present on disk under `cfg.home/models`. Never downloads.
+pub fn local_embedder(cfg: &Config) -> Option<Arc<dyn Embedder>> {
+    #[cfg(any(feature = "embeddings", feature = "embeddings-dynamic"))]
+    {
+        let models::LocalModelPresence::Present { spec, .. } =
+            models::check_local_model_presence(&cfg.home, &cfg.embed_model)
+        else {
+            return None;
+        };
+        let key = format!("{}|{}|{}", cfg.home.display(), spec.canonical_id, spec.revision);
+        static LOCAL_CACHE: OnceLock<Mutex<HashMap<String, Arc<dyn Embedder>>>> = OnceLock::new();
+        let cache = LOCAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut map) = cache.lock() {
+            if let Some(e) = map.get(&key) {
+                return Some(e.clone());
+            }
+            let e: Arc<dyn Embedder> = Arc::new(fast::FastEmbedder::new(cfg.home.clone(), spec));
+            map.insert(key, e.clone());
+            return Some(e);
+        }
+        Some(Arc::new(fast::FastEmbedder::new(cfg.home.clone(), spec)))
+    }
+    #[cfg(not(any(feature = "embeddings", feature = "embeddings-dynamic")))]
+    {
+        let _ = cfg;
+        None
+    }
+}
+
+/// Resolve the embedder for `cfg` with an explicit `allow_remote` gate.
+/// Explicitly registered process embedders ([`register_embedder`]) take
+/// precedence for tests and custom integrations. Never downloads a model.
+pub fn embedder_for_with_remote_flag(cfg: &Config, allow_remote: bool) -> Arc<dyn Embedder> {
+    if let Ok(reg) = registry().lock()
+        && let Some(e) = reg.get(&cfg.embed_model)
+    {
         return e.clone();
     }
-    #[cfg(feature = "embeddings")]
-    {
-        let e: Arc<dyn Embedder> = Arc::new(fast::FastEmbedder::new(model.clone(), cfg.home.join("models")));
-        reg.insert(model, e.clone());
-        e
+    match cfg.memory.embedder.trim().to_ascii_lowercase().as_str() {
+        "off" => Arc::new(NoopEmbedder::new(cfg.embed_model.clone())),
+        "local" => {
+            local_embedder(cfg).unwrap_or_else(|| Arc::new(NoopEmbedder::new(cfg.embed_model.clone())))
+        }
+        "ollama" => call_http_factory(cfg, HttpEmbedderRequest::ExplicitOllama { allow_remote })
+            .unwrap_or_else(|| Arc::new(NoopEmbedder::new(cfg.memory.ollama_model.clone()))),
+        "openai_compat" => call_http_factory(cfg, HttpEmbedderRequest::ExplicitOpenAiCompat { allow_remote })
+            .unwrap_or_else(|| {
+                let name = cfg.memory.openai_compat_model.clone().unwrap_or_else(|| cfg.embed_model.clone());
+                Arc::new(NoopEmbedder::new(name))
+            }),
+        // `auto`: local when compiled in and fetched, else loopback Ollama
+        // serving `ollama_model`, else lexical-only.
+        _ => local_embedder(cfg)
+            .or_else(|| call_http_factory(cfg, HttpEmbedderRequest::AutoLoopbackOllama))
+            .unwrap_or_else(|| Arc::new(NoopEmbedder::new(cfg.embed_model.clone()))),
     }
-    #[cfg(not(feature = "embeddings"))]
+}
+
+/// The embedder for `cfg` with remote backends disabled (`allow_remote = false`).
+pub fn embedder_for(cfg: &Config) -> Arc<dyn Embedder> {
+    embedder_for_with_remote_flag(cfg, false)
+}
+
+/// Resolve the embedder for organization `org`, reading `orgs.allow_remote_embedder`
+/// from `db` so note text and queries never leave the machine unless `org`
+/// explicitly opted in. Runs off the async worker thread because HTTP backends
+/// perform a single DNS lookup to classify loopback vs remote.
+pub async fn embedder_for_org(db: &Db, cfg: &Config, org: &str) -> Arc<dyn Embedder> {
+    // Fast path: test/custom registered embedder needs no DB read or DNS.
+    if let Ok(reg) = registry().lock()
+        && let Some(e) = reg.get(&cfg.embed_model)
     {
-        drop(reg);
-        Arc::new(NoopEmbedder::new(model))
+        return e.clone();
     }
+    let org_owned = org.to_string();
+    let allow_remote =
+        db.read_async(move |c| Ok(org_allows_remote_embedder(c, &org_owned))).await.unwrap_or(false);
+    let cfg_owned = cfg.clone();
+    crate::blocking(move || Ok(embedder_for_with_remote_flag(&cfg_owned, allow_remote)))
+        .await
+        .unwrap_or_else(|_| Arc::new(NoopEmbedder::new(cfg.embed_model.clone())))
 }
 
 /// Embed one text, or an error when the embedder is unavailable or fails.
@@ -187,25 +295,30 @@ pub(crate) fn embed_note(
     Ok((single, vecs))
 }
 
-#[cfg(feature = "embeddings")]
+#[cfg(any(feature = "embeddings", feature = "embeddings-dynamic"))]
 mod fast {
-    //! fastembed-backed embedder. The model loads on first use; a failed load
-    //! is retried at most once a minute.
+    //! Offline-only fastembed-backed embedder.
+    //!
+    //! Loads ONLY already-fetched, SHA-256-verified pinned model files from
+    //! `<cfg.home>/models/<slug>/<revision>/` via `try_new_from_user_defined`.
+    //! `hf-hub` is not compiled into `ua-memory`, so save, search, and
+    //! `system_doctor` can never download a model.
 
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+    use fastembed::{
+        InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
+    };
 
-    use super::{EmbedError, Embedder};
+    use super::{EmbedError, Embedder, models};
 
     const RETRY_AFTER: Duration = Duration::from_secs(60);
-    const LOCAL_MODEL_REVISION: &str = "fastembed-7.7";
 
     pub struct FastEmbedder {
-        name: String,
-        cache_dir: PathBuf,
+        home: PathBuf,
+        spec: &'static models::PinnedModel,
         state: Mutex<State>,
     }
 
@@ -216,31 +329,14 @@ mod fast {
     }
 
     impl FastEmbedder {
-        pub fn new(name: String, cache_dir: PathBuf) -> Self {
-            Self { name, cache_dir, state: Mutex::new(State::default()) }
+        pub fn new(home: PathBuf, spec: &'static models::PinnedModel) -> Self {
+            Self { home, spec, state: Mutex::new(State::default()) }
         }
-    }
-
-    /// Accept fastembed's variant name (`BGESmallENV15`), its model code
-    /// (`Xenova/bge-small-en-v1.5`) or the upstream id (`BAAI/bge-small-en-v1.5`).
-    fn resolve(name: &str) -> Option<EmbeddingModel> {
-        if let Ok(m) = name.parse::<EmbeddingModel>() {
-            return Some(m);
-        }
-        let models = TextEmbedding::list_supported_models();
-        if let Some(info) = models.iter().find(|i| i.model_code.eq_ignore_ascii_case(name)) {
-            return Some(info.model.clone());
-        }
-        let tail = name.rsplit('/').next().unwrap_or(name);
-        models
-            .iter()
-            .find(|i| i.model_code.rsplit('/').next().is_some_and(|t| t.eq_ignore_ascii_case(tail)))
-            .map(|i| i.model.clone())
     }
 
     impl Embedder for FastEmbedder {
         fn model(&self) -> &str {
-            &self.name
+            self.spec.canonical_id
         }
 
         fn backend(&self) -> &str {
@@ -248,7 +344,14 @@ mod fast {
         }
 
         fn revision(&self) -> &str {
-            LOCAL_MODEL_REVISION
+            self.spec.revision
+        }
+
+        fn available(&self) -> bool {
+            matches!(
+                models::check_local_model_presence(&self.home, self.spec.canonical_id),
+                models::LocalModelPresence::Present { .. }
+            )
         }
 
         fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
@@ -259,20 +362,30 @@ mod fast {
                 {
                     return Err(EmbedError { category: "model_acquisition", message: msg.clone() });
                 }
-                let Some(model) = resolve(&self.name) else {
-                    return Err(EmbedError {
-                        category: "model_acquisition",
-                        message: format!("unknown embedding model {:?}", self.name),
-                    });
+                let verified = match models::load_verified_local_model(&self.home, self.spec.canonical_id) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        st.last_failure = Some((Instant::now(), msg.clone()));
+                        return Err(EmbedError { category: "model_acquisition", message: msg });
+                    }
                 };
-                let opts = TextInitOptions::new(model).with_cache_dir(self.cache_dir.clone());
-                match TextEmbedding::try_new(opts) {
+                let tokenizer_files = TokenizerFiles {
+                    tokenizer_file: verified.tokenizer_file,
+                    config_file: verified.config_file,
+                    special_tokens_map_file: verified.special_tokens_map_file,
+                    tokenizer_config_file: verified.tokenizer_config_file,
+                };
+                let user_model = UserDefinedEmbeddingModel::new(verified.onnx_file, tokenizer_files)
+                    .with_pooling(Pooling::Cls);
+                match TextEmbedding::try_new_from_user_defined(user_model, InitOptionsUserDefined::default())
+                {
                     Ok(m) => {
                         st.model = Some(m);
                         st.last_failure = None;
                     }
                     Err(e) => {
-                        let msg = format!("could not load embedding model {}: {e}", self.name);
+                        let msg =
+                            format!("could not load local embedding model {}: {e}", self.spec.canonical_id);
                         st.last_failure = Some((Instant::now(), msg.clone()));
                         return Err(EmbedError { category: "model_acquisition", message: msg });
                     }

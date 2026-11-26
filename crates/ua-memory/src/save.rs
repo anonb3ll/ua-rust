@@ -7,7 +7,7 @@ use ua_core::time::Clock;
 use ua_core::{Caller, Config, UaError, UaResult};
 use ua_store::{Db, WriteTx};
 
-use super::embed::{self, BruteForceIndex, VectorIndex, embedder_for};
+use super::embed::{self, BruteForceIndex, VectorIndex, embedder_for_org};
 use super::note::{
     self, Eligibility, Note, assert_privileged, embed_text, emit, json_opt, json_text, ledger_label,
     ledger_text, linked_note, text_sha, write_author,
@@ -225,7 +225,7 @@ struct Outcome {
 /// are left untouched and are never scored until backfilled.
 pub async fn save(db: &Db, cfg: &Config, caller: &Caller, req: SaveRequest) -> UaResult<Value> {
     let p = Prepared::new(caller, req)?;
-    let embedder = embedder_for(cfg);
+    let embedder = embedder_for_org(db, cfg, &caller.org_id).await;
     let identity = embedder.identity();
 
     // Create: embed first, so the single vector and chunks commit with the

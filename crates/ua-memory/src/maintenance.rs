@@ -11,7 +11,7 @@ use ua_store::Db;
 use crate::blocking;
 
 use super::chunks::{self, BACKFILL_BATCH};
-use super::embed::{self, embedder_for};
+use super::embed::{self, embedder_for_org};
 use super::note::{DELETED_TAG, NOTE_COLS, Note, days_ago, embed_text, fetch, text_sha};
 
 /// Thresholds for [`prune_candidates`]. The `memory_prune_candidates` tool
@@ -287,7 +287,7 @@ pub async fn backfill_embeddings_capped(
     org: &str,
     max_batches: Option<usize>,
 ) -> UaResult<BackfillReport> {
-    let embedder = embedder_for(cfg);
+    let embedder = embedder_for_org(db, cfg, org).await;
     let identity = embedder.identity();
     let mut report =
         BackfillReport { identity: identity.clone(), available: embedder.available(), ..Default::default() };

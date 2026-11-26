@@ -24,7 +24,10 @@ pub mod inbound;
 pub mod outbound;
 pub mod policy;
 
-pub use outbound::{Body, Outbound, OutboundError, Request, Response};
+pub use outbound::{
+    Body, Lookup, Outbound, OutboundError, Request, ResolvedEndpoint, Response, resolve_endpoint,
+    resolve_endpoint_with_lookup,
+};
 pub use policy::{Addresses, Hosts, Policy, Schemes};
 /// HTTP types used in the [`Outbound`] API, so callers need no `reqwest`
 /// dependency of their own.

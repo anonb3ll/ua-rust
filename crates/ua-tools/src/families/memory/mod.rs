@@ -12,6 +12,9 @@
 //! who may change a note live in `ua_memory`. Every tool reads and writes
 //! only the caller's organization's notes (`ctx.caller.org_id`).
 
+pub mod models_fetch;
+pub mod remote;
+
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,10 +27,11 @@ use ua_store::SchemaPart;
 
 pub use ua_memory::embed::{
     BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embed_batch, embedder_for,
-    register_embedder, vector_identity,
+    embedder_for_org, register_embedder, vector_identity,
 };
 pub use ua_memory::maintenance::{BackfillReport, backfill_embeddings};
 pub(crate) use ua_memory::mark_untrusted;
+pub use ua_memory::models;
 pub use ua_memory::schema::{
     CHUNKS_SCHEMA, CHUNKS_TENANT_PART, EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA,
 };
@@ -39,6 +43,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
 }
 
 pub fn register(r: &mut Registry) {
+    remote::install_http_embedder_factory();
     register_save(r);
     register_search(r);
     register_lifecycle(r);
