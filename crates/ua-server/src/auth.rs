@@ -24,7 +24,8 @@
 //! a credential run as the local anonymous identity with the full tool
 //! surface, like stdio.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
@@ -266,24 +267,76 @@ pub fn check_auth_policy(hub: &ua_tools::Hub) -> ua_core::UaResult<()> {
     Ok(())
 }
 
+/// TTL for caching a passing (`Ok(())`) single-organization auth-policy check
+/// on live unauthenticated event streams. Keeps per-event delivery from taking
+/// a pooled reader on every broadcast while bounding any stale window to ~1 s
+/// (HTTP requests and `StreamAuth::recheck` still bypass the cache, and any
+/// failure invalidates it immediately).
+pub const AUTH_POLICY_CACHE_TTL: Duration = Duration::from_secs(1);
+
+/// Short-TTL cache for the single-organization auth-policy check on live
+/// unauthenticated event streams. Only `Ok(())` is cached; failures are never
+/// cached and immediately clear any cached entry.
+pub struct AuthPolicyCache {
+    ttl: Duration,
+    last_ok: Mutex<Option<Instant>>,
+}
+
+impl AuthPolicyCache {
+    pub fn new() -> Self {
+        Self::with_ttl(AUTH_POLICY_CACHE_TTL)
+    }
+
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self { ttl, last_ok: Mutex::new(None) }
+    }
+
+    /// True when a passing check completed within `ttl`.
+    pub fn is_fresh(&self) -> bool {
+        let guard = self.last_ok.lock().unwrap_or_else(|e| e.into_inner());
+        guard.is_some_and(|at| at.elapsed() < self.ttl)
+    }
+
+    /// Record a passing single-organization check.
+    pub fn record_ok(&self) {
+        *self.last_ok.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    /// Clear any cached passing check immediately (called on any failure).
+    pub fn invalidate(&self) {
+        *self.last_ok.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+impl Default for AuthPolicyCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Fixed response message for refused unauthenticated requests so internal
 /// store errors or organization metadata never leak to anonymous callers.
 const UNAUTH_REFUSED_MSG: &str =
     "authentication required: unauthenticated mode is single-organization only; set enforce_auth = true";
 
 /// Request-time fail-closed check for unauthenticated non-public HTTP requests
-/// when `enforce_auth` is `false`. Re-reads `orgs` from the store so creating
-/// a second organization while the hub is running closes anonymous access
-/// immediately with zero window.
+/// when `enforce_auth` is `false`. Re-reads `orgs` from the store (uncached)
+/// so creating a second organization while the hub is running closes anonymous
+/// HTTP access immediately with zero window.
 async fn check_unauthenticated_allowed(state: &AppState) -> Result<(), &'static str> {
     let hub = state.hub.clone();
     match tokio::task::spawn_blocking(move || check_auth_policy(&hub)).await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => {
+            state.auth_policy.record_ok();
+            Ok(())
+        }
         Ok(Err(e)) => {
+            state.auth_policy.invalidate();
             tracing::warn!(error = %e, "refusing unauthenticated request");
             Err(UNAUTH_REFUSED_MSG)
         }
         Err(e) => {
+            state.auth_policy.invalidate();
             tracing::warn!(error = %e, "refusing unauthenticated request: auth policy check task failed");
             Err(UNAUTH_REFUSED_MSG)
         }

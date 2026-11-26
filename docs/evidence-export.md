@@ -390,7 +390,12 @@ and the operator signs that digest offline.
     earlier checkpoint's *signature* check while keeping exit `0` (recording a
     `warnings` entry on `valid`). Pass `--revoked-key-id` only when you
     independently know that key was compromised, because anyone with database
-    write access can set `evidence_key.revoked_at`. When the verifier supplied
+    write access can set `evidence_key.revoked_at`. Because its signature check
+    is skipped once revoked in the verifier's trust, a revoked key's
+    checkpoints in `evidence_checkpoint` detect only a careless ledger rewrite
+    (where `event_log` and the checkpoint row disagree); out-of-band pinning
+    (`--prev-checkpoint` or `signed_checkpoints` in `--trust-file`) is the only
+    protection for those `seq`s. When the verifier supplied
     a pinned key for `prev.key_id`, `verify` always checks the store key row
     and Ed25519 signature (`ledger_mismatch`, exit `1`, if the key row is
     missing/altered or the signature fails); if digest, `entry_hash`, and
