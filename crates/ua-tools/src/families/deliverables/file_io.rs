@@ -178,6 +178,39 @@ impl Destination {
         Ok(digest(&limited_read(&File::from(file), 2)?) == sha256)
     }
 
+    /// Pending publication keeps its private staging name until a receipt
+    /// commits. Inspect both names under the publication write lock.
+    pub fn check_unpublished(&self, staging: &str, name: &str) -> UaResult<()> {
+        let staged = match fs::statat(&self.fd, staging, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Some(stat),
+            Err(Errno::NOENT) => None,
+            Err(e) => return Err(file_error(e)),
+        };
+        if staged.as_ref().is_some_and(|stat| {
+            FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile && stat.st_nlink == 1
+        }) {
+            return Ok(());
+        }
+        match fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat)
+                if staged
+                    .is_some_and(|staged| (staged.st_dev, staged.st_ino) == (stat.st_dev, stat.st_ino)) =>
+            {
+                return Err(UaError::conflict_code(
+                    "release_already_published",
+                    "a published file release cannot be cancelled",
+                ));
+            }
+            Err(Errno::NOENT) if staged.is_none() => return Ok(()),
+            Ok(_) | Err(Errno::NOENT) => {}
+            Err(e) => return Err(file_error(e)),
+        }
+        Err(UaError::conflict_code(
+            "release_publication_uncertain",
+            "the staged file changed and publication status cannot be confirmed",
+        ))
+    }
+
     /// Prove a prior publication using the staged inode and approved digest.
     /// A file with identical bytes at a different inode is no proof.
     pub fn confirm_published(&self, staging: &str, name: &str, sha256: &str) -> UaResult<bool> {

@@ -109,11 +109,24 @@ is refused, even when its bytes have the same hash. The approval is consumed
 once, the release is ledgered once, and retries of a completed release verify
 the published bytes before returning its receipt.
 
+A verified human operator can call `deliverable_release_cancel(approval_id)`
+when an authorized release can no longer proceed. Use the approval ID of the
+stalled release. The hub checks the original release directory and refuses
+if publication occurred or the staging state makes publication uncertain.
+An existing destination with a missing staged file is treated as uncertain.
+Cancellation drops the pending bytes and frees the revision and destination
+reservations in the same transaction as the cancellation event. The consumed
+approval and the cancellation record remain in the audit trail. The hub
+cleans up the private staged file after committing. Retrying the cancellation
+returns the original cancellation timestamp and can retry that cleanup.
+A new release of the revision needs fresh approval. Cancellation leaves the
+task workflow and any existing destination file in place.
+
 `deliverable_verify(revision_id)` compares the stored identity with the
 current source or with the published file after release. It returns the
 comparison and does not return file contents. Pending release intents hold
-up to 1 MiB of approved file bytes in SQLite until completion. Database
-backups made during a pending release can therefore contain those bytes.
+up to 1 MiB of approved file bytes in SQLite until completion or cancellation.
+Database backups made during a pending release can therefore contain those bytes.
 
 ## What is recorded
 
@@ -131,6 +144,7 @@ the revision identity; never the title or the summary.
 |---|---|
 | `agent.deliverable.created` | `org_id`, `deliverable_id`, `task_id`, `kind`, `repo` |
 | `agent.deliverable.revised` | `org_id`, `deliverable_id`, `task_id`, `revision_id`, `rev_no`, `kind`, `identity`, `repo` |
+| `agent.deliverable.release_cancelled` | `org_id`, `deliverable_id`, `task_id`, `revision_id`, `sha256`, `size_bytes`, `approval_id`, `approver`, `destination`, `root_identity` |
 
 A revision that moves the workflow head also appends the workflow record's
 own `agent.task.workflow` event (`kind: "capsule"`, `fields: ["head_sha"]`).

@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{Caller, UaError, UaResult};
 use ua_deliverables::files::{self, FileRevision, Release, Submission, digest};
+use ua_org::authz::{Authority, Authz};
 use ua_store::WriteTx;
 
 use super::{FAMILY, caller_task, positive, require_caller_org, require_writer, view, write_capsule};
@@ -48,6 +49,13 @@ struct ReleaseArgs {
     revision_id: i64,
     /// A new basename under the operator-configured release directory.
     destination: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CancelArgs {
+    /// Approval ID of the exact pending release to cancel.
+    approval_id: i64,
 }
 
 fn require_file_caller(caller: &Caller) -> UaResult<()> {
@@ -193,8 +201,19 @@ fn require_root(dir: &Destination, r: &Release) -> UaResult<()> {
     Ok(())
 }
 
+fn release_location(ctx: &ToolCtx, r: &Release) -> UaResult<(Destination, String)> {
+    let dir = Destination::configured(ctx)?;
+    require_root(&dir, r)?;
+    destination_name(&r.destination)?;
+    let staging_id = r
+        .staging_id
+        .parse::<ulid::Ulid>()
+        .map_err(|_| UaError::internal("release has an invalid staging id"))?;
+    Ok((dir, format!(".ua-release-{staging_id}")))
+}
+
 enum Admission {
-    Authorized,
+    Authorized(i64),
     Refused(UaError),
 }
 
@@ -209,7 +228,7 @@ fn authorize(tx: &mut WriteTx<'_>, ctx: &ToolCtx, a: &ReleaseArgs) -> UaResult<A
             ));
         }
         require_root(&Destination::configured(ctx)?, &release)?;
-        return Ok(Admission::Authorized);
+        return Ok(Admission::Authorized(release.approval_id));
     }
     let task = writable_task(tx, ctx, file.deliverable.task_id)?;
     let dir = Destination::configured(ctx)?;
@@ -229,12 +248,17 @@ fn authorize(tx: &mut WriteTx<'_>, ctx: &ToolCtx, a: &ReleaseArgs) -> UaResult<A
             "source bytes changed since submission",
         )));
     }
-    let payload = json!({
+    let mut payload = json!({
         "task_id": file.deliverable.task_id, "deliverable_id": file.deliverable.id, "revision_id": a.revision_id,
         "sha256": file.revision.identity, "size_bytes": file.size_bytes, "producer": file.revision.producer,
         "workflow_revision": workflow_revision, "ownership_generation": ownership_generation,
         "destination": a.destination, "root_identity": dir.identity,
     });
+    // Bind the next approval to this cancellation, including approvals
+    // already granted for a different destination of the same revision.
+    if let Some(cancelled) = files::latest_cancellation(tx, org, a.revision_id)? {
+        payload["cancelled_release_approval_id"] = json!(cancelled);
+    }
     match approvals::gate(tx, ctx.hub.cfg(), &ctx.caller, RELEASE_TOOL, &payload)? {
         GateOutcome::Pending { approval_id } => {
             Ok(Admission::Refused(UaError::ApprovalRequired { tool: RELEASE_TOOL.into(), approval_id }))
@@ -252,6 +276,7 @@ fn authorize(tx: &mut WriteTx<'_>, ctx: &ToolCtx, a: &ReleaseArgs) -> UaResult<A
                 &file,
                 &Release {
                     approval_id,
+                    revision_id: a.revision_id,
                     requester: ctx.caller.label.clone(),
                     approver,
                     destination: a.destination.clone(),
@@ -261,9 +286,10 @@ fn authorize(tx: &mut WriteTx<'_>, ctx: &ToolCtx, a: &ReleaseArgs) -> UaResult<A
                     ownership_generation,
                     payload: Some(bytes),
                     released_at: None,
+                    cancelled_at: None,
                 },
             )?;
-            Ok(Admission::Authorized)
+            Ok(Admission::Authorized(approval_id))
         }
     }
 }
@@ -292,14 +318,14 @@ fn release_output(file: &FileRevision, r: &Release, at: String, created: bool) -
 
 async fn release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult<Value> {
     require_file_caller(&ctx.caller)?;
-    let id = positive(a.revision_id, "revision_id")?;
+    positive(a.revision_id, "revision_id")?;
     destination_name(&a.destination)?;
     let db = ctx.hub.db().clone();
     let ctx2 = ctx.clone();
-    let admission = db.write_async(move |tx| authorize(tx, &ctx2, &a)).await?;
-    if let Admission::Refused(e) = admission {
-        return Err(e);
-    }
+    let approval_id = match db.write_async(move |tx| authorize(tx, &ctx2, &a)).await? {
+        Admission::Authorized(approval_id) => approval_id,
+        Admission::Refused(e) => return Err(e),
+    };
 
     // The pass and the approved bytes have committed. Keep the staged inode
     // until the completion transaction commits so a retry can recognize a
@@ -307,18 +333,17 @@ async fn release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult<Value> {
     let (out, dir, staging) = db
         .write_async(move |tx| {
             let org = &ctx.caller.org_id;
-            let file = files::file_revision(tx, org, id)?;
-            let task_id = file.deliverable.task_id;
-            let r = files::release(tx, org, id)?
+            let r = files::release_by_approval(tx, org, approval_id)?
                 .ok_or_else(|| UaError::internal("authorized release is missing"))?;
-            let dir = Destination::configured(&ctx)?;
-            require_root(&dir, &r)?;
-            destination_name(&r.destination)?;
-            let staging_id = r
-                .staging_id
-                .parse::<ulid::Ulid>()
-                .map_err(|_| UaError::internal("release has an invalid staging id"))?;
-            let staging = format!(".ua-release-{staging_id}");
+            if r.cancelled_at.is_some() {
+                return Err(UaError::conflict_code(
+                    "release_cancelled",
+                    "the authorized release was cancelled",
+                ));
+            }
+            let file = files::file_revision(tx, org, r.revision_id)?;
+            let task_id = file.deliverable.task_id;
+            let (dir, staging) = release_location(&ctx, &r)?;
             if let Some(at) = &r.released_at {
                 if !dir.matches(&r.destination, &file.revision.identity)? {
                     return Err(UaError::denied("deliverable_tampered", "released bytes changed"));
@@ -380,6 +405,51 @@ async fn release(ctx: ToolCtx, a: ReleaseArgs) -> UaResult<Value> {
     Ok(out)
 }
 
+async fn cancel_release(ctx: ToolCtx, a: CancelArgs) -> UaResult<Value> {
+    require_file_caller(&ctx.caller)?;
+    Authz::new(ctx.hub.cfg()).require(&ctx.caller, &[Authority::Operator], &ctx.caller.org_id)?;
+    let approval_id = positive(a.approval_id, "approval_id")?;
+    let db = ctx.hub.db().clone();
+    let (out, cleanup) = db
+        .write_async(move |tx| {
+            let org = &ctx.caller.org_id;
+            require_caller_org(tx, &ctx)?;
+            let r = files::release_by_approval(tx, org, approval_id)?
+                .ok_or_else(|| UaError::not_found("file release for this approval"))?;
+            let (at, cancelled, cleanup) = if let Some(at) = &r.cancelled_at {
+                // Retry private staging cleanup if a prior call committed before cleaning up.
+                let cleanup = release_location(&ctx, &r)
+                    .ok()
+                    .filter(|(dir, staging)| dir.check_unpublished(staging, &r.destination).is_ok());
+                (at.clone(), false, cleanup)
+            } else {
+                if r.released_at.is_some() {
+                    return Err(UaError::conflict_code(
+                        "release_already_published",
+                        "a published file release cannot be cancelled",
+                    ));
+                }
+                let (dir, staging) = release_location(&ctx, &r)?;
+                dir.check_unpublished(&staging, &r.destination)?;
+                let file = files::file_revision(tx, org, r.revision_id)?;
+                let at = files::cancel(tx, &file, &r, &ctx.caller.label)?;
+                (at, true, Some((dir, staging)))
+            };
+            Ok((
+                json!({
+                    "approval_id": approval_id, "revision_id": r.revision_id,
+                    "cancelled_at": at, "cancelled": cancelled,
+                }),
+                cleanup,
+            ))
+        })
+        .await?;
+    if let Some((dir, staging)) = cleanup {
+        dir.clean_staging(&staging);
+    }
+    Ok(out)
+}
+
 pub(super) fn register(r: &mut Registry) {
     r.add(tool(
         "deliverable_submit",
@@ -396,4 +466,9 @@ pub(super) fn register(r: &mut Registry) {
         "Release the latest file revision from a task in review to a new filename in the configured directory. Requires a distinct human's approval of the exact revision, SHA-256 and destination; retry the same request after approval.",
         release,
     ).family(FAMILY).always_gated().gates_in_handler());
+    r.add(tool(
+        "deliverable_release_cancel",
+        "Cancel a pending unpublished file release by its exact approval ID, discard pending bytes and free its destination. Requires a verified human operator.",
+        cancel_release,
+    ).family(FAMILY));
 }

@@ -160,8 +160,80 @@ pub const FILE_TENANT_PART: Procedure = ua_store::org::tenant_part(
     &["deliverable_files", "deliverable_releases"],
 );
 
+const RELEASE_CANCELLATION_SCHEMA: SchemaPart = SchemaPart {
+    name: "deliverables.v3.release_cancellation",
+    sql: "
+ALTER TABLE deliverable_releases RENAME TO deliverable_releases_v2;
+CREATE TABLE deliverable_releases (
+    approval_id INTEGER PRIMARY KEY,
+    revision_id INTEGER NOT NULL,
+    org_id TEXT NOT NULL,
+    requester TEXT NOT NULL,
+    approver TEXT NOT NULL CHECK (approver <> requester COLLATE NOCASE),
+    destination TEXT NOT NULL,
+    root_identity TEXT NOT NULL,
+    staging_id TEXT NOT NULL UNIQUE,
+    workflow_revision INTEGER NOT NULL,
+    ownership_generation INTEGER NOT NULL,
+    payload BLOB,
+    released_at TEXT,
+    cancelled_at TEXT,
+    cancelled_by TEXT,
+    CHECK (released_at IS NULL OR cancelled_at IS NULL),
+    CHECK ((cancelled_by IS NULL) = (cancelled_at IS NULL)),
+    CHECK ((payload IS NULL) = (released_at IS NOT NULL OR cancelled_at IS NOT NULL)),
+    CHECK (length(payload) <= 1048576)
+);
+INSERT INTO deliverable_releases (
+    approval_id, revision_id, org_id, requester, approver, destination, root_identity,
+    staging_id, workflow_revision, ownership_generation, payload, released_at
+) SELECT
+    approval_id, revision_id, org_id, requester, approver, destination, root_identity,
+    staging_id, workflow_revision, ownership_generation, payload, released_at
+FROM deliverable_releases_v2;
+DROP TABLE deliverable_releases_v2;
+
+CREATE UNIQUE INDEX idx_deliverable_releases_active_revision
+    ON deliverable_releases (revision_id) WHERE cancelled_at IS NULL;
+CREATE UNIQUE INDEX idx_deliverable_releases_active_destination
+    ON deliverable_releases (root_identity, destination COLLATE NOCASE) WHERE cancelled_at IS NULL;
+CREATE INDEX idx_deliverable_releases_cancelled_revision
+    ON deliverable_releases (revision_id, approval_id) WHERE cancelled_at IS NOT NULL;
+CREATE TRIGGER deliverable_releases_revision BEFORE INSERT ON deliverable_releases
+WHEN NOT EXISTS (
+    SELECT 1 FROM deliverable_files f WHERE f.revision_id = NEW.revision_id AND f.org_id = NEW.org_id
+)
+BEGIN SELECT RAISE(ABORT, 'a release needs a file revision in its own organization'); END;
+CREATE TRIGGER deliverable_releases_pending BEFORE INSERT ON deliverable_releases
+WHEN NEW.released_at IS NOT NULL OR NEW.cancelled_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'a new release must be pending'); END;
+CREATE TRIGGER deliverable_releases_fixed BEFORE UPDATE ON deliverable_releases
+WHEN OLD.released_at IS NOT NULL OR OLD.cancelled_at IS NOT NULL
+     OR (NEW.released_at IS NULL AND NEW.cancelled_at IS NULL) OR NEW.payload IS NOT NULL
+     OR NEW.revision_id IS NOT OLD.revision_id OR NEW.org_id IS NOT OLD.org_id
+     OR NEW.approval_id IS NOT OLD.approval_id OR NEW.requester IS NOT OLD.requester
+     OR NEW.approver IS NOT OLD.approver OR NEW.destination IS NOT OLD.destination
+     OR NEW.root_identity IS NOT OLD.root_identity OR NEW.staging_id IS NOT OLD.staging_id
+     OR NEW.workflow_revision IS NOT OLD.workflow_revision
+     OR NEW.ownership_generation IS NOT OLD.ownership_generation
+BEGIN SELECT RAISE(ABORT, 'a pending release may only advance to completed or cancelled'); END;
+CREATE TRIGGER deliverable_releases_no_delete BEFORE DELETE ON deliverable_releases
+BEGIN SELECT RAISE(ABORT, 'a release is never deleted'); END;
+",
+};
+
+const RELEASE_CANCELLATION_TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.deliverable_release_cancellation", &["deliverable_releases"]);
+
 /// The crate's schema parts, in application order. They need
 /// `organization.v1.store` applied first.
 pub fn schema_parts() -> Vec<Part> {
-    vec![SCHEMA.into(), TENANT_PART.into(), FILE_SCHEMA.into(), FILE_TENANT_PART.into()]
+    vec![
+        SCHEMA.into(),
+        TENANT_PART.into(),
+        FILE_SCHEMA.into(),
+        FILE_TENANT_PART.into(),
+        RELEASE_CANCELLATION_SCHEMA.into(),
+        RELEASE_CANCELLATION_TENANT_PART.into(),
+    ]
 }
