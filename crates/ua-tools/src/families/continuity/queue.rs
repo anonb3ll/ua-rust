@@ -944,9 +944,26 @@ fn ready_unowned(c: &Connection, org: &str) -> UaResult<i64> {
         c,
         "SELECT * FROM tasks WHERE org_id = ?1 AND archived_at IS NULL AND parked_at IS NULL \
          AND status NOT IN ('done','cancelled') \
-         AND EXISTS (SELECT 1 FROM task_dependencies d WHERE d.org_id = ?1 AND d.task_id = tasks.id) \
-         AND NOT EXISTS (SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id = d.depends_on_task_id \
-             AND p.org_id = ?1 WHERE d.org_id = ?1 AND d.task_id = tasks.id AND p.status NOT IN ('done','cancelled')) \
+         AND EXISTS ( \
+             SELECT 1 FROM graph_nodes gn_src \
+             JOIN graph_edges ge ON ge.org_id = gn_src.org_id AND ge.src_id = gn_src.id \
+                 AND ge.kind = 'depends_on' AND ge.state = 'active' AND ge.valid_to IS NULL \
+             JOIN graph_nodes gn_dst ON gn_dst.org_id = ge.org_id AND gn_dst.id = ge.dst_id \
+                 AND gn_dst.kind = 'task' \
+             WHERE gn_src.org_id = ?1 AND gn_src.kind = 'task' \
+               AND gn_src.external_id = CAST(tasks.id AS TEXT) \
+         ) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM graph_nodes gn_src \
+             JOIN graph_edges ge ON ge.org_id = gn_src.org_id AND ge.src_id = gn_src.id \
+                 AND ge.kind = 'depends_on' AND ge.state = 'active' AND ge.valid_to IS NULL \
+             JOIN graph_nodes gn_dst ON gn_dst.org_id = ge.org_id AND gn_dst.id = ge.dst_id \
+                 AND gn_dst.kind = 'task' \
+             JOIN tasks p ON p.org_id = ?1 AND CAST(p.id AS TEXT) = gn_dst.external_id \
+             WHERE gn_src.org_id = ?1 AND gn_src.kind = 'task' \
+               AND gn_src.external_id = CAST(tasks.id AS TEXT) \
+               AND p.status NOT IN ('done','cancelled') \
+         ) \
          AND COALESCE(TRIM(next_owner), '') = '' AND COALESCE(TRIM(claimed_by), '') = ''",
         [org],
     )?;
@@ -1034,8 +1051,16 @@ fn milestone_readiness(c: &Connection, org: &str) -> UaResult<Value> {
             continue;
         }
         let mut gate = gate_task_ids(notes);
-        let mut stmt =
-            c.prepare("SELECT depends_on_task_id FROM task_dependencies WHERE org_id = ?1 AND task_id = ?2")?;
+        let mut stmt = c.prepare(
+            "SELECT CAST(gn_dst.external_id AS INTEGER) \
+             FROM graph_nodes gn_src \
+             JOIN graph_edges ge ON ge.org_id = gn_src.org_id AND ge.src_id = gn_src.id \
+                 AND ge.kind = 'depends_on' AND ge.state = 'active' AND ge.valid_to IS NULL \
+             JOIN graph_nodes gn_dst ON gn_dst.org_id = ge.org_id AND gn_dst.id = ge.dst_id \
+                 AND gn_dst.kind = 'task' \
+             WHERE gn_src.org_id = ?1 AND gn_src.kind = 'task' \
+               AND gn_src.external_id = CAST(?2 AS TEXT)",
+        )?;
         for dep in stmt.query_map(params![org, id], |r| r.get::<_, i64>(0))? {
             gate.insert(dep?);
         }

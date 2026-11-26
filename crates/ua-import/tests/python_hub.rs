@@ -523,7 +523,8 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     // Counts.
     assert_eq!(n(&db, "SELECT COUNT(*) FROM agents"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM tasks"), 4);
-    assert_eq!(n(&db, "SELECT COUNT(*) FROM task_dependencies"), 1);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM task_dependencies"), 0);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM graph_edges WHERE kind = 'depends_on' AND valid_to IS NULL"), 1);
     assert_eq!(table(&r, "task_dependencies").skipped.get("missing_depends_on_task_id"), Some(&1));
     assert_eq!(n(&db, "SELECT COUNT(*) FROM task_comments"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM task_comment_threads"), 1);

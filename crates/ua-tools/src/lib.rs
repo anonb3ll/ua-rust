@@ -239,6 +239,9 @@ pub fn schema_parts() -> Vec<Part> {
     // tenant-scoped; D2c).
     parts.push(families::skill_registry::YANKS_SCHEMA.into());
     parts.push(families::skill_registry::YANKS_TENANT_PART.into());
+    // C2a: migrate default-org `task_dependencies` into `graph_edges(kind='depends_on')`
+    // and freeze `task_dependencies` read-only.
+    parts.push(families::tasks::DEPENDS_ON_GRAPH_PART.into());
     parts
 }
 
