@@ -5227,6 +5227,7 @@ dependencies = [
  "libc",
  "rand 0.9.5",
  "rusqlite",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.11.1",

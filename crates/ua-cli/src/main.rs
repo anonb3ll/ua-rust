@@ -456,9 +456,9 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Evidence(ops::evidence::EvidenceArgs {
-            cmd: ops::evidence::EvidenceCmd::Sign { key_file, digest, out },
+            cmd: ops::evidence::EvidenceCmd::Sign { key_file, checkpoint_file, prev_checkpoint, out },
         }) => {
-            ops::evidence::run_sign(&key_file, &digest, out.as_deref())?;
+            ops::evidence::run_sign(&key_file, &checkpoint_file, prev_checkpoint.as_deref(), out.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
         cmd => {
@@ -677,9 +677,7 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                                 println!("revoked {n} token(s) for {label}");
                             }
                         },
-                        Cmd::Evidence(args) => {
-                            ops::evidence::run(&hub, args)?;
-                        }
+                        Cmd::Evidence(args) => return ops::evidence::run(&hub, args),
                         Cmd::LoginLink { label } => {
                             // A login link signs a browser in as a human; same bar as acting
                             // as a human from the CLI.
