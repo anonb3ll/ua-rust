@@ -239,6 +239,9 @@ pub fn schema_parts() -> Vec<Part> {
     // tenant-scoped; D2c).
     parts.push(families::skill_registry::YANKS_SCHEMA.into());
     parts.push(families::skill_registry::YANKS_TENANT_PART.into());
+    // Per-class column invariants and org-existence trigger on
+    // `evidence_checkpoint` (additive; `evidence_key_store.v1` is frozen).
+    parts.push(ua_store::evidence::CHECKPOINT_CHECKS_PART.into());
     parts
 }
 
