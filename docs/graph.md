@@ -201,12 +201,17 @@ wrapper without blocking on #2790, under two strict rules:
    (`families/graph_store.rs`) before opening a write transaction, and as a
    defense-in-depth invariant inside `GraphRepo` in `ua-store` on every insert.
 
-**Ledger linkage.** Every node creation and edge assertion/retraction appends an
-`agent.graph.node_created`, `agent.graph.edge_asserted`, or
-`agent.graph.edge_retracted` event to `event_log` in the same write transaction,
-and records `source_kind = 'event'`, `source_ref = 'event:<seq>'` (or
+**Ledger linkage.** Every node creation, node update, edge assertion, edge
+weight update, and edge retraction appends an `agent.graph.node_created`,
+`agent.graph.node_updated`, `agent.graph.edge_asserted`,
+`agent.graph.edge_updated`, or `agent.graph.edge_retracted` event to
+`event_log` in the same write transaction, and creations/assertions record
+`source_kind = 'event'`, `source_ref = 'event:<seq>'` (or
 `source_kind = 'mirror'` with the enclosing domain event's `seq` for mirrored
-domain writes).
+domain writes). `agent.graph.node_updated` and `agent.graph.edge_updated`
+carry `changed_fields` plus safe old/new transitions only (for non-default
+organizations: originator `'system'`, zero `display_label`, `meta_json`,
+`owner_id`, `team_id`, or principal labels).
 
 ### Validity and `as_of` reads
 
@@ -820,12 +825,23 @@ approval gate → typed arguments → handler → same-transaction ledger event)
 Authority comes from `ua-org::authz` (identity and membership), never from a
 session profile:
 
-1. **No public `graph_node_upsert` tool; nodes are domain-owned per kind.**
-   C1 exposes **no** public generic node-creation or node-upsert tool. Instead,
-   `ua-graph` / `GraphRepo` exposes an internal
-   `graph_node_ensure(org_id, kind, external_id, provenance)` primitive for
-   **domain code paths only**: it creates the node row if absent (recording its
-   immutable provenance) and touches nothing else if the row already exists.
+1. **No public `graph_node_upsert` or `graph_node_update` tool; nodes are domain-owned per kind.**
+   Neither C1 nor C2 exposes a public generic node-creation, node-upsert, or
+   node-update tool. Instead, `ua-graph` / `GraphRepo` exposes internal
+   primitives for **domain code paths only**:
+   - `graph_node_ensure(org_id, kind, external_id, provenance)` creates the node
+     row if absent (recording its immutable provenance) and touches nothing else
+     if the row already exists.
+   - **C2 slice 1 (landed):** `graph_node_update` updates only the mutable
+     columns (`visibility`, `team_id`, `owner_type`, `owner_id`,
+     `display_label`, `meta_json`, `archived_at`) and appends
+     `agent.graph.node_updated` in the same write transaction;
+     `graph_edge_update_weight` updates `graph_edges.weight` on live edges and
+     appends `agent.graph.edge_updated` in the same write transaction. A
+     workspace source-scan guard (`crates/ua-graph/tests/update_guard.rs`)
+     forbids any `UPDATE graph_nodes` / `UPDATE graph_edges` outside
+     `crates/ua-store/src/graph.rs` and any direct call to the low-level
+     `GraphRepo` update methods outside `crates/ua-graph/src/write.rs`.
    Both node creation and every mutable-field update (`visibility`, `team_id`,
    `owner_type`, `owner_id`, `display_label`, `meta_json`, `archived_at`) are
    domain-owned per node kind — `visibility`, `owner_*`, and `team_id` change

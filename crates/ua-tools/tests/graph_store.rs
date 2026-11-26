@@ -92,7 +92,11 @@ fn seed_node(
 #[tokio::test]
 async fn no_public_graph_node_upsert_and_profile_exposure_is_enforced() {
     let reg = builtin_registry();
-    assert!(reg.get("graph_node_upsert").is_none(), "C1 must never expose a public graph_node_upsert tool");
+    for forbidden in
+        ["graph_node_upsert", "graph_node_update", "graph_edge_update", "graph_edge_update_weight"]
+    {
+        assert!(reg.get(forbidden).is_none(), "graph store must never expose a public {forbidden} tool");
+    }
     for read_tool in
         ["graph_node_get", "graph_neighbors", "graph_traverse", "graph_shortest_path", "graph_expand"]
     {
