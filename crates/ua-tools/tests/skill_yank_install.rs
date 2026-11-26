@@ -956,6 +956,93 @@ async fn install_enforces_workspace_sandbox_hook_and_dependency_guards() {
     assert_eq!(member_err.code(), "denied");
     assert_eq!(member_err.reason_code(), Some("dependency_dir"));
     assert!(!h.ws().join("safe-skills").exists());
+
+    // 5. Target-guard-only path: when `core.hooksPath` lies *inside* `target_dir`
+    //    or `<target_dir>/<name>` (so no member path lands inside the hooks dir,
+    //    and ONLY `guard_configured_hooks_dir` catches `hooks.starts_with(dir)`),
+    //    install MUST still refuse with `denied` / `hook_dir`.
+    let set_nested_hooks = std::process::Command::new("git")
+        .args(["config", "core.hooksPath", "hooks-parent/sandbox-skill/nested-hooks"])
+        .current_dir(h.ws())
+        .status()
+        .expect("git config nested core.hooksPath");
+    assert!(set_nested_hooks.success());
+    std::fs::create_dir_all(h.ws().join("hooks-parent/sandbox-skill/nested-hooks")).unwrap();
+    let parent_contains_err = h
+        .reg_call(
+            &dev_agent("builder-1", DEFAULT_ORG),
+            "install",
+            json!({ "name": "sandbox-skill", "target_dir": "hooks-parent" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(parent_contains_err.code(), "denied", "{parent_contains_err:?}");
+    assert_eq!(parent_contains_err.reason_code(), Some("hook_dir"), "{parent_contains_err:?}");
+    assert!(!h.ws().join("hooks-parent/sandbox-skill/SKILL.md").exists());
+
+    // 6. Destination-name guard: a valid kebab-case skill named `"target"`
+    //    installed into a safe `target_dir` is still refused by `guard_inside_root`
+    //    because `<target_dir>/target` hits `DEPENDENCY_DIRS`.
+    write_skill_dir(&src_root, "target", "skill named target.", &[]);
+    h.publish_skill("target", "src-skills/target").await;
+    let dep_name_err = h
+        .reg_call(
+            &dev_agent("builder-1", DEFAULT_ORG),
+            "install",
+            json!({ "name": "target", "target_dir": "safe-skills" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(dep_name_err.code(), "denied");
+    assert_eq!(dep_name_err.reason_code(), Some("dependency_dir"));
+    assert!(!h.ws().join("safe-skills/target").exists());
+
+    // 7. `SKILL.md` frontmatter `name` check on overwrite: even when the existing
+    //    directory's file hash matches a row in `skill_versions` for this skill,
+    //    overwrite MUST still be refused if the on-disk `SKILL.md` does not
+    //    declare `name: <skill>` (e.g., legacy/imported row with wrong/missing name).
+    let wrong_name_md =
+        "---\nname: other-skill\ndescription: Mismatched frontmatter name.\n---\n\n# Wrong\n\nBody.\n";
+    let wrong_hash = content_hash(wrong_name_md);
+    h.hub
+        .db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO skill_versions (org_id, name, version, content_hash, source, content, \
+                 published_by, published_at) \
+                 VALUES ('default', 'name-check', 1, ?1, 'src/name-check/SKILL.md', ?2, 'ops-bot', \
+                 '2026-01-01T00:00:00+00:00')",
+                params![wrong_hash, wrong_name_md],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    write_skill_dir(&src_root, "name-check", "proper v2 skill.", &[]);
+    h.publish_skill("name-check", "src-skills/name-check").await;
+
+    let existing_dir = h.ws().join("name-check-root/name-check");
+    std::fs::create_dir_all(&existing_dir).unwrap();
+    std::fs::write(existing_dir.join("SKILL.md"), wrong_name_md).unwrap();
+
+    let fm_name_err = h
+        .reg_call(
+            &dev_agent("builder-1", DEFAULT_ORG),
+            "install",
+            json!({
+                "name": "name-check",
+                "version": 2,
+                "target_dir": "name-check-root",
+                "overwrite": true,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(fm_name_err.code(), "conflict", "{fm_name_err:?}");
+    assert!(
+        fm_name_err.to_string().contains("does not declare name"),
+        "expected SKILL.md frontmatter name refusal, got: {fm_name_err}"
+    );
+    assert_eq!(std::fs::read_to_string(existing_dir.join("SKILL.md")).unwrap(), wrong_name_md);
 }
 
 #[tokio::test]
