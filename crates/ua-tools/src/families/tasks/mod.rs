@@ -9,6 +9,7 @@
 //! comment thread tables and the goal tables.
 
 mod comments;
+pub mod goal_links;
 mod goals;
 mod graph;
 mod list;
@@ -16,6 +17,8 @@ mod write;
 pub(crate) use write::{check_release_completion, complete_after_release};
 
 pub(crate) use write::{NewTask, insert_task};
+
+pub use goal_links::{SERVES_GOAL_GRAPH, import_legacy_link};
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params};

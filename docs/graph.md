@@ -6,6 +6,10 @@ document is the review gate for the shared graph store before any code lands.
 Its companions are [organization.md](organization.md), [memory.md](memory.md),
 [deliverables.md](deliverables.md), and [evidence-export.md](evidence-export.md).
 
+C2 progress: slice 1 (domain-only node and edge-weight updates) and slice b
+(the default organization's `task_goal_links` on `serves_goal` edges,
+[C2 slice b](#c2-slice-b-task_goal_links--serves_goal)) have landed.
+
 ## Why one graph store
 
 Today relationships in ua-rust live in separate, domain-private tables and
@@ -16,7 +20,9 @@ ad-hoc code paths:
   `crates/ua-tools/src/families/tasks/graph.rs`.
 - `task_goal_links` and `goals.parent_goal_id`
   (`crates/ua-tools/src/families/tasks/mod.rs`, `tasks/goals.rs`) hold the goal
-  why-chain and the single goal each task serves.
+  why-chain and the single goal each task serves. (C2 slice b moved the
+  default organization's links onto `serves_goal` edges; see
+  [C2 slice b](#c2-slice-b-task_goal_links--serves_goal).)
 - `graph_canvas_scenes` and `graph_canvas_revisions`
   (`crates/ua-tools/src/families/graph.rs`) store Excalidraw scenes and parse
   them into task and dependency **suggestions** only; it is not an edge store.
@@ -649,13 +655,75 @@ tables, tool contracts, and tests remain untouched until C2.
 | Existing surface | Location | Current role | C1 | C2+ disposition |
 | --- | --- | --- | --- | --- |
 | `task_dependencies` | `crates/ua-tools/src/families/core_schema.rs:46`, `tasks/graph.rs` | Explicit task prerequisite DAG (`dependency_add`, `dependency_list`, `dependency_remove`) with CTE cycle check and creator-only delete. | Unchanged | **Move in C2** to `graph_edges(kind = 'depends_on')`, written directly (not mirrored) behind `dependency_*`. **Explicit contract change:** JSON shapes and `cycle_detected` stay identical, but a dependency subgraph exceeding `1,000` reachable nodes / `5,000` reachable edges / `50 ms` from the new edge now returns `invalid_argument` (`cycle_check_bound_exceeded`) where today's CTE has no bound (retrying helps only for the 50 ms deadline; node/edge caps are deterministic). **Sequencing:** in non-default organizations, `dependency_*` waits for `#2790`, because there is no immutable principal ID yet and stamping `'system'` would lose the creator identity that creator-only delete relies on. |
-| `task_goal_links` | `crates/ua-tools/src/families/tasks/mod.rs:93`, `tasks/goals.rs` | Single goal a task serves (`goal_manage` `link`/`unlink`/`ancestry`). | Unchanged | **Move in C2** to `graph_edges(kind = 'serves_goal')`, keeping N:1 uniqueness via `idx_graph_edges_single_out_live` and preserving the `goal_manage` contract. |
+| `task_goal_links` | `crates/ua-tools/src/families/tasks/mod.rs:93`, `tasks/goals.rs`, `tasks/goal_links.rs` | Single goal a task serves (`goal_manage` `link`/`unlink`/`ancestry`). | Unchanged | **Moved in C2 slice b (default organization only)** to `graph_edges(kind = 'serves_goal')`, written directly (not mirrored), keeping N:1 uniqueness via `idx_graph_edges_single_out_live` and the `goal_manage` contract. `goals.v3.serves_goal_graph` copies the default organization's rows as imports and freezes the table for that organization. **Non-default organizations stay on `task_goal_links` until #2790** (same reason as `dependency_*`: no immutable principal ID, and `'system'` would lose who linked the task). See [C2 slice b](#c2-slice-b-task_goal_links--serves_goal). |
 | `goals.parent_goal_id` | `crates/ua-tools/src/families/tasks/mod.rs:84` | Why-chain tree column (max depth 8). | Unchanged | **Stays** authoritative on `goals`; optional read-only mirror to `goal_parent` in C2 if cross-domain traversals need it. |
 | `graph_canvas_scenes`, `graph_canvas_revisions` | `crates/ua-tools/src/families/graph.rs` | Excalidraw scene blob store + deterministic parser emitting `task_suggestions` and `dependency_suggestions` (**proposals only**). | Unchanged | **Stays as-is.** Canvas scenes are visual documents, never an authoritative edge store. Post-C2 UI/tools may render a `ua-graph` subgraph onto a board, while human-approved proposals still create real edges through domain tools. |
 | `memory_entities`, `memory_links` | `crates/ua-tools/src/families/export.rs:586` (`GRAPH_TABLES`), [memory.md](memory.md) §4–§5 | Do not exist in `crates/` today; `export.rs` checks `has_table()` for Python-hub migration manifests. | Unchanged | **No separate tables (`graph.v1` is the only edge store).** `memory.md` §4's model stands while its storage section is superseded by `graph_nodes` / `graph_edges` (amended in Memory v2 `#2799`, not C2). Memory §4 entity/link writes go through `GraphRepo` once C1 lands; `export.rs::GRAPH_TABLES` reads from `ua-graph` (or a compatibility view). |
 | `vault_query` (`[[wikilink]]` PPR) | `crates/ua-tools/src/families/vault/query.rs` | On-the-fly disk walk + undirected Personalized PageRank over markdown files. | Unchanged | **Stays disk-authoritative in C1.** In C2+ (with track B9 content-hash vault ingest), `vault_query` can read indexed `vault_note` / `links_to` rows through `seed_expand`, keeping the disk walk as fallback for unindexed vaults. |
 | Relational FKs (`tasks.parent_id`, `deliverables.task_id`, `delegations.task_id`, `task_hold_members`, `plan_steps.plan_id`) | Their owning families | Core relational invariants enforced by owning tables. | Unchanged | **Stay authoritative** on their owning tables; projected into `graph_edges` (`subtask_of`, `produces`, `delegated_to`) in the same write transaction only where cross-domain traversal or G3 provenance needs them. For acyclic mirrors (`subtask_of`), a `cycle_check_bound_exceeded` refusal rolls back the enclosing transaction (retryable only on the 50 ms deadline; node/edge caps are deterministic). |
 | Team-spec topology (`delegates_to`, `reviews`, `escalates_to`, `can_observe`) | [organization.md](organization.md) (`team_specs`) | Enforced seat interaction rules inside append-only canonical JSON specs. | Unchanged | **Authoritative in `team_specs`**; projected into `graph_edges` on spec commit in C2+ in the same write transaction for graph queries and visualization, never editable directly via `graph_edge_assert`. For acyclic mirrors (`delegates_to`, `escalates_to`), a `cycle_check_bound_exceeded` refusal rolls back the spec commit (retryable only on the 50 ms deadline; node/edge caps are deterministic). |
+
+### C2 slice b: `task_goal_links` → `serves_goal`
+
+Landed. The decisions, as built (`crates/ua-tools/src/families/tasks/goal_links.rs`):
+
+- **Default organization only.** A default-organization link is a live
+  `serves_goal` edge from the task's `task` node to the goal's `goal` node
+  (`external_id` the decimal id, `visibility = 'org'`, no `display_label`).
+  `goal_manage` `link` ensures both nodes with `graph_node_ensure` and
+  asserts the edge with `assert_edge` in the action's write transaction, as a
+  domain write: `asserted_by` the acting label (provisional, pre-#2790),
+  `asserted_by_kind` `person` for a verified human and `agent` otherwise
+  (`system` only for a label `PrincipalId` refuses), `source_kind = 'event'`
+  and `source_ref = 'event:<seq>'`. Every other organization reads and
+  writes `task_goal_links` exactly as before; its goal actions never touch
+  the graph, so the pre-#2790 non-default rule is never reached.
+- **Contract parity.** Replies and errors are unchanged. A link to the goal
+  the task already serves is a no-op; a link to another goal is still
+  refused (`goal_task is single-valued`), so moving a task is `unlink` then
+  `link`: the first closes the old edge, the second asserts a new one, and
+  `idx_graph_edges_single_out_live` keeps at most one live edge per task.
+  (Replacing the edge inside one `link` call would change the contract and
+  is left to an explicit decision.) `ancestry` follows the live edge, then
+  `goals.parent_goal_id` as before. `task_update`'s check that a moved task's
+  goal is in its new project reads the same edge.
+- **Close, never delete.** `unlink` retracts the edge (`valid_to = now`);
+  deleting a default-organization task closes its live edge, as the old
+  table's `ON DELETE CASCADE` removed the row. History stays readable as of
+  any earlier time.
+- **Events.** `goal_manage` still appends `agent.goal.linked` and
+  `agent.goal.unlinked` with the same payloads. The graph primitives add
+  their own `agent.graph.node_created` (each node once),
+  `agent.graph.edge_asserted` and `agent.graph.edge_retracted`, in the same
+  transaction; they are different channels, so no `agent.goal.*` count
+  moves. A refused link writes nothing.
+- **Limits.** Linking honours `graph_max_nodes_per_org`,
+  `graph_max_edges_per_org` and `graph_max_live_edges_per_node`. The last is
+  a contract change at scale: a goal with 5,000 live tasks (the default
+  cap) refuses another link (`node_edge_limit_exceeded`).
+- **Migration.** `goals.v3.serves_goal_graph` (a procedure part, after the
+  graph parts) copies each default-organization `task_goal_links` row whose
+  task and goal are the default organization's onto a `system` import edge
+  (`source_kind = 'import'`, `source_ref = 'import:task_goal_links:<task_id>'`,
+  `valid_from` the row's `linked_at` when it is a timestamp no later than
+  now, `meta_json.linked_by`), creating import nodes as needed. It writes no
+  ledger event (a schema part cannot), drops no row, records
+  `<n> copied, <m> skipped` in its audit SQL (`schema_procedures`), and
+  `system_doctor` reports `database.serves_goal_links_copied_at_upgrade` and
+  `database.serves_goal_links_not_copied` (the latter also in the `database`
+  detail when non-zero) to default-organization readers.
+- **Old table.** The same part installs `task_goal_links_default_frozen`
+  (refuses a new default-organization row for a default-organization task;
+  a row naming another organization's task is already refused by
+  `task_goal_links_org_parent`) and `task_goal_links_default_frozen_update`
+  (refuses changing a default-organization row's task, goal, `linked_by` or
+  `linked_at`). The copied rows stay as an archive; a row the part skipped is
+  still served from the old table until it is unlinked, and `unlink` removes
+  the task's legacy row along with closing its edge. `ua import python-hub`
+  writes legacy links as import edges (`source_ref = 'import:<source hash>'`)
+  instead of rows.
+- **No node updates.** Nothing here calls `graph_node_update`, so
+  `DOMAIN_UPDATE_CALL_ALLOWLIST` stays empty.
 
 ## Alignment with `memory.md` step 5
 
@@ -922,7 +990,7 @@ session profile:
 | --- | --- | --- |
 | **C0** | This document (`docs/graph.md`). | CTO design read + independent diff read. No code. |
 | **C1** | `GraphRepo` (SQLite) in `ua-store`, `crates/ua-graph`, `graph.v1` + `organization.v1.graph`, `org_classification.rs` entry, governed tools (`graph_node_get`, `graph_neighbors`, `graph_traverse`, `graph_shortest_path`, `graph_expand`, `graph_edge_assert`, `graph_edge_retract`), internal `graph_node_ensure`, isolation & DoS tests, benchmark harness meeting [Benchmark floor](#benchmark-floor-c1-acceptance-gate). | Independent review + benchmark floor + CI/Cloud Build green. |
-| **C2** | Consumer migrations, one PR per consumer: `task_dependencies`, `task_goal_links`, Memory §4/§5 graph leg on `GraphRepo`, optional `vault_query` indexed PPR, `team_specs` topology projection. | Per-consumer parity + isolation tests. |
+| **C2** | Consumer migrations, one PR per consumer: `task_dependencies`, `task_goal_links` (**landed**, slice b, default organization only), Memory §4/§5 graph leg on `GraphRepo`, optional `vault_query` indexed PPR, `team_specs` topology projection. | Per-consumer parity + isolation tests. |
 | **C3** | Dependency-driven workflow graph runner replacing YAML workflow engine and LangGraph surface. | Separate design amendment before code. |
 
 **What C1 must not do:** no consumer rewrites, no `graph.links.v1`, no

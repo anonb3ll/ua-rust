@@ -1054,6 +1054,34 @@ fn copy_table(
                             }
                         }
                     }
+                    if map.kind == Kind::GoalLinks {
+                        // The default organization's links are graph edges.
+                        let int = |name: &str| match col_value(&plan.cols, &vals, name) {
+                            Some(SqlValue::Integer(i)) => Some(*i),
+                            _ => None,
+                        };
+                        let (Some(task_id), Some(goal_id)) = (int("task_id"), int("goal_id")) else {
+                            bump(&mut skipped, "invalid_link");
+                            continue;
+                        };
+                        let fresh = ua_tools::families::tasks::import_legacy_link(
+                            tx,
+                            task_id,
+                            goal_id,
+                            as_text(col_value(&plan.cols, &vals, "linked_by")),
+                            as_text(col_value(&plan.cols, &vals, "linked_at")),
+                            &format!("import:{source_hash}"),
+                        )?;
+                        if !fresh {
+                            return Err(UaError::conflict(format!(
+                                "task_goal_links row with source rowid {rowid} could not be stored: task \
+                                 {task_id} already serves a goal; the target must not already hold rows with \
+                                 imported keys"
+                            )));
+                        }
+                        copied += 1;
+                        continue;
+                    }
                     if map.rowid_to.is_some() {
                         vals.push(SqlValue::Integer(rowid));
                     }

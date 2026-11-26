@@ -675,7 +675,10 @@ here for memory columns, owners and defaults.
   Every later part that drops or rewrites rows records them in the same
   transaction (item 11 of [Converting a table family](#converting-a-table-family)).
   The importer writes legacy goals, links, proposals and items
-  to `default` and never copies a source `org_id`.
+  to `default` and never copies a source `org_id`. Since C2 slice b the
+  default organization's links are `serves_goal` graph edges, not
+  `task_goal_links` rows ([graph.md](graph.md#c2-slice-b-task_goal_links--serves_goal));
+  other organizations keep the table until #2790.
   `crates/ua-tools/tests/goals_tenant.rs` holds the upgrade and the
   isolation tests.
 - The managed-secret store and per-organization GitHub credentials: the

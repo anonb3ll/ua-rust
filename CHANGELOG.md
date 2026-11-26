@@ -860,6 +860,26 @@ from its commit history.
 
 ### Changed
 
+- The default organization's task→goal links are `serves_goal` edges in the
+  shared graph store (`docs/graph.md`, C2 slice b). `goal_manage` `link`,
+  `unlink` and `ancestry`, and `task_update`'s project check, keep their
+  replies and errors; a second goal for a linked task is still refused
+  (`single-valued`). Linking ensures the task and goal nodes and asserts the
+  edge (`agent.graph.node_created` / `agent.graph.edge_asserted` beside
+  `agent.goal.linked`); unlinking, and deleting the task, close it with
+  `valid_to` (`agent.graph.edge_retracted`) and never delete it. Linking is
+  now subject to the graph limits (`graph_max_nodes_per_org`,
+  `graph_max_edges_per_org`, and `graph_max_live_edges_per_node`, which caps
+  a goal at 5,000 live tasks by default). The schema part
+  `goals.v3.serves_goal_graph` copies existing default-organization
+  `task_goal_links` rows onto edges as imports (`source_kind = 'import'`,
+  `valid_from` the row's `linked_at`), keeps the rows, records the copied and
+  skipped counts in its audit SQL, reports them in `system_doctor`
+  (`database.serves_goal_links_copied_at_upgrade`,
+  `serves_goal_links_not_copied`), and freezes the table for the default
+  organization (`task_goal_links_default_frozen` triggers). `ua import
+  python-hub` writes legacy links as graph edges. Other organizations keep
+  `task_goal_links`, unchanged, until immutable principal IDs land (#2790).
 - `ua import python-hub` never copies a source `org_id` by column name, even
   where the target has the column (`event_log`, the harness config tables).
   Such rows are refused unless `--drop-org-scope` is given. Before this,

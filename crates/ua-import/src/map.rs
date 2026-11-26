@@ -75,9 +75,15 @@ pub(crate) enum Kind {
     /// Legacy delegations are imported into the default organization, with
     /// their tasks (a source `org_id` is never copied).
     Delegations,
-    /// Legacy goals and task-goal links are imported into the default
-    /// organization, with their tasks (a source `org_id` is never copied).
+    /// Legacy goals are imported into the default organization, with their
+    /// tasks (a source `org_id` is never copied).
     Goals,
+    /// Legacy task-goal links become the default organization's
+    /// `serves_goal` graph edges (`ua_tools::families::tasks::import_legacy_link`,
+    /// `source_kind = 'import'`, `source_ref = 'import:<source hash>'`), never
+    /// `task_goal_links` rows: that table is frozen for the default
+    /// organization (`goals.v3.serves_goal_graph`).
+    GoalLinks,
     /// Legacy work proposals and their items are imported into the default
     /// organization (a source `org_id` is never copied).
     WorkProposals,
@@ -105,6 +111,7 @@ impl Kind {
                 | Kind::Approvals
                 | Kind::Delegations
                 | Kind::Goals
+                | Kind::GoalLinks
                 | Kind::WorkProposals
                 | Kind::Memory
                 | Kind::Nodes
@@ -172,7 +179,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     },
     TableMap {
         refs: &[TASK_REF, Ref { col: "goal_id", table: "goals", key: "id" }],
-        kind: Kind::Goals,
+        kind: Kind::GoalLinks,
         ..plain("task_goal_links")
     },
     TableMap { refs: &[TASK_REF], kind: Kind::TaskChildren, ..plain("task_workflow") },
