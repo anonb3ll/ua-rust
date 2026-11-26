@@ -31,12 +31,17 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_cfg(|_| {})
+    }
+
+    fn with_cfg(f: impl FnOnce(&mut Config)) -> Self {
         let home = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_home(home.path());
         cfg.human_identities = vec!["operator".into(), "reviewer".into()];
         cfg.lifecycle_operators = Some(vec!["ops-bot".into()]);
         cfg.workspace = Some(ws.path().to_path_buf());
+        f(&mut cfg);
         let hub = Hub::in_memory(cfg).unwrap();
         Self { _home: home, _ws: ws, hub, reg: builtin_registry() }
     }
@@ -592,16 +597,37 @@ async fn catalog_install_verifies_members_expected_hash_mode_0644_and_rejects_ta
         }
     }
 
-    // Overwrite: false refuses an existing directory.
-    let no_overwrite = h
+    // L1: Verify `skill.installed` ledger event was recorded with caller, skill, version, hash, target.
+    let (inst_orig, inst_ev_raw): (String, String) = h
+        .hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT originator, payload FROM event_log WHERE channel = 'skill.installed' \
+                 ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(inst_orig, "builder-1");
+    let inst_ev: Value = serde_json::from_str(&inst_ev_raw).unwrap();
+    assert_eq!(inst_ev["name"], "pkg-install");
+    assert_eq!(inst_ev["version"], 1);
+    assert_eq!(inst_ev["content_hash"], hash1);
+    assert_eq!(inst_ev["target"], ".claude/skills/pkg-install");
+    assert_eq!(inst_ev["file_count"], 3);
+
+    // M1: Overwrite defaults to `false`: omitting `overwrite` refuses an existing directory.
+    let default_no_overwrite = h
         .reg_call(
             &dev_agent("builder-1", DEFAULT_ORG),
             "install",
-            json!({ "name": "pkg-install", "target_dir": ".claude/skills", "overwrite": false }),
+            json!({ "name": "pkg-install", "target_dir": ".claude/skills" }),
         )
         .await
         .unwrap_err();
-    assert_eq!(no_overwrite.code(), "conflict");
+    assert_eq!(default_no_overwrite.code(), "conflict");
 
     // Refuses overwriting an unrelated non-skill directory (no SKILL.md).
     let non_skill = h.ws().join("non-skill-root/pkg-install");
@@ -618,7 +644,29 @@ async fn catalog_install_verifies_members_expected_hash_mode_0644_and_rejects_ta
     assert_eq!(non_skill_err.code(), "conflict");
     assert_eq!(std::fs::read_to_string(non_skill.join("important.txt")).unwrap(), "do not delete");
 
-    // Atomic upgrade v1 -> v2 replaces files cleanly and leaves no stale v1 files or staging dirs.
+    // M1: A planted SKILL.md (even an exact copy of the published SKILL.md declaring
+    // `name: pkg-install`) alongside unknown files (`important.md`, `sub/notes.md`)
+    // MUST be refused even with `overwrite: true`, deleting ZERO files!
+    let planted = h.ws().join("area/pkg-install");
+    std::fs::create_dir_all(planted.join("sub")).unwrap();
+    let real_md = std::fs::read(dest.join("SKILL.md")).unwrap();
+    std::fs::write(planted.join("SKILL.md"), &real_md).unwrap();
+    std::fs::write(planted.join("important.md"), "precious top-level file").unwrap();
+    std::fs::write(planted.join("sub/notes.md"), "precious nested file").unwrap();
+    let planted_err = h
+        .reg_call(
+            &dev_agent("builder-1", DEFAULT_ORG),
+            "install",
+            json!({ "name": "pkg-install", "target_dir": "area", "overwrite": true }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(planted_err.code(), "conflict", "planted SKILL.md must be refused: {planted_err:?}");
+    assert_eq!(std::fs::read_to_string(planted.join("important.md")).unwrap(), "precious top-level file");
+    assert_eq!(std::fs::read_to_string(planted.join("sub/notes.md")).unwrap(), "precious nested file");
+
+    // Atomic upgrade v1 -> v2 with `overwrite: true` succeeds when every on-disk
+    // file matches published v1, replacing files cleanly with no stale v1 files.
     std::fs::remove_file(src_root.join("pkg-install/scripts/helper.sh")).unwrap();
     write_skill_dir(
         &src_root,
@@ -632,7 +680,7 @@ async fn catalog_install_verifies_members_expected_hash_mode_0644_and_rejects_ta
         .reg_call(
             &dev_agent("builder-1", DEFAULT_ORG),
             "install",
-            json!({ "name": "pkg-install", "version": 2, "target_dir": ".claude/skills" }),
+            json!({ "name": "pkg-install", "version": 2, "target_dir": ".claude/skills", "overwrite": true }),
         )
         .await
         .unwrap();
@@ -655,7 +703,8 @@ async fn catalog_install_verifies_members_expected_hash_mode_0644_and_rejects_ta
             )
             .await
             .unwrap_err();
-        assert_eq!(err.code(), "invalid_argument", "target {bad_target}");
+        assert_eq!(err.code(), "denied", "target {bad_target}: {err:?}");
+        assert_eq!(err.reason_code(), Some("outside_sandbox"), "target {bad_target}: {err:?}");
     }
     assert!(!outside.path().join("pkg-install").exists());
 
@@ -775,4 +824,268 @@ async fn cross_org_isolation_returns_not_found_for_foreign_get_and_install() {
     assert_eq!(inst_foreign.code(), "not_found");
     assert_eq!(inst_missing.code(), "not_found");
     assert!(!h.ws().join("installed").exists());
+}
+
+#[tokio::test]
+async fn install_enforces_workspace_sandbox_hook_and_dependency_guards() {
+    let agent_ws = tempfile::tempdir().unwrap();
+    let agent_ws_path = agent_ws.path().to_path_buf();
+    let h = Harness::with_cfg(|cfg| {
+        cfg.agent_workspaces.insert("denied-bot".into(), "deny".into());
+        cfg.agent_workspaces.insert("scoped-bot".into(), agent_ws_path.to_string_lossy().into_owned());
+    });
+
+    // Initialize a real git repo in the hub workspace with a custom `core.hooksPath`
+    // so `guard_configured_hooks_dir` and `guard_configured_hooks` are exercised too.
+    let git_init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(h.ws())
+        .status()
+        .expect("git init");
+    assert!(git_init.success());
+    let git_cfg = std::process::Command::new("git")
+        .args(["config", "core.hooksPath", "custom-hooks"])
+        .current_dir(h.ws())
+        .status()
+        .expect("git config core.hooksPath");
+    assert!(git_cfg.success());
+    std::fs::create_dir_all(h.ws().join("custom-hooks")).unwrap();
+
+    let src_root = h.ws().join("src-skills");
+    write_skill_dir(&src_root, "sandbox-skill", "sandbox guard test.", &[]);
+    h.publish_skill("sandbox-skill", "src-skills/sandbox-skill").await;
+
+    // 1. Agent with `agent_workspaces = deny` is refused with `workspace_denied`
+    //    and writes nothing to the hub workspace root.
+    let deny_err = h
+        .reg_call(
+            &dev_agent("denied-bot", DEFAULT_ORG),
+            "install",
+            json!({ "name": "sandbox-skill", "target_dir": "installed" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(deny_err.code(), "denied");
+    assert_eq!(deny_err.reason_code(), Some("workspace_denied"));
+    assert!(!h.ws().join("installed").exists());
+
+    // 2. Agent with its own `agent_workspaces` root installs ONLY into its own
+    //    root and never into the hub root.
+    let scoped_res = h
+        .reg_call(
+            &dev_agent("scoped-bot", DEFAULT_ORG),
+            "install",
+            json!({ "name": "sandbox-skill", "target_dir": "skills" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scoped_res["ok"], true);
+    assert!(agent_ws.path().join("skills/sandbox-skill/SKILL.md").is_file());
+    assert!(!h.ws().join("skills/sandbox-skill").exists());
+
+    // 3. Hook dirs (`.git`, `.husky`, configured `custom-hooks`) and dependency
+    //    dirs (`node_modules`, `.venv/lib/python3.12/site-packages`, `target`)
+    //    are ALL refused without writing anything.
+    for (bad_target, expected_reason) in [
+        (".git", "hook_dir"),
+        (".git/hooks", "hook_dir"),
+        (".husky", "hook_dir"),
+        ("custom-hooks", "hook_dir"),
+        ("custom-hooks/nested", "hook_dir"),
+        ("node_modules", "dependency_dir"),
+        (".venv/lib/python3.12/site-packages", "dependency_dir"),
+        ("target", "dependency_dir"),
+    ] {
+        let err = h
+            .reg_call(
+                &dev_agent("builder-1", DEFAULT_ORG),
+                "install",
+                json!({ "name": "sandbox-skill", "target_dir": bad_target }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "denied", "{bad_target}: {err:?}");
+        assert_eq!(err.reason_code(), Some(expected_reason), "{bad_target}: {err:?}");
+        assert!(
+            !h.ws().join(bad_target).join("sandbox-skill").exists(),
+            "{bad_target} must not receive installed files"
+        );
+    }
+
+    // 4. A package carrying a member path inside a dependency dir (`node_modules/p.js`)
+    //    is also refused by member-path guard checks before any write.
+    let md = "---\nname: dep-member\ndescription: Dep member test. Use when testing guards.\n---\n\n# Dep\n\nOne.\nTwo.\nThree.\n";
+    let js = "module.exports = {};\n";
+    let manifest = json!({
+        "schema_version": PACKAGE_SCHEMA_VERSION,
+        "files": [
+            { "path": "SKILL.md", "sha256": content_hash(md), "bytes": md.len(), "mode": 0o644 },
+            { "path": "node_modules/p.js", "sha256": content_hash(js), "bytes": js.len(), "mode": 0o644 },
+        ],
+    });
+    let manifest_str = py_dumps(&manifest, None);
+    let stored_hash = content_hash(&manifest_str);
+    let payload_str = py_dumps(
+        &json!({
+            "SKILL.md": BASE64.encode(md.as_bytes()),
+            "node_modules/p.js": BASE64.encode(js.as_bytes()),
+        }),
+        None,
+    );
+    h.hub
+        .db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO skill_versions (org_id, name, version, content_hash, source, content, \
+                 published_by, published_at, package_manifest, package_payload) \
+                 VALUES ('default', 'dep-member', 1, ?1, 'src/dep-member/SKILL.md', ?2, 'ops-bot', \
+                 '2026-01-01T00:00:00+00:00', ?3, ?4)",
+                params![stored_hash, md, manifest_str, payload_str],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let member_err = h
+        .reg_call(
+            &dev_agent("builder-1", DEFAULT_ORG),
+            "install",
+            json!({ "name": "dep-member", "target_dir": "safe-skills" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(member_err.code(), "denied");
+    assert_eq!(member_err.reason_code(), Some("dependency_dir"));
+    assert!(!h.ws().join("safe-skills").exists());
+}
+
+#[tokio::test]
+async fn drift_flags_installed_yanked_skill_and_hash_wide_yank_blocks_other_names() {
+    let h = Harness::new();
+    let src_root = h.ws().join("src-skills");
+    write_skill_dir(&src_root, "yanked-drift", "drift test payload.", &[]);
+    let pub1 = h.publish_skill("yanked-drift", "src-skills/yanked-drift").await;
+    let hash1 = pub1["skill"]["content_hash"].as_str().unwrap().to_string();
+
+    // Install v1 onto disk BEFORE yanking it.
+    let inst = h
+        .reg_call(
+            &dev_agent("builder-1", DEFAULT_ORG),
+            "install",
+            json!({ "name": "yanked-drift", "version": 1, "target_dir": "surface" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inst["ok"], true);
+
+    // L3: Seed a second skill `hash-twin` v1 carrying the exact same `content_hash`
+    // (same SKILL.md + manifest + payload) BEFORE yanking `yanked-drift` v1, and
+    // assign `hash-twin` to `builder-1`.
+    let (md, manifest_str, payload_str): (String, String, String) = h
+        .hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT content, package_manifest, package_payload FROM skill_versions \
+                 WHERE org_id = 'default' AND name = 'yanked-drift' AND version = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .unwrap();
+    h.hub
+        .db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO skill_versions (org_id, name, version, content_hash, source, content, \
+                 published_by, published_at, package_manifest, package_payload) \
+                 VALUES ('default', 'hash-twin', 1, ?1, 'src/hash-twin/SKILL.md', ?2, 'ops-bot', \
+                 '2026-01-01T00:00:00+00:00', ?3, ?4)",
+                params![hash1, md, manifest_str, payload_str],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    h.assign_skill("hash-twin", "builder-1", Some(1)).await;
+    h.register_node_and_bundle().await;
+
+    // Yank `yanked-drift` v1 ONLY (NOT `hash-twin` by name).
+    h.gated_reg(&human_op(), "yank", json!({ "name": "yanked-drift", "version": 1, "reason": "bad-hash" }))
+        .await;
+
+    // L2: `drift` flags the installed-but-yanked skill in `yanked`, NOT `unregistered`.
+    let d1 = h.reg_call(&ops_bot(), "drift", json!({ "surface_dir": "surface" })).await.unwrap();
+    assert!(d1["unregistered"].as_array().unwrap().is_empty(), "yanked skill must not be unregistered: {d1}");
+    let yanked_list = d1["yanked"].as_array().unwrap();
+    assert_eq!(yanked_list.len(), 1, "{d1}");
+    assert_eq!(yanked_list[0]["name"], "yanked-drift");
+    assert_eq!(yanked_list[0]["yanked_version"], 1);
+    assert_eq!(yanked_list[0]["reason"], "bad-hash");
+
+    // Publish fixed v2: `drift` still flags on-disk yanked v1 in `yanked` (with
+    // replacement_version: 2) as well as `stale`, and upgrading on-disk yanked v1
+    // to v2 with `overwrite: true` succeeds cleanly.
+    write_skill_dir(&src_root, "yanked-drift", "v2 fixed payload.", &[]);
+    h.publish_skill("yanked-drift", "src-skills/yanked-drift").await;
+    let d2 = h.reg_call(&ops_bot(), "drift", json!({ "surface_dir": "surface" })).await.unwrap();
+    assert_eq!(d2["yanked"].as_array().unwrap().len(), 1, "{d2}");
+    assert_eq!(d2["yanked"][0]["replacement_version"], 2);
+    assert_eq!(d2["stale"].as_array().unwrap().len(), 1, "{d2}");
+
+    let upgrade = h
+        .reg_call(
+            &dev_agent("builder-1", DEFAULT_ORG),
+            "install",
+            json!({ "name": "yanked-drift", "version": 2, "target_dir": "surface", "overwrite": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upgrade["version"], 2);
+
+    // L3: Hash-wide yank refusal blocks `hash-twin` v1 across `get`, `install`,
+    // `assign`, `resolve`, and `node_config` even though only `yanked-drift` v1
+    // is named in `skill_version_yanks`.
+    let twin_get = h
+        .reg_call(&dev_agent("builder-1", DEFAULT_ORG), "get", json!({ "name": "hash-twin", "version": 1 }))
+        .await
+        .unwrap_err();
+    assert_eq!(twin_get.code(), "conflict");
+    assert_eq!(twin_get.reason_code(), Some("yanked"));
+
+    let twin_inst = h
+        .reg_call(
+            &dev_agent("builder-1", DEFAULT_ORG),
+            "install",
+            json!({ "name": "hash-twin", "version": 1, "target_dir": "twin-out" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(twin_inst.code(), "conflict");
+    assert_eq!(twin_inst.reason_code(), Some("yanked"));
+
+    let twin_assign = h
+        .reg_call(
+            &ops_bot(),
+            "assign",
+            json!({ "skill_name": "hash-twin", "target": "builder-2", "version": 1 }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(twin_assign.code(), "conflict");
+    assert_eq!(twin_assign.reason_code(), Some("yanked"));
+
+    let twin_res = h
+        .reg_call(&dev_agent("builder-1", DEFAULT_ORG), "resolve", json!({ "agent_label": "builder-1" }))
+        .await
+        .unwrap();
+    assert!(
+        twin_res["skills"].as_array().unwrap().is_empty(),
+        "resolve must omit hash-yanked twin: {twin_res}"
+    );
+
+    let nc = h.ok(&device(), "node_config", json!({ "node": NODE })).await;
+    let notes = nc["assigned_skills"].as_array().unwrap();
+    let twin_note = notes.iter().find(|n| n["name"] == "hash-twin").expect("hash-twin note");
+    assert_eq!(twin_note["included"], false);
+    assert_eq!(twin_note["reason"], "yanked");
+    assert_eq!(twin_note["skipped"], "yanked");
 }

@@ -57,7 +57,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use base64::Engine as _;
@@ -1183,10 +1183,6 @@ struct YankParams {
     reason: Option<String>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallParams {
@@ -1196,7 +1192,7 @@ struct InstallParams {
     #[serde(default)]
     expected_hash: Option<String>,
     target_dir: String,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     overwrite: bool,
 }
 
@@ -2642,10 +2638,11 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
         }
         (None, None) => None,
     };
-    // The registry side: every skill's latest version, and with an agent the
-    // versions it resolves to (pins honoured).
+    // The registry side: every skill's latest non-yanked version, any yanked
+    // versions (so installed-but-yanked skills are flagged rather than called
+    // unregistered), and with an agent the versions it resolves to (pins honoured).
     let org = ctx.caller.org_id.as_str();
-    let (all_latest, resolved) = ctx.hub.db().read(|c| {
+    let (all_latest, yanked_rows, resolved) = ctx.hub.db().read(|c| {
         let mut stmt = c.prepare(
             "SELECT sv.name, sv.version, sv.content_hash, sv.package_manifest FROM skill_versions sv \
              JOIN (SELECT name, MAX(version) AS version FROM skill_versions WHERE org_id = ?1 GROUP BY name) latest \
@@ -2665,12 +2662,42 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
                 Ok((name, version, hash, cmp))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        let mut y_stmt = c.prepare(
+            "SELECT y.name, y.version, y.content_hash, y.yanked_at, y.reason, sv.package_manifest \
+             FROM skill_version_yanks y \
+             LEFT JOIN skill_versions sv \
+               ON sv.org_id = y.org_id AND sv.name = y.name AND sv.version = y.version \
+             WHERE y.org_id = ?1 \
+             ORDER BY y.version DESC",
+        )?;
+        let yanked_rows = y_stmt
+            .query_map([org], |r| {
+                let name: String = r.get(0)?;
+                let version: i64 = r.get(1)?;
+                let hash: String = r.get(2)?;
+                let yanked_at: String = r.get(3)?;
+                let reason: Option<String> = r.get(4)?;
+                let manifest: Option<String> = r.get(5)?;
+                let manifest = manifest.and_then(|s| serde_json::from_str::<Value>(&s).ok());
+                let cmp = drift_compare_hash(&hash, manifest.as_ref());
+                Ok((name, version, hash, cmp, yanked_at, reason))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         let resolved = match &label {
             Some(l) => Some(resolve(c, org, l, profile.as_deref())?),
             None => None,
         };
-        Ok((rows, resolved))
+        Ok((rows, yanked_rows, resolved))
     })?;
+    let mut yanked_by_name: BTreeMap<String, (i64, String, Option<String>)> = BTreeMap::new();
+    let mut yanked_by_hash: BTreeMap<String, (String, i64, String, Option<String>)> = BTreeMap::new();
+    for (y_name, y_ver, y_hash, y_cmp, y_at, y_reason) in yanked_rows {
+        yanked_by_name.entry(y_name.clone()).or_insert_with(|| (y_ver, y_at.clone(), y_reason.clone()));
+        yanked_by_hash
+            .entry(y_cmp)
+            .or_insert_with(|| (y_name.clone(), y_ver, y_at.clone(), y_reason.clone()));
+        yanked_by_hash.entry(y_hash).or_insert((y_name, y_ver, y_at, y_reason));
+    }
     let latest_all: BTreeMap<String, (i64, String, String)> =
         all_latest.into_iter().map(|(n, v, h, cmp)| (n, (v, h, cmp))).collect();
     let scoped = resolved.is_some();
@@ -2686,23 +2713,59 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
     };
     let mut names: BTreeSet<String> = on_disk.keys().cloned().collect();
     names.extend(latest.keys().cloned());
-    let (mut missing, mut stale, mut unregistered, mut unassigned, mut synced) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut missing, mut stale, mut unregistered, mut unassigned, mut synced, mut yanked) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for name in names {
         let disk = on_disk.get(&name);
         let reg = latest.get(&name);
         match (disk, reg) {
             (None, Some((v, _, _))) => missing.push(json!({ "name": name, "registry_version": v })),
             (None, None) => {}
-            (Some(h), None) => match (scoped, latest_all.get(&name)) {
-                (true, Some((v, _, _))) => {
-                    unassigned.push(json!({ "name": name, "on_disk_hash": h, "registry_version": v }));
+            (Some(h), None) => {
+                if let Some((y_skill, y_ver, y_at, y_reason)) = yanked_by_hash.get(h) {
+                    yanked.push(json!({
+                        "name": name,
+                        "on_disk_hash": h,
+                        "yanked_skill": y_skill,
+                        "yanked_version": y_ver,
+                        "yanked_at": y_at,
+                        "reason": y_reason,
+                    }));
+                } else if let Some((y_ver, y_at, y_reason)) = yanked_by_name.get(&name) {
+                    yanked.push(json!({
+                        "name": name,
+                        "on_disk_hash": h,
+                        "yanked_skill": name,
+                        "yanked_version": y_ver,
+                        "yanked_at": y_at,
+                        "reason": y_reason,
+                    }));
+                } else {
+                    match (scoped, latest_all.get(&name)) {
+                        (true, Some((v, _, _))) => {
+                            unassigned
+                                .push(json!({ "name": name, "on_disk_hash": h, "registry_version": v }));
+                        }
+                        _ => unregistered.push(json!({ "name": name, "on_disk_hash": h })),
+                    }
                 }
-                _ => unregistered.push(json!({ "name": name, "on_disk_hash": h })),
-            },
-            (Some(h), Some((v, rh, cmp))) if h != cmp => stale.push(json!({
-                "name": name, "on_disk_hash": h, "registry_hash": rh, "registry_version": v,
-            })),
+            }
+            (Some(h), Some((v, rh, cmp))) if h != cmp => {
+                if let Some((y_skill, y_ver, y_at, y_reason)) = yanked_by_hash.get(h) {
+                    yanked.push(json!({
+                        "name": name,
+                        "on_disk_hash": h,
+                        "yanked_skill": y_skill,
+                        "yanked_version": y_ver,
+                        "yanked_at": y_at,
+                        "reason": y_reason,
+                        "replacement_version": v,
+                    }));
+                }
+                stale.push(json!({
+                    "name": name, "on_disk_hash": h, "registry_hash": rh, "registry_version": v,
+                }));
+            }
             (Some(_), Some((v, _, _))) => synced.push(json!({ "name": name, "version": v })),
         }
     }
@@ -2711,6 +2774,7 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
         "comparison": if label.is_some() { "resolved_assignments" } else { "latest_published" },
         "missing": missing,
         "stale": stale,
+        "yanked": yanked,
         "unregistered": unregistered,
         "unassigned": unassigned,
         "synced": synced,
@@ -2813,56 +2877,29 @@ fn yank_as(ctx: &ToolCtx, who: String, p: YankParams) -> UaResult<Value> {
         .and_then(pending)
 }
 
-/// RAII cleanup guard for an atomic install staging directory: deletes the
-/// staging tree on drop unless disarmed after a successful swap.
-struct StageCleanup(Option<PathBuf>);
-
-impl StageCleanup {
-    fn new(path: PathBuf) -> Self {
-        Self(Some(path))
-    }
-
-    fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for StageCleanup {
-    fn drop(&mut self) {
-        if let Some(dir) = self.0.take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-}
-
-/// Resolve an install target directory strictly inside the workspace root,
-/// refusing `..`, out-of-root absolute paths, backslashes, NUL bytes, and any
-/// symlink component. Creates missing directory segments inside the workspace
-/// one component at a time while checking `symlink_metadata` on every step.
-fn resolve_install_root(ctx: &ToolCtx, raw: &str) -> UaResult<(PathBuf, String)> {
+/// Parse and validate an install `target_dir` relative to the caller's sandbox
+/// root BEFORE touching the filesystem: refuses empty paths, NUL bytes,
+/// backslashes, `..`, out-of-sandbox absolute paths, non-UTF-8 segments,
+/// control characters, and hidden/bidi Unicode code points.
+fn parse_install_target_parts(
+    sb: &crate::families::workspace::Sandbox,
+    raw: &str,
+) -> UaResult<(Vec<String>, String)> {
     let raw_t = raw.trim();
     if raw_t.is_empty() || raw_t.contains('\0') || raw_t.contains('\\') {
         return Err(UaError::invalid(format!("unsafe install target_dir {raw:?}")));
     }
-    if ctx.caller.org_id != ua_core::DEFAULT_ORG {
-        return Err(crate::families::workspace::workspace_org_unsupported());
-    }
-    let ws = ctx.hub.cfg().workspace_root();
-    let ws_real = ws
-        .canonicalize()
-        .map_err(|_| UaError::invalid("workspace root does not exist or cannot be resolved"))?;
     let p = Path::new(raw_t);
     let rel: PathBuf = if p.is_absolute() {
-        p.strip_prefix(&ws_real)
-            .or_else(|_| p.strip_prefix(&ws))
-            .map_err(|_| UaError::invalid(format!("target_dir {raw:?} is outside the workspace root")))?
+        p.strip_prefix(&sb.root)
+            .map_err(|_| {
+                UaError::denied("outside_sandbox", format!("target_dir {raw:?} is outside the sandbox"))
+            })?
             .to_path_buf()
     } else {
         p.to_path_buf()
     };
 
-    // Validate every path component BEFORE touching the filesystem so an
-    // invalid path (e.g. `newdir/../escape`) never creates stray directories.
     let mut parts = Vec::new();
     for comp in rel.components() {
         match comp {
@@ -2877,227 +2914,997 @@ fn resolve_install_root(ctx: &ToolCtx, raw: &str) -> UaResult<(PathBuf, String)>
             }
             Component::CurDir => {}
             _ => {
-                return Err(UaError::invalid(format!("target_dir {raw:?} escapes the workspace root")));
+                return Err(UaError::denied(
+                    "outside_sandbox",
+                    format!("target_dir {raw:?} escapes the sandbox"),
+                ));
             }
         }
     }
     if parts.is_empty() {
         return Err(UaError::invalid("target_dir must name a directory inside the workspace"));
     }
+    let rel_str = parts.join("/");
+    Ok((parts, rel_str))
+}
 
-    let mut cur = ws_real;
-    for seg in &parts {
-        cur.push(seg);
-        match std::fs::symlink_metadata(&cur) {
+/// Apply the hub's workspace safety guards (`guard_inside_root` for hook and
+/// dependency directories, plus `guard_configured_hooks_dir` /
+/// `guard_configured_hooks` for custom `core.hooksPath`) to `target_dir`,
+/// `<target_dir>/<name>`, and every member path before creating any directory
+/// or file.
+async fn guard_install_paths(
+    sb: &crate::families::workspace::Sandbox,
+    target_rel: &str,
+    shown_target: &str,
+    name: &str,
+    members: &[PackageMember],
+) -> UaResult<()> {
+    let target_path = sb.root.join(target_rel);
+    let dest_path = target_path.join(name);
+    let dest_shown = format!("{shown_target}/{name}");
+    ua_core::safety::guard_inside_root(&target_path, &sb.root, shown_target, true)?;
+    ua_core::safety::guard_inside_root(&dest_path, &sb.root, &dest_shown, true)?;
+    crate::families::workspace::guard_configured_hooks_dir(&target_path, &sb.root, shown_target).await?;
+    crate::families::workspace::guard_configured_hooks_dir(&dest_path, &sb.root, &dest_shown).await?;
+    for m in members {
+        let clean = validate_package_path(&m.path)?;
+        let member_path = dest_path.join(&clean);
+        let member_shown = format!("{dest_shown}/{clean}");
+        ua_core::safety::guard_inside_root(&member_path, &sb.root, &member_shown, true)?;
+        crate::families::workspace::guard_configured_hooks(&member_path, &sb.root, &member_shown).await?;
+    }
+    Ok(())
+}
+
+/// All normalized and raw content hashes published for `(org, name)` (including
+/// yanked versions, so `install { overwrite: true }` can upgrade away from an
+/// installed yanked v1 to a fixed v2 while still refusing to wipe unknown or
+/// locally modified files).
+fn known_version_hashes(c: &Connection, org: &str, name: &str) -> UaResult<BTreeSet<String>> {
+    let mut stmt = c.prepare(
+        "SELECT content_hash, package_manifest FROM skill_versions WHERE org_id = ?1 AND name = ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![org, name], |r| {
+            let hash: String = r.get(0)?;
+            let manifest: Option<String> = r.get(1)?;
+            let manifest = manifest.and_then(|s| serde_json::from_str::<Value>(&s).ok());
+            Ok((hash, manifest))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut hashes = BTreeSet::new();
+    for (hash, manifest) in rows {
+        hashes.insert(drift_compare_hash(&hash, manifest.as_ref()));
+        hashes.insert(hash);
+    }
+    Ok(hashes)
+}
+
+/// Verify that an already-captured on-disk directory is an unmodified copy of a
+/// published registry version of `name`, and that its `SKILL.md` declares
+/// `name`. Returns the sorted list of exact relative file paths inside it so
+/// cleanup unlinks only those verified files (never `remove_dir_all` on unknown
+/// files).
+fn verify_existing_matches_registry(
+    name: &str,
+    existing_members: &BTreeMap<String, PackageMember>,
+    known_hashes: &BTreeSet<String>,
+) -> UaResult<Vec<String>> {
+    let md = existing_members.get("SKILL.md").ok_or_else(|| {
+        UaError::conflict(format!("refusing to overwrite {name:?}: existing directory is missing SKILL.md"))
+    })?;
+    let md_text = std::str::from_utf8(&md.bytes).map_err(|_| {
+        UaError::conflict(format!("refusing to overwrite {name:?}: existing SKILL.md is not UTF-8"))
+    })?;
+    let fm_name =
+        frontmatter(md_text).and_then(|fm| fm.get("name").and_then(Value::as_str).map(str::to_string));
+    if fm_name.as_deref() != Some(name) {
+        return Err(UaError::conflict(format!(
+            "refusing to overwrite {name:?}: existing SKILL.md does not declare name {name:?}"
+        )));
+    }
+    let pkg_hash = package_hash(&build_manifest(existing_members));
+    let single_hash = (existing_members.len() == 1).then(|| content_hash(md_text));
+    let matched =
+        known_hashes.contains(&pkg_hash) || single_hash.as_deref().is_some_and(|h| known_hashes.contains(h));
+    if !matched {
+        return Err(UaError::conflict(format!(
+            "refusing to overwrite {name:?}: existing files do not match any published registry version of \
+             {name:?}; unknown or modified files will not be deleted"
+        )));
+    }
+    Ok(existing_members.keys().cloned().collect())
+}
+
+#[cfg(unix)]
+mod install_fs {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::{CStr, CString};
+    use std::fs::File;
+    use std::io::{self, Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Component, Path};
+
+    use ua_core::{UaError, UaResult};
+
+    use super::{
+        MAX_PACKAGE_BYTES, MAX_PACKAGE_ENTRIES, MAX_PACKAGE_FILE_BYTES, MAX_PACKAGE_FILES,
+        MAX_SKILL_FILE_BYTES, MODE_FILE, PackageMember, portable_collision_key, sha256_bytes,
+        validate_package_path, verify_existing_matches_registry,
+    };
+
+    const DIR_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    fn c_seg(s: &str) -> UaResult<CString> {
+        CString::new(s).map_err(|_| UaError::invalid(format!("path segment {s:?} contains a NUL byte")))
+    }
+
+    fn openat_dir(at: libc::c_int, name: &CStr) -> io::Result<OwnedFd> {
+        // SAFETY: `name` is a valid NUL-terminated string; non-negative fd is owned by us.
+        let fd = unsafe { libc::openat(at, name.as_ptr(), DIR_FLAGS) };
+        if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
+    }
+
+    fn mkdirat_0755(parent: &OwnedFd, name: &CStr) -> io::Result<()> {
+        // SAFETY: `parent` is a valid open directory fd and `name` is NUL-terminated.
+        let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
+        if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    fn fstat_dev_ino(fd: &OwnedFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `fd` is a valid open descriptor and `st` points to writable `stat` storage.
+        let rc = unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: `fstat` succeeded and initialized `st`.
+            let st = unsafe { st.assume_init() };
+            Ok((st.st_dev, st.st_ino))
+        }
+    }
+
+    fn fstatat_nofollow(parent: &OwnedFd, name: &CStr) -> io::Result<libc::stat> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `parent` is a valid open directory fd, `name` is NUL-terminated, `st` is writable.
+        let rc = unsafe {
+            libc::fstatat(parent.as_raw_fd(), name.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+        };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: `fstatat` succeeded and initialized `st`.
+            Ok(unsafe { st.assume_init() })
+        }
+    }
+
+    fn renameat_same(parent: &OwnedFd, old: &CStr, new: &CStr) -> io::Result<()> {
+        // SAFETY: `parent` is an open directory fd; `old` and `new` are NUL-terminated.
+        let rc =
+            unsafe { libc::renameat(parent.as_raw_fd(), old.as_ptr(), parent.as_raw_fd(), new.as_ptr()) };
+        if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    fn unlinkat_entry(parent: &OwnedFd, name: &CStr, is_dir: bool) -> io::Result<()> {
+        let flags = if is_dir { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: `parent` is an open directory fd and `name` is NUL-terminated.
+        let rc = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    fn read_dir_names(dir: &OwnedFd) -> io::Result<Vec<String>> {
+        // Open a fresh fd to `.` so `fdopendir` / `closedir` owns its own fd
+        // and starts at offset 0 without closing `dir`.
+        let dot = c".";
+        let dup_fd = openat_dir(dir.as_raw_fd(), dot)?;
+        let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(dup_fd);
+        // SAFETY: `raw_fd` is a valid open directory fd whose ownership transfers to `fdopendir`.
+        let dirp = unsafe { libc::fdopendir(raw_fd) };
+        if dirp.is_null() {
+            let err = io::Error::last_os_error();
+            // SAFETY: `fdopendir` failed so we still own `raw_fd`.
+            unsafe {
+                libc::close(raw_fd);
+            }
+            return Err(err);
+        }
+        struct DirGuard(*mut libc::DIR);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` is a valid `DIR*` returned by `fdopendir`.
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+        let _guard = DirGuard(dirp);
+        let mut names = Vec::new();
+        loop {
+            // SAFETY: `dirp` is valid and owned exclusively by this function.
+            let entry = unsafe { libc::readdir(dirp) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: `d_name` is a NUL-terminated C string inside `entry`.
+            let cstr = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let bytes = cstr.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let s = std::str::from_utf8(bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "directory contains non-UTF-8 entry name")
+            })?;
+            names.push(s.to_string());
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// Open `sb_root` component-by-component from `/` with
+    /// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, then walk (and optionally
+    /// create) each validated segment of `parts` relative to its parent dirfd.
+    fn open_dir_chain(
+        sb_root: &Path,
+        parts: &[String],
+        create_missing: bool,
+        shown: &str,
+    ) -> UaResult<OwnedFd> {
+        let mut cur: Option<OwnedFd> = None;
+        for comp in sb_root.components() {
+            let next = match comp {
+                Component::RootDir => openat_dir(libc::AT_FDCWD, c"/")
+                    .map_err(|e| UaError::internal(format!("cannot open root directory: {e}")))?,
+                Component::Normal(seg) => {
+                    let at = cur
+                        .as_ref()
+                        .ok_or_else(|| UaError::internal("sandbox root is not absolute"))?
+                        .as_raw_fd();
+                    let cname = CString::new(seg.as_bytes())
+                        .map_err(|_| UaError::invalid("sandbox root contains a NUL byte"))?;
+                    openat_dir(at, &cname).map_err(|e| {
+                        if e.raw_os_error() == Some(libc::ELOOP) {
+                            UaError::invalid(
+                                "sandbox root passes through a symlink; symlinks are not followed",
+                            )
+                        } else {
+                            UaError::invalid(format!("cannot open sandbox root: {e}"))
+                        }
+                    })?
+                }
+                _ => return Err(UaError::invalid("sandbox root is not canonical")),
+            };
+            cur = Some(next);
+        }
+        let mut cur_fd = cur.ok_or_else(|| UaError::invalid("sandbox root is empty"))?;
+
+        for seg in parts {
+            let cseg = c_seg(seg)?;
+            let next_fd = match openat_dir(cur_fd.as_raw_fd(), &cseg) {
+                Ok(fd) => fd,
+                Err(e) if create_missing && e.kind() == io::ErrorKind::NotFound => {
+                    match mkdirat_0755(&cur_fd, &cseg) {
+                        Ok(()) => {}
+                        Err(me) if me.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(me) => {
+                            return Err(UaError::invalid(format!(
+                                "cannot create target_dir {shown:?}: {me}"
+                            )));
+                        }
+                    }
+                    openat_dir(cur_fd.as_raw_fd(), &cseg).map_err(|oe| {
+                        if oe.raw_os_error() == Some(libc::ELOOP) {
+                            UaError::invalid(format!(
+                                "target_dir {shown:?} passes through a symlink; symlinks are not followed"
+                            ))
+                        } else if oe.raw_os_error() == Some(libc::ENOTDIR) {
+                            UaError::invalid(format!(
+                                "target_dir {shown:?} path component is not a directory"
+                            ))
+                        } else {
+                            UaError::invalid(format!("cannot open target_dir {shown:?}: {oe}"))
+                        }
+                    })?
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(UaError::invalid(format!(
+                        "target_dir {shown:?} passes through a symlink; symlinks are not followed"
+                    )));
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
+                    return Err(UaError::invalid(format!(
+                        "target_dir {shown:?} path component is not a directory"
+                    )));
+                }
+                Err(e) => {
+                    return Err(UaError::invalid(format!("cannot inspect target_dir {shown:?}: {e}")));
+                }
+            };
+            cur_fd = next_fd;
+        }
+        Ok(cur_fd)
+    }
+
+    /// Re-walk the entire parent chain from `sb_root` through `parts` without
+    /// following symlinks and verify it still resolves to the exact `(dev, ino)`
+    /// of our pinned `target_fd`.
+    fn verify_dir_chain_identity(
+        sb_root: &Path,
+        parts: &[String],
+        expected: (libc::dev_t, libc::ino_t),
+        shown: &str,
+    ) -> UaResult<()> {
+        let verified_fd = open_dir_chain(sb_root, parts, false, shown)?;
+        let actual = fstat_dev_ino(&verified_fd)
+            .map_err(|e| UaError::internal(format!("cannot stat target_dir {shown:?}: {e}")))?;
+        if actual != expected {
+            return Err(UaError::conflict(format!("target_dir {shown:?} changed during install; aborting")));
+        }
+        Ok(())
+    }
+
+    fn read_regular_at(parent: &OwnedFd, seg: &CStr, label: &str, cap: usize) -> UaResult<Vec<u8>> {
+        let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `parent` is a valid open directory fd and `seg` is NUL-terminated.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), seg.as_ptr(), flags) };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            return Err(if err.raw_os_error() == Some(libc::ELOOP) {
+                UaError::invalid(format!("{label} is a symlink; symlinks are not followed"))
+            } else {
+                UaError::invalid(format!("{label} could not be read: {err}"))
+            });
+        }
+        // SAFETY: `fd` is a valid newly opened descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut file = File::from(owned);
+        let meta = file.metadata().map_err(|_| UaError::invalid(format!("{label} could not be read")))?;
+        if !meta.is_file() {
+            return Err(UaError::invalid(format!("{label} is a special file")));
+        }
+        if meta.len() > cap as u64 {
+            return Err(UaError::invalid(format!("{label} exceeds the {cap}-byte limit")));
+        }
+        let mut buf = Vec::new();
+        Read::by_ref(&mut file)
+            .take((cap as u64) + 1)
+            .read_to_end(&mut buf)
+            .map_err(|_| UaError::invalid(format!("{label} could not be read")))?;
+        if buf.len() > cap {
+            return Err(UaError::invalid(format!("{label} exceeds the {cap}-byte limit")));
+        }
+        Ok(buf)
+    }
+
+    /// Capture every file inside `root_fd` strictly via `openat` / `fstatat`
+    /// without following symlinks, enforcing D1 package rules so any unknown,
+    /// hidden, symlinked, or special file is detected before overwrite.
+    fn capture_package_from_dirfd(
+        root_fd: &OwnedFd,
+        label: &str,
+    ) -> UaResult<BTreeMap<String, PackageMember>> {
+        fn walk(
+            dir_fd: &OwnedFd,
+            prefix: &str,
+            members: &mut BTreeMap<String, PackageMember>,
+            portable: &mut BTreeSet<String>,
+            entries_seen: &mut usize,
+            total_bytes: &mut usize,
+            label: &str,
+        ) -> UaResult<()> {
+            let names = read_dir_names(dir_fd)
+                .map_err(|e| UaError::invalid(format!("cannot read {label:?}: {e}")))?;
+            for name in names {
+                *entries_seen += 1;
+                if *entries_seen > MAX_PACKAGE_ENTRIES {
+                    return Err(UaError::invalid(format!(
+                        "directory {label:?} exceeds {MAX_PACKAGE_ENTRIES} entries"
+                    )));
+                }
+                let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+                let clean = validate_package_path(&rel)?;
+                let cseg = c_seg(&name)?;
+                let st = fstatat_nofollow(dir_fd, &cseg)
+                    .map_err(|e| UaError::invalid(format!("cannot inspect {clean:?}: {e}")))?;
+                let ftype = st.st_mode & libc::S_IFMT;
+                if ftype == libc::S_IFLNK {
+                    return Err(UaError::invalid(format!(
+                        "symlink {clean:?} inside {label:?} is not allowed"
+                    )));
+                }
+                if ftype == libc::S_IFDIR {
+                    let sub_fd = openat_dir(dir_fd.as_raw_fd(), &cseg)
+                        .map_err(|e| UaError::invalid(format!("cannot descend into {clean:?}: {e}")))?;
+                    walk(&sub_fd, &clean, members, portable, entries_seen, total_bytes, label)?;
+                } else if ftype == libc::S_IFREG {
+                    if members.len() >= MAX_PACKAGE_FILES {
+                        return Err(UaError::invalid(format!(
+                            "directory {label:?} exceeds {MAX_PACKAGE_FILES} files"
+                        )));
+                    }
+                    if !portable.insert(portable_collision_key(&clean)) {
+                        return Err(UaError::invalid(format!("colliding path {clean:?}")));
+                    }
+                    let cap = if clean == "SKILL.md" { MAX_SKILL_FILE_BYTES } else { MAX_PACKAGE_FILE_BYTES };
+                    let bytes = read_regular_at(dir_fd, &cseg, &clean, cap)?;
+                    *total_bytes = total_bytes.saturating_add(bytes.len());
+                    if *total_bytes > MAX_PACKAGE_BYTES {
+                        return Err(UaError::invalid(format!(
+                            "directory {label:?} exceeds {MAX_PACKAGE_BYTES} bytes"
+                        )));
+                    }
+                    let sha256 = sha256_bytes(&bytes);
+                    members
+                        .insert(clean.clone(), PackageMember { path: clean, bytes, sha256, mode: MODE_FILE });
+                } else {
+                    return Err(UaError::invalid(format!("special file {clean:?} is not allowed")));
+                }
+            }
+            Ok(())
+        }
+
+        let mut members = BTreeMap::new();
+        let mut portable = BTreeSet::new();
+        let mut entries_seen = 0usize;
+        let mut total_bytes = 0usize;
+        walk(root_fd, "", &mut members, &mut portable, &mut entries_seen, &mut total_bytes, label)?;
+        Ok(members)
+    }
+
+    /// Write one verified package member inside `stage_fd` using `mkdirat`,
+    /// `openat(O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)`,
+    /// and `fchmod(0o644)`. Records every created subdir and file in `cleanup`.
+    fn write_member_at_0644(
+        stage_fd: &OwnedFd,
+        rel_path: &str,
+        bytes: &[u8],
+        created_dirs: &mut Vec<String>,
+        created_files: &mut Vec<String>,
+    ) -> UaResult<()> {
+        let clean = validate_package_path(rel_path)?;
+        let segments: Vec<&str> = clean.split('/').collect();
+        let mut owned_dir: Option<OwnedFd> = None;
+        let mut prefix = String::new();
+        for dir_seg in &segments[..segments.len() - 1] {
+            let parent = owned_dir.as_ref().unwrap_or(stage_fd);
+            let cseg = c_seg(dir_seg)?;
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(dir_seg);
+            let next_fd = match openat_dir(parent.as_raw_fd(), &cseg) {
+                Ok(fd) => fd,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    mkdirat_0755(parent, &cseg)
+                        .map_err(|me| UaError::internal(format!("cannot create staging subdir: {me}")))?;
+                    created_dirs.push(prefix.clone());
+                    openat_dir(parent.as_raw_fd(), &cseg)
+                        .map_err(|oe| UaError::internal(format!("cannot open staging subdir: {oe}")))?
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(UaError::invalid(format!(
+                        "install staging path {clean:?} hit a symlink; symlinks are not followed"
+                    )));
+                }
+                Err(e) => {
+                    return Err(UaError::internal(format!("cannot inspect staging subdir: {e}")));
+                }
+            };
+            owned_dir = Some(next_fd);
+        }
+
+        let leaf_parent = owned_dir.as_ref().unwrap_or(stage_fd);
+        let leaf_c = c_seg(segments[segments.len() - 1])?;
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `leaf_parent` is a valid open directory fd and `leaf_c` is NUL-terminated.
+        let fd =
+            unsafe { libc::openat(leaf_parent.as_raw_fd(), leaf_c.as_ptr(), flags, 0o644 as libc::c_uint) };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            return Err(if err.raw_os_error() == Some(libc::ELOOP) {
+                UaError::invalid(format!("install path {clean:?} is a symlink; symlinks are not followed"))
+            } else {
+                UaError::internal(format!("cannot create staged file {clean:?}: {err}"))
+            });
+        }
+        // SAFETY: `fd` is a valid newly opened descriptor.
+        let mut file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        created_files.push(clean.clone());
+        file.write_all(bytes)
+            .map_err(|e| UaError::internal(format!("cannot write staged file {clean:?}: {e}")))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| UaError::internal(format!("cannot set 0644 mode on {clean:?}: {e}")))?;
+        file.sync_all().map_err(|e| UaError::internal(format!("cannot sync staged file {clean:?}: {e}")))?;
+        let meta = file.metadata().map_err(|e| UaError::internal(format!("cannot stat staged file: {e}")))?;
+        if !meta.is_file() || meta.len() != bytes.len() as u64 {
+            return Err(UaError::internal(format!("staged file {clean:?} failed post-write check")));
+        }
+        Ok(())
+    }
+
+    /// Unlink ONLY the exact listed relative file paths and their parent
+    /// subdirectories inside `dir_fd`, then `rmdir` `dir_name` inside
+    /// `parent_fd`. Never traverses unknown entries and never deletes unknown
+    /// files.
+    fn unlink_known_tree(
+        parent_fd: &OwnedFd,
+        dir_name: &CStr,
+        dir_fd: &OwnedFd,
+        rel_files: &[String],
+        extra_dirs: &[String],
+    ) {
+        let mut subdirs: BTreeSet<String> = extra_dirs.iter().cloned().collect();
+        for rel in rel_files {
+            let segs: Vec<&str> = rel.split('/').collect();
+            if segs.is_empty() {
+                continue;
+            }
+            let mut cur_owned: Option<OwnedFd> = None;
+            let mut prefix = String::new();
+            let mut ok = true;
+            for d in &segs[..segs.len() - 1] {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(d);
+                subdirs.insert(prefix.clone());
+                let p = cur_owned.as_ref().unwrap_or(dir_fd);
+                let Ok(cseg) = CString::new(*d) else {
+                    ok = false;
+                    break;
+                };
+                match openat_dir(p.as_raw_fd(), &cseg) {
+                    Ok(fd) => cur_owned = Some(fd),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && let Ok(leaf) = CString::new(segs[segs.len() - 1]) {
+                let p = cur_owned.as_ref().unwrap_or(dir_fd);
+                let _ = unlinkat_entry(p, &leaf, false);
+            }
+        }
+        // Remove subdirectories deepest-first.
+        let mut dirs: Vec<String> = subdirs.into_iter().collect();
+        dirs.sort_by(|a, b| {
+            let da = a.matches('/').count();
+            let db = b.matches('/').count();
+            db.cmp(&da).then_with(|| b.cmp(a))
+        });
+        for rel_dir in dirs {
+            let segs: Vec<&str> = rel_dir.split('/').collect();
+            if segs.is_empty() {
+                continue;
+            }
+            let mut cur_owned: Option<OwnedFd> = None;
+            let mut ok = true;
+            for d in &segs[..segs.len() - 1] {
+                let p = cur_owned.as_ref().unwrap_or(dir_fd);
+                let Ok(cseg) = CString::new(*d) else {
+                    ok = false;
+                    break;
+                };
+                match openat_dir(p.as_raw_fd(), &cseg) {
+                    Ok(fd) => cur_owned = Some(fd),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && let Ok(leaf) = CString::new(segs[segs.len() - 1]) {
+                let p = cur_owned.as_ref().unwrap_or(dir_fd);
+                let _ = unlinkat_entry(p, &leaf, true);
+            }
+        }
+        let _ = unlinkat_entry(parent_fd, dir_name, true);
+    }
+
+    struct StageFdCleanup<'a> {
+        parent_fd: &'a OwnedFd,
+        stage_fd: Option<OwnedFd>,
+        stage_name: CString,
+        created_dirs: Vec<String>,
+        created_files: Vec<String>,
+        armed: bool,
+    }
+
+    impl<'a> StageFdCleanup<'a> {
+        fn disarm(&mut self) {
+            self.armed = false;
+            self.stage_fd = None;
+        }
+    }
+
+    impl Drop for StageFdCleanup<'_> {
+        fn drop(&mut self) {
+            if self.armed
+                && let Some(stage_fd) = self.stage_fd.take()
+            {
+                unlink_known_tree(
+                    self.parent_fd,
+                    &self.stage_name,
+                    &stage_fd,
+                    &self.created_files,
+                    &self.created_dirs,
+                );
+            }
+        }
+    }
+
+    /// Dirfd-anchored atomic stage-and-swap inside `sb_root/parts/<name>`.
+    ///
+    /// Anchors every `mkdirat`, `openat`, `fstatat`, `renameat`, and `unlinkat`
+    /// to open directory file descriptors (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`),
+    /// re-verifies the full parent chain identity immediately before swap and
+    /// before removing a verified backup, and unlinks only verified files.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stage_and_swap_members_with_hook(
+        sb_root: &Path,
+        parts: &[String],
+        shown_target: &str,
+        name: &str,
+        members: &[PackageMember],
+        overwrite: bool,
+        known_hashes: &BTreeSet<String>,
+        before_swap: impl FnOnce(),
+    ) -> UaResult<()> {
+        let target_fd = open_dir_chain(sb_root, parts, true, shown_target)?;
+        let target_id = fstat_dev_ino(&target_fd)
+            .map_err(|e| UaError::internal(format!("cannot stat target_dir {shown_target:?}: {e}")))?;
+        let name_c = c_seg(name)?;
+
+        let replacing: Option<Vec<String>> = match fstatat_nofollow(&target_fd, &name_c) {
+            Ok(st) => {
+                let ftype = st.st_mode & libc::S_IFMT;
+                if ftype == libc::S_IFLNK {
+                    return Err(UaError::invalid(format!(
+                        "install destination {name:?} is a symlink; symlinks are not followed"
+                    )));
+                }
+                if ftype != libc::S_IFDIR {
+                    return Err(UaError::invalid(format!(
+                        "install destination {name:?} exists and is not a directory"
+                    )));
+                }
+                if !overwrite {
+                    return Err(UaError::conflict(format!(
+                        "skill directory {name:?} already exists; pass overwrite: true to replace"
+                    )));
+                }
+                let dest_fd = openat_dir(target_fd.as_raw_fd(), &name_c).map_err(|e| {
+                    if e.raw_os_error() == Some(libc::ELOOP) {
+                        UaError::invalid(format!(
+                            "install destination {name:?} is a symlink; symlinks are not followed"
+                        ))
+                    } else {
+                        UaError::invalid(format!("cannot inspect destination {name:?}: {e}"))
+                    }
+                })?;
+                let existing_entries = read_dir_names(&dest_fd)
+                    .map_err(|e| UaError::invalid(format!("cannot read destination {name:?}: {e}")))?;
+                if existing_entries.is_empty() {
+                    Some(Vec::new())
+                } else {
+                    let existing_members = capture_package_from_dirfd(&dest_fd, name).map_err(|e| {
+                        UaError::conflict(format!(
+                            "refusing to overwrite {name:?}: existing directory does not match a published \
+                             registry version of {name:?} ({e})"
+                        ))
+                    })?;
+                    let verified_paths =
+                        verify_existing_matches_registry(name, &existing_members, known_hashes)?;
+                    Some(verified_paths)
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(UaError::invalid(format!("cannot inspect destination {name:?}: {e}")));
+            }
+        };
+
+        let nonce = &uuid::Uuid::new_v4().simple().to_string()[..12];
+        let stage_name = format!(".{name}.ua-install-{nonce}");
+        let stage_c = c_seg(&stage_name)?;
+        mkdirat_0755(&target_fd, &stage_c)
+            .map_err(|e| UaError::internal(format!("cannot create install staging dir: {e}")))?;
+        let stage_fd = openat_dir(target_fd.as_raw_fd(), &stage_c)
+            .map_err(|e| UaError::internal(format!("cannot open install staging dir: {e}")))?;
+        let mut cleanup = StageFdCleanup {
+            parent_fd: &target_fd,
+            stage_fd: Some(stage_fd),
+            stage_name: stage_c.clone(),
+            created_dirs: Vec::new(),
+            created_files: Vec::new(),
+            armed: true,
+        };
+
+        let mut seen_portable = BTreeSet::new();
+        for m in members {
+            let clean = validate_package_path(&m.path)?;
+            if !seen_portable.insert(portable_collision_key(&clean)) {
+                return Err(UaError::conflict(format!("duplicate or colliding member path {clean:?}")));
+            }
+            let sfd = cleanup.stage_fd.as_ref().expect("stage_fd held while armed");
+            write_member_at_0644(
+                sfd,
+                &clean,
+                &m.bytes,
+                &mut cleanup.created_dirs,
+                &mut cleanup.created_files,
+            )?;
+        }
+
+        before_swap();
+
+        // Re-verify the entire parent chain from `sb_root` right before swap so
+        // any symlink swapped into a parent directory aborts the install cleanly.
+        verify_dir_chain_identity(sb_root, parts, target_id, shown_target)?;
+
+        // Re-check destination via `target_fd` right before swap.
+        match fstatat_nofollow(&target_fd, &name_c) {
+            Ok(st) if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK => {
+                return Err(UaError::invalid(format!(
+                    "install destination {name:?} became a symlink; symlinks are not followed"
+                )));
+            }
+            Ok(_) if replacing.is_none() => {
+                return Err(UaError::conflict(format!(
+                    "skill directory {name:?} appeared concurrently; pass overwrite: true to replace"
+                )));
+            }
+            _ => {}
+        }
+
+        if let Some(existing_paths) = replacing {
+            let backup_name = format!(".{name}.ua-backup-{nonce}");
+            let backup_c = c_seg(&backup_name)?;
+            renameat_same(&target_fd, &name_c, &backup_c)
+                .map_err(|e| UaError::internal(format!("cannot move existing skill aside for swap: {e}")))?;
+            match renameat_same(&target_fd, &stage_c, &name_c) {
+                Ok(()) => {
+                    cleanup.disarm();
+                    // Re-verify parent chain before unlinking ONLY the verified
+                    // files of the previous registry version inside `backup_fd`.
+                    if verify_dir_chain_identity(sb_root, parts, target_id, shown_target).is_ok()
+                        && let Ok(backup_fd) = openat_dir(target_fd.as_raw_fd(), &backup_c)
+                    {
+                        unlink_known_tree(&target_fd, &backup_c, &backup_fd, &existing_paths, &[]);
+                    }
+                }
+                Err(e) => {
+                    let _ = renameat_same(&target_fd, &backup_c, &name_c);
+                    return Err(UaError::internal(format!("cannot commit staged skill install: {e}")));
+                }
+            }
+        } else {
+            renameat_same(&target_fd, &stage_c, &name_c)
+                .map_err(|e| UaError::internal(format!("cannot commit staged skill install: {e}")))?;
+            cleanup.disarm();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+mod install_fs {
+    use std::collections::BTreeSet;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    use ua_core::{UaError, UaResult};
+
+    use super::{
+        PackageMember, capture_package, portable_collision_key, validate_package_path,
+        verify_existing_matches_registry,
+    };
+
+    fn walk_target_dir(sb_root: &Path, parts: &[String], create: bool, shown: &str) -> UaResult<PathBuf> {
+        let mut cur = sb_root.to_path_buf();
+        for seg in parts {
+            cur.push(seg);
+            match std::fs::symlink_metadata(&cur) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(UaError::invalid(format!(
+                            "target_dir {shown:?} passes through a symlink; symlinks are not followed"
+                        )));
+                    }
+                    if !meta.file_type().is_dir() {
+                        return Err(UaError::invalid(format!(
+                            "target_dir {shown:?} path component is not a directory"
+                        )));
+                    }
+                }
+                Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&cur)
+                        .map_err(|err| UaError::invalid(format!("cannot create target_dir: {err}")))?;
+                }
+                Err(e) => {
+                    return Err(UaError::invalid(format!("cannot inspect target_dir {shown:?}: {e}")));
+                }
+            }
+        }
+        Ok(cur)
+    }
+
+    fn unlink_known_paths(root: &Path, rel_files: &[String], extra_dirs: &[String]) {
+        let mut dirs: BTreeSet<PathBuf> = extra_dirs.iter().map(|d| root.join(d)).collect();
+        for rel in rel_files {
+            let p = root.join(rel);
+            let _ = std::fs::remove_file(&p);
+            let mut cur = p.parent();
+            while let Some(parent) = cur {
+                if parent == root {
+                    break;
+                }
+                dirs.insert(parent.to_path_buf());
+                cur = parent.parent();
+            }
+        }
+        let mut sorted: Vec<PathBuf> = dirs.into_iter().collect();
+        sorted.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        for d in sorted {
+            let _ = std::fs::remove_dir(d);
+        }
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stage_and_swap_members_with_hook(
+        sb_root: &Path,
+        parts: &[String],
+        shown_target: &str,
+        name: &str,
+        members: &[PackageMember],
+        overwrite: bool,
+        known_hashes: &BTreeSet<String>,
+        before_swap: impl FnOnce(),
+    ) -> UaResult<()> {
+        let target_root = walk_target_dir(sb_root, parts, true, shown_target)?;
+        let dest = target_root.join(name);
+        let replacing = match std::fs::symlink_metadata(&dest) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
                     return Err(UaError::invalid(format!(
-                        "target_dir {raw:?} passes through a symlink; symlinks are not followed"
+                        "install destination {name:?} is a symlink; symlinks are not followed"
                     )));
                 }
                 if !meta.file_type().is_dir() {
                     return Err(UaError::invalid(format!(
-                        "target_dir {raw:?} path component is not a directory"
+                        "install destination {name:?} exists and is not a directory"
                     )));
                 }
+                if !overwrite {
+                    return Err(UaError::conflict(format!(
+                        "skill directory {name:?} already exists; pass overwrite: true to replace"
+                    )));
+                }
+                let has_entries = std::fs::read_dir(&dest)
+                    .map_err(|e| UaError::invalid(format!("cannot inspect destination {name:?}: {e}")))?
+                    .next()
+                    .is_some();
+                if !has_entries {
+                    Some(Vec::new())
+                } else {
+                    let existing = capture_package(&dest, name).map_err(|e| {
+                        UaError::conflict(format!(
+                            "refusing to overwrite {name:?}: existing directory does not match a published \
+                             registry version of {name:?} ({e})"
+                        ))
+                    })?;
+                    Some(verify_existing_matches_registry(name, &existing, known_hashes)?)
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut builder = std::fs::DirBuilder::new();
-                #[cfg(unix)]
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(UaError::invalid(format!("cannot inspect destination {name:?}: {e}"))),
+        };
+
+        let nonce = &uuid::Uuid::new_v4().simple().to_string()[..12];
+        let stage_dir = target_root.join(format!(".{name}.ua-install-{nonce}"));
+        std::fs::create_dir(&stage_dir)
+            .map_err(|e| UaError::internal(format!("cannot create install staging dir: {e}")))?;
+        let mut created_files = Vec::new();
+        let mut created_dirs = Vec::new();
+        let write_res: UaResult<()> = (|| {
+            let mut seen_portable = BTreeSet::new();
+            for m in members {
+                let clean = validate_package_path(&m.path)?;
+                if !seen_portable.insert(portable_collision_key(&clean)) {
+                    return Err(UaError::conflict(format!("duplicate or colliding member path {clean:?}")));
+                }
+                let full = stage_dir.join(&clean);
+                if let Some(parent) = full.parent()
+                    && parent != stage_dir
+                    && !parent.exists()
                 {
-                    use std::os::unix::fs::DirBuilderExt;
-                    builder.mode(0o755);
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| UaError::internal(format!("cannot create staging subdir: {e}")))?;
+                    if let Ok(rel_d) = parent.strip_prefix(&stage_dir) {
+                        created_dirs.push(rel_d.to_string_lossy().into_owned());
+                    }
                 }
-                builder
-                    .create(&cur)
-                    .map_err(|err| UaError::invalid(format!("cannot create target_dir: {err}")))?;
-                let meta = std::fs::symlink_metadata(&cur)
-                    .map_err(|err| UaError::invalid(format!("cannot verify target_dir: {err}")))?;
-                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-                    return Err(UaError::invalid(format!(
-                        "target_dir {raw:?} passes through a symlink; symlinks are not followed"
-                    )));
-                }
+                let mut f =
+                    OpenOptions::new().write(true).create_new(true).open(&full).map_err(|e| {
+                        UaError::internal(format!("cannot create staged file {clean:?}: {e}"))
+                    })?;
+                created_files.push(clean);
+                f.write_all(&m.bytes)
+                    .map_err(|e| UaError::internal(format!("cannot write staged file: {e}")))?;
+                f.sync_all().map_err(|e| UaError::internal(format!("cannot sync staged file: {e}")))?;
             }
-            Err(e) => {
-                return Err(UaError::invalid(format!("cannot inspect target_dir {raw:?}: {e}")));
-            }
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            unlink_known_paths(&stage_dir, &created_files, &created_dirs);
+            return Err(e);
         }
+
+        before_swap();
+
+        if let Err(e) = walk_target_dir(sb_root, parts, false, shown_target) {
+            unlink_known_paths(&stage_dir, &created_files, &created_dirs);
+            return Err(e);
+        }
+        if let Some(existing_paths) = replacing {
+            let backup_dir = target_root.join(format!(".{name}.ua-backup-{nonce}"));
+            std::fs::rename(&dest, &backup_dir)
+                .map_err(|e| UaError::internal(format!("cannot move existing skill aside for swap: {e}")))?;
+            match std::fs::rename(&stage_dir, &dest) {
+                Ok(()) => {
+                    if walk_target_dir(sb_root, parts, false, shown_target).is_ok() {
+                        unlink_known_paths(&backup_dir, &existing_paths, &[]);
+                    }
+                }
+                Err(e) => {
+                    let _ = std::fs::rename(&backup_dir, &dest);
+                    unlink_known_paths(&stage_dir, &created_files, &created_dirs);
+                    return Err(UaError::internal(format!("cannot commit staged skill install: {e}")));
+                }
+            }
+        } else if let Err(e) = std::fs::rename(&stage_dir, &dest) {
+            unlink_known_paths(&stage_dir, &created_files, &created_dirs);
+            return Err(UaError::internal(format!("cannot commit staged skill install: {e}")));
+        }
+        Ok(())
     }
-    Ok((cur, parts.join("/")))
 }
 
-/// Write one verified package member into `stage_dir` using `O_NOFOLLOW`,
-/// `O_CREAT | O_EXCL`, and mode `0o644` (never `0o755`).
-fn write_file_nofollow_0644(stage_dir: &Path, rel_path: &str, bytes: &[u8]) -> UaResult<()> {
-    let clean = validate_package_path(rel_path)?;
-    let mut cur = stage_dir.to_path_buf();
-    let segments: Vec<&str> = clean.split('/').collect();
-    for dir_seg in &segments[..segments.len() - 1] {
-        cur.push(dir_seg);
-        match std::fs::symlink_metadata(&cur) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-                    return Err(UaError::invalid(format!(
-                        "install staging path {clean:?} hit a non-directory or symlink"
-                    )));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut builder = std::fs::DirBuilder::new();
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    builder.mode(0o755);
-                }
-                builder
-                    .create(&cur)
-                    .map_err(|err| UaError::internal(format!("cannot create staging subdir: {err}")))?;
-            }
-            Err(e) => {
-                return Err(UaError::internal(format!("cannot inspect staging subdir: {e}")));
-            }
-        }
-    }
-    cur.push(segments[segments.len() - 1]);
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o644);
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let mut file = opts.open(&cur).map_err(|e| {
-        if e.raw_os_error() == Some(libc::ELOOP) {
-            UaError::invalid(format!("install path {clean:?} is a symlink; symlinks are not followed"))
-        } else {
-            UaError::internal(format!("cannot create staged file {clean:?}: {e}"))
-        }
-    })?;
-    file.write_all(bytes)
-        .map_err(|e| UaError::internal(format!("cannot write staged file {clean:?}: {e}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o644))
-            .map_err(|e| UaError::internal(format!("cannot set 0644 mode on {clean:?}: {e}")))?;
-    }
-    file.sync_all().map_err(|e| UaError::internal(format!("cannot sync staged file {clean:?}: {e}")))?;
-    let meta = file.metadata().map_err(|e| UaError::internal(format!("cannot stat staged file: {e}")))?;
-    if !meta.is_file() || meta.len() != bytes.len() as u64 {
-        return Err(UaError::internal(format!("staged file {clean:?} failed post-write check")));
-    }
-    Ok(())
-}
-
-/// Atomically stage every verified member into a sibling directory inside
-/// `target_root`, then swap into `target_root/<name>`. Any failure cleans up
-/// the staging directory and leaves `target_root/<name>` untouched (no partial
-/// package on disk).
 fn stage_and_swap_members(
-    target_root: &Path,
+    sb_root: &Path,
+    parts: &[String],
+    shown_target: &str,
     name: &str,
     members: &[PackageMember],
     overwrite: bool,
+    known_hashes: &BTreeSet<String>,
 ) -> UaResult<()> {
-    let dest = target_root.join(name);
-    let replacing = match std::fs::symlink_metadata(&dest) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(UaError::invalid(format!(
-                    "install destination {name:?} is a symlink; symlinks are not followed"
-                )));
-            }
-            if !meta.file_type().is_dir() {
-                return Err(UaError::invalid(format!(
-                    "install destination {name:?} exists and is not a directory"
-                )));
-            }
-            if !overwrite {
-                return Err(UaError::conflict(format!(
-                    "skill directory {name:?} already exists; pass overwrite: true to replace"
-                )));
-            }
-            // Refuse wiping an unrelated non-skill directory: an existing
-            // destination must either be empty or hold a regular SKILL.md.
-            let has_entries = std::fs::read_dir(&dest)
-                .map_err(|e| UaError::invalid(format!("cannot inspect destination {name:?}: {e}")))?
-                .next()
-                .is_some();
-            if has_entries && !is_regular_file(&dest.join("SKILL.md")) {
-                return Err(UaError::conflict(format!(
-                    "existing directory {name:?} is not a skill directory (missing regular SKILL.md)"
-                )));
-            }
-            true
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(UaError::invalid(format!("cannot inspect destination {name:?}: {e}"))),
-    };
-
-    let nonce = &uuid::Uuid::new_v4().simple().to_string()[..12];
-    let stage_dir = target_root.join(format!(".{name}.ua-install-{nonce}"));
-    {
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o755);
-        }
-        builder
-            .create(&stage_dir)
-            .map_err(|e| UaError::internal(format!("cannot create install staging dir: {e}")))?;
-    }
-    let mut cleanup = StageCleanup::new(stage_dir.clone());
-
-    let mut seen_portable = BTreeSet::new();
-    for m in members {
-        let clean = validate_package_path(&m.path)?;
-        if !seen_portable.insert(portable_collision_key(&clean)) {
-            return Err(UaError::conflict(format!("duplicate or colliding member path {clean:?}")));
-        }
-        write_file_nofollow_0644(&stage_dir, &clean, &m.bytes)?;
-    }
-
-    // Re-check destination immediately before swap so a symlink swapped in
-    // during staging is never followed or replaced.
-    if let Ok(meta) = std::fs::symlink_metadata(&dest)
-        && meta.file_type().is_symlink()
-    {
-        return Err(UaError::invalid(format!(
-            "install destination {name:?} became a symlink; symlinks are not followed"
-        )));
-    }
-
-    if replacing {
-        let backup_dir = target_root.join(format!(".{name}.ua-backup-{nonce}"));
-        std::fs::rename(&dest, &backup_dir)
-            .map_err(|e| UaError::internal(format!("cannot move existing skill aside for swap: {e}")))?;
-        match std::fs::rename(&stage_dir, &dest) {
-            Ok(()) => {
-                cleanup.disarm();
-                let _ = std::fs::remove_dir_all(&backup_dir);
-            }
-            Err(e) => {
-                let _ = std::fs::rename(&backup_dir, &dest);
-                return Err(UaError::internal(format!("cannot commit staged skill install: {e}")));
-            }
-        }
-    } else {
-        std::fs::rename(&stage_dir, &dest)
-            .map_err(|e| UaError::internal(format!("cannot commit staged skill install: {e}")))?;
-        cleanup.disarm();
-    }
-    Ok(())
+    install_fs::stage_and_swap_members_with_hook(
+        sb_root,
+        parts,
+        shown_target,
+        name,
+        members,
+        overwrite,
+        known_hashes,
+        || {},
+    )
 }
 
 /// Catalog `install`: re-verify every package member against `package_manifest`
 /// and `content_hash`, refuse yanked versions or mismatched `expected_hash`,
-/// and materialize into `<target_dir>/<name>` atomically with `O_NOFOLLOW` and
-/// mode `0o644` (`docs/skill-sources.md` §4 & §6).
-fn install(ctx: &ToolCtx, p: InstallParams) -> UaResult<Value> {
-    let _who = author(ctx)?;
+/// enforce the caller's workspace sandbox and safety guards (`hook_dir`,
+/// `dependency_dir`, configured `core.hooksPath`), materialize atomically into
+/// `<target_dir>/<name>` via dirfd-anchored `openat`/`mkdirat`/`renameat` at
+/// mode `0o644`, and record `skill.installed` in the ledger
+/// (`docs/skill-sources.md` §4 & §6).
+async fn install(ctx: ToolCtx, p: InstallParams) -> UaResult<Value> {
+    let who = author(&ctx)?;
     if ctx.caller.enforce_profile && !ctx.caller.profile.allows_tool("fs_write") {
         return Err(UaError::denied(
             "profile_denied",
@@ -3118,13 +3925,21 @@ fn install(ctx: &ToolCtx, p: InstallParams) -> UaResult<Value> {
     };
 
     // Load and re-verify strictly inside the caller's organization BEFORE
-    // checking workspace paths, so another org's skill returns `not_found`.
-    let org = ctx.caller.org_id.as_str();
-    let loaded =
-        ctx.hub.db().read(|c| load_version(c, org, &name, version))?.ok_or_else(|| match version {
-            Some(v) => UaError::not_found(format!("unknown version {v} for skill {name:?}")),
-            None => UaError::not_found(format!("unknown skill: {name:?}")),
-        })?;
+    // checking workspace sandbox/paths, so another org's skill returns `not_found`.
+    let org = ctx.caller.org_id.clone();
+    let name_q = name.clone();
+    let (loaded, known_hashes) = ctx
+        .hub
+        .db()
+        .read_async(move |c| {
+            let loaded = load_version(c, &org, &name_q, version)?.ok_or_else(|| match version {
+                Some(v) => UaError::not_found(format!("unknown version {v} for skill {name_q:?}")),
+                None => UaError::not_found(format!("unknown skill: {name_q:?}")),
+            })?;
+            let known = known_version_hashes(c, &org, &name_q)?;
+            Ok((loaded, known))
+        })
+        .await?;
     let verified_hash = loaded.public["content_hash"].as_str().unwrap_or_default().to_string();
     let verified_version = loaded.public["version"].as_i64().unwrap_or_default();
     if let Some(exp) = expected_hash.as_deref()
@@ -3138,8 +3953,22 @@ fn install(ctx: &ToolCtx, p: InstallParams) -> UaResult<Value> {
         ));
     }
 
-    let (target_root, target_rel) = resolve_install_root(ctx, &p.target_dir)?;
-    stage_and_swap_members(&target_root, &name, &loaded.members, p.overwrite)?;
+    // Resolve through the caller's workspace sandbox (enforces `agent_workspaces = deny`,
+    // per-agent workspace roots, and non-default org refusal) and apply all
+    // workspace safety guards to target_dir, destination, and every member path.
+    let sb = crate::families::workspace::sandbox(&ctx)?;
+    let (parts, target_rel) = parse_install_target_parts(&sb, &p.target_dir)?;
+    guard_install_paths(&sb, &target_rel, &p.target_dir, &name, &loaded.members).await?;
+
+    let sb_root = sb.root.clone();
+    let shown_target = p.target_dir.clone();
+    let name_w = name.clone();
+    let members_w = loaded.members.clone();
+    let overwrite = p.overwrite;
+    blocking(move || {
+        stage_and_swap_members(&sb_root, &parts, &shown_target, &name_w, &members_w, overwrite, &known_hashes)
+    })
+    .await?;
 
     let installed_rel = format!("{target_rel}/{name}");
     let files: Vec<Value> = loaded
@@ -3154,13 +3983,39 @@ fn install(ctx: &ToolCtx, p: InstallParams) -> UaResult<Value> {
             })
         })
         .collect();
+    let file_count = files.len();
+
+    let org_ev = ctx.caller.org_id.clone();
+    let name_ev = name.clone();
+    let hash_ev = verified_hash.clone();
+    let target_ev = installed_rel.clone();
+    ctx.hub
+        .db()
+        .write_async(move |tx| {
+            emit(
+                tx,
+                &org_ev,
+                "skill.installed",
+                json!({
+                    "name": ledger_text(&org_ev, &name_ev),
+                    "version": verified_version,
+                    "content_hash": ledger_text(&org_ev, &hash_ev),
+                    "target": ledger_text(&org_ev, &target_ev),
+                    "file_count": file_count,
+                }),
+                &who,
+            )?;
+            Ok(())
+        })
+        .await?;
+
     Ok(json!({
         "ok": true,
         "name": name,
         "version": verified_version,
         "content_hash": verified_hash,
         "installed_path": installed_rel,
-        "file_count": files.len(),
+        "file_count": file_count,
         "files": files,
     }))
 }
@@ -3168,6 +4023,9 @@ fn install(ctx: &ToolCtx, p: InstallParams) -> UaResult<Value> {
 async fn skill_registry(ctx: ToolCtx, a: SkillRegistryArgs) -> UaResult<Value> {
     let raw = a.action.trim().to_ascii_lowercase();
     let action = crate::routes::action_of("skill_registry", Some(&a.action))?;
+    if action == "install" {
+        return install(ctx, params(a.params)?).await;
+    }
     blocking(move || match action {
         "publish" => publish(&ctx, params(a.params)?),
         "list" => list(&ctx, params(a.params)?),
@@ -3177,7 +4035,6 @@ async fn skill_registry(ctx: ToolCtx, a: SkillRegistryArgs) -> UaResult<Value> {
         "resolve" => resolve_action(&ctx, params(a.params)?),
         "drift" => drift(&ctx, params(a.params)?),
         "yank" => yank(&ctx, params(a.params)?),
-        "install" => install(&ctx, params(a.params)?),
         "source_add" => super::skill_sources::source_add(&ctx, params(a.params)?),
         "source_revoke" => super::skill_sources::source_revoke(&ctx, params(a.params)?),
         "source_list" => super::skill_sources::source_list(&ctx, params(a.params)?),
@@ -3210,12 +4067,13 @@ pub fn register(r: &mut Registry) {
              {skill_name, target, target_type: agent|profile, version?} (an agent assignment wins over a profile \
              one), unassign {skill_name, target, target_type}, resolve {agent_label, profile?} (own skills, or any \
              agent's for an operator; omits yanked versions), drift {surface_dir, agent_label?, profile?} \
-             (read-only: missing, stale, unregistered, unassigned and synced skills), yank {name, version, reason?} \
-             (human operator only, behind human approval: permanently yank a published version, blocking assign, \
-             install, get, resolve, node_config and re-importing/re-publishing the yanked content_hash), install \
-             {name, version?, expected_hash?, target_dir, overwrite?} (re-verify every member against \
-             package_manifest and content_hash, check optional expected_hash, and atomically materialize into \
-             <target_dir>/<name> inside the workspace with O_NOFOLLOW and mode 0o644), source_add {url, pinned_sha, \
+             (read-only: missing, stale, yanked, unregistered, unassigned and synced skills), yank {name, version, \
+             reason?} (human operator only, behind human approval: permanently yank a published version, blocking \
+             assign, install, get, resolve, node_config and re-importing/re-publishing the yanked content_hash), \
+             install {name, version?, expected_hash?, target_dir, overwrite?} (re-verify every member against \
+             package_manifest and content_hash, check optional expected_hash, enforce workspace sandbox and hook / \
+             dependency guards, and atomically materialize into <target_dir>/<name> with O_NOFOLLOW and mode 0o644; \
+             overwrite defaults to false and only replaces unmodified published versions of the skill), source_add \
              tracking_ref?, allowed_subpaths?} (human operator only, behind human approval: register an https:// Git \
              skill source pinned to an exact 40-char commit SHA), source_revoke {source_id, reason?} (human operator \
              only, behind human approval: terminally revoke a skill source), source_list {status?} (list this \
@@ -3595,6 +4453,8 @@ mod tests {
     #[test]
     fn install_stage_failure_leaves_no_partial_package_on_disk() {
         let root = tempfile::tempdir().unwrap();
+        let ws_real = root.path().canonicalize().unwrap();
+        let parts = vec!["skills".to_string()];
         let members = vec![
             PackageMember {
                 path: "SKILL.md".into(),
@@ -3610,10 +4470,70 @@ mod tests {
                 mode: MODE_FILE,
             },
         ];
-        let err = stage_and_swap_members(root.path(), "atomic-test", &members, true).unwrap_err();
+        let known = BTreeSet::new();
+        let err = stage_and_swap_members(&ws_real, &parts, "skills", "atomic-test", &members, false, &known)
+            .unwrap_err();
         assert_eq!(err.code(), "invalid_argument");
-        assert!(!root.path().join("atomic-test").exists(), "failed install must leave no destination dir");
-        let leftover: Vec<_> = std::fs::read_dir(root.path()).unwrap().collect();
+        assert!(!ws_real.join("skills/atomic-test").exists(), "failed install must leave no destination dir");
+        let leftover: Vec<_> = std::fs::read_dir(ws_real.join("skills")).unwrap().collect();
         assert!(leftover.is_empty(), "failed install must clean up staging dir: {leftover:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_parent_symlink_swap_before_rename_aborts_without_touching_outside() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ws_real = root.path().canonicalize().unwrap();
+        let outside_real = outside.path().canonicalize().unwrap();
+
+        // Plant a decoy skill directory inside `outside` to verify it is neither
+        // overwritten nor deleted if a parent dir is swapped for a symlink.
+        let outside_dest = outside_real.join("swap-skill");
+        std::fs::create_dir_all(&outside_dest).unwrap();
+        std::fs::write(outside_dest.join("SKILL.md"), "outside sentinel").unwrap();
+        std::fs::write(outside_dest.join("precious.txt"), "do not touch").unwrap();
+
+        let md = b"---\nname: swap-skill\ndescription: Test.\n---\nBody.\n";
+        let members = vec![PackageMember {
+            path: "SKILL.md".into(),
+            bytes: md.to_vec(),
+            sha256: sha256_bytes(md),
+            mode: MODE_FILE,
+        }];
+        let parts = vec!["area".to_string(), "skills".to_string()];
+        let known = BTreeSet::new();
+
+        // Deterministically swap `<ws>/area` for a symlink to `outside` right
+        // after staging finishes and right before the `renameat` swap.
+        let area_path = ws_real.join("area");
+        let moved_area = ws_real.join("area-moved");
+        let outside_for_hook = outside_real.clone();
+        let err = install_fs::stage_and_swap_members_with_hook(
+            &ws_real,
+            &parts,
+            "area/skills",
+            "swap-skill",
+            &members,
+            false,
+            &known,
+            move || {
+                std::fs::rename(&area_path, &moved_area).unwrap();
+                symlink(&outside_for_hook, &area_path).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "invalid_argument", "expected symlink refusal, got {err:?}");
+
+        // Outside directory must be completely untouched.
+        assert_eq!(std::fs::read_to_string(outside_dest.join("SKILL.md")).unwrap(), "outside sentinel");
+        assert_eq!(std::fs::read_to_string(outside_dest.join("precious.txt")).unwrap(), "do not touch");
+        // Original moved target dir must have cleaned up its staging dir and have no installed skill.
+        let orig_skills = ws_real.join("area-moved/skills");
+        assert!(!orig_skills.join("swap-skill").exists());
+        let leftover: Vec<_> = std::fs::read_dir(&orig_skills).unwrap().collect();
+        assert!(leftover.is_empty(), "staging dir must be cleaned up on abort: {leftover:?}");
     }
 }
