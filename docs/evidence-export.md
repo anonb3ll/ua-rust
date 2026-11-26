@@ -382,24 +382,29 @@ and the operator signs that digest offline.
   `verify`, never as a pass.
   - *DB-side consistency check:* `verify` also re-checks every earlier signed
     `hub` checkpoint (`seq <= checkpoint.seq`) still present in
-    `evidence_checkpoint` — recomputing its digest, checking
-    `event_log[prev_seq].entry_hash`, and verifying its Ed25519 signature when
-    the verifier supplied a key for that `key_id`. **Database state alone never
+    `evidence_checkpoint` — **always** recomputing its digest and comparing
+    `event_log[prev_seq].entry_hash` (`ledger_mismatch`, exit `1`, on any
+    mismatch), even when the signer is revoked. **Database state alone never
     relaxes a check:** only the verifier's own revocation list
-    (`--revoked-key-id` or `--trust-file`'s `revoked_key_ids`) may exempt an
-    earlier checkpoint as a non-witness (recording a `warnings` entry on
-    `valid`, exit `0`). When an earlier checkpoint's signer is marked revoked
-    only in `evidence_key.revoked_at` (without being revoked in the verifier's
-    own trust) or is missing from `evidence_key`, `verify` still compares its
-    digest and `event_log[prev_seq].entry_hash` (and still verifies its
-    signature whenever the verifier supplied that key), returning
-    `ledger_mismatch` (exit `1`) on any tamper and `witness_skipped` (exit `2`)
-    otherwise. An earlier checkpoint signed by a non-revoked rotated-out key
-    not present in the verifier's trust material still has its digest and
-    `entry_hash` checked and adds a benign `warnings` entry on `valid` (exit
-    `0`). Because an attacker with SQLite write access could drop triggers to
-    delete an earlier row or clear its `signature`, the DB-side check alone is
-    a consistency check rather than full tamper-evidence.
+    (`--revoked-key-id` or `--trust-file`'s `revoked_key_ids`) may skip an
+    earlier checkpoint's *signature* check while keeping exit `0` (recording a
+    `warnings` entry on `valid`). Pass `--revoked-key-id` only when you
+    independently know that key was compromised, because anyone with database
+    write access can set `evidence_key.revoked_at`. When the verifier supplied
+    a pinned key for `prev.key_id`, `verify` always checks the store key row
+    and Ed25519 signature (`ledger_mismatch`, exit `1`, if the key row is
+    missing/altered or the signature fails); if digest, `entry_hash`, and
+    signature all verify against the supplied key, the witness is accepted
+    despite `evidence_key.revoked_at` (with a `warnings` note, exit `0`). When
+    no pinned key was supplied for `prev.key_id` and it is marked revoked in
+    `evidence_key.revoked_at` (without verifier revocation) or missing from
+    `evidence_key`, `verify` returns `witness_skipped` (exit `2`) after
+    checking `entry_hash`. An earlier checkpoint signed by a non-revoked
+    rotated-out key not present in the verifier's trust material still has its
+    digest and `entry_hash` checked and adds a benign `warnings` entry on
+    `valid` (exit `0`). Because an attacker with SQLite write access could drop
+    triggers to delete an earlier row or clear its `signature`, the DB-side
+    check alone is a consistency check rather than full tamper-evidence.
   - *Out-of-band tamper-evidence:* `verify` accepts records held outside the
     hub database via repeatable `--prev-checkpoint <file>` flags (pointing at
     local copies of previously signed checkpoint files) and/or a
@@ -456,9 +461,9 @@ and the operator signs that digest offline.
 
   | Exit code | Meaning | States / conditions |
   |---|---|---|
-  | `0` | Verified | `valid` — including when `warnings` notes a non-revoked rotated-out earlier key not supplied in the verifier's trust (`signature not verified: no pinned key supplied`), or an earlier witness exempted by the verifier's own `--revoked-key-id` / `revoked_key_ids` |
-  | `1` | Refused | `digest_mismatch`, `ledger_mismatch`, `invalid_signature`, `key_mismatch` |
-  | `2` | Cannot verify | `unsigned`, `unknown_key`, `key_revoked`, `valid_in_store_only`, `witness_skipped` (an earlier witness whose key is DB-revoked without verifier revocation or missing from `evidence_key`), `org_class_not_verifiable`, or any missing/invalid input, config, open/schema-fence, or database error |
+  | `0` | Verified | `valid` — including when `warnings` notes a non-revoked rotated-out earlier key not supplied in the verifier's trust (`signature not verified: no pinned key supplied`), a witness whose signature check was skipped by the verifier's own `--revoked-key-id` / `revoked_key_ids` (digest and `entry_hash` still checked), or a witness that verified against a verifier-supplied key despite DB `revoked_at` |
+  | `1` | Refused | `digest_mismatch`, `ledger_mismatch` (including an earlier witness missing from `evidence_key` when the verifier supplied a pinned key for it), `invalid_signature`, `key_mismatch` |
+  | `2` | Cannot verify | `unsigned`, `unknown_key`, `key_revoked`, `valid_in_store_only`, `witness_skipped` (an earlier witness with no supplied key whose signer is DB-revoked without verifier revocation or missing from `evidence_key`), `org_class_not_verifiable`, or any missing/invalid input, config, open/schema-fence, or database error |
 
   `key-generate` and `sign` are offline: they do not open or create a hub
   database. Key and checkpoint changes are appended to `event_log`

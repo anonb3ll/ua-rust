@@ -1579,13 +1579,35 @@ fn db_revoked_key_cannot_hide_careless_rewrite_or_variant_a_over_cli() {
     )
     .unwrap();
 
-    // Careless rewrite with DB-revoked k1 MUST still exit 1 (`ledger_mismatch`).
+    // Careless rewrite with DB-revoked k1 MUST still exit 1 (`ledger_mismatch`), even if the
+    // verifier passes `--revoked-key-id k1`!
     let careless = ua(&home)
         .args(["evidence", "verify", "--checkpoint", "cp-2", "--trust-file", trust_both.to_str().unwrap()])
         .output()
         .unwrap();
     assert_eq!(careless.status.code(), Some(1), "{}", text(&careless.stdout));
     assert_eq!(serde_json::from_slice::<Value>(&careless.stdout).unwrap()["state"], "ledger_mismatch");
+
+    let careless_with_rev = ua(&home)
+        .args([
+            "evidence",
+            "verify",
+            "--checkpoint",
+            "cp-2",
+            "--anchor-key",
+            &pk2,
+            "--anchor-key-id",
+            "k2",
+            "--revoked-key-id",
+            "k1",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(careless_with_rev.status.code(), Some(1), "{}", text(&careless_with_rev.stdout));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&careless_with_rev.stdout).unwrap()["state"],
+        "ledger_mismatch"
+    );
 
     // Variant A with DB-revoked k1 MUST still exit 1 (`ledger_mismatch`) under trust {k1, k2}.
     {

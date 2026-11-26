@@ -1253,22 +1253,24 @@ fn verify_pinned_checkpoints(
 
 /// DB-side consistency check over every earlier signed `hub` checkpoint
 /// (`seq <= target_seq`) still present in `evidence_checkpoint`:
-/// - Only the **verifier's own** revocation (`--revoked-key-id` or
-///   `--trust-file`'s `revoked_key_ids`) may exempt an earlier checkpoint
-///   (recorded as a warning while keeping exit `0`). Database state alone
-///   must never relax a check.
-/// - For every non-verifier-revoked earlier checkpoint, always check stored
-///   digest vs recomputed fields and `event_log[prev_seq].entry_hash`
-///   (`LedgerMismatch`, exit `1`, on any mismatch).
+/// - For EVERY earlier signed `hub` checkpoint — including one signed by a
+///   verifier-revoked key — always check stored digest vs recomputed fields
+///   and `event_log[prev_seq].entry_hash` (`LedgerMismatch`, exit `1`, on any
+///   mismatch).
+/// - If `prev.key_id` is in the **verifier's own** revocation list
+///   (`--revoked-key-id` or `--trust-file`'s `revoked_key_ids`), skip only its
+///   signature check and record a warning (keeping exit `0`).
 /// - When the verifier explicitly supplied a pinned key for `prev.key_id`,
-///   always check its Ed25519 signature (even if `evidence_key.revoked_at`
-///   was set in SQLite), refusing with `LedgerMismatch` (exit `1`) on a bad
-///   signature.
-/// - If `prev.key_id` is marked revoked in the database (without being
-///   revoked by the verifier) or missing from `evidence_key`, return
-///   `WitnessSkipped` (exit `2`) after confirming no `LedgerMismatch` exists
-///   on any earlier checkpoint.
-/// - If `prev.key_id` exists and is not revoked, and the verifier supplied
+///   always check its store key row and Ed25519 signature (`LedgerMismatch`,
+///   exit `1`, if missing/altered/invalid). If digest, `entry_hash`, and
+///   signature all verify against the supplied key, accept the witness even if
+///   `evidence_key.revoked_at` was set in SQLite (noting DB `revoked_at` in
+///   `warnings`, exit `0`).
+/// - When no pinned key was supplied for `prev.key_id` and it is marked
+///   revoked in `evidence_key.revoked_at` (without verifier revocation) or
+///   missing from `evidence_key`, return `WitnessSkipped` (exit `2`) after
+///   confirming no `LedgerMismatch` exists on any earlier checkpoint.
+/// - When `prev.key_id` exists and is not revoked, and the verifier supplied
 ///   pinned trust only for a newer key (normal rotation), record a benign
 ///   warning and keep exit `0`.
 fn verify_earlier_db_checkpoints(
@@ -1294,15 +1296,8 @@ fn verify_earlier_db_checkpoints(
     let mut warnings = Vec::new();
     let mut first_skipped: Option<CheckpointVerification> = None;
     for (prev, prev_stored_digest, prev_signature) in earlier {
-        // Only the verifier's own revocation list may exempt an earlier checkpoint.
-        if trust.is_revoked(&prev.key_id) {
-            warnings.push(format!(
-                "skipped earlier checkpoint {:?}: signing key {:?} is revoked by verifier trust",
-                prev.checkpoint_id, prev.key_id
-            ));
-            continue;
-        }
-        // Always check digest and ledger entry_hash first; DB state can never skip this.
+        // Always check digest and ledger entry_hash first — even for a verifier-revoked
+        // signer — so neither DB state nor `--revoked-key-id` can hide a ledger rewrite.
         if prev.digest() != prev_stored_digest {
             return Ok(Err(CheckpointVerification::LedgerMismatch {
                 reason: format!(
@@ -1337,6 +1332,14 @@ fn verify_earlier_db_checkpoints(
                     prev.checkpoint_id
                 ),
             }));
+        }
+        // Only the verifier's own revocation list may skip the signature check while keeping exit 0.
+        if trust.is_revoked(&prev.key_id) {
+            warnings.push(format!(
+                "earlier checkpoint {:?} (key {:?}) signature check skipped: key revoked by verifier trust",
+                prev.checkpoint_id, prev.key_id
+            ));
+            continue;
         }
         let key_row = key_get(conn, &prev.key_id)?;
         let db_revoked = key_row.as_ref().is_some_and(|k| k.revoked_at.is_some());
@@ -1375,35 +1378,35 @@ fn verify_earlier_db_checkpoints(
                     ),
                 }));
             }
-            if db_revoked && first_skipped.is_none() {
-                first_skipped = Some(CheckpointVerification::WitnessSkipped {
-                    checkpoint_id: prev.checkpoint_id.clone(),
-                    key_id: prev.key_id.clone(),
-                    reason: format!(
-                        "earlier checkpoint {:?} names key {:?}, which is marked revoked in the database \
-                         but not in the verifier's revocation list; pass --revoked-key-id {} (or add it to \
-                         revoked_key_ids in --trust-file) to exempt it",
-                        prev.checkpoint_id, prev.key_id, prev.key_id
-                    ),
-                });
+            // Digest, entry_hash, and signature all verified against the verifier's own key:
+            // accept the witness even if `evidence_key.revoked_at` is set in SQLite.
+            if db_revoked {
+                warnings.push(format!(
+                    "earlier checkpoint {:?} (key {:?}) verified against verifier-supplied key despite \
+                     evidence_key.revoked_at being set in the database",
+                    prev.checkpoint_id, prev.key_id
+                ));
             }
         } else if db_revoked {
-            // DB-revoked without verifier revocation: entry_hash matched, signature check
-            // skipped, and we exit 2 (WitnessSkipped) so DB state cannot relax verification.
+            // DB-revoked without verifier key or verifier revocation: entry_hash matched,
+            // signature check skipped, and we exit 2 (WitnessSkipped) so DB state cannot
+            // relax verification.
             if first_skipped.is_none() {
                 first_skipped = Some(CheckpointVerification::WitnessSkipped {
                     checkpoint_id: prev.checkpoint_id.clone(),
                     key_id: prev.key_id.clone(),
                     reason: format!(
                         "earlier checkpoint {:?} names key {:?}, which is marked revoked in the database \
-                         but not in the verifier's revocation list; pass --revoked-key-id {} (or add it to \
-                         revoked_key_ids in --trust-file) to exempt it",
-                        prev.checkpoint_id, prev.key_id, prev.key_id
+                         but not in the verifier's trust material; pass --revoked-key-id {} (or add it to \
+                         revoked_key_ids in --trust-file) only if you independently know {:?} was \
+                         compromised, because anyone with database write access can set revoked_at",
+                        prev.checkpoint_id, prev.key_id, prev.key_id, prev.key_id
                     ),
                 });
             }
         } else if key_row.is_none() {
-            // Unknown signer in DB: entry_hash matched, signature check skipped, exit 2.
+            // Unknown signer in DB with no pinned key supplied: entry_hash matched, signature
+            // check skipped, exit 2.
             if first_skipped.is_none() {
                 first_skipped = Some(CheckpointVerification::WitnessSkipped {
                     checkpoint_id: prev.checkpoint_id.clone(),
@@ -2411,26 +2414,36 @@ mod tests {
             CheckpointVerification::valid()
         );
 
-        // 2. Revoke k1 in DB only (NOT in verifier trust): cp-1 itself is KeyRevoked; cp-2
-        //    returns WitnessSkipped (exit 2) so DB state alone cannot relax checks.
+        // 2. Revoke k1 in DB only (NOT in verifier trust):
+        //    - cp-1 itself is KeyRevoked.
+        //    - With trust={k1, k2}, cp-1's digest, entry_hash, AND signature all verify against
+        //      the verifier-supplied k1, so cp-2 is accepted (exit 0) with a warning noting DB revoked_at.
+        //    - With anchor=k2 or trust={k2} (no key supplied for k1), cp-2 returns WitnessSkipped (exit 2)
+        //      so DB state alone cannot relax checks.
         db.write(|tx| key_revoke(tx, "k1", "now")).unwrap();
         assert_eq!(
             db.read(|c| verify_checkpoint_with(c, "cp-1", &trust_both)).unwrap(),
             CheckpointVerification::KeyRevoked { key_id: "k1".into() }
         );
-        for trust in [VerifyTrust::from_anchor(Some(&anchor_k2)), trust_both.clone(), trust_only_k2.clone()] {
+        let v_both_db_rev = db.read(|c| verify_checkpoint_with(c, "cp-2", &trust_both)).unwrap();
+        assert_eq!(v_both_db_rev.exit_code(), 0, "{v_both_db_rev:?}");
+        assert!(
+            v_both_db_rev.warnings().iter().any(|w| w.contains("cp-1") && w.contains("revoked_at")),
+            "{v_both_db_rev:?}"
+        );
+        for trust in [VerifyTrust::from_anchor(Some(&anchor_k2)), trust_only_k2.clone()] {
             let v = db.read(|c| verify_checkpoint_with(c, "cp-2", &trust)).unwrap();
             assert_eq!(v.exit_code(), 2, "{v:?}");
             assert!(
-                matches!(v, CheckpointVerification::WitnessSkipped { ref checkpoint_id, ref key_id, .. }
-                    if checkpoint_id == "cp-1" && key_id == "k1"),
+                matches!(v, CheckpointVerification::WitnessSkipped { ref checkpoint_id, ref key_id, ref reason }
+                    if checkpoint_id == "cp-1" && key_id == "k1" && reason.contains("independently")),
                 "{v:?}"
             );
         }
 
         // 3. When the verifier explicitly revokes k1 in its own trust (--revoked-key-id k1 /
-        //    revoked_key_ids), cp-1 is exempted with a warning and cp-2 verifies (exit 0) in
-        //    every mode.
+        //    revoked_key_ids), cp-1's signature check is skipped with a warning (digest and
+        //    entry_hash still checked) and cp-2 verifies (exit 0) in every mode.
         for mut trust in [VerifyTrust::from_anchor(Some(&anchor_k2)), trust_both.clone(), trust_only_k2] {
             trust.revoked_key_ids.push("k1".into());
             let v = db.read(|c| verify_checkpoint_with(c, "cp-2", &trust)).unwrap();
@@ -2501,11 +2514,17 @@ mod tests {
         };
 
         // Careless rewrite (cp-1 untouched) MUST still return LedgerMismatch (exit 1) in EVERY mode
-        // despite DB revoked_at on k1.
+        // despite DB revoked_at on k1 — AND even when the verifier passes `--revoked-key-id k1`!
         for trust in [VerifyTrust::from_anchor(Some(&anchor_k2)), trust_both.clone(), trust_only_k2.clone()] {
             let v = db.read(|c| verify_checkpoint_with(c, "cp-2", &trust)).unwrap();
             assert_eq!(v.exit_code(), 1, "{v:?}");
             assert!(matches!(v, CheckpointVerification::LedgerMismatch { .. }), "{v:?}");
+
+            let mut with_verifier_rev = trust;
+            with_verifier_rev.revoked_key_ids.push("k1".into());
+            let v_rev = db.read(|c| verify_checkpoint_with(c, "cp-2", &with_verifier_rev)).unwrap();
+            assert_eq!(v_rev.exit_code(), 1, "{v_rev:?}");
+            assert!(matches!(v_rev, CheckpointVerification::LedgerMismatch { .. }), "{v_rev:?}");
         }
 
         // Variant A (drop immutable trigger, rewrite cp-1.hash + cp-1.digest):
