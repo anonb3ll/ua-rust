@@ -162,13 +162,38 @@ fn count_active_tokens_ro(db_path: &Path) -> anyhow::Result<Option<i64>> {
     Ok(Some(count))
 }
 
+fn count_orgs_ro(db_path: &Path) -> anyhow::Result<Option<ua_store::org::OrgCounts>> {
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let conn = open_ro(db_path)?;
+    Ok(ua_store::org::org_counts(&conn)?)
+}
+
 fn check_auth_lockout(cfg: &Config) -> CheckResult {
     if !cfg.enforce_auth {
-        return check(
-            "auth_lockout",
-            Status::Warn,
-            "enforce_auth is false; HTTP routes accept unauthenticated requests",
-        );
+        return match count_orgs_ro(&cfg.db_path()) {
+            Ok(Some(counts)) if counts.has_non_default() => check(
+                "auth_lockout",
+                Status::Fail,
+                format!(
+                    "enforce_auth is false while the store holds {} organizations ({} non-default, \
+                     active or suspended): unauthenticated mode is single-organization only and \
+                     `ua serve` refuses to start; set enforce_auth = true",
+                    counts.total, counts.non_default
+                ),
+            ),
+            Err(e) => check(
+                "auth_lockout",
+                Status::Fail,
+                format!("enforce_auth is false and could not inspect orgs: {e}"),
+            ),
+            Ok(None) | Ok(Some(_)) => check(
+                "auth_lockout",
+                Status::Warn,
+                "enforce_auth is false; HTTP routes accept unauthenticated requests (single-organization mode only)",
+            ),
+        };
     }
     let static_count = cfg.static_tokens().len();
     if static_count > 0 {
@@ -201,6 +226,30 @@ fn check_auth_lockout(cfg: &Config) -> CheckResult {
 
 fn check_origin_security(cfg: &Config, allow_non_loopback: bool) -> CheckResult {
     let non_loopback = !cfg.bind.ip().is_loopback();
+    if !cfg.enforce_auth {
+        match count_orgs_ro(&cfg.db_path()) {
+            Ok(Some(counts)) if counts.has_non_default() => {
+                return check(
+                    "origin_security",
+                    Status::Fail,
+                    format!(
+                        "bind {} has enforce_auth = false while the store holds {} organizations \
+                         ({} non-default, active or suspended): unauthenticated mode is \
+                         single-organization only, even on loopback",
+                        cfg.bind, counts.total, counts.non_default
+                    ),
+                );
+            }
+            Err(e) => {
+                return check(
+                    "origin_security",
+                    Status::Fail,
+                    format!("enforce_auth is false and could not inspect orgs: {e}"),
+                );
+            }
+            Ok(None) | Ok(Some(_)) => {}
+        }
+    }
     if non_loopback && !cfg.enforce_auth {
         return check(
             "origin_security",

@@ -526,6 +526,9 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
 
                     match cmd {
                         Cmd::Serve => {
+                            // Fail closed before starting background loops or binding any port:
+                            // `enforce_auth = false` is single-organization mode only.
+                            ua_server::auth::check_auth_policy(&hub)?;
                             warn_if_locked_out(&state).await;
                             // One token for the server and every background loop: a signal
                             // cancels it, then `serve_until_shutdown` drains them.

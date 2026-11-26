@@ -432,3 +432,138 @@ fn backup_manifest_and_lock_protected_restore_roundtrip() {
         .unwrap();
     assert!(unpinned_ok.status.success(), "stderr={}", String::from_utf8_lossy(&unpinned_ok.stderr));
 }
+
+#[test]
+fn auth_off_refuses_serve_and_fails_doctor_when_second_org_exists_and_keeps_single_org_parity() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("hub-home");
+
+    let init = ua_cmd(&home)
+        .args(["init", "--home", home.to_str().unwrap(), "--agent", "builder-1", "--json"])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "init: {}", String::from_utf8_lossy(&init.stderr));
+
+    // 1. Single-organization parity: with only `default`, `enforce_auth = false` on loopback
+    //    warns in `ua doctor` (passes origin_security) and `ua serve` still starts cleanly.
+    let single_doc = ua_cmd(&home)
+        .env("UA_ENFORCE_AUTH", "false")
+        .env("UA_BIND", "127.0.0.1:0")
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        single_doc.status.success(),
+        "single-org doctor: {}",
+        String::from_utf8_lossy(&single_doc.stdout)
+    );
+    let single_rep = parse_stdout_json(&single_doc);
+    assert_eq!(single_rep["ok"], true);
+    let find_check = |rep: &Value, name: &str| -> Value {
+        rep["checks"].as_array().unwrap().iter().find(|c| c["name"] == name).cloned().unwrap()
+    };
+    assert_eq!(find_check(&single_rep, "auth_lockout")["status"], "warn");
+    assert_eq!(find_check(&single_rep, "origin_security")["status"], "pass");
+
+    // Verify `ua serve` starts and listens on loopback with 1 org + auth off.
+    let mut child = ua_cmd(&home)
+        .env("UA_ENFORCE_AUTH", "false")
+        .env("UA_BIND", "127.0.0.1:0")
+        .env("UA_LOG", "info")
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stderr.take().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut started = false;
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        line.clear();
+        let n = reader.read_line(&mut line).unwrap();
+        if n == 0 {
+            break;
+        }
+        if line.contains("hub listening") {
+            started = true;
+            break;
+        }
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(started, "single-org loopback `ua serve` with enforce_auth=false must still start");
+
+    // 2. Add a second organization (`active`, then `suspended`): both `ua doctor` and
+    //    `ua serve` must fail closed and name the organization count from the store.
+    {
+        let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+        conn.execute(
+            "INSERT INTO orgs (id, slug, display_name, status, allowed_profiles, created_at) \
+             VALUES ('org-b', 'org-b', 'Org B', 'active', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+    }
+
+    for status in ["active", "suspended"] {
+        if status == "suspended" {
+            let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+            conn.execute("UPDATE orgs SET status = 'suspended' WHERE id = 'org-b'", []).unwrap();
+        }
+
+        let doc = ua_cmd(&home)
+            .env("UA_ENFORCE_AUTH", "false")
+            .env("UA_BIND", "127.0.0.1:0")
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap();
+        assert!(!doc.status.success(), "doctor must fail for {status} second org");
+        let rep = parse_stdout_json(&doc);
+        assert_eq!(rep["ok"], false, "status={status}: {rep}");
+        for name in ["auth_lockout", "origin_security"] {
+            let c = find_check(&rep, name);
+            assert_eq!(c["status"], "fail", "status={status} {name}: {c}");
+            let detail = c["detail"].as_str().unwrap();
+            assert!(detail.contains("2 organizations"), "status={status} {name}: {detail}");
+        }
+
+        let serve = ua_cmd(&home)
+            .env("UA_ENFORCE_AUTH", "false")
+            .env("UA_BIND", "127.0.0.1:0")
+            .env("UA_LOG", "info")
+            .arg("serve")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&serve.stderr);
+        assert!(!serve.status.success(), "ua serve must refuse for {status} second org: {err}");
+        assert!(err.contains("2 organizations"), "status={status}: {err}");
+        assert!(err.contains("enforce_auth = false"), "status={status}: {err}");
+        assert!(!err.contains("hub listening"), "status={status}: must refuse before binding: {err}");
+    }
+
+    // 3. With `enforce_auth = true` and 2 organizations, `ua doctor` passes auth/origin checks.
+    let doc_enforced = ua_cmd(&home)
+        .env("UA_ENFORCE_AUTH", "true")
+        .env("UA_BIND", "127.0.0.1:0")
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        doc_enforced.status.success(),
+        "doctor with enforce_auth=true failed: {}",
+        String::from_utf8_lossy(&doc_enforced.stdout)
+    );
+    let rep_enforced = parse_stdout_json(&doc_enforced);
+    assert_eq!(find_check(&rep_enforced, "auth_lockout")["status"], "pass");
+    assert_eq!(find_check(&rep_enforced, "origin_security")["status"], "pass");
+}

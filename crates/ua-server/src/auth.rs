@@ -18,9 +18,11 @@
 //! must carry the session's CSRF token in `X-CSRF-Token`.
 //!
 //! Comparison is constant time. A 401 carries the RFC 9728 challenge
-//! (`resource_metadata`) when OAuth is on. With `enforce_auth` off, requests
-//! without a credential run as the local anonymous identity with the full
-//! tool surface, like stdio.
+//! (`resource_metadata`) when OAuth is on. With `enforce_auth` off — a
+//! single-organization mode only, refused whenever `orgs` holds any
+//! organization other than `default` (active or suspended) — requests without
+//! a credential run as the local anonymous identity with the full tool
+//! surface, like stdio.
 
 use std::sync::Arc;
 
@@ -234,6 +236,51 @@ fn is_public_path(path: &str) -> bool {
         || crate::slack_api::is_slack_path(path)
 }
 
+/// Enforce the single-organization rule for unauthenticated mode (`enforce_auth = false`).
+///
+/// When `enforce_auth` is `false`, `orgs` must hold no organization other than
+/// `default` (active or suspended). Counts are read directly from the store,
+/// never from a caller, and any unreadable or missing `orgs` table fails
+/// closed.
+pub fn check_auth_policy(hub: &ua_tools::Hub) -> ua_core::UaResult<()> {
+    if hub.cfg().enforce_auth {
+        return Ok(());
+    }
+    let counts = hub.db().read(ua_store::org::org_counts)?.ok_or_else(|| {
+        ua_core::UaError::denied(
+            "auth_required_multi_org",
+            "refusing to run with enforce_auth = false: orgs table is missing",
+        )
+    })?;
+    if counts.has_non_default() {
+        return Err(ua_core::UaError::denied(
+            "auth_required_multi_org",
+            format!(
+                "refusing to run with enforce_auth = false while the store holds {} organizations \
+                 ({} non-default, active or suspended): unauthenticated mode is single-organization \
+                 only; set enforce_auth = true (UA_ENFORCE_AUTH=true)",
+                counts.total, counts.non_default
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Request-time fail-closed check for unauthenticated non-public HTTP requests
+/// when `enforce_auth` is `false`. Re-reads `orgs` from the store so creating
+/// a second organization while the hub is running closes anonymous access
+/// immediately with zero window.
+async fn check_unauthenticated_allowed(state: &AppState) -> Result<(), String> {
+    let hub = state.hub.clone();
+    match tokio::task::spawn_blocking(move || check_auth_policy(&hub)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => {
+            Err("refusing unauthenticated request: could not verify organization count in store".into())
+        }
+    }
+}
+
 pub async fn authenticate(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let public = is_public_path(&path);
@@ -281,6 +328,11 @@ pub async fn authenticate(State(state): State<AppState>, mut req: Request, next:
             return Redirect::to(&format!("/login?{q}")).into_response();
         }
         return unauthorized(&state, None, "bearer token required");
+    } else if !public {
+        match check_unauthenticated_allowed(&state).await {
+            Ok(()) => anonymous(),
+            Err(msg) => return unauthorized(&state, None, &msg),
+        }
     } else {
         anonymous()
     };

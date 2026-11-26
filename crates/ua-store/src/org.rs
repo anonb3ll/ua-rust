@@ -78,6 +78,40 @@ fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
         .map(|o| o.unwrap_or(false))
 }
 
+/// Organization counts read directly from `orgs` (active and suspended alike).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrgCounts {
+    /// Total rows in `orgs` (including `'default'`, active or suspended).
+    pub total: i64,
+    /// Rows in `orgs` other than `'default'` (active or suspended).
+    pub non_default: i64,
+}
+
+impl OrgCounts {
+    /// Whether `orgs` holds any organization other than `'default'` (active or
+    /// suspended). Unauthenticated (`enforce_auth = false`) mode is strictly a
+    /// single-organization mode and must fail closed whenever this is true.
+    pub fn has_non_default(self) -> bool {
+        self.non_default > 0
+    }
+}
+
+/// Count organizations stored in `orgs` (active and suspended alike).
+///
+/// Returns `Ok(None)` only when the `orgs` table does not exist yet (for
+/// example, a pre-tenancy database inspected read-only by `ua doctor`).
+pub fn org_counts(conn: &Connection) -> UaResult<Option<OrgCounts>> {
+    if !table_exists(conn, "orgs")? {
+        return Ok(None);
+    }
+    let (total, non_default): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN id != ?1 THEN 1 ELSE 0 END), 0) FROM orgs",
+        [DEFAULT_ORG],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(Some(OrgCounts { total, non_default }))
+}
+
 fn sql_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -676,5 +710,35 @@ mod tests {
             assert!(err.contains(bad.name), "{err}");
             assert_eq!(conn.query_row("SELECT COUNT(*) FROM orgs", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         }
+    }
+
+    #[test]
+    fn org_counts_reports_active_and_suspended_non_default_organizations() {
+        let empty = Connection::open_in_memory().unwrap();
+        assert_eq!(org_counts(&empty).unwrap(), None);
+
+        let conn = store_db();
+        assert_eq!(org_counts(&conn).unwrap(), Some(OrgCounts { total: 1, non_default: 0 }));
+        assert!(!org_counts(&conn).unwrap().unwrap().has_non_default());
+
+        conn.execute(
+            "INSERT INTO orgs (id, slug, display_name, status, created_at) \
+             VALUES ('org-b', 'org-b', 'Org B', 'active', '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        let c = org_counts(&conn).unwrap().unwrap();
+        assert_eq!(c, OrgCounts { total: 2, non_default: 1 });
+        assert!(c.has_non_default());
+
+        conn.execute(
+            "INSERT INTO orgs (id, slug, display_name, status, created_at) \
+             VALUES ('org-c', 'org-c', 'Org C', 'suspended', '2026-01-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        let c = org_counts(&conn).unwrap().unwrap();
+        assert_eq!(c, OrgCounts { total: 3, non_default: 2 });
+        assert!(c.has_non_default());
     }
 }

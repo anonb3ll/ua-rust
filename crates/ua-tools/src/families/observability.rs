@@ -1012,6 +1012,9 @@ struct DbFacts {
     /// left no ledger event, so the doctor reports them. Default-organization
     /// readers only.
     harness_approvals_expired_at_upgrade: Option<i64>,
+    /// Store-wide organization counts (active and suspended). Default-organization
+    /// readers only, so non-default organizations never learn hub-wide org counts.
+    org_counts: Option<ua_store::org::OrgCounts>,
 }
 
 /// Database facts for `system_doctor`. The memory counts and the fleet are
@@ -1074,6 +1077,9 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
         harness_approvals_expired_at_upgrade: (org == ua_core::DEFAULT_ORG)
             .then(|| crate::families::harness_config::upgrade_expired_approvals(c).ok())
             .flatten(),
+        org_counts: (org == ua_core::DEFAULT_ORG)
+            .then(|| ua_store::org::org_counts(c).ok().flatten())
+            .flatten(),
     })
 }
 
@@ -1098,6 +1104,22 @@ fn hub_auth_check(cfg: &Config, facts: &DbFacts) -> Value {
     let static_tokens = cfg.static_tokens().len();
     let issued = facts.active_tokens;
     let any = static_tokens > 0 || issued > 0;
+    if !cfg.enforce_auth
+        && let Some(counts) = facts.org_counts
+        && counts.has_non_default()
+    {
+        return finding(
+            "hub_auth",
+            MISCONFIGURED,
+            format!(
+                "enforce_auth=false while the store holds {} organizations ({} non-default, \
+                 active or suspended): unauthenticated mode is single-organization only; \
+                 enable enforce_auth=true",
+                counts.total, counts.non_default
+            ),
+            "UA_ENFORCE_AUTH, UA_AGENT_TOKENS",
+        );
+    }
     let detail = format!(
         "enforce_auth={}; static tokens configured: {static_tokens}; active issued tokens: {issued}; humans configured: {}",
         cfg.enforce_auth,
@@ -1112,8 +1134,24 @@ fn hub_auth_check(cfg: &Config, facts: &DbFacts) -> Value {
     finding("hub_auth", status, detail, "UA_ENFORCE_AUTH, UA_AGENT_TOKENS")
 }
 
-fn bind_check(cfg: &Config) -> Value {
+fn bind_check(cfg: &Config, facts: &DbFacts) -> Value {
     let loopback = cfg.bind.ip().is_loopback();
+    if !cfg.enforce_auth
+        && let Some(counts) = facts.org_counts
+        && counts.has_non_default()
+    {
+        return finding(
+            "http_bind",
+            MISCONFIGURED,
+            format!(
+                "bind {} has enforce_auth=false while the store holds {} organizations \
+                 ({} non-default, active or suspended): unauthenticated mode is \
+                 single-organization only, even on loopback",
+                cfg.bind, counts.total, counts.non_default
+            ),
+            "UA_BIND, UA_ENFORCE_AUTH",
+        );
+    }
     let (status, detail) = match (loopback, cfg.enforce_auth) {
         (true, _) => (LIVE, format!("listening on loopback port {}", cfg.bind.port())),
         (false, true) => {
@@ -1932,7 +1970,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         hub_resource_check(&ctx.caller, "hub_auth", "UA_ENFORCE_AUTH, UA_AGENT_TOKENS", || {
             hub_auth_check(cfg, &facts)
         }),
-        hub_resource_check(&ctx.caller, "http_bind", "UA_BIND, UA_ENFORCE_AUTH", || bind_check(cfg)),
+        hub_resource_check(&ctx.caller, "http_bind", "UA_BIND, UA_ENFORCE_AUTH", || bind_check(cfg, &facts)),
         hub_resource_check(&ctx.caller, "approval_gating", "UA_APPROVAL_TOOLS, UA_HUMAN_IDENTITIES", || {
             approval_check(cfg, reg)
         }),
