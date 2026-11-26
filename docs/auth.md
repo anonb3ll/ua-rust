@@ -31,6 +31,20 @@ A caller with no verified identity (a stdio process, or an HTTP request when
 where every process that can reach it is trusted: `ua doctor` fails a
 non-loopback bind without enforced auth.
 
+**Single-organization only.** Unauthenticated HTTP mode (`enforce_auth = false`)
+is strictly single-organization. As soon as `orgs` contains any organization
+other than `default` (active or suspended), `ua serve` refuses to start,
+`ua doctor` fails `auth_lockout` and `origin_security` (even on loopback),
+`system_doctor` reports `MISCONFIGURED`, unauthenticated non-public HTTP
+requests fail closed with `401`, and already-open anonymous event streams
+(`/api/events/stream`, `/ui/activity/stream`) are revoked with `auth_revoked`.
+A missing or unreadable `orgs` table fails closed the same way.
+
+**Local stdio (`ua mcp`).** `ua mcp` over stdio is a local hub-host caller
+(`Caller::local`) with direct access to the hub database; it does not run the
+HTTP `enforce_auth` / multi-organization check and stays an unverified local
+caller regardless of `enforce_auth` or organization count.
+
 There is no identity to scope a read by, so mailboxes and conversations are
 a **message board**:
 

@@ -266,17 +266,26 @@ pub fn check_auth_policy(hub: &ua_tools::Hub) -> ua_core::UaResult<()> {
     Ok(())
 }
 
+/// Fixed response message for refused unauthenticated requests so internal
+/// store errors or organization metadata never leak to anonymous callers.
+const UNAUTH_REFUSED_MSG: &str =
+    "authentication required: unauthenticated mode is single-organization only; set enforce_auth = true";
+
 /// Request-time fail-closed check for unauthenticated non-public HTTP requests
 /// when `enforce_auth` is `false`. Re-reads `orgs` from the store so creating
 /// a second organization while the hub is running closes anonymous access
 /// immediately with zero window.
-async fn check_unauthenticated_allowed(state: &AppState) -> Result<(), String> {
+async fn check_unauthenticated_allowed(state: &AppState) -> Result<(), &'static str> {
     let hub = state.hub.clone();
     match tokio::task::spawn_blocking(move || check_auth_policy(&hub)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => {
-            Err("refusing unauthenticated request: could not verify organization count in store".into())
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "refusing unauthenticated request");
+            Err(UNAUTH_REFUSED_MSG)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "refusing unauthenticated request: auth policy check task failed");
+            Err(UNAUTH_REFUSED_MSG)
         }
     }
 }
@@ -331,7 +340,7 @@ pub async fn authenticate(State(state): State<AppState>, mut req: Request, next:
     } else if !public {
         match check_unauthenticated_allowed(&state).await {
             Ok(()) => anonymous(),
-            Err(msg) => return unauthorized(&state, None, &msg),
+            Err(msg) => return unauthorized(&state, None, msg),
         }
     } else {
         anonymous()

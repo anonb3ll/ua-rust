@@ -1012,9 +1012,10 @@ struct DbFacts {
     /// left no ledger event, so the doctor reports them. Default-organization
     /// readers only.
     harness_approvals_expired_at_upgrade: Option<i64>,
-    /// Store-wide organization counts (active and suspended). Default-organization
-    /// readers only, so non-default organizations never learn hub-wide org counts.
-    org_counts: Option<ua_store::org::OrgCounts>,
+    /// Store-wide organization counts (active and suspended), or `Err` when
+    /// the `orgs` table is missing or unreadable. Default-organization readers
+    /// only, so non-default organizations never learn hub-wide org counts.
+    org_counts: Option<Result<ua_store::org::OrgCounts, String>>,
     /// Migration counts recorded by `tasks.v3.depends_on_graph`
     /// (`families::tasks::depends_on_migration_summary`): copied and skipped
     /// `task_dependencies` rows. Default-organization readers only.
@@ -1081,9 +1082,11 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
         harness_approvals_expired_at_upgrade: (org == ua_core::DEFAULT_ORG)
             .then(|| crate::families::harness_config::upgrade_expired_approvals(c).ok())
             .flatten(),
-        org_counts: (org == ua_core::DEFAULT_ORG)
-            .then(|| ua_store::org::org_counts(c).ok().flatten())
-            .flatten(),
+        org_counts: (org == ua_core::DEFAULT_ORG).then(|| match ua_store::org::org_counts(c) {
+            Ok(Some(counts)) => Ok(counts),
+            Ok(None) => Err("orgs table is missing".to_string()),
+            Err(e) => Err(format!("could not read orgs table: {e}")),
+        }),
         depends_on_migration: (org == ua_core::DEFAULT_ORG)
             .then(|| crate::families::tasks::depends_on_migration_summary(c))
             .flatten(),
@@ -1112,20 +1115,35 @@ fn hub_auth_check(cfg: &Config, facts: &DbFacts) -> Value {
     let issued = facts.active_tokens;
     let any = static_tokens > 0 || issued > 0;
     if !cfg.enforce_auth
-        && let Some(counts) = facts.org_counts
-        && counts.has_non_default()
+        && let Some(counts) = &facts.org_counts
     {
-        return finding(
-            "hub_auth",
-            MISCONFIGURED,
-            format!(
-                "enforce_auth=false while the store holds {} organizations ({} non-default, \
-                 active or suspended): unauthenticated mode is single-organization only; \
-                 enable enforce_auth=true",
-                counts.total, counts.non_default
-            ),
-            "UA_ENFORCE_AUTH, UA_AGENT_TOKENS",
-        );
+        match counts {
+            Ok(counts) if counts.has_non_default() => {
+                return finding(
+                    "hub_auth",
+                    MISCONFIGURED,
+                    format!(
+                        "enforce_auth=false while the store holds {} organizations ({} non-default, \
+                         active or suspended): unauthenticated mode is single-organization only; \
+                         enable enforce_auth=true",
+                        counts.total, counts.non_default
+                    ),
+                    "UA_ENFORCE_AUTH, UA_AGENT_TOKENS",
+                );
+            }
+            Ok(_) => {}
+            Err(reason) => {
+                return finding(
+                    "hub_auth",
+                    MISCONFIGURED,
+                    format!(
+                        "enforce_auth=false and cannot verify single-organization constraint ({reason}): \
+                         enable enforce_auth=true"
+                    ),
+                    "UA_ENFORCE_AUTH, UA_AGENT_TOKENS",
+                );
+            }
+        }
     }
     let detail = format!(
         "enforce_auth={}; static tokens configured: {static_tokens}; active issued tokens: {issued}; humans configured: {}",
@@ -1144,20 +1162,36 @@ fn hub_auth_check(cfg: &Config, facts: &DbFacts) -> Value {
 fn bind_check(cfg: &Config, facts: &DbFacts) -> Value {
     let loopback = cfg.bind.ip().is_loopback();
     if !cfg.enforce_auth
-        && let Some(counts) = facts.org_counts
-        && counts.has_non_default()
+        && let Some(counts) = &facts.org_counts
     {
-        return finding(
-            "http_bind",
-            MISCONFIGURED,
-            format!(
-                "bind {} has enforce_auth=false while the store holds {} organizations \
-                 ({} non-default, active or suspended): unauthenticated mode is \
-                 single-organization only, even on loopback",
-                cfg.bind, counts.total, counts.non_default
-            ),
-            "UA_BIND, UA_ENFORCE_AUTH",
-        );
+        match counts {
+            Ok(counts) if counts.has_non_default() => {
+                return finding(
+                    "http_bind",
+                    MISCONFIGURED,
+                    format!(
+                        "bind {} has enforce_auth=false while the store holds {} organizations \
+                         ({} non-default, active or suspended): unauthenticated mode is \
+                         single-organization only, even on loopback",
+                        cfg.bind, counts.total, counts.non_default
+                    ),
+                    "UA_BIND, UA_ENFORCE_AUTH",
+                );
+            }
+            Ok(_) => {}
+            Err(reason) => {
+                return finding(
+                    "http_bind",
+                    MISCONFIGURED,
+                    format!(
+                        "bind {} has enforce_auth=false and cannot verify single-organization \
+                         constraint ({reason}): enable enforce_auth=true",
+                        cfg.bind
+                    ),
+                    "UA_BIND, UA_ENFORCE_AUTH",
+                );
+            }
+        }
     }
     let (status, detail) = match (loopback, cfg.enforce_auth) {
         (true, _) => (LIVE, format!("listening on loopback port {}", cfg.bind.port())),
@@ -2314,5 +2348,40 @@ mod tests {
         assert_eq!(host_low_memory("org-b", low), None);
         assert_eq!(host_low_memory(ua_core::DEFAULT_ORG, Some((50.0, 500, 1000))), None);
         assert_eq!(host_low_memory(ua_core::DEFAULT_ORG, None), None);
+    }
+
+    /// A missing or unreadable `orgs` table must not be hidden by `.ok().flatten()`
+    /// when `enforce_auth = false`: both `hub_auth` and `http_bind` report
+    /// `MISCONFIGURED`.
+    #[test]
+    fn failed_org_count_read_reports_misconfigured_when_auth_off() {
+        let mut cfg = Config::for_home(std::env::temp_dir());
+        cfg.enforce_auth = false;
+        cfg.bind = "127.0.0.1:8788".parse().unwrap();
+        let hub = crate::Hub::in_memory(cfg.clone()).unwrap();
+
+        // Missing `orgs` table -> Err in DbFacts -> MISCONFIGURED.
+        hub.db()
+            .write(|tx| {
+                tx.execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE orgs;")?;
+                Ok(())
+            })
+            .unwrap();
+        let missing_facts = hub.db().read(|c| db_facts(c, ua_core::DEFAULT_ORG, false)).unwrap();
+        assert!(matches!(missing_facts.org_counts, Some(Err(_))));
+        assert_eq!(hub_auth_check(&cfg, &missing_facts)["status"], MISCONFIGURED);
+        assert_eq!(bind_check(&cfg, &missing_facts)["status"], MISCONFIGURED);
+
+        // Unreadable `orgs` table (query error) -> Err in DbFacts -> MISCONFIGURED.
+        hub.db()
+            .write(|tx| {
+                tx.execute_batch("CREATE TABLE orgs (broken INTEGER);")?;
+                Ok(())
+            })
+            .unwrap();
+        let unreadable_facts = hub.db().read(|c| db_facts(c, ua_core::DEFAULT_ORG, false)).unwrap();
+        assert!(matches!(unreadable_facts.org_counts, Some(Err(_))));
+        assert_eq!(hub_auth_check(&cfg, &unreadable_facts)["status"], MISCONFIGURED);
+        assert_eq!(bind_check(&cfg, &unreadable_facts)["status"], MISCONFIGURED);
     }
 }

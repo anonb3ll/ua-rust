@@ -194,7 +194,13 @@ impl StreamAuth {
         admitted_gated: bool,
     ) -> Result<(), &'static str> {
         let id = match &self.credential {
-            Credential::Unverified => AuthIdentity::in_default(self.label.clone(), self.kind, false),
+            Credential::Unverified => {
+                if let Err(e) = crate::auth::check_auth_policy(&state.hub) {
+                    tracing::warn!(error = %e, "revoking unauthenticated event stream");
+                    return Err("auth_required_multi_org");
+                }
+                AuthIdentity::in_default(self.label.clone(), self.kind, false)
+            }
             Credential::Bearer(t) => {
                 resolve_bearer_blocking(state, t.expose_secret(), self.path).ok_or("credential_invalid")?
             }
@@ -492,6 +498,23 @@ impl Cursor {
                 _ = self.recheck.tick() => self.run_recheck().await,
                 recv = self.rx.recv() => match recv {
                     Ok(ev) => {
+                        if matches!(self.auth.credential, Credential::Unverified)
+                            && !self.state.hub.cfg().enforce_auth
+                        {
+                            let hub = self.state.hub.clone();
+                            let allowed = tokio::task::spawn_blocking(move || {
+                                crate::auth::check_auth_policy(&hub)
+                            })
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(ua_core::UaError::internal(format!("blocking task failed: {e}")))
+                            });
+                            if let Err(e) = allowed {
+                                tracing::warn!(error = %e, "revoking unauthenticated event stream");
+                                self.revoke("auth_required_multi_org");
+                                continue;
+                            }
+                        }
                         if AUTH_CHANNELS.contains(&ev.channel.as_str()) {
                             self.schedule_recheck();
                         }
@@ -697,6 +720,30 @@ mod tests {
         assert!(matches!(item, StreamItem::Revoked { reason: "credential_invalid" }), "{item:?}");
         let after = tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled");
         assert!(after.is_none(), "items after the revocation");
+    }
+
+    #[tokio::test]
+    async fn unverified_recheck_refuses_when_second_org_exists() {
+        let mut cfg = Config::for_home(std::env::temp_dir());
+        cfg.enforce_auth = false;
+        let state = AppState::new(Hub::in_memory(cfg).unwrap(), Arc::new(builtin_registry()));
+        let auth = local_auth();
+        let scope = EventScope::default();
+        assert_eq!(auth.recheck(&state, &scope, false), Ok(()));
+
+        state
+            .hub
+            .db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, status, allowed_profiles, created_at) \
+                     VALUES ('org-b', 'org-b', 'Org B', 'active', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(auth.recheck(&state, &scope, false), Err("auth_required_multi_org"));
     }
 
     /// A state whose policy file is `dir/policy.yaml`, holding `text`.
