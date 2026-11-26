@@ -1,8 +1,9 @@
 //! `goal_manage(action, params)`: goals as a why-chain.
 //!
-//! `parent_goal_id` is why-ancestry (root first). `task_goal_links` is the
-//! single goal a task serves. Neither is `tasks.parent_id` nesting nor the
-//! `task_dependencies` prerequisite graph.
+//! `parent_goal_id` is why-ancestry (root first). The single goal a task
+//! serves is a `serves_goal` graph edge in the default organization and a
+//! `task_goal_links` row in any other ([`super::goal_links`]). Neither is
+//! `tasks.parent_id` nesting nor the `task_dependencies` prerequisite graph.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -12,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{UaError, UaResult};
 
+use super::goal_links::{self, GraphCaps};
 use super::*;
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -147,12 +149,15 @@ async fn manage(ctx: ToolCtx, a: GoalArgs) -> UaResult<Value> {
         "link" => {
             let p: LinkParams = parse_params("link", a.params)?;
             let who = author(&ctx, p.author.as_deref())?;
-            db.write_async(move |tx| link(tx, &org, p, &who)).await
+            let actor = goal_links::graph_actor(&ctx.caller, &who);
+            let caps = GraphCaps::of(ctx.hub.cfg());
+            db.write_async(move |tx| link(tx, &org, p, &who, actor, caps)).await
         }
         "unlink" => {
             let p: LinkParams = parse_params("unlink", a.params)?;
             let who = author(&ctx, p.author.as_deref())?;
-            db.write_async(move |tx| unlink(tx, &org, p, &who)).await
+            let actor = goal_links::graph_actor(&ctx.caller, &who);
+            db.write_async(move |tx| unlink(tx, &org, p, &who, actor)).await
         }
         "edit" => {
             let p: EditParams = parse_params("edit", a.params)?;
@@ -175,7 +180,14 @@ async fn manage(ctx: ToolCtx, a: GoalArgs) -> UaResult<Value> {
         }
         "ancestry" => {
             let p: TaskIdParams = parse_params("ancestry", a.params)?;
-            db.read_async(move |c| why_chain(c, &org, p.task_id)).await
+            db.read_mut_async(move |c| {
+                let served = match task_object(c, &org, p.task_id)? {
+                    Some(_) => goal_links::served_goal_read(c, &org, p.task_id)?,
+                    None => None,
+                };
+                why_chain(c, &org, p.task_id, served)
+            })
+            .await
         }
         other => Err(crate::routes::unhandled("goal_manage", other)),
     }
@@ -328,22 +340,13 @@ fn detail(conn: &Connection, org: &str, id: i64) -> UaResult<Value> {
     Ok(json!({ "goal": g, "ancestry": chain, "edge": EDGE_ANCESTRY, "meaning": MEANING }))
 }
 
-/// The goal task `task_id` serves, through organization `org`'s links only.
-fn linked_goal(conn: &Connection, org: &str, task_id: i64) -> UaResult<Option<i64>> {
-    Ok(conn
-        .query_row(
-            "SELECT goal_id FROM task_goal_links WHERE org_id = ?1 AND task_id = ?2",
-            params![org, task_id],
-            |r| r.get(0),
-        )
-        .optional()?)
-}
-
-fn why_chain(conn: &Connection, org: &str, task_id: i64) -> UaResult<Value> {
+/// The why-chain of task `task_id`, which serves goal `served` (read by
+/// the caller through organization `org`'s links only).
+fn why_chain(conn: &Connection, org: &str, task_id: i64, served: Option<i64>) -> UaResult<Value> {
     let task = task_object(conn, org, task_id)?
         .ok_or_else(|| UaError::not_found(format!("unknown task: {task_id}")))?;
     let unlinked = json!({ "task_id": task_id, "goal_id": null, "edge": EDGE_ANCESTRY, "chain": [], "meaning": MEANING });
-    let Some(goal_id) = linked_goal(conn, org, task_id)? else { return Ok(unlinked) };
+    let Some(goal_id) = served else { return Ok(unlinked) };
     let Some(g) = goal(conn, org, goal_id)? else { return Ok(unlinked) };
     if str_field(&g, "project") != str_field(&task, "project") {
         return Ok(unlinked);
@@ -354,7 +357,14 @@ fn why_chain(conn: &Connection, org: &str, task_id: i64) -> UaResult<Value> {
     )
 }
 
-fn link(tx: &mut ua_store::WriteTx<'_>, org: &str, p: LinkParams, who: &str) -> UaResult<Value> {
+fn link(
+    tx: &mut ua_store::WriteTx<'_>,
+    org: &str,
+    p: LinkParams,
+    who: &str,
+    actor: goal_links::Actor,
+    caps: GraphCaps,
+) -> UaResult<Value> {
     require_org(tx, org)?;
     let task = task_object(tx, org, p.task_id)?
         .ok_or_else(|| UaError::not_found(format!("unknown task: {}", p.task_id)))?;
@@ -363,7 +373,7 @@ fn link(tx: &mut ua_store::WriteTx<'_>, org: &str, p: LinkParams, who: &str) -> 
         return Err(UaError::invalid("task and goal must belong to the same project"));
     }
     ancestry_ids(tx, org, p.goal_id)?;
-    if let Some(existing) = linked_goal(tx, org, p.task_id)? {
+    if let Some(existing) = goal_links::served_goal_tx(tx, org, p.task_id)? {
         if existing != p.goal_id {
             return Err(UaError::invalid(format!(
                 "task {} already serves goal {existing}; goal_task is single-valued",
@@ -371,27 +381,31 @@ fn link(tx: &mut ua_store::WriteTx<'_>, org: &str, p: LinkParams, who: &str) -> 
             )));
         }
     } else {
-        tx.execute(
-            "INSERT INTO task_goal_links (org_id, task_id, goal_id, linked_by, linked_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![org, p.task_id, p.goal_id, who, now()],
-        )?;
+        goal_links::link(tx, org, p.task_id, p.goal_id, who, actor, caps)?;
         emit(tx, org, "agent.goal.linked", json!({ "task_id": p.task_id, "goal_id": p.goal_id }), who)?;
     }
+    let served = goal_links::served_goal_tx(tx, org, p.task_id)?;
     Ok(json!({
         "task_id": p.task_id,
         "goal_id": p.goal_id,
         "edge": EDGE_TASK,
-        "why_chain": why_chain(tx, org, p.task_id)?,
+        "why_chain": why_chain(tx, org, p.task_id, served)?,
     }))
 }
 
-fn unlink(tx: &mut ua_store::WriteTx<'_>, org: &str, p: LinkParams, who: &str) -> UaResult<Value> {
+fn unlink(
+    tx: &mut ua_store::WriteTx<'_>,
+    org: &str,
+    p: LinkParams,
+    who: &str,
+    actor: goal_links::Actor,
+) -> UaResult<Value> {
     require_org(tx, org)?;
     if task_object(tx, org, p.task_id)?.is_none() {
         return Err(UaError::not_found(format!("unknown task: {}", p.task_id)));
     }
     require_goal(tx, org, p.goal_id)?;
-    match linked_goal(tx, org, p.task_id)? {
+    match goal_links::served_goal_tx(tx, org, p.task_id)? {
         None => return Err(UaError::invalid(format!("task {} serves no goal", p.task_id))),
         Some(g) if g != p.goal_id => {
             return Err(UaError::invalid(format!(
@@ -401,7 +415,7 @@ fn unlink(tx: &mut ua_store::WriteTx<'_>, org: &str, p: LinkParams, who: &str) -
         }
         Some(_) => {}
     }
-    tx.execute("DELETE FROM task_goal_links WHERE org_id = ?1 AND task_id = ?2", params![org, p.task_id])?;
+    goal_links::unlink(tx, org, p.task_id, actor)?;
     emit(tx, org, "agent.goal.unlinked", json!({ "task_id": p.task_id, "goal_id": p.goal_id }), who)?;
     Ok(json!({ "task_id": p.task_id, "goal_id": p.goal_id, "edge": EDGE_TASK, "unlinked": true }))
 }

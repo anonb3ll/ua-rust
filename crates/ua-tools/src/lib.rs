@@ -245,6 +245,10 @@ pub fn schema_parts() -> Vec<Part> {
     // C2a: migrate default-org `task_dependencies` into `graph_edges(kind='depends_on')`
     // and freeze `task_dependencies` read-only.
     parts.push(families::tasks::DEPENDS_ON_GRAPH_PART.into());
+    // The default organization's task goal links copied onto `serves_goal`
+    // graph edges, and the old table frozen for that organization (C2b).
+    // After the goal parts and the graph parts.
+    parts.push(families::tasks::SERVES_GOAL_GRAPH.into());
     parts
 }
 

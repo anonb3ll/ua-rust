@@ -67,7 +67,8 @@ const DOMAIN_UPDATE_CALL_ALLOWLIST: &[&str] = &[];
 /// `Ok(None)` so schema migrations and bulk importers do not write to the
 /// hash-chained ledger; runtime handlers and `ua-server` must NEVER be added
 /// here.
-const MIGRATION_GRAPH_ALLOWLIST: &[&str] = &["crates/ua-tools/src/families/tasks/graph.rs"];
+const MIGRATION_GRAPH_ALLOWLIST: &[&str] =
+    &["crates/ua-tools/src/families/tasks/graph.rs", "crates/ua-tools/src/families/tasks/goal_links.rs"];
 
 /// Crates where dynamic `format!` table-slot DML (`UPDATE {}`, `REPLACE INTO {}`,
 /// `INSERT OR REPLACE INTO {}`) is forbidden.

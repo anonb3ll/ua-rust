@@ -729,6 +729,7 @@ fn check_target(src: &Connection, db: &Db, report: &Report, opts: &Options) -> a
                 check_key_overlap(src, db, map, rep.last_key)?;
             }
             Kind::TaskDependencies => check_task_dependencies_overlap(src, db, map, rep.last_key)?,
+            Kind::GoalLinks => check_goal_links_overlap(src, db, map, rep.last_key)?,
             _ => check_key_overlap(src, db, map, rep.last_key)?,
         }
     }
@@ -857,6 +858,46 @@ fn check_task_dependencies_overlap(
         bail!(
             "graph_edges already holds a depends_on edge with dependency_id = {dep_id} that this import \
              would copy; the target must not hold rows with imported keys. Import into a fresh database \
+             (nothing was written)"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse, before anything is written, when a source `task_goal_links` row
+/// still to be copied names a task that already serves a goal in the target
+/// (a live `serves_goal` edge from its task node).
+fn check_goal_links_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> anyhow::Result<()> {
+    let plan = plan_table(src, db, map)?;
+    let sel = format!(
+        "SELECT rowid, {} FROM {} WHERE rowid > ?1 ORDER BY rowid",
+        select_list(&plan.cols),
+        q(map.source)
+    );
+    let mut stmt = src.prepare(&sel)?;
+    let mut rows = stmt.query([last])?;
+    let mut clash: Option<i64> = None;
+    db.read(|c| {
+        let mut probe = c.prepare(
+            "SELECT 1 FROM graph_edges e JOIN graph_nodes n ON n.org_id = e.org_id AND n.id = e.src_id \
+             WHERE e.org_id = 'default' AND e.kind = 'serves_goal' AND e.valid_to IS NULL \
+             AND n.kind = 'task' AND n.external_id = ?1 LIMIT 1",
+        )?;
+        while let Some(r) = rows.next()? {
+            let vals = row_values(r, 1, plan.cols.len())?;
+            if let Some(SqlValue::Integer(task_id)) = col_value(&plan.cols, &vals, "task_id")
+                && probe.exists([task_id.to_string()])?
+            {
+                clash = Some(*task_id);
+                break;
+            }
+        }
+        Ok(())
+    })?;
+    if let Some(task_id) = clash {
+        bail!(
+            "graph_edges already holds a live serves_goal edge for task {task_id}, whose task_goal_links row this \
+             import would copy; the target must not hold rows with imported keys. Import into a fresh database \
              (nothing was written)"
         );
     }
@@ -1101,6 +1142,29 @@ fn copy_table(
                                 }
                             }
                         }
+                    }
+                    if map.kind == Kind::GoalLinks {
+                        // The default organization's links are graph edges.
+                        let int = |name: &str| match col_value(&plan.cols, &vals, name) {
+                            Some(SqlValue::Integer(i)) => Some(*i),
+                            _ => None,
+                        };
+                        let (Some(task_id), Some(goal_id)) = (int("task_id"), int("goal_id")) else {
+                            bump(&mut skipped, "invalid_link");
+                            continue;
+                        };
+                        match ua_tools::families::tasks::import_legacy_link(
+                            tx,
+                            task_id,
+                            goal_id,
+                            as_text(col_value(&plan.cols, &vals, "linked_by")),
+                            as_text(col_value(&plan.cols, &vals, "linked_at")),
+                            &format!("import:{source_hash}"),
+                        )? {
+                            None => copied += 1,
+                            Some(reason) => bump(&mut skipped, reason),
+                        }
+                        continue;
                     }
                     if map.rowid_to.is_some() {
                         vals.push(SqlValue::Integer(rowid));

@@ -535,10 +535,28 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM task_comments"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM task_comment_threads"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM goals"), 1);
-    assert_eq!(n(&db, "SELECT COUNT(*) FROM task_goal_links"), 1);
+    // The link becomes the default organization's `serves_goal` graph edge
+    // (an import, `valid_from` its `linked_at`), never a frozen
+    // `task_goal_links` row.
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM task_goal_links"), 0);
+    assert_eq!(
+        n(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM graph_edges e \
+                 JOIN graph_nodes t ON t.id = e.src_id AND t.kind = 'task' AND t.external_id = '1' \
+                 JOIN graph_nodes g ON g.id = e.dst_id AND g.kind = 'goal' AND g.external_id = '1' \
+                 WHERE e.org_id = 'default' AND e.kind = 'serves_goal' AND e.valid_to IS NULL \
+                 AND e.source_kind = 'import' AND e.asserted_by = 'system' AND e.valid_from = '{T0}' \
+                 AND e.source_ref LIKE 'import:%'"
+            )
+        ),
+        1
+    );
+    assert_eq!(table(&r, "task_goal_links").copied, 1);
     // Goals and their links land in the default organization, with their
     // tasks: the source `org_id` is never copied.
-    for t in ["goals", "task_goal_links"] {
+    for t in ["goals", "task_goal_links", "graph_nodes", "graph_edges"] {
         assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
     }
     assert_eq!(n(&db, "SELECT COUNT(*) FROM plans"), 1);
