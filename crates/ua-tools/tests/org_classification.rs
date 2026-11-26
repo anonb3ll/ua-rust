@@ -130,6 +130,7 @@ const TENANT: &[&str] = &[
     "skill_assignments",
     "skill_publish_staging",
     "skill_sources",
+    "skill_version_yanks",
     "harness_config_bundles",
     "harness_config_proposals",
     "harness_config_drift",
@@ -157,6 +158,10 @@ const TENANT: &[&str] = &[
     "org_role_grants",
     "org_seats",
     "org_service_identities",
+    // shared graph store (`ua-graph`): org_id from birth, triggers from `organization.v1.graph`
+    "graph_nodes",
+    "graph_edges",
+    "graph_org_counts",
 ];
 
 /// Tenant tables that do not yet pass the tenant check. May only shrink.

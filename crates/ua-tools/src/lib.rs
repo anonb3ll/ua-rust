@@ -228,9 +228,17 @@ pub fn schema_parts() -> Vec<Part> {
     // never holds a private key (docs/evidence-export.md, S2). Self-contained
     // beyond its own `evidence_key` foreign key.
     parts.push(ua_store::evidence::KEY_STORE_PART.into());
-    // Org-scoped Git skill source allowlist (born tenant-scoped; D2a).
+    // Org-scoped Git skill source allowlist (born tenant-scoped; D2a) and
+    // staged import source_id binding (D2b).
     parts.push(families::skill_sources::SCHEMA.into());
     parts.push(families::skill_sources::TENANT_PART.into());
+    parts.push(families::skill_registry::SOURCE_ID_SCHEMA.into());
+    // Shared tenant-scoped graph store (`ua-graph`, born tenant-scoped; C1).
+    parts.extend(families::graph_store::schema_parts());
+    // Permanent per-org skill version yanks (`skill_version_yanks`, born
+    // tenant-scoped; D2c).
+    parts.push(families::skill_registry::YANKS_SCHEMA.into());
+    parts.push(families::skill_registry::YANKS_TENANT_PART.into());
     parts
 }
 

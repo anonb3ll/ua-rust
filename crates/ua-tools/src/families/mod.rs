@@ -20,6 +20,7 @@ pub mod export;
 pub mod github;
 pub mod governance;
 pub mod graph;
+pub mod graph_store;
 pub mod harness_config;
 pub mod idempotency;
 pub mod injection;
@@ -114,6 +115,7 @@ pub fn register(r: &mut Registry) {
     github::register(r);
     governance::register(r);
     graph::register(r);
+    graph_store::register(r);
     harness_config::register(r);
     injection::register(r);
     managed_secrets::register(r);

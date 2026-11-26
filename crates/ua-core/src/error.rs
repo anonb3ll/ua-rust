@@ -12,6 +12,11 @@ pub type UaResult<T> = Result<T, UaError>;
 pub enum UaError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// An invalid argument a client branches on by `reason_code` (for example
+    /// `cycle_detected`, `cycle_check_bound_exceeded`, `invalid_endpoint_kind`).
+    /// Its `code` is still `invalid_argument`.
+    #[error("invalid argument: {reason}")]
+    InvalidArgumentCode { reason: String, reason_code: String },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("denied: {reason}")]
@@ -35,6 +40,11 @@ impl UaError {
         Self::InvalidArgument(msg.into())
     }
 
+    /// An invalid argument with a machine-readable reason code.
+    pub fn invalid_code(reason_code: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::InvalidArgumentCode { reason: reason.into(), reason_code: reason_code.into() }
+    }
+
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self::NotFound(msg.into())
     }
@@ -52,10 +62,12 @@ impl UaError {
         Self::ConflictCode { reason: reason.into(), reason_code: reason_code.into() }
     }
 
-    /// The reason code of a denial or coded conflict, if any.
+    /// The reason code of a denial, coded conflict, or coded invalid argument, if any.
     pub fn reason_code(&self) -> Option<&str> {
         match self {
-            Self::Denied { reason_code, .. } | Self::ConflictCode { reason_code, .. } => Some(reason_code),
+            Self::Denied { reason_code, .. }
+            | Self::ConflictCode { reason_code, .. }
+            | Self::InvalidArgumentCode { reason_code, .. } => Some(reason_code),
             _ => None,
         }
     }
@@ -67,7 +79,7 @@ impl UaError {
     /// Stable machine-readable code.
     pub fn code(&self) -> &'static str {
         match self {
-            Self::InvalidArgument(_) => "invalid_argument",
+            Self::InvalidArgument(_) | Self::InvalidArgumentCode { .. } => "invalid_argument",
             Self::NotFound(_) => "not_found",
             Self::Denied { .. } => "denied",
             Self::ApprovalRequired { .. } => "approval_required",
@@ -81,9 +93,9 @@ impl UaError {
     pub fn to_json(&self) -> Value {
         let mut body = json!({ "ok": false, "error": self.code(), "message": self.to_string() });
         match self {
-            Self::Denied { reason_code, .. } | Self::ConflictCode { reason_code, .. } => {
-                body["reason_code"] = json!(reason_code)
-            }
+            Self::Denied { reason_code, .. }
+            | Self::ConflictCode { reason_code, .. }
+            | Self::InvalidArgumentCode { reason_code, .. } => body["reason_code"] = json!(reason_code),
             Self::ApprovalRequired { approval_id, tool } => {
                 body["approval_id"] = json!(approval_id);
                 body["tool"] = json!(tool);

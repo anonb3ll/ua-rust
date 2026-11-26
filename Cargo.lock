@@ -5272,6 +5272,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ua-graph"
+version = "0.1.0"
+dependencies = [
+ "jiff 1.0.1",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ua-core",
+ "ua-store",
+ "ulid",
+]
+
+[[package]]
 name = "ua-import"
 version = "0.1.0"
 dependencies = [
@@ -5451,6 +5465,7 @@ dependencies = [
  "tree-sitter-typescript",
  "ua-core",
  "ua-deliverables",
+ "ua-graph",
  "ua-ingress",
  "ua-memory",
  "ua-org",

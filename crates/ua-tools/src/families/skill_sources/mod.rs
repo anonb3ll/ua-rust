@@ -1,5 +1,6 @@
-//! `skill_sources`: org-scoped Git skill source allowlist and hardened fetch
-//! plumbing (slice D2a; see `docs/skill-sources.md`).
+//! `skill_sources`: org-scoped Git skill source allowlist, hardened fetch
+//! plumbing, discovery, refresh, and staged import (slices D2a + D2b; see
+//! `docs/skill-sources.md`).
 //!
 //! Actions exposed under `skill_registry`:
 //! - `source_add` `{url, tracking_ref?, pinned_sha, allowed_subpaths?}`:
@@ -11,25 +12,45 @@
 //!   `skill.source_revoked`.
 //! - `source_list` `{status?}`: lists the caller's organization's sources
 //!   (`active` by default, or `revoked` / `all`).
+//! - `source_refresh` `{source_id, tracking_ref?}`: resolves `tracking_ref` to
+//!   a candidate SHA and reports what changed without moving `pinned_sha`,
+//!   creating a version, or updating assignments.
+//! - `source_discover` `{source_id, sha?}`: lists candidate skill packages
+//!   under `allowed_subpaths` at `pinned_sha` (or explicit 40-char `sha`) via
+//!   `ls-tree -r -l -z` only; symlinks, gitlinks and non-regular modes are
+//!   refused.
+//! - `source_import` `{source_id, path, name?, sha?}`: reads blobs at the exact
+//!   SHA by object id, runs the full D1 review/screening pipeline, copies bytes
+//!   into `skill_publish_staging` with `git:<canonical_url>@<sha>:<path>`
+//!   provenance, and parks the D1 publish approval (with member diff on upgrade).
 //!
-//! `source_discover`, `source_refresh`, `source_import`, `yank`, and catalog
-//! `install` arrive in slices D2b and D2c.
+//! Version `yank` and catalog `install` live alongside the registry core in
+//! [`super::skill_registry`].
 
 pub mod fetch;
+pub mod plumbing;
+
+use std::collections::BTreeSet;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{UaError, UaResult};
-use ua_org::authz::{Authority, Authz};
 use ua_store::{Procedure, SchemaPart};
 
 use self::fetch::{
-    url_uniqueness_key, validate_allowed_subpaths, validate_sha, validate_source_url, validate_tracking_ref,
+    FetchOptions, ParsedSourceUrl, SystemDnsResolver, url_uniqueness_key, validate_allowed_subpaths,
+    validate_sha, validate_source_url, validate_tracking_ref,
+};
+use self::plumbing::{
+    SourceFetchCtx, discover_source, read_package_from_source, refresh_source, validate_skill_repo_path,
 };
 use super::agents::verified;
 use super::plans::ledger_text;
-use super::skill_registry::{emit, gate_pass, pending};
+use super::skill_registry::{
+    check_name, emit, frontmatter, gate_pass, human_operator, operator, pending, stage_members,
+};
+use super::skills::review_in_memory;
 use crate::registry::ToolCtx;
 
 const MAX_REVOKE_REASON_BYTES: usize = 500;
@@ -122,6 +143,35 @@ pub(crate) struct SourceListParams {
     pub status: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceRefreshParams {
+    pub source_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceDiscoverParams {
+    pub source_id: String,
+    /// Optional exact 40-char commit SHA; defaults to the source's `pinned_sha`.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceImportParams {
+    pub source_id: String,
+    /// Repository-relative directory containing `SKILL.md` (or `"."` for repo root).
+    pub path: String,
+    /// Optional skill name override; defaults to `SKILL.md` frontmatter `name` or directory leaf.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Optional exact 40-char commit SHA; defaults to the source's `pinned_sha`.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
 struct SourceRow {
     id: String,
     canonical_url: String,
@@ -159,33 +209,6 @@ fn source_row(r: &Row<'_>) -> rusqlite::Result<SourceRow> {
         "revoke_reason": r.get::<_, Option<String>>(13)?,
     });
     Ok(SourceRow { id, canonical_url, tracking_ref, pinned_sha, allowed_subpaths, status, public })
-}
-
-/// Human operator authority check for `skill_sources` mutations
-/// (`docs/skill-sources.md` §1): requires an existing org in `orgs`, a verified
-/// identity, and [`Authority::Operator`] (human-only; never an agent or
-/// lifecycle operator).
-fn human_operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
-    let org = ctx.caller.org_id.as_str();
-    let known = ctx
-        .hub
-        .db()
-        .read(|c| Ok(c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?))?;
-    if known.is_none() {
-        return Err(UaError::invalid(format!(
-            "unknown organization {org:?}; skill sources were not changed"
-        )));
-    }
-    let who = verified(&ctx.caller).map(str::to_string).ok_or_else(|| {
-        UaError::denied("identity_required", "managing skill sources requires an authenticated identity")
-    })?;
-    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], org) {
-        return Err(UaError::denied(
-            "operator_required",
-            format!("{what} requires a human operator of this organization"),
-        ));
-    }
-    Ok(who)
 }
 
 fn load_source(c: &Connection, org: &str, id: &str) -> UaResult<Option<SourceRow>> {
@@ -422,6 +445,146 @@ pub(crate) fn source_list(ctx: &ToolCtx, p: SourceListParams) -> UaResult<Value>
     })
 }
 
+fn source_url_and_opts(canonical_url: &str) -> UaResult<(ParsedSourceUrl, FetchOptions)> {
+    #[cfg(any(test, feature = "test-util"))]
+    if canonical_url.starts_with("file://") {
+        let parsed = self::fetch::validate_file_source_url_for_test(canonical_url)?;
+        return Ok((parsed, FetchOptions::for_local_file_test()));
+    }
+    let parsed = validate_source_url(canonical_url)?;
+    Ok((parsed, FetchOptions::production()))
+}
+
+fn load_active_source(ctx: &ToolCtx, raw_id: &str, action: &str) -> UaResult<SourceRow> {
+    let id = raw_id.trim();
+    if id.is_empty() {
+        return Err(UaError::invalid("source_id is required"));
+    }
+    let org = ctx.caller.org_id.as_str();
+    let row = ctx
+        .hub
+        .db()
+        .read(|c| load_source(c, org, id))?
+        .ok_or_else(|| UaError::not_found(format!("unknown skill source {id:?}")))?;
+    if row.status == "revoked" {
+        return Err(UaError::conflict(format!("skill source {id:?} is revoked; {action} is refused")));
+    }
+    Ok(row)
+}
+
+/// `skill_registry { action: "source_refresh", params }`.
+pub(crate) fn source_refresh(ctx: &ToolCtx, p: SourceRefreshParams) -> UaResult<Value> {
+    let _who = verified(&ctx.caller).ok_or_else(|| {
+        UaError::denied("identity_required", "refreshing a skill source requires an authenticated identity")
+    })?;
+    let row = load_active_source(ctx, &p.source_id, "refresh")?;
+    let (parsed_url, opts) = source_url_and_opts(&row.canonical_url)?;
+    let src = SourceFetchCtx {
+        data_home: &ctx.hub.cfg().home,
+        org_id: &ctx.caller.org_id,
+        url: &parsed_url,
+        allowed_subpaths: &row.allowed_subpaths,
+        resolver: &SystemDnsResolver,
+        opts: &opts,
+    };
+    let report = refresh_source(&src, &row.tracking_ref, &row.pinned_sha)?;
+    Ok(json!({
+        "ok": true,
+        "source_id": row.id,
+        "canonical_url": row.canonical_url,
+        "tracking_ref": report.tracking_ref,
+        "pinned_sha": report.pinned_sha,
+        "candidate_sha": report.candidate_sha,
+        "changed": report.changed,
+        "diff_available": report.diff_available,
+        "diff_note": report.diff_note,
+        "changed_files": report.changed_files.iter().map(|f| f.to_json()).collect::<Vec<_>>(),
+        "changed_packages": report.changed_packages,
+        "truncated": report.truncated,
+    }))
+}
+
+/// `skill_registry { action: "source_discover", params }`.
+pub(crate) fn source_discover(ctx: &ToolCtx, p: SourceDiscoverParams) -> UaResult<Value> {
+    let _who = verified(&ctx.caller).ok_or_else(|| {
+        UaError::denied("identity_required", "discovering skills requires an authenticated identity")
+    })?;
+    let row = load_active_source(ctx, &p.source_id, "discover")?;
+    let target_sha = match p.sha.as_deref() {
+        Some(s) => validate_sha(s)?,
+        None => row.pinned_sha.clone(),
+    };
+    // Default (`pinned_sha`): fetch the approved pin directly by SHA even if
+    // upstream has moved `tracking_ref`. An explicit different `sha` is allowed
+    // only when it equals the current `tracking_ref` tip.
+    let verify_ref = (target_sha != row.pinned_sha).then_some(row.tracking_ref.as_str());
+    let (parsed_url, opts) = source_url_and_opts(&row.canonical_url)?;
+    let src = SourceFetchCtx {
+        data_home: &ctx.hub.cfg().home,
+        org_id: &ctx.caller.org_id,
+        url: &parsed_url,
+        allowed_subpaths: &row.allowed_subpaths,
+        resolver: &SystemDnsResolver,
+        opts: &opts,
+    };
+    let packages = discover_source(&src, &target_sha, verify_ref)?;
+    Ok(json!({
+        "ok": true,
+        "source_id": row.id,
+        "canonical_url": row.canonical_url,
+        "sha": target_sha,
+        "allowed_subpaths": row.allowed_subpaths,
+        "packages": packages.iter().map(|pkg| pkg.to_json()).collect::<Vec<_>>(),
+    }))
+}
+
+/// `skill_registry { action: "source_import", params }`.
+pub(crate) fn source_import(ctx: &ToolCtx, p: SourceImportParams) -> UaResult<Value> {
+    let who = operator(ctx, "importing a skill from a source")?;
+    source_import_as(ctx, &who, p)
+}
+
+pub(crate) fn source_import_as(ctx: &ToolCtx, who: &str, p: SourceImportParams) -> UaResult<Value> {
+    let row = load_active_source(ctx, &p.source_id, "import")?;
+    let clean_path = validate_skill_repo_path(&p.path, &row.allowed_subpaths)?;
+    let target_sha = match p.sha.as_deref() {
+        Some(s) => validate_sha(s)?,
+        None => row.pinned_sha.clone(),
+    };
+    // Default (`pinned_sha`): import the approved pin directly by SHA even if
+    // upstream has moved `tracking_ref`. An explicit different `sha` is allowed
+    // only as an explicit upgrade equal to the current `tracking_ref` tip.
+    let verify_ref = (target_sha != row.pinned_sha).then_some(row.tracking_ref.as_str());
+    let (parsed_url, opts) = source_url_and_opts(&row.canonical_url)?;
+    let src = SourceFetchCtx {
+        data_home: &ctx.hub.cfg().home,
+        org_id: &ctx.caller.org_id,
+        url: &parsed_url,
+        allowed_subpaths: &row.allowed_subpaths,
+        resolver: &SystemDnsResolver,
+        opts: &opts,
+    };
+    let members = read_package_from_source(&src, &target_sha, verify_ref, &clean_path)?;
+
+    let md_text = std::str::from_utf8(&members["SKILL.md"].bytes)
+        .map_err(|_| UaError::invalid("SKILL.md must be valid UTF-8"))?;
+    let inferred_name = frontmatter(md_text)
+        .and_then(|fm| fm.get("name").and_then(Value::as_str).map(str::to_string))
+        .or_else(|| if clean_path == "." { None } else { clean_path.rsplit('/').next().map(str::to_string) });
+    let raw_name = p.name.or(inferred_name).unwrap_or_default();
+    let name = check_name(&raw_name)?;
+
+    let dir_name = if clean_path == "." {
+        name.as_str()
+    } else {
+        clean_path.rsplit('/').next().unwrap_or(name.as_str())
+    };
+    let member_paths: BTreeSet<String> = members.keys().cloned().collect();
+    let review = review_in_memory(dir_name, md_text, &member_paths, "info");
+    let provenance = format!("git:{}@{}:{clean_path}", row.canonical_url, target_sha);
+    stage_members(ctx, who, name, provenance, Some(row.id), members, review)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +726,125 @@ mod tests {
             assert_eq!(p["source_id"], source_id);
             assert_eq!(p["canonical_url"], Value::Null);
         }
+    }
+
+    #[tokio::test]
+    async fn org_b_source_import_and_publish_redacts_default_ledger() {
+        use std::process::Command;
+
+        let home = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let git_ok = |args: &[&str]| -> String {
+            let out = Command::new("git")
+                .current_dir(remote.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git_ok(&["init", "-b", "main"]);
+        let skill_dir = remote.path().join("skills/orgb-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: orgb-skill\ndescription: Org B private skill. Use when asked to check org-b tasks.\n---\n\n\
+             # Org B Skill\n\nStep one.\nStep two.\nStep three.\n",
+        )
+        .unwrap();
+        git_ok(&["add", "."]);
+        git_ok(&["commit", "-m", "v1"]);
+        let sha = git_ok(&["rev-parse", "HEAD"]);
+
+        let mut cfg = Config::for_home(home.path());
+        cfg.human_identities = vec!["operator".into()];
+        let hub = crate::Hub::in_memory(cfg).unwrap();
+        hub.db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
+                     VALUES ('org-b', 'org-b', 'Org B', '[\"developer\", \"operator\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO skill_sources (org_id, id, canonical_url, host, repo_path, allowed_subpaths, \
+                     tracking_ref, pinned_sha, status, added_by, added_at, approval_id) \
+                     VALUES ('org-b', 'src-orgb-import', ?1, '', ?2, '[\"skills\"]', 'main', ?3, 'active', \
+                     'operator', '2026-01-01T00:00:00+00:00', NULL)",
+                    params![format!("file://{}", remote.path().display()), remote.path().display().to_string(), sha],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let b_ctx = ToolCtx {
+            hub: hub.clone(),
+            caller: Caller {
+                label: "operator".into(),
+                kind: ActorKind::Human,
+                profile: Profile::Operator,
+                enforce_profile: true,
+                session_key: Some("s1".into()),
+                transport: Transport::Mcp,
+                org_id: "org-b".into(),
+            },
+        };
+        let staged = source_import_as(
+            &b_ctx,
+            "operator",
+            SourceImportParams {
+                source_id: "src-orgb-import".into(),
+                path: "skills/orgb-skill".into(),
+                name: None,
+                sha: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(staged["status"], "approval_pending", "{staged}");
+        let approval_id = staged["approval_id"].as_i64().unwrap();
+        let staging_id = staged["staging_id"].as_str().unwrap().to_string();
+
+        // Approve in SQL and publish from staging.
+        hub.db()
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE approvals SET status = 'approved', resolved_by = 'reviewer', resolved_at = ?2, \
+                     updated_at = ?2 WHERE id = ?1",
+                    params![approval_id, ua_core::time::now()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let published =
+            crate::families::skill_registry::publish_staged_for_test(&b_ctx, "operator", &staging_id)
+                .unwrap();
+        assert_eq!(published["ok"], true, "{published}");
+        assert_eq!(published["skill"]["version"], 1);
+
+        // Verify ORG-EVENT-DEFAULT redaction on the skill.published ledger event.
+        let (orig, payload): (String, String) = hub
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT COALESCE(originator, ''), payload FROM event_log \
+                     WHERE channel = 'skill.published' ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(orig, crate::approvals::NEUTRAL_ORIGINATOR);
+        for secret in ["orgb-skill", sha.as_str(), "skills/orgb-skill", "operator"] {
+            assert!(!payload.contains(secret), "skill.published leaked {secret}: {payload}");
+        }
+        let p: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(p["name"], Value::Null);
+        assert_eq!(p["source"], Value::Null);
+        assert_eq!(p["content_hash"], Value::Null);
+        assert_eq!(p["staging_id"], staging_id);
     }
 }

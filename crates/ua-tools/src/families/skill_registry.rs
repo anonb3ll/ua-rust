@@ -48,10 +48,12 @@
 //!
 //! Multi-file skill packages reuse the Python hub's canonical `package_manifest`
 //! (schema version 1) and base64 `package_payload` format; every member's hash
-//! and size are verified on read (`get`, `resolve`, and harness config bundles),
-//! and imported Python-hub packages continue to verify. See `docs/skills.md`.
-//!
-//! Not ported: the catalog and team installs, and git skill sources.
+//! and size are verified on read (`get`, `resolve`, and harness config bundles)
+//! and on catalog `install`, and imported Python-hub packages continue to
+//! verify. Permanent per-org version yanks (`yank` -> `skill_version_yanks` +
+//! `skill.yanked`) immediately block `assign`, `install`, `get`, `resolve`,
+//! `node_config`, and re-importing/re-publishing the yanked `content_hash`.
+//! See `docs/skills.md` and `docs/skill-sources.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -141,6 +143,54 @@ ALTER TABLE skill_publish_staging ADD COLUMN package_manifest TEXT;
 ALTER TABLE skill_publish_staging ADD COLUMN package_payload TEXT;
 ",
 };
+
+/// `skill_registry.v4.source_id`: bind staged Git imports to the originating
+/// `skill_sources.id` so source revocation reaches already-staged and in-flight
+/// imports at both stage commit and publish time.
+pub const SOURCE_ID_SCHEMA: SchemaPart = SchemaPart {
+    name: "skill_registry.v4.source_id",
+    sql: "
+ALTER TABLE skill_publish_staging ADD COLUMN source_id TEXT;
+",
+};
+
+/// `skill_registry.v5.yanks`: permanent per-organization skill version yanks
+/// (`docs/skill-sources.md` §6). Born tenant-scoped (`org_id TEXT NOT NULL`);
+/// generated `*_org_exists` and `*_org_immutable` triggers come from
+/// [`YANKS_TENANT_PART`].
+pub const YANKS_SCHEMA: SchemaPart = SchemaPart {
+    name: "skill_registry.v5.yanks",
+    sql: "
+CREATE TABLE IF NOT EXISTS skill_version_yanks (
+    org_id TEXT NOT NULL DEFAULT 'default',
+    name TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    reason TEXT,
+    yanked_by TEXT NOT NULL,
+    yanked_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, name, version)
+);
+CREATE INDEX IF NOT EXISTS idx_skill_version_yanks_org_hash
+    ON skill_version_yanks(org_id, content_hash);
+CREATE TRIGGER IF NOT EXISTS skill_version_yanks_immutable_update
+BEFORE UPDATE ON skill_version_yanks
+BEGIN
+    SELECT RAISE(ABORT, 'skill version yanks are permanent and cannot be modified');
+END;
+CREATE TRIGGER IF NOT EXISTS skill_version_yanks_immutable_delete
+BEFORE DELETE ON skill_version_yanks
+BEGIN
+    SELECT RAISE(ABORT, 'skill version yanks are permanent and cannot be deleted');
+END;
+",
+};
+
+/// `organization.v1.tools.skill_yanks`: installs `skill_version_yanks_org_exists`
+/// and `skill_version_yanks_org_immutable` after `skill_registry.v5.yanks` and
+/// `organization.v1.store`.
+pub const YANKS_TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.tools.skill_yanks", &["skill_version_yanks"]);
 
 /// `skill_registry.v2.tenant_keys`: rebuild `skill_versions` around
 /// `UNIQUE(org_id, name, version)` and `skill_assignments` around
@@ -413,7 +463,7 @@ pub const BINARY_ASSET_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "web
 pub const PACKAGE_SCHEMA_VERSION: u64 = 1;
 /// File mode recorded for every file published by this hub (`0o644`).
 /// Executable bits are never honoured.
-const MODE_FILE: u64 = 0o644;
+pub(crate) const MODE_FILE: u64 = 0o644;
 /// Supporting-file mode accepted when verifying packages imported from the
 /// Python hub (`0o755`), never honoured as executable and never accepted on
 /// `SKILL.md`.
@@ -429,7 +479,7 @@ fn valid_name(name: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
 }
 
-fn check_name(raw: &str) -> UaResult<String> {
+pub(crate) fn check_name(raw: &str) -> UaResult<String> {
     let name = raw.trim();
     if valid_name(name) {
         Ok(name.to_string())
@@ -556,7 +606,8 @@ pub(crate) fn is_allowed_binary_extension(path: &str) -> bool {
 
 /// Canonical relative member path inside a skill package: no absolute paths,
 /// no `..`/`.` segments, no hidden files or directories (leading `.`), no
-/// backslashes, colons or control characters, within depth and length limits.
+/// backslashes, colons, C0/C1 control characters, or hidden/bidi Unicode code
+/// points, within depth and length limits.
 pub(crate) fn validate_package_path(value: &str) -> UaResult<String> {
     if value.is_empty()
         || value.len() > MAX_PACKAGE_PATH
@@ -564,7 +615,7 @@ pub(crate) fn validate_package_path(value: &str) -> UaResult<String> {
         || value.ends_with('/')
         || value.contains('\\')
         || value.contains(':')
-        || value.bytes().any(|b| b < 0x20 || b == 0x7f)
+        || value.chars().any(|c| c.is_control() || super::skills::hidden_char(c))
     {
         return Err(UaError::invalid(format!("unsafe supporting file path {value:?}")));
     }
@@ -587,7 +638,7 @@ pub(crate) fn validate_package_path(value: &str) -> UaResult<String> {
     Ok(value.to_string())
 }
 
-fn portable_collision_key(path: &str) -> String {
+pub(crate) fn portable_collision_key(path: &str) -> String {
     ComposingNormalizer::new_nfc().normalize(path).to_lowercase()
 }
 
@@ -655,6 +706,7 @@ fn version_row(r: &Row<'_>) -> rusqlite::Result<Value> {
 
 struct RawVersionRow {
     public: Value,
+    source: String,
     content: String,
     content_hash: String,
     manifest_raw: Option<String>,
@@ -666,6 +718,7 @@ fn raw_version_row(r: &Row<'_>) -> rusqlite::Result<RawVersionRow> {
     Ok(RawVersionRow {
         public,
         content_hash: r.get(3)?,
+        source: r.get(4)?,
         manifest_raw: r.get(7)?,
         content: r.get(8)?,
         payload_raw: r.get(9)?,
@@ -766,19 +819,47 @@ fn verify_and_decode(
 
 struct LoadedVersion {
     public: Value,
+    source: String,
     members: Vec<PackageMember>,
 }
 
-/// A version of `name` in `org` (the latest when `version` is `None`),
-/// verified end-to-end across every package member. Another organization's
-/// version reads as missing; a tampered stored file is refused.
-fn load_version(
+enum LoadOutcome {
+    Missing,
+    Yanked { version: i64 },
+    AttestationFailed { version: i64 },
+    Loaded(LoadedVersion),
+}
+
+fn is_version_yanked(c: &Connection, org: &str, name: &str, version: i64) -> UaResult<bool> {
+    Ok(c.query_row(
+        "SELECT 1 FROM skill_version_yanks WHERE org_id = ?1 AND name = ?2 AND version = ?3",
+        params![org, name, version],
+        |_| Ok(true),
+    )
+    .optional()?
+    .unwrap_or(false))
+}
+
+/// If any version in `org` with `content_hash` has been yanked, returns its
+/// `(name, version)` so re-importing or re-publishing the same content is
+/// refused (`docs/skill-sources.md` §6).
+fn find_yanked_hash(c: &Connection, org: &str, content_hash: &str) -> UaResult<Option<(String, i64)>> {
+    Ok(c.query_row(
+        "SELECT name, version FROM skill_version_yanks WHERE org_id = ?1 AND content_hash = ?2 \
+         ORDER BY yanked_at DESC, version DESC LIMIT 1",
+        params![org, content_hash],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()?)
+}
+
+fn fetch_raw_version(
     c: &Connection,
     org: &str,
     name: &str,
     version: Option<i64>,
-) -> UaResult<Option<LoadedVersion>> {
-    let raw = match version {
+) -> UaResult<Option<RawVersionRow>> {
+    Ok(match version {
         Some(v) => c
             .query_row(
                 &format!(
@@ -798,8 +879,18 @@ fn load_version(
                 raw_version_row,
             )
             .optional()?,
-    };
-    let Some(raw) = raw else {
+    })
+}
+
+/// Load and verify a version without refusing yanked versions (used when
+/// computing upgrade diffs from a previously yanked version to a fresh fix).
+fn load_version_raw_verified(
+    c: &Connection,
+    org: &str,
+    name: &str,
+    version: Option<i64>,
+) -> UaResult<Option<LoadedVersion>> {
+    let Some(raw) = fetch_raw_version(c, org, name, version)? else {
         return Ok(None);
     };
     let members = verify_and_decode(
@@ -810,7 +901,59 @@ fn load_version(
     )?;
     let mut public = raw.public;
     public["files"] = Value::Array(members.iter().map(PackageMember::to_wire_json).collect());
-    Ok(Some(LoadedVersion { public, members }))
+    Ok(Some(LoadedVersion { public, source: raw.source, members }))
+}
+
+fn load_version_outcome(
+    c: &Connection,
+    org: &str,
+    name: &str,
+    version: Option<i64>,
+) -> UaResult<LoadOutcome> {
+    let Some(raw) = fetch_raw_version(c, org, name, version)? else {
+        return Ok(LoadOutcome::Missing);
+    };
+    let ver = raw.public["version"].as_i64().unwrap_or_default();
+    if is_version_yanked(c, org, name, ver)? || find_yanked_hash(c, org, &raw.content_hash)?.is_some() {
+        return Ok(LoadOutcome::Yanked { version: ver });
+    }
+    let members = match verify_and_decode(
+        &raw.content,
+        &raw.content_hash,
+        raw.manifest_raw.as_deref(),
+        raw.payload_raw.as_deref(),
+    ) {
+        Ok(m) => m,
+        Err(UaError::Conflict { .. }) => return Ok(LoadOutcome::AttestationFailed { version: ver }),
+        Err(e) => return Err(e),
+    };
+    let mut public = raw.public;
+    public["files"] = Value::Array(members.iter().map(PackageMember::to_wire_json).collect());
+    Ok(LoadOutcome::Loaded(LoadedVersion { public, source: raw.source, members }))
+}
+
+/// A version of `name` in `org` (the latest when `version` is `None`),
+/// verified end-to-end across every package member and checked against
+/// `skill_version_yanks`. Another organization's version reads as missing; a
+/// yanked version returns `conflict` (`yanked`); a tampered stored file is
+/// refused (`conflict`).
+fn load_version(
+    c: &Connection,
+    org: &str,
+    name: &str,
+    version: Option<i64>,
+) -> UaResult<Option<LoadedVersion>> {
+    match load_version_outcome(c, org, name, version)? {
+        LoadOutcome::Missing => Ok(None),
+        LoadOutcome::Yanked { version: v } => Err(UaError::conflict_code(
+            "yanked",
+            format!("skill {name:?} v{v} has been yanked and cannot be served"),
+        )),
+        LoadOutcome::AttestationFailed { .. } => {
+            Err(UaError::conflict("skill content hash does not match the reviewed registry version"))
+        }
+        LoadOutcome::Loaded(loaded) => Ok(Some(loaded)),
+    }
 }
 
 fn assignment_row(r: &Row<'_>) -> rusqlite::Result<Value> {
@@ -898,14 +1041,22 @@ pub(crate) fn resolve_with_skips(
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     for (name, pin, via) in picked.into_iter().take(MAX_RESOLVED_SKILLS) {
-        let loaded = match load_version(c, org, &name, pin) {
-            Ok(Some(loaded)) => loaded,
-            Ok(None) => continue,
-            Err(UaError::Conflict { .. }) => {
-                skipped.push(SkippedSkill { name, version: pin, via, reason: "attestation_failed" });
+        let loaded = match load_version_outcome(c, org, &name, pin)? {
+            LoadOutcome::Loaded(loaded) => loaded,
+            LoadOutcome::Missing => continue,
+            LoadOutcome::Yanked { version } => {
+                skipped.push(SkippedSkill { name, version: Some(version), via, reason: "yanked" });
                 continue;
             }
-            Err(e) => return Err(e),
+            LoadOutcome::AttestationFailed { version } => {
+                skipped.push(SkippedSkill {
+                    name,
+                    version: Some(version),
+                    via,
+                    reason: "attestation_failed",
+                });
+                continue;
+            }
         };
         let manifest = match &loaded.public["package_manifest"] {
             Value::Null => None,
@@ -926,8 +1077,8 @@ pub(crate) fn resolve_with_skips(
 
 /// The skills assigned to `agent` in `org` directly or through `profile`: direct
 /// assignments first (each source sorted by name), a direct one winning over
-/// a profile one of the same skill, at most [`MAX_RESOLVED_SKILLS`]. A pinned
-/// version that is missing is skipped; a stored version whose hash or member
+/// a profile one of the same skill, at most [`MAX_RESOLVED_SKILLS`]. Missing or
+/// yanked versions are omitted; a stored version whose hash or member
 /// attestation fails is refused, never served.
 pub(crate) fn resolve(
     c: &Connection,
@@ -936,7 +1087,7 @@ pub(crate) fn resolve(
     profile: Option<&str>,
 ) -> UaResult<Vec<Resolved>> {
     let (resolved, skipped) = resolve_with_skips(c, org, agent, profile)?;
-    if !skipped.is_empty() {
+    if skipped.iter().any(|s| s.reason != "yanked") {
         return Err(UaError::conflict("skill content hash does not match the reviewed registry version"));
     }
     Ok(resolved)
@@ -947,7 +1098,9 @@ pub(crate) fn resolve(
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SkillRegistryArgs {
-    /// `publish`, `list`, `get`, `assign`, `unassign`, `resolve` or `drift`.
+    /// `publish`, `list`, `get`, `assign`, `unassign`, `resolve`, `drift`,
+    /// `yank`, `install`, `source_add`, `source_revoke`, `source_list`,
+    /// `source_refresh`, `source_discover`, or `source_import`.
     pub action: String,
     /// The action's parameters (see the tool description).
     #[serde(default)]
@@ -1021,6 +1174,28 @@ struct DriftParams {
     profile: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct YankParams {
+    name: String,
+    version: i64,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallParams {
+    name: String,
+    #[serde(default)]
+    version: Option<i64>,
+    #[serde(default)]
+    expected_hash: Option<String>,
+    target_dir: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
 fn params<T: DeserializeOwned>(raw: Option<Value>) -> UaResult<T> {
     let raw = match raw {
         None | Some(Value::Null) => json!({}),
@@ -1040,7 +1215,7 @@ fn author(ctx: &ToolCtx) -> UaResult<String> {
 /// is served. An organization `orgs` does not hold is refused first, before
 /// anything is read or written (organizations are never deleted, so the
 /// check cannot go stale).
-fn operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
+pub(super) fn operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
     let org = ctx.caller.org_id.as_str();
     let known = ctx
         .hub
@@ -1060,6 +1235,31 @@ fn operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
         return Err(UaError::denied(
             "operator_required",
             format!("{what} is an operator action (a human or a lifecycle operator)"),
+        ));
+    }
+    Ok(who)
+}
+
+/// Human-only operator authority check (`docs/skill-sources.md` §1 & §6):
+/// requires an existing org in `orgs`, a verified identity, and
+/// [`Authority::Operator`] (human operator only; never an agent or lifecycle
+/// operator).
+pub(super) fn human_operator(ctx: &ToolCtx, what: &str) -> UaResult<String> {
+    let org = ctx.caller.org_id.as_str();
+    let known = ctx
+        .hub
+        .db()
+        .read(|c| Ok(c.query_row("SELECT 1 FROM orgs WHERE id = ?1", [org], |_| Ok(())).optional()?))?;
+    if known.is_none() {
+        return Err(UaError::invalid(format!(
+            "unknown organization {org:?}; the skill registry was not changed"
+        )));
+    }
+    let who = author(ctx)?;
+    if !Authz::new(ctx.hub.cfg()).holds(&ctx.caller, &[Authority::Operator], org) {
+        return Err(UaError::denied(
+            "operator_required",
+            format!("{what} requires a human operator of this organization"),
         ));
     }
     Ok(who)
@@ -1428,6 +1628,7 @@ struct Staged {
     content: String,
     content_hash: String,
     source: String,
+    source_id: Option<String>,
     findings: Value,
     requested_by: String,
     published_version: Option<i64>,
@@ -1437,34 +1638,265 @@ struct Staged {
 
 fn load_staged(c: &Connection, org: &str, id: &str) -> UaResult<Option<Staged>> {
     Ok(c.query_row(
-        "SELECT id, name, content, content_hash, source, findings_json, requested_by, published_version, \
-         package_manifest, package_payload \
+        "SELECT id, name, content, content_hash, source, source_id, findings_json, requested_by, \
+         published_version, package_manifest, package_payload \
          FROM skill_publish_staging WHERE org_id = ?1 AND id = ?2",
         params![org, id],
         |r| {
-            let findings: String = r.get(5)?;
+            let findings: String = r.get(6)?;
             Ok(Staged {
                 id: r.get(0)?,
                 name: r.get(1)?,
                 content: r.get(2)?,
                 content_hash: r.get(3)?,
                 source: r.get(4)?,
+                source_id: r.get(5)?,
                 findings: serde_json::from_str(&findings).unwrap_or_else(|_| json!([])),
-                requested_by: r.get(6)?,
-                published_version: r.get(7)?,
-                package_manifest: r.get(8)?,
-                package_payload: r.get(9)?,
+                requested_by: r.get(7)?,
+                published_version: r.get(8)?,
+                package_manifest: r.get(9)?,
+                package_payload: r.get(10)?,
             })
         },
     )
     .optional()?)
 }
 
+fn active_source_pinned_sha(c: &Connection, org: &str, source_id: &str, what: &str) -> UaResult<String> {
+    let row: Option<(String, String)> = c
+        .query_row(
+            "SELECT status, pinned_sha FROM skill_sources WHERE org_id = ?1 AND id = ?2",
+            params![org, source_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((status, pinned_sha)) = row else {
+        return Err(UaError::conflict(format!(
+            "skill source {source_id:?} does not exist; {what} is refused"
+        )));
+    };
+    if status != "active" {
+        return Err(UaError::conflict(format!("skill source {source_id:?} is revoked; {what} is refused")));
+    }
+    Ok(pinned_sha)
+}
+
+/// Parse `git:<canonical_url>@<40-char-sha>:<repo_path>` provenance strings.
+fn parse_git_provenance(source: &str) -> Option<(&str, &str, &str)> {
+    let rest = source.strip_prefix("git:")?;
+    let (url, tail) = rest.split_once('@')?;
+    let (sha, repo_path) = tail.split_once(':')?;
+    if url.is_empty() || sha.len() != 40 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    Some((url, sha, repo_path))
+}
+
+/// Deterministic member diff between a previously published package version and
+/// a newly staged version (`docs/skill-sources.md` §5): `added`, `removed`,
+/// `modified`, and `unchanged` paths with old/new byte counts and SHA-256 hashes.
+fn compute_member_diff(prev_members: &[PackageMember], new_members: &[PackageMember]) -> Value {
+    let prev_map: BTreeMap<&str, &PackageMember> =
+        prev_members.iter().map(|m| (m.path.as_str(), m)).collect();
+    let new_map: BTreeMap<&str, &PackageMember> = new_members.iter().map(|m| (m.path.as_str(), m)).collect();
+    let mut all_paths: BTreeSet<&str> = prev_map.keys().copied().collect();
+    all_paths.extend(new_map.keys().copied());
+
+    let (mut added, mut removed, mut modified, mut unchanged) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for path in all_paths {
+        match (prev_map.get(path), new_map.get(path)) {
+            (None, Some(new_m)) => added.push(json!({
+                "path": path,
+                "new_bytes": new_m.bytes.len(),
+                "new_sha256": new_m.sha256,
+            })),
+            (Some(old_m), None) => removed.push(json!({
+                "path": path,
+                "old_bytes": old_m.bytes.len(),
+                "old_sha256": old_m.sha256,
+            })),
+            (Some(old_m), Some(new_m))
+                if old_m.sha256 != new_m.sha256 || old_m.bytes.len() != new_m.bytes.len() =>
+            {
+                modified.push(json!({
+                    "path": path,
+                    "old_bytes": old_m.bytes.len(),
+                    "new_bytes": new_m.bytes.len(),
+                    "old_sha256": old_m.sha256,
+                    "new_sha256": new_m.sha256,
+                }));
+            }
+            (Some(_), Some(new_m)) => unchanged.push(json!({
+                "path": path,
+                "bytes": new_m.bytes.len(),
+                "sha256": new_m.sha256,
+            })),
+            (None, None) => {}
+        }
+    }
+    json!({
+        "added": added,
+        "removed": removed,
+        "modified": modified,
+        "unchanged": unchanged,
+    })
+}
+
+fn compute_skill_md_diff(prev_md: &str, new_md: &str) -> String {
+    let diff =
+        similar::TextDiff::configure().timeout(std::time::Duration::from_secs(2)).diff_lines(prev_md, new_md);
+    diff.unified_diff().context_radius(3).header("a/SKILL.md", "b/SKILL.md").to_string()
+}
+
+/// Escape control characters (such as ESC and CR) and hidden Unicode characters
+/// before rendering approval diff text so terminals and UI views cannot be
+/// spoofed.
+fn escape_display_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '\n' || c == '\t' {
+            out.push(c);
+        } else if c.is_control() || super::skills::hidden_char(c) {
+            use std::fmt::Write;
+            let _ = write!(&mut out, "\\u{{{:04X}}}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Format a human-readable summary of `member_diff`, source changes, pin
+/// advances, and `skill_md_diff` for `ApprovalRow::display`
+/// (`approval_pending`, `approvals::get`, and Inbox UI).
+pub(crate) fn approval_display(
+    _c: &Connection,
+    approval_org: &str,
+    payload: &Value,
+) -> UaResult<Option<Value>> {
+    if payload["action"].as_str() != Some("publish") {
+        return Ok(None);
+    }
+    let org = payload["org_id"].as_str().unwrap_or(ua_core::DEFAULT_ORG);
+    if org != approval_org {
+        return Ok(None);
+    }
+    let member_diff = payload.get("member_diff");
+    let pin_advance = match (payload["source_pinned_sha"].as_str(), payload["new_sha"].as_str()) {
+        (Some(pin), Some(new)) if pin != new => Some((pin, new)),
+        _ => None,
+    };
+    if member_diff.is_none() && pin_advance.is_none() {
+        return Ok(None);
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let source_changed = payload["source_changed"].as_bool().unwrap_or(false);
+    if source_changed {
+        let skill_name = payload["name"].as_str().unwrap_or("?");
+        lines.push(format!(
+            "WARNING: SOURCE CHANGED — a different repository or path is claiming existing skill {skill_name:?}"
+        ));
+    }
+    if let Some(prev_v) = payload["previous_version"].as_i64() {
+        let prev_hash = payload["previous_content_hash"].as_str().unwrap_or("");
+        let new_hash = payload["content_hash"].as_str().unwrap_or("");
+        lines.push(format!("Upgrade from v{prev_v} ({prev_hash}) to new revision ({new_hash})"));
+    }
+    if let Some((pin, new)) = pin_advance {
+        lines.push(format!("Pin advance: {pin} \u{2192} {new} (explicit upgrade from tracking_ref tip)"));
+    }
+    if let Some(prev_src) = payload["previous_source"].as_str() {
+        lines.push(format!("Previous source: {prev_src}"));
+    }
+    if let Some(src) = payload["source"].as_str() {
+        lines.push(format!("Source: {src}"));
+    }
+    if let Some(member_diff) = member_diff {
+        lines.push("Members:".into());
+        for item in member_diff["added"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "+ {} ({} bytes, sha256 {})",
+                item["path"].as_str().unwrap_or("?"),
+                item["new_bytes"].as_u64().unwrap_or(0),
+                item["new_sha256"].as_str().unwrap_or("?"),
+            ));
+        }
+        for item in member_diff["removed"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "- {} ({} bytes, sha256 {})",
+                item["path"].as_str().unwrap_or("?"),
+                item["old_bytes"].as_u64().unwrap_or(0),
+                item["old_sha256"].as_str().unwrap_or("?"),
+            ));
+        }
+        for item in member_diff["modified"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "~ {} ({} -> {} bytes, sha256 {} -> {})",
+                item["path"].as_str().unwrap_or("?"),
+                item["old_bytes"].as_u64().unwrap_or(0),
+                item["new_bytes"].as_u64().unwrap_or(0),
+                item["old_sha256"].as_str().unwrap_or("?"),
+                item["new_sha256"].as_str().unwrap_or("?"),
+            ));
+        }
+        for item in member_diff["unchanged"].as_array().into_iter().flatten() {
+            lines.push(format!(
+                "  {} (unchanged, {} bytes)",
+                item["path"].as_str().unwrap_or("?"),
+                item["bytes"].as_u64().unwrap_or(0),
+            ));
+        }
+    }
+    let skill_md_diff = payload["skill_md_diff"].as_str().unwrap_or_default();
+    if !skill_md_diff.is_empty() {
+        lines.push(String::new());
+        lines.push(skill_md_diff.trim_end().to_string());
+    }
+    let diff_text = escape_display_text(&lines.join("\n"));
+    let mut lines_added = 0usize;
+    let mut lines_removed = 0usize;
+    let mut in_hunk = false;
+    for l in skill_md_diff.lines() {
+        if l.starts_with("@@ ") {
+            in_hunk = true;
+        } else if in_hunk {
+            if l.starts_with('+') {
+                lines_added += 1;
+            } else if l.starts_with('-') {
+                lines_removed += 1;
+            }
+        }
+    }
+    let mut out = json!({
+        "previous_version": payload["previous_version"],
+        "previous_content_hash": payload["previous_content_hash"],
+        "previous_source": payload["previous_source"],
+        "source_changed": source_changed,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "diff": diff_text,
+    });
+    if let Some(diff) = member_diff {
+        out["member_diff"] = diff.clone();
+    }
+    if let Some((pin, new)) = pin_advance {
+        out["source_pinned_sha"] = json!(pin);
+        out["new_sha"] = json!(new);
+    }
+    Ok(Some(out))
+}
+
 /// What a publish approval shows and binds: the organization, the full staged
-/// `SKILL.md` (at most 64 KiB), its hash, the review's findings, and for
-/// staged packages the canonical manifest (every file's path, size, hash and
-/// mode) plus every supporting file's full text (within `MAX_APPROVAL_TEXT_BYTES`).
-fn staged_payload(org: &str, s: &Staged) -> UaResult<Value> {
+/// `SKILL.md` (at most 64 KiB), its hash, the review's findings, for staged
+/// packages the canonical manifest (every file's path, size, hash and mode)
+/// plus every supporting file's full text (within `MAX_APPROVAL_TEXT_BYTES`),
+/// Git provenance and `source_id` / `source_pinned_sha` when imported from a
+/// Git source, and on upgrade the member diff, `previous_source`,
+/// `source_changed`, and `SKILL.md` unified diff against the latest published
+/// version (§5).
+fn staged_payload(c: &Connection, org: &str, s: &Staged) -> UaResult<Value> {
     let members = verify_and_decode(
         &s.content,
         &s.content_hash,
@@ -1480,6 +1912,25 @@ fn staged_payload(org: &str, s: &Staged) -> UaResult<Value> {
         "content": s.content,
         "review_findings": s.findings,
     });
+    if let Some(sid) = &s.source_id {
+        payload["source_id"] = json!(sid);
+        let pinned: Option<String> = c
+            .query_row(
+                "SELECT pinned_sha FROM skill_sources WHERE org_id = ?1 AND id = ?2",
+                params![org, sid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(pin) = pinned {
+            payload["source_pinned_sha"] = json!(pin);
+        }
+    }
+    if let Some((canonical_url, new_sha, repo_path)) = parse_git_provenance(&s.source) {
+        payload["source"] = json!(s.source);
+        payload["canonical_url"] = json!(canonical_url);
+        payload["new_sha"] = json!(new_sha);
+        payload["repo_path"] = json!(repo_path);
+    }
     if let Some(m_str) = &s.package_manifest {
         let manifest: Value =
             serde_json::from_str(m_str).map_err(|_| UaError::conflict("staged skill manifest is corrupt"))?;
@@ -1501,6 +1952,44 @@ fn staged_payload(org: &str, s: &Staged) -> UaResult<Value> {
         }
         payload["package_manifest"] = manifest;
         payload["package_files"] = Value::Array(package_files);
+    }
+    if let Some(prev) = load_version_raw_verified(c, org, &s.name, None)?
+        && prev.public["content_hash"].as_str() != Some(s.content_hash.as_str())
+    {
+        let prev_md = prev.public["content"].as_str().unwrap_or_default();
+        let prev_ver = prev.public["version"].as_i64().unwrap_or_default();
+        let prev_source_id: Option<String> = c
+            .query_row(
+                "SELECT source_id FROM skill_publish_staging \
+                 WHERE org_id = ?1 AND name = ?2 AND published_version = ?3 \
+                 ORDER BY created_at DESC LIMIT 1",
+                params![org, s.name, prev_ver],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let source_id_changed = match (&prev_source_id, &s.source_id) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        };
+        let source_changed = source_id_changed
+            || match (parse_git_provenance(&prev.source), parse_git_provenance(&s.source)) {
+                (Some((p_url, _, p_path)), Some((n_url, _, n_path))) => p_url != n_url || p_path != n_path,
+                (None, None) => false,
+                _ => true,
+            };
+        payload["previous_version"] = prev.public["version"].clone();
+        payload["previous_content_hash"] = prev.public["content_hash"].clone();
+        payload["previous_source"] = json!(prev.source);
+        payload["source_changed"] = json!(source_changed);
+        payload["member_diff"] = compute_member_diff(&prev.members, &members);
+        payload["skill_md_diff"] = json!(compute_skill_md_diff(prev_md, &s.content));
+        if parse_git_provenance(&s.source).is_some() || parse_git_provenance(&prev.source).is_some() {
+            payload["previous_sha"] = match parse_git_provenance(&prev.source) {
+                Some((_, old_sha, _)) => json!(old_sha),
+                None => Value::Null,
+            };
+        }
     }
     Ok(payload)
 }
@@ -1532,20 +2021,26 @@ fn existing_version(c: &Connection, org: &str, name: &str, hash: &str) -> UaResu
     Ok(Some(public))
 }
 
-/// `publish {name, path}`: review the skill, copy every file into the hub's
-/// staging table and ask for the approval. It never publishes; after approval,
-/// `publish {staging_id}` versions the staged copy without reading the
-/// workspace again.
-fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult<Value> {
-    let name = check_name(name.as_deref().unwrap_or_default())?;
-    let (target, rel) = workspace_target(ctx, path)?;
-    let (dir, rel_md) = skill_dir(&target, &rel, path)?;
-    let members = capture_package(&dir, path)?;
-    let text = std::str::from_utf8(&members["SKILL.md"].bytes)
+/// Screen, manifest, stage into `skill_publish_staging`, and park a one-time
+/// human publish approval for an already-captured package (`members`).
+/// Shared by D1 workspace `publish {name, path}` and D2b `source_import`.
+pub(super) fn stage_members(
+    ctx: &ToolCtx,
+    who: &str,
+    name: String,
+    source_provenance: String,
+    source_id: Option<String>,
+    members: BTreeMap<String, PackageMember>,
+    mut review: Value,
+) -> UaResult<Value> {
+    let md = members.get("SKILL.md").ok_or_else(|| UaError::invalid("skill package is missing SKILL.md"))?;
+    if md.bytes.contains(&0) {
+        return Err(UaError::invalid("SKILL.md must not contain NUL bytes"));
+    }
+    let text = std::str::from_utf8(&md.bytes)
         .map_err(|_| UaError::invalid("SKILL.md must be valid UTF-8"))?
         .to_string();
     let support_findings = audit_supporting_files(&members)?;
-    let mut review = super::skills::review_dirs(vec![dir.clone()], &dir, "info");
     if !support_findings.is_empty() {
         if let Some(arr) = review["findings"].as_array_mut() {
             arr.extend(support_findings.iter().cloned());
@@ -1567,11 +2062,6 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
     }
     if review["status"] == "fail" {
         return Ok(json!({ "ok": false, "blocked": true, "name": name, "review": review }));
-    }
-    // Re-check SKILL.md did not change while skill_review read it from disk.
-    let md_after = read_regular_nofollow(&dir.join("SKILL.md"), "SKILL.md", MAX_SKILL_FILE_BYTES)?;
-    if md_after != members["SKILL.md"].bytes {
-        return Err(UaError::conflict("skill changed while it was being reviewed; retry publish"));
     }
     if let Some(fm) = frontmatter(&text)
         && let Some(fm_name) = fm.get("name").and_then(Value::as_str)
@@ -1612,14 +2102,31 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
     let who = who.to_string();
     let org = ctx.caller.org_id.as_str();
     ctx.hub.db().write(|tx| {
+        // M1: re-check source revocation inside the write transaction so a
+        // revoke racing an in-flight fetch still blocks staging.
+        if let Some(sid) = source_id.as_deref() {
+            active_source_pinned_sha(tx, org, sid, "import")?;
+        }
+        // §6: re-importing or re-publishing a yanked content_hash is refused,
+        // never idempotent.
+        if let Some((y_name, y_ver)) = find_yanked_hash(tx, org, &hash)? {
+            return Err(UaError::conflict_code(
+                "yanked",
+                format!(
+                    "content_hash {hash} matches yanked skill {y_name:?} v{y_ver}; \
+                     re-importing or re-publishing a yanked revision is refused"
+                ),
+            ));
+        }
         if let Some(skill) = existing_version(tx, org, &name, &hash)? {
             return Ok(json!({ "ok": true, "idempotent": true, "skill": skill, "review": review }));
         }
         let reuse: Option<String> = tx
             .query_row(
                 "SELECT id FROM skill_publish_staging WHERE org_id = ?1 AND name = ?2 AND content_hash = ?3 \
-                 AND requested_by = ?4 AND published_version IS NULL ORDER BY created_at DESC LIMIT 1",
-                params![org, name, hash, who],
+                 AND source = ?4 AND COALESCE(source_id, '') = COALESCE(?5, '') AND requested_by = ?6 \
+                 AND published_version IS NULL ORDER BY created_at DESC LIMIT 1",
+                params![org, name, hash, source_provenance, source_id, who],
                 |r| r.get(0),
             )
             .optional()?;
@@ -1629,15 +2136,16 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
                 let id = format!("sk-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
                 tx.execute(
                     "INSERT INTO skill_publish_staging (org_id, id, name, content, content_hash, source, \
-                     findings_json, requested_by, created_at, package_manifest, package_payload) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     source_id, findings_json, requested_by, created_at, package_manifest, package_payload) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         org,
                         id,
                         name,
                         text,
                         hash,
-                        rel_md,
+                        source_provenance,
+                        source_id,
                         json!(findings).to_string(),
                         who,
                         ua_core::time::now(),
@@ -1649,20 +2157,47 @@ fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult
             }
         };
         let staged = load_staged(tx, org, &id)?.ok_or_else(|| UaError::internal("staged row vanished"))?;
-        let approval_payload = staged_payload(org, &staged)?;
+        let approval_payload = staged_payload(tx, org, &staged)?;
         let state = approvals::request(tx, &cfg, &caller, GATE, &approval_payload)?;
-        Ok(json!({
+        let mut resp = json!({
             "ok": false,
             "status": format!("approval_{}", state.status()),
             "approval_id": state.approval_id(),
             "staging_id": id,
             "name": name,
             "content_hash": hash,
+            "source": source_provenance,
             "package_manifest": manifest,
             "review": review,
-            "next": "once a human approves, call publish {staging_id}; the staged copy is published, not the file",
-        }))
+            "next": "once a human approves, call publish {staging_id}; the staged copy is published, not the source",
+        });
+        if let Some(sid) = &source_id {
+            resp["source_id"] = json!(sid);
+        }
+        if let Some(diff) = approval_payload.get("member_diff") {
+            resp["previous_version"] = approval_payload["previous_version"].clone();
+            resp["member_diff"] = diff.clone();
+        }
+        Ok(resp)
     })
+}
+
+/// `publish {name, path}`: review the skill, copy every file into the hub's
+/// staging table and ask for the approval. It never publishes; after approval,
+/// `publish {staging_id}` versions the staged copy without reading the
+/// workspace again.
+fn stage(ctx: &ToolCtx, who: &str, name: Option<String>, path: &str) -> UaResult<Value> {
+    let name = check_name(name.as_deref().unwrap_or_default())?;
+    let (target, rel) = workspace_target(ctx, path)?;
+    let (dir, rel_md) = skill_dir(&target, &rel, path)?;
+    let members = capture_package(&dir, path)?;
+    let review = super::skills::review_dirs(vec![dir.clone()], &dir, "info");
+    // Re-check SKILL.md did not change while skill_review read it from disk.
+    let md_after = read_regular_nofollow(&dir.join("SKILL.md"), "SKILL.md", MAX_SKILL_FILE_BYTES)?;
+    if md_after != members["SKILL.md"].bytes {
+        return Err(UaError::conflict("skill changed while it was being reviewed; retry publish"));
+    }
+    stage_members(ctx, who, name, rel_md, None, members, review)
 }
 
 /// `publish {staging_id}`: version the staged copy behind its approval.
@@ -1677,13 +2212,36 @@ fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
             if staged.requested_by != who {
                 return Err(missing());
             }
-            let approval_payload = staged_payload(org, &staged)?;
+            // M1: if this staged import came from a Git source, refuse publishing
+            // if that source has been revoked since staging.
+            if let Some(sid) = staged.source_id.as_deref() {
+                active_source_pinned_sha(tx, org, sid, "publish")?;
+            }
+            verify_and_decode(
+                &staged.content,
+                &staged.content_hash,
+                staged.package_manifest.as_deref(),
+                staged.package_payload.as_deref(),
+            )?;
+            // §6: if this content_hash was yanked (including between stage and
+            // publish), refuse instead of returning idempotent or publishing.
+            if let Some((y_name, y_ver)) = find_yanked_hash(tx, org, &staged.content_hash)? {
+                return Err(UaError::conflict_code(
+                    "yanked",
+                    format!(
+                        "content_hash {} matches yanked skill {y_name:?} v{y_ver}; \
+                         re-publishing a yanked revision is refused",
+                        staged.content_hash
+                    ),
+                ));
+            }
             if let Some(skill) = existing_version(tx, org, &staged.name, &staged.content_hash)? {
                 return Ok(Ok(json!({ "ok": true, "idempotent": true, "skill": skill })));
             }
             if staged.published_version.is_some() {
                 return Err(UaError::conflict("this staged publish was already used"));
             }
+            let approval_payload = staged_payload(tx, org, &staged)?;
             if let Some(approval) = gate(tx, ctx, &approval_payload)? {
                 return Ok(Err(approval));
             }
@@ -1740,6 +2298,11 @@ fn publish_staged(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
         .and_then(pending)
 }
 
+#[cfg(test)]
+pub(super) fn publish_staged_for_test(ctx: &ToolCtx, who: &str, id: &str) -> UaResult<Value> {
+    publish_staged(ctx, who, id)
+}
+
 fn publish(ctx: &ToolCtx, p: PublishParams) -> UaResult<Value> {
     let who = operator(ctx, "publishing a skill")?;
     match (p.staging_id.as_deref(), p.path.as_deref()) {
@@ -1756,11 +2319,30 @@ fn list(ctx: &ToolCtx, p: ListParams) -> UaResult<Value> {
     let name = p.name.filter(|n| !n.trim().is_empty());
     let org = ctx.caller.org_id.as_str();
     ctx.hub.db().read(|c| {
-        let mut stmt = c.prepare(&format!(
-            "SELECT {LIST_COLS} FROM skill_versions WHERE org_id = ?1 AND (?2 IS NULL OR name = ?2) \
-             ORDER BY name, version DESC"
-        ))?;
-        let skills = stmt.query_map(params![org, name], version_row)?.collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = c.prepare(
+            "SELECT sv.id, sv.name, sv.version, sv.content_hash, sv.source, sv.published_by, \
+                    sv.published_at, sv.package_manifest, y.yanked_at, y.reason \
+             FROM skill_versions sv \
+             LEFT JOIN skill_version_yanks y \
+               ON y.org_id = sv.org_id AND y.name = sv.name AND y.version = sv.version \
+             WHERE sv.org_id = ?1 AND (?2 IS NULL OR sv.name = ?2) \
+             ORDER BY sv.name, sv.version DESC",
+        )?;
+        let skills = stmt
+            .query_map(params![org, name], |r| {
+                let mut v = version_row(r)?;
+                let yanked_at: Option<String> = r.get(8)?;
+                let yank_reason: Option<String> = r.get(9)?;
+                v["yanked"] = json!(yanked_at.is_some());
+                if let Some(at) = yanked_at {
+                    v["yanked_at"] = json!(at);
+                    if let Some(reason) = yank_reason {
+                        v["yank_reason"] = json!(reason);
+                    }
+                }
+                Ok(v)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({ "skills": skills }))
     })
 }
@@ -1819,6 +2401,14 @@ fn assign_as(ctx: &ToolCtx, who: String, p: AssignParams) -> UaResult<Value> {
                 None => UaError::not_found(format!("skill {name:?} has no published version yet")),
             });
         };
+        // §6: a yanked version (or any version carrying a yanked content_hash)
+        // can never be assigned.
+        if is_version_yanked(tx, org, &name, pin)? || find_yanked_hash(tx, org, &hash)?.is_some() {
+            return Err(UaError::conflict_code(
+                "yanked",
+                format!("skill {name:?} v{pin} has been yanked and cannot be assigned"),
+            ));
+        }
         // The skill rides into the harness of every node of this agent or
         // profile: a human approves the assignment of this content first.
         // The payload binds the organization, so a pass is never consumed
@@ -2048,14 +2638,18 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
         }
         (None, None) => None,
     };
-    // The registry side: every skill's latest version, and with an agent the
-    // versions it resolves to (pins honoured).
+    // The registry side: every skill's latest non-yanked version, any yanked
+    // versions (so installed-but-yanked skills are flagged rather than called
+    // unregistered), and with an agent the versions it resolves to (pins honoured).
     let org = ctx.caller.org_id.as_str();
-    let (all_latest, resolved) = ctx.hub.db().read(|c| {
+    let (all_latest, yanked_rows, resolved) = ctx.hub.db().read(|c| {
         let mut stmt = c.prepare(
             "SELECT sv.name, sv.version, sv.content_hash, sv.package_manifest FROM skill_versions sv \
              JOIN (SELECT name, MAX(version) AS version FROM skill_versions WHERE org_id = ?1 GROUP BY name) latest \
-             ON sv.name = latest.name AND sv.version = latest.version WHERE sv.org_id = ?1",
+             ON sv.name = latest.name AND sv.version = latest.version \
+             LEFT JOIN skill_version_yanks y \
+               ON y.org_id = sv.org_id AND y.name = sv.name AND y.version = sv.version \
+             WHERE sv.org_id = ?1 AND y.version IS NULL",
         )?;
         let rows = stmt
             .query_map([org], |r| {
@@ -2068,12 +2662,42 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
                 Ok((name, version, hash, cmp))
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        let mut y_stmt = c.prepare(
+            "SELECT y.name, y.version, y.content_hash, y.yanked_at, y.reason, sv.package_manifest \
+             FROM skill_version_yanks y \
+             LEFT JOIN skill_versions sv \
+               ON sv.org_id = y.org_id AND sv.name = y.name AND sv.version = y.version \
+             WHERE y.org_id = ?1 \
+             ORDER BY y.version DESC",
+        )?;
+        let yanked_rows = y_stmt
+            .query_map([org], |r| {
+                let name: String = r.get(0)?;
+                let version: i64 = r.get(1)?;
+                let hash: String = r.get(2)?;
+                let yanked_at: String = r.get(3)?;
+                let reason: Option<String> = r.get(4)?;
+                let manifest: Option<String> = r.get(5)?;
+                let manifest = manifest.and_then(|s| serde_json::from_str::<Value>(&s).ok());
+                let cmp = drift_compare_hash(&hash, manifest.as_ref());
+                Ok((name, version, hash, cmp, yanked_at, reason))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         let resolved = match &label {
             Some(l) => Some(resolve(c, org, l, profile.as_deref())?),
             None => None,
         };
-        Ok((rows, resolved))
+        Ok((rows, yanked_rows, resolved))
     })?;
+    let mut yanked_by_name: BTreeMap<String, (i64, String, Option<String>)> = BTreeMap::new();
+    let mut yanked_by_hash: BTreeMap<String, (String, i64, String, Option<String>)> = BTreeMap::new();
+    for (y_name, y_ver, y_hash, y_cmp, y_at, y_reason) in yanked_rows {
+        yanked_by_name.entry(y_name.clone()).or_insert_with(|| (y_ver, y_at.clone(), y_reason.clone()));
+        yanked_by_hash
+            .entry(y_cmp)
+            .or_insert_with(|| (y_name.clone(), y_ver, y_at.clone(), y_reason.clone()));
+        yanked_by_hash.entry(y_hash).or_insert((y_name, y_ver, y_at, y_reason));
+    }
     let latest_all: BTreeMap<String, (i64, String, String)> =
         all_latest.into_iter().map(|(n, v, h, cmp)| (n, (v, h, cmp))).collect();
     let scoped = resolved.is_some();
@@ -2089,23 +2713,59 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
     };
     let mut names: BTreeSet<String> = on_disk.keys().cloned().collect();
     names.extend(latest.keys().cloned());
-    let (mut missing, mut stale, mut unregistered, mut unassigned, mut synced) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut missing, mut stale, mut unregistered, mut unassigned, mut synced, mut yanked) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for name in names {
         let disk = on_disk.get(&name);
         let reg = latest.get(&name);
         match (disk, reg) {
             (None, Some((v, _, _))) => missing.push(json!({ "name": name, "registry_version": v })),
             (None, None) => {}
-            (Some(h), None) => match (scoped, latest_all.get(&name)) {
-                (true, Some((v, _, _))) => {
-                    unassigned.push(json!({ "name": name, "on_disk_hash": h, "registry_version": v }));
+            (Some(h), None) => {
+                if let Some((y_skill, y_ver, y_at, y_reason)) = yanked_by_hash.get(h) {
+                    yanked.push(json!({
+                        "name": name,
+                        "on_disk_hash": h,
+                        "yanked_skill": y_skill,
+                        "yanked_version": y_ver,
+                        "yanked_at": y_at,
+                        "reason": y_reason,
+                    }));
+                } else if let Some((y_ver, y_at, y_reason)) = yanked_by_name.get(&name) {
+                    yanked.push(json!({
+                        "name": name,
+                        "on_disk_hash": h,
+                        "yanked_skill": name,
+                        "yanked_version": y_ver,
+                        "yanked_at": y_at,
+                        "reason": y_reason,
+                    }));
+                } else {
+                    match (scoped, latest_all.get(&name)) {
+                        (true, Some((v, _, _))) => {
+                            unassigned
+                                .push(json!({ "name": name, "on_disk_hash": h, "registry_version": v }));
+                        }
+                        _ => unregistered.push(json!({ "name": name, "on_disk_hash": h })),
+                    }
                 }
-                _ => unregistered.push(json!({ "name": name, "on_disk_hash": h })),
-            },
-            (Some(h), Some((v, rh, cmp))) if h != cmp => stale.push(json!({
-                "name": name, "on_disk_hash": h, "registry_hash": rh, "registry_version": v,
-            })),
+            }
+            (Some(h), Some((v, rh, cmp))) if h != cmp => {
+                if let Some((y_skill, y_ver, y_at, y_reason)) = yanked_by_hash.get(h) {
+                    yanked.push(json!({
+                        "name": name,
+                        "on_disk_hash": h,
+                        "yanked_skill": y_skill,
+                        "yanked_version": y_ver,
+                        "yanked_at": y_at,
+                        "reason": y_reason,
+                        "replacement_version": v,
+                    }));
+                }
+                stale.push(json!({
+                    "name": name, "on_disk_hash": h, "registry_hash": rh, "registry_version": v,
+                }));
+            }
             (Some(_), Some((v, _, _))) => synced.push(json!({ "name": name, "version": v })),
         }
     }
@@ -2114,15 +2774,1258 @@ fn drift(ctx: &ToolCtx, p: DriftParams) -> UaResult<Value> {
         "comparison": if label.is_some() { "resolved_assignments" } else { "latest_published" },
         "missing": missing,
         "stale": stale,
+        "yanked": yanked,
         "unregistered": unregistered,
         "unassigned": unassigned,
         "synced": synced,
     }))
 }
 
+const MAX_YANK_REASON_BYTES: usize = 500;
+
+fn yank(ctx: &ToolCtx, p: YankParams) -> UaResult<Value> {
+    let who = human_operator(ctx, "yanking a skill version")?;
+    yank_as(ctx, who, p)
+}
+
+/// `yank` for `who`, a human operator of the caller's organization
+/// (`docs/skill-sources.md` §6). Permanent: writes `skill_version_yanks` and
+/// appends `skill.yanked` in the same transaction behind a human approval.
+fn yank_as(ctx: &ToolCtx, who: String, p: YankParams) -> UaResult<Value> {
+    let name = check_name(&p.name)?;
+    let version = positive(Some(p.version))?.unwrap_or(1);
+    let reason = match p.reason {
+        None => None,
+        Some(raw) => {
+            if raw.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+                return Err(UaError::invalid("yank reason must not contain control characters"));
+            }
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.len() > MAX_YANK_REASON_BYTES {
+                return Err(UaError::invalid(format!(
+                    "yank reason exceeds the {MAX_YANK_REASON_BYTES}-byte limit"
+                )));
+            } else {
+                Some(trimmed)
+            }
+        }
+    };
+    let org = ctx.caller.org_id.as_str();
+    ctx.hub
+        .db()
+        .write(|tx| {
+            // Another organization's version answers identically to missing (`not_found`).
+            let content_hash: String = tx
+                .query_row(
+                    "SELECT content_hash FROM skill_versions \
+                     WHERE org_id = ?1 AND name = ?2 AND version = ?3",
+                    params![org, name, version],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| UaError::not_found(format!("unknown version {version} for skill {name:?}")))?;
+            if is_version_yanked(tx, org, &name, version)? {
+                return Err(UaError::conflict_code(
+                    "yanked",
+                    format!("skill {name:?} v{version} is already yanked; yanks are permanent"),
+                ));
+            }
+            let payload = json!({
+                "action": "yank",
+                "org_id": org,
+                "name": name,
+                "version": version,
+                "content_hash": content_hash,
+                "reason": reason,
+            });
+            if let Some(approval_id) = gate(tx, ctx, &payload)? {
+                return Ok(Err(approval_id));
+            }
+            let now = ua_core::time::now();
+            tx.execute(
+                "INSERT INTO skill_version_yanks (org_id, name, version, content_hash, reason, yanked_by, yanked_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![org, name, version, content_hash, reason, who, now],
+            )?;
+            emit(
+                tx,
+                org,
+                "skill.yanked",
+                json!({
+                    "name": ledger_text(org, &name),
+                    "version": version,
+                    "content_hash": ledger_text(org, &content_hash),
+                    "reason": reason.as_deref().map(|r| ledger_text(org, r)).unwrap_or(Value::Null),
+                    "yanked_at": now,
+                }),
+                &who,
+            )?;
+            Ok(Ok(json!({
+                "ok": true,
+                "yank": {
+                    "name": name,
+                    "version": version,
+                    "content_hash": content_hash,
+                    "reason": reason,
+                    "yanked_by": who,
+                    "yanked_at": now,
+                },
+            })))
+        })
+        .and_then(pending)
+}
+
+/// Parse and validate an install `target_dir` relative to the caller's sandbox
+/// root BEFORE touching the filesystem: refuses empty paths, NUL bytes,
+/// backslashes, `..`, out-of-sandbox absolute paths, non-UTF-8 segments,
+/// control characters, and hidden/bidi Unicode code points.
+fn parse_install_target_parts(
+    sb: &crate::families::workspace::Sandbox,
+    raw: &str,
+) -> UaResult<(Vec<String>, String)> {
+    let raw_t = raw.trim();
+    if raw_t.is_empty() || raw_t.contains('\0') || raw_t.contains('\\') {
+        return Err(UaError::invalid(format!("unsafe install target_dir {raw:?}")));
+    }
+    let p = Path::new(raw_t);
+    let rel: PathBuf = if p.is_absolute() {
+        p.strip_prefix(&sb.root)
+            .map_err(|_| {
+                UaError::denied("outside_sandbox", format!("target_dir {raw:?} is outside the sandbox"))
+            })?
+            .to_path_buf()
+    } else {
+        p.to_path_buf()
+    };
+
+    let mut parts = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => {
+                let s = seg
+                    .to_str()
+                    .ok_or_else(|| UaError::invalid(format!("target_dir {raw:?} contains non-UTF-8")))?;
+                if s.is_empty() || s.chars().any(|c| c.is_control() || super::skills::hidden_char(c)) {
+                    return Err(UaError::invalid(format!("unsafe install target_dir {raw:?}")));
+                }
+                parts.push(s.to_string());
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(UaError::denied(
+                    "outside_sandbox",
+                    format!("target_dir {raw:?} escapes the sandbox"),
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(UaError::invalid("target_dir must name a directory inside the workspace"));
+    }
+    let rel_str = parts.join("/");
+    Ok((parts, rel_str))
+}
+
+/// Apply the hub's workspace safety guards (`guard_inside_root` for hook and
+/// dependency directories, plus `guard_configured_hooks_dir` /
+/// `guard_configured_hooks` for custom `core.hooksPath`) to `target_dir`,
+/// `<target_dir>/<name>`, and every member path before creating any directory
+/// or file.
+async fn guard_install_paths(
+    sb: &crate::families::workspace::Sandbox,
+    target_rel: &str,
+    shown_target: &str,
+    name: &str,
+    members: &[PackageMember],
+) -> UaResult<()> {
+    let target_path = sb.root.join(target_rel);
+    let dest_path = target_path.join(name);
+    let dest_shown = format!("{shown_target}/{name}");
+    ua_core::safety::guard_inside_root(&target_path, &sb.root, shown_target, true)?;
+    ua_core::safety::guard_inside_root(&dest_path, &sb.root, &dest_shown, true)?;
+    crate::families::workspace::guard_configured_hooks_dir(&target_path, &sb.root, shown_target).await?;
+    crate::families::workspace::guard_configured_hooks_dir(&dest_path, &sb.root, &dest_shown).await?;
+    for m in members {
+        let clean = validate_package_path(&m.path)?;
+        let member_path = dest_path.join(&clean);
+        let member_shown = format!("{dest_shown}/{clean}");
+        ua_core::safety::guard_inside_root(&member_path, &sb.root, &member_shown, true)?;
+        crate::families::workspace::guard_configured_hooks(&member_path, &sb.root, &member_shown).await?;
+    }
+    Ok(())
+}
+
+/// All normalized and raw content hashes published for `(org, name)` (including
+/// yanked versions, so `install { overwrite: true }` can upgrade away from an
+/// installed yanked v1 to a fixed v2 while still refusing to wipe unknown or
+/// locally modified files).
+fn known_version_hashes(c: &Connection, org: &str, name: &str) -> UaResult<BTreeSet<String>> {
+    let mut stmt = c.prepare(
+        "SELECT content_hash, package_manifest FROM skill_versions WHERE org_id = ?1 AND name = ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![org, name], |r| {
+            let hash: String = r.get(0)?;
+            let manifest: Option<String> = r.get(1)?;
+            let manifest = manifest.and_then(|s| serde_json::from_str::<Value>(&s).ok());
+            Ok((hash, manifest))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut hashes = BTreeSet::new();
+    for (hash, manifest) in rows {
+        hashes.insert(drift_compare_hash(&hash, manifest.as_ref()));
+        hashes.insert(hash);
+    }
+    Ok(hashes)
+}
+
+/// Verify that an already-captured on-disk directory is an unmodified copy of a
+/// published registry version of `name`, and that its `SKILL.md` declares
+/// `name`. Returns the sorted list of exact relative file paths inside it so
+/// cleanup unlinks only those verified files (never `remove_dir_all` on unknown
+/// files).
+fn verify_existing_matches_registry(
+    name: &str,
+    existing_members: &BTreeMap<String, PackageMember>,
+    known_hashes: &BTreeSet<String>,
+) -> UaResult<Vec<String>> {
+    let md = existing_members.get("SKILL.md").ok_or_else(|| {
+        UaError::conflict(format!("refusing to overwrite {name:?}: existing directory is missing SKILL.md"))
+    })?;
+    let md_text = std::str::from_utf8(&md.bytes).map_err(|_| {
+        UaError::conflict(format!("refusing to overwrite {name:?}: existing SKILL.md is not UTF-8"))
+    })?;
+    let fm_name =
+        frontmatter(md_text).and_then(|fm| fm.get("name").and_then(Value::as_str).map(str::to_string));
+    if fm_name.as_deref() != Some(name) {
+        return Err(UaError::conflict(format!(
+            "refusing to overwrite {name:?}: existing SKILL.md does not declare name {name:?}"
+        )));
+    }
+    let pkg_hash = package_hash(&build_manifest(existing_members));
+    let single_hash = (existing_members.len() == 1).then(|| content_hash(md_text));
+    let matched =
+        known_hashes.contains(&pkg_hash) || single_hash.as_deref().is_some_and(|h| known_hashes.contains(h));
+    if !matched {
+        return Err(UaError::conflict(format!(
+            "refusing to overwrite {name:?}: existing files do not match any published registry version of \
+             {name:?}; unknown or modified files will not be deleted"
+        )));
+    }
+    Ok(existing_members.keys().cloned().collect())
+}
+
+#[cfg(unix)]
+mod install_fs {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::{CStr, CString};
+    use std::fs::File;
+    use std::io::{self, Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Component, Path};
+
+    use ua_core::{UaError, UaResult};
+
+    use super::{
+        MAX_PACKAGE_BYTES, MAX_PACKAGE_ENTRIES, MAX_PACKAGE_FILE_BYTES, MAX_PACKAGE_FILES,
+        MAX_SKILL_FILE_BYTES, MODE_FILE, PackageMember, portable_collision_key, sha256_bytes,
+        validate_package_path, verify_existing_matches_registry,
+    };
+
+    const DIR_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    fn c_seg(s: &str) -> UaResult<CString> {
+        CString::new(s).map_err(|_| UaError::invalid(format!("path segment {s:?} contains a NUL byte")))
+    }
+
+    fn openat_dir(at: libc::c_int, name: &CStr) -> io::Result<OwnedFd> {
+        // SAFETY: `name` is a valid NUL-terminated string; non-negative fd is owned by us.
+        let fd = unsafe { libc::openat(at, name.as_ptr(), DIR_FLAGS) };
+        if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
+    }
+
+    fn mkdirat_0755(parent: &OwnedFd, name: &CStr) -> io::Result<()> {
+        // SAFETY: `parent` is a valid open directory fd and `name` is NUL-terminated.
+        let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
+        if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    fn fstat_dev_ino(fd: &OwnedFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `fd` is a valid open descriptor and `st` points to writable `stat` storage.
+        let rc = unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: `fstat` succeeded and initialized `st`.
+            let st = unsafe { st.assume_init() };
+            Ok((st.st_dev, st.st_ino))
+        }
+    }
+
+    fn fstatat_nofollow(parent: &OwnedFd, name: &CStr) -> io::Result<libc::stat> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `parent` is a valid open directory fd, `name` is NUL-terminated, `st` is writable.
+        let rc = unsafe {
+            libc::fstatat(parent.as_raw_fd(), name.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+        };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: `fstatat` succeeded and initialized `st`.
+            Ok(unsafe { st.assume_init() })
+        }
+    }
+
+    fn renameat_same(parent: &OwnedFd, old: &CStr, new: &CStr) -> io::Result<()> {
+        // SAFETY: `parent` is an open directory fd; `old` and `new` are NUL-terminated.
+        let rc =
+            unsafe { libc::renameat(parent.as_raw_fd(), old.as_ptr(), parent.as_raw_fd(), new.as_ptr()) };
+        if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    fn unlinkat_entry(parent: &OwnedFd, name: &CStr, is_dir: bool) -> io::Result<()> {
+        let flags = if is_dir { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: `parent` is an open directory fd and `name` is NUL-terminated.
+        let rc = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    fn read_dir_names(dir: &OwnedFd) -> io::Result<Vec<String>> {
+        // Open a fresh fd to `.` so `fdopendir` / `closedir` owns its own fd
+        // and starts at offset 0 without closing `dir`.
+        let dot = c".";
+        let dup_fd = openat_dir(dir.as_raw_fd(), dot)?;
+        let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(dup_fd);
+        // SAFETY: `raw_fd` is a valid open directory fd whose ownership transfers to `fdopendir`.
+        let dirp = unsafe { libc::fdopendir(raw_fd) };
+        if dirp.is_null() {
+            let err = io::Error::last_os_error();
+            // SAFETY: `fdopendir` failed so we still own `raw_fd`.
+            unsafe {
+                libc::close(raw_fd);
+            }
+            return Err(err);
+        }
+        struct DirGuard(*mut libc::DIR);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` is a valid `DIR*` returned by `fdopendir`.
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+        let _guard = DirGuard(dirp);
+        let mut names = Vec::new();
+        loop {
+            // SAFETY: `dirp` is valid and owned exclusively by this function.
+            let entry = unsafe { libc::readdir(dirp) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: `d_name` is a NUL-terminated C string inside `entry`.
+            let cstr = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let bytes = cstr.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let s = std::str::from_utf8(bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "directory contains non-UTF-8 entry name")
+            })?;
+            names.push(s.to_string());
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// Open `sb_root` component-by-component from `/` with
+    /// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, then walk (and optionally
+    /// create) each validated segment of `parts` relative to its parent dirfd.
+    fn open_dir_chain(
+        sb_root: &Path,
+        parts: &[String],
+        create_missing: bool,
+        shown: &str,
+    ) -> UaResult<OwnedFd> {
+        let mut cur: Option<OwnedFd> = None;
+        for comp in sb_root.components() {
+            let next = match comp {
+                Component::RootDir => openat_dir(libc::AT_FDCWD, c"/")
+                    .map_err(|e| UaError::internal(format!("cannot open root directory: {e}")))?,
+                Component::Normal(seg) => {
+                    let at = cur
+                        .as_ref()
+                        .ok_or_else(|| UaError::internal("sandbox root is not absolute"))?
+                        .as_raw_fd();
+                    let cname = CString::new(seg.as_bytes())
+                        .map_err(|_| UaError::invalid("sandbox root contains a NUL byte"))?;
+                    openat_dir(at, &cname).map_err(|e| {
+                        if e.raw_os_error() == Some(libc::ELOOP) {
+                            UaError::invalid(
+                                "sandbox root passes through a symlink; symlinks are not followed",
+                            )
+                        } else {
+                            UaError::invalid(format!("cannot open sandbox root: {e}"))
+                        }
+                    })?
+                }
+                _ => return Err(UaError::invalid("sandbox root is not canonical")),
+            };
+            cur = Some(next);
+        }
+        let mut cur_fd = cur.ok_or_else(|| UaError::invalid("sandbox root is empty"))?;
+
+        for seg in parts {
+            let cseg = c_seg(seg)?;
+            let next_fd = match openat_dir(cur_fd.as_raw_fd(), &cseg) {
+                Ok(fd) => fd,
+                Err(e) if create_missing && e.kind() == io::ErrorKind::NotFound => {
+                    match mkdirat_0755(&cur_fd, &cseg) {
+                        Ok(()) => {}
+                        Err(me) if me.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(me) => {
+                            return Err(UaError::invalid(format!(
+                                "cannot create target_dir {shown:?}: {me}"
+                            )));
+                        }
+                    }
+                    openat_dir(cur_fd.as_raw_fd(), &cseg).map_err(|oe| {
+                        if oe.raw_os_error() == Some(libc::ELOOP) {
+                            UaError::invalid(format!(
+                                "target_dir {shown:?} passes through a symlink; symlinks are not followed"
+                            ))
+                        } else if oe.raw_os_error() == Some(libc::ENOTDIR) {
+                            UaError::invalid(format!(
+                                "target_dir {shown:?} path component is not a directory"
+                            ))
+                        } else {
+                            UaError::invalid(format!("cannot open target_dir {shown:?}: {oe}"))
+                        }
+                    })?
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(UaError::invalid(format!(
+                        "target_dir {shown:?} passes through a symlink; symlinks are not followed"
+                    )));
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
+                    return Err(UaError::invalid(format!(
+                        "target_dir {shown:?} path component is not a directory"
+                    )));
+                }
+                Err(e) => {
+                    return Err(UaError::invalid(format!("cannot inspect target_dir {shown:?}: {e}")));
+                }
+            };
+            cur_fd = next_fd;
+        }
+        Ok(cur_fd)
+    }
+
+    /// Re-walk the entire parent chain from `sb_root` through `parts` without
+    /// following symlinks and verify it still resolves to the exact `(dev, ino)`
+    /// of our pinned `target_fd`.
+    fn verify_dir_chain_identity(
+        sb_root: &Path,
+        parts: &[String],
+        expected: (libc::dev_t, libc::ino_t),
+        shown: &str,
+    ) -> UaResult<()> {
+        let verified_fd = open_dir_chain(sb_root, parts, false, shown)?;
+        let actual = fstat_dev_ino(&verified_fd)
+            .map_err(|e| UaError::internal(format!("cannot stat target_dir {shown:?}: {e}")))?;
+        if actual != expected {
+            return Err(UaError::conflict(format!("target_dir {shown:?} changed during install; aborting")));
+        }
+        Ok(())
+    }
+
+    fn read_regular_at(parent: &OwnedFd, seg: &CStr, label: &str, cap: usize) -> UaResult<Vec<u8>> {
+        let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `parent` is a valid open directory fd and `seg` is NUL-terminated.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), seg.as_ptr(), flags) };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            return Err(if err.raw_os_error() == Some(libc::ELOOP) {
+                UaError::invalid(format!("{label} is a symlink; symlinks are not followed"))
+            } else {
+                UaError::invalid(format!("{label} could not be read: {err}"))
+            });
+        }
+        // SAFETY: `fd` is a valid newly opened descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut file = File::from(owned);
+        let meta = file.metadata().map_err(|_| UaError::invalid(format!("{label} could not be read")))?;
+        if !meta.is_file() {
+            return Err(UaError::invalid(format!("{label} is a special file")));
+        }
+        if meta.len() > cap as u64 {
+            return Err(UaError::invalid(format!("{label} exceeds the {cap}-byte limit")));
+        }
+        let mut buf = Vec::new();
+        Read::by_ref(&mut file)
+            .take((cap as u64) + 1)
+            .read_to_end(&mut buf)
+            .map_err(|_| UaError::invalid(format!("{label} could not be read")))?;
+        if buf.len() > cap {
+            return Err(UaError::invalid(format!("{label} exceeds the {cap}-byte limit")));
+        }
+        Ok(buf)
+    }
+
+    /// Capture every file inside `root_fd` strictly via `openat` / `fstatat`
+    /// without following symlinks, enforcing D1 package rules so any unknown,
+    /// hidden, symlinked, or special file is detected before overwrite.
+    fn capture_package_from_dirfd(
+        root_fd: &OwnedFd,
+        label: &str,
+    ) -> UaResult<BTreeMap<String, PackageMember>> {
+        fn walk(
+            dir_fd: &OwnedFd,
+            prefix: &str,
+            members: &mut BTreeMap<String, PackageMember>,
+            portable: &mut BTreeSet<String>,
+            entries_seen: &mut usize,
+            total_bytes: &mut usize,
+            label: &str,
+        ) -> UaResult<()> {
+            let names = read_dir_names(dir_fd)
+                .map_err(|e| UaError::invalid(format!("cannot read {label:?}: {e}")))?;
+            for name in names {
+                *entries_seen += 1;
+                if *entries_seen > MAX_PACKAGE_ENTRIES {
+                    return Err(UaError::invalid(format!(
+                        "directory {label:?} exceeds {MAX_PACKAGE_ENTRIES} entries"
+                    )));
+                }
+                let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+                let clean = validate_package_path(&rel)?;
+                let cseg = c_seg(&name)?;
+                let st = fstatat_nofollow(dir_fd, &cseg)
+                    .map_err(|e| UaError::invalid(format!("cannot inspect {clean:?}: {e}")))?;
+                let ftype = st.st_mode & libc::S_IFMT;
+                if ftype == libc::S_IFLNK {
+                    return Err(UaError::invalid(format!(
+                        "symlink {clean:?} inside {label:?} is not allowed"
+                    )));
+                }
+                if ftype == libc::S_IFDIR {
+                    let sub_fd = openat_dir(dir_fd.as_raw_fd(), &cseg)
+                        .map_err(|e| UaError::invalid(format!("cannot descend into {clean:?}: {e}")))?;
+                    walk(&sub_fd, &clean, members, portable, entries_seen, total_bytes, label)?;
+                } else if ftype == libc::S_IFREG {
+                    if members.len() >= MAX_PACKAGE_FILES {
+                        return Err(UaError::invalid(format!(
+                            "directory {label:?} exceeds {MAX_PACKAGE_FILES} files"
+                        )));
+                    }
+                    if !portable.insert(portable_collision_key(&clean)) {
+                        return Err(UaError::invalid(format!("colliding path {clean:?}")));
+                    }
+                    let cap = if clean == "SKILL.md" { MAX_SKILL_FILE_BYTES } else { MAX_PACKAGE_FILE_BYTES };
+                    let bytes = read_regular_at(dir_fd, &cseg, &clean, cap)?;
+                    *total_bytes = total_bytes.saturating_add(bytes.len());
+                    if *total_bytes > MAX_PACKAGE_BYTES {
+                        return Err(UaError::invalid(format!(
+                            "directory {label:?} exceeds {MAX_PACKAGE_BYTES} bytes"
+                        )));
+                    }
+                    let sha256 = sha256_bytes(&bytes);
+                    members
+                        .insert(clean.clone(), PackageMember { path: clean, bytes, sha256, mode: MODE_FILE });
+                } else {
+                    return Err(UaError::invalid(format!("special file {clean:?} is not allowed")));
+                }
+            }
+            Ok(())
+        }
+
+        let mut members = BTreeMap::new();
+        let mut portable = BTreeSet::new();
+        let mut entries_seen = 0usize;
+        let mut total_bytes = 0usize;
+        walk(root_fd, "", &mut members, &mut portable, &mut entries_seen, &mut total_bytes, label)?;
+        Ok(members)
+    }
+
+    /// Write one verified package member inside `stage_fd` using `mkdirat`,
+    /// `openat(O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o644)`,
+    /// and `fchmod(0o644)`. Records every created subdir and file in `cleanup`.
+    fn write_member_at_0644(
+        stage_fd: &OwnedFd,
+        rel_path: &str,
+        bytes: &[u8],
+        created_dirs: &mut Vec<String>,
+        created_files: &mut Vec<String>,
+    ) -> UaResult<()> {
+        let clean = validate_package_path(rel_path)?;
+        let segments: Vec<&str> = clean.split('/').collect();
+        let mut owned_dir: Option<OwnedFd> = None;
+        let mut prefix = String::new();
+        for dir_seg in &segments[..segments.len() - 1] {
+            let parent = owned_dir.as_ref().unwrap_or(stage_fd);
+            let cseg = c_seg(dir_seg)?;
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(dir_seg);
+            let next_fd = match openat_dir(parent.as_raw_fd(), &cseg) {
+                Ok(fd) => fd,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    mkdirat_0755(parent, &cseg)
+                        .map_err(|me| UaError::internal(format!("cannot create staging subdir: {me}")))?;
+                    created_dirs.push(prefix.clone());
+                    openat_dir(parent.as_raw_fd(), &cseg)
+                        .map_err(|oe| UaError::internal(format!("cannot open staging subdir: {oe}")))?
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                    return Err(UaError::invalid(format!(
+                        "install staging path {clean:?} hit a symlink; symlinks are not followed"
+                    )));
+                }
+                Err(e) => {
+                    return Err(UaError::internal(format!("cannot inspect staging subdir: {e}")));
+                }
+            };
+            owned_dir = Some(next_fd);
+        }
+
+        let leaf_parent = owned_dir.as_ref().unwrap_or(stage_fd);
+        let leaf_c = c_seg(segments[segments.len() - 1])?;
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `leaf_parent` is a valid open directory fd and `leaf_c` is NUL-terminated.
+        let fd =
+            unsafe { libc::openat(leaf_parent.as_raw_fd(), leaf_c.as_ptr(), flags, 0o644 as libc::c_uint) };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            return Err(if err.raw_os_error() == Some(libc::ELOOP) {
+                UaError::invalid(format!("install path {clean:?} is a symlink; symlinks are not followed"))
+            } else {
+                UaError::internal(format!("cannot create staged file {clean:?}: {err}"))
+            });
+        }
+        // SAFETY: `fd` is a valid newly opened descriptor.
+        let mut file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        created_files.push(clean.clone());
+        file.write_all(bytes)
+            .map_err(|e| UaError::internal(format!("cannot write staged file {clean:?}: {e}")))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| UaError::internal(format!("cannot set 0644 mode on {clean:?}: {e}")))?;
+        file.sync_all().map_err(|e| UaError::internal(format!("cannot sync staged file {clean:?}: {e}")))?;
+        let meta = file.metadata().map_err(|e| UaError::internal(format!("cannot stat staged file: {e}")))?;
+        if !meta.is_file() || meta.len() != bytes.len() as u64 {
+            return Err(UaError::internal(format!("staged file {clean:?} failed post-write check")));
+        }
+        Ok(())
+    }
+
+    /// Unlink ONLY the exact listed relative file paths and their parent
+    /// subdirectories inside `dir_fd`, then `rmdir` `dir_name` inside
+    /// `parent_fd`. Never traverses unknown entries and never deletes unknown
+    /// files.
+    fn unlink_known_tree(
+        parent_fd: &OwnedFd,
+        dir_name: &CStr,
+        dir_fd: &OwnedFd,
+        rel_files: &[String],
+        extra_dirs: &[String],
+    ) {
+        let mut subdirs: BTreeSet<String> = extra_dirs.iter().cloned().collect();
+        for rel in rel_files {
+            let segs: Vec<&str> = rel.split('/').collect();
+            if segs.is_empty() {
+                continue;
+            }
+            let mut cur_owned: Option<OwnedFd> = None;
+            let mut prefix = String::new();
+            let mut ok = true;
+            for d in &segs[..segs.len() - 1] {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(d);
+                subdirs.insert(prefix.clone());
+                let p = cur_owned.as_ref().unwrap_or(dir_fd);
+                let Ok(cseg) = CString::new(*d) else {
+                    ok = false;
+                    break;
+                };
+                match openat_dir(p.as_raw_fd(), &cseg) {
+                    Ok(fd) => cur_owned = Some(fd),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && let Ok(leaf) = CString::new(segs[segs.len() - 1]) {
+                let p = cur_owned.as_ref().unwrap_or(dir_fd);
+                let _ = unlinkat_entry(p, &leaf, false);
+            }
+        }
+        // Remove subdirectories deepest-first.
+        let mut dirs: Vec<String> = subdirs.into_iter().collect();
+        dirs.sort_by(|a, b| {
+            let da = a.matches('/').count();
+            let db = b.matches('/').count();
+            db.cmp(&da).then_with(|| b.cmp(a))
+        });
+        for rel_dir in dirs {
+            let segs: Vec<&str> = rel_dir.split('/').collect();
+            if segs.is_empty() {
+                continue;
+            }
+            let mut cur_owned: Option<OwnedFd> = None;
+            let mut ok = true;
+            for d in &segs[..segs.len() - 1] {
+                let p = cur_owned.as_ref().unwrap_or(dir_fd);
+                let Ok(cseg) = CString::new(*d) else {
+                    ok = false;
+                    break;
+                };
+                match openat_dir(p.as_raw_fd(), &cseg) {
+                    Ok(fd) => cur_owned = Some(fd),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && let Ok(leaf) = CString::new(segs[segs.len() - 1]) {
+                let p = cur_owned.as_ref().unwrap_or(dir_fd);
+                let _ = unlinkat_entry(p, &leaf, true);
+            }
+        }
+        let _ = unlinkat_entry(parent_fd, dir_name, true);
+    }
+
+    struct StageFdCleanup<'a> {
+        parent_fd: &'a OwnedFd,
+        stage_fd: Option<OwnedFd>,
+        stage_name: CString,
+        created_dirs: Vec<String>,
+        created_files: Vec<String>,
+        armed: bool,
+    }
+
+    impl<'a> StageFdCleanup<'a> {
+        fn disarm(&mut self) {
+            self.armed = false;
+            self.stage_fd = None;
+        }
+    }
+
+    impl Drop for StageFdCleanup<'_> {
+        fn drop(&mut self) {
+            if self.armed
+                && let Some(stage_fd) = self.stage_fd.take()
+            {
+                unlink_known_tree(
+                    self.parent_fd,
+                    &self.stage_name,
+                    &stage_fd,
+                    &self.created_files,
+                    &self.created_dirs,
+                );
+            }
+        }
+    }
+
+    /// Dirfd-anchored atomic stage-and-swap inside `sb_root/parts/<name>`.
+    ///
+    /// Anchors every `mkdirat`, `openat`, `fstatat`, `renameat`, and `unlinkat`
+    /// to open directory file descriptors (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`),
+    /// re-verifies the full parent chain identity immediately before swap and
+    /// before removing a verified backup, and unlinks only verified files.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stage_and_swap_members_with_hook(
+        sb_root: &Path,
+        parts: &[String],
+        shown_target: &str,
+        name: &str,
+        members: &[PackageMember],
+        overwrite: bool,
+        known_hashes: &BTreeSet<String>,
+        before_swap: impl FnOnce(),
+    ) -> UaResult<()> {
+        let target_fd = open_dir_chain(sb_root, parts, true, shown_target)?;
+        let target_id = fstat_dev_ino(&target_fd)
+            .map_err(|e| UaError::internal(format!("cannot stat target_dir {shown_target:?}: {e}")))?;
+        let name_c = c_seg(name)?;
+
+        let replacing: Option<Vec<String>> = match fstatat_nofollow(&target_fd, &name_c) {
+            Ok(st) => {
+                let ftype = st.st_mode & libc::S_IFMT;
+                if ftype == libc::S_IFLNK {
+                    return Err(UaError::invalid(format!(
+                        "install destination {name:?} is a symlink; symlinks are not followed"
+                    )));
+                }
+                if ftype != libc::S_IFDIR {
+                    return Err(UaError::invalid(format!(
+                        "install destination {name:?} exists and is not a directory"
+                    )));
+                }
+                if !overwrite {
+                    return Err(UaError::conflict(format!(
+                        "skill directory {name:?} already exists; pass overwrite: true to replace"
+                    )));
+                }
+                let dest_fd = openat_dir(target_fd.as_raw_fd(), &name_c).map_err(|e| {
+                    if e.raw_os_error() == Some(libc::ELOOP) {
+                        UaError::invalid(format!(
+                            "install destination {name:?} is a symlink; symlinks are not followed"
+                        ))
+                    } else {
+                        UaError::invalid(format!("cannot inspect destination {name:?}: {e}"))
+                    }
+                })?;
+                let existing_entries = read_dir_names(&dest_fd)
+                    .map_err(|e| UaError::invalid(format!("cannot read destination {name:?}: {e}")))?;
+                if existing_entries.is_empty() {
+                    Some(Vec::new())
+                } else {
+                    let existing_members = capture_package_from_dirfd(&dest_fd, name).map_err(|e| {
+                        UaError::conflict(format!(
+                            "refusing to overwrite {name:?}: existing directory does not match a published \
+                             registry version of {name:?} ({e})"
+                        ))
+                    })?;
+                    let verified_paths =
+                        verify_existing_matches_registry(name, &existing_members, known_hashes)?;
+                    Some(verified_paths)
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(UaError::invalid(format!("cannot inspect destination {name:?}: {e}")));
+            }
+        };
+
+        let nonce = &uuid::Uuid::new_v4().simple().to_string()[..12];
+        let stage_name = format!(".{name}.ua-install-{nonce}");
+        let stage_c = c_seg(&stage_name)?;
+        mkdirat_0755(&target_fd, &stage_c)
+            .map_err(|e| UaError::internal(format!("cannot create install staging dir: {e}")))?;
+        let stage_fd = openat_dir(target_fd.as_raw_fd(), &stage_c)
+            .map_err(|e| UaError::internal(format!("cannot open install staging dir: {e}")))?;
+        let mut cleanup = StageFdCleanup {
+            parent_fd: &target_fd,
+            stage_fd: Some(stage_fd),
+            stage_name: stage_c.clone(),
+            created_dirs: Vec::new(),
+            created_files: Vec::new(),
+            armed: true,
+        };
+
+        let mut seen_portable = BTreeSet::new();
+        for m in members {
+            let clean = validate_package_path(&m.path)?;
+            if !seen_portable.insert(portable_collision_key(&clean)) {
+                return Err(UaError::conflict(format!("duplicate or colliding member path {clean:?}")));
+            }
+            let sfd = cleanup.stage_fd.as_ref().expect("stage_fd held while armed");
+            write_member_at_0644(
+                sfd,
+                &clean,
+                &m.bytes,
+                &mut cleanup.created_dirs,
+                &mut cleanup.created_files,
+            )?;
+        }
+
+        before_swap();
+
+        // Re-verify the entire parent chain from `sb_root` right before swap so
+        // any symlink swapped into a parent directory aborts the install cleanly.
+        verify_dir_chain_identity(sb_root, parts, target_id, shown_target)?;
+
+        // Re-check destination via `target_fd` right before swap.
+        match fstatat_nofollow(&target_fd, &name_c) {
+            Ok(st) if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK => {
+                return Err(UaError::invalid(format!(
+                    "install destination {name:?} became a symlink; symlinks are not followed"
+                )));
+            }
+            Ok(_) if replacing.is_none() => {
+                return Err(UaError::conflict(format!(
+                    "skill directory {name:?} appeared concurrently; pass overwrite: true to replace"
+                )));
+            }
+            _ => {}
+        }
+
+        if let Some(existing_paths) = replacing {
+            let backup_name = format!(".{name}.ua-backup-{nonce}");
+            let backup_c = c_seg(&backup_name)?;
+            renameat_same(&target_fd, &name_c, &backup_c)
+                .map_err(|e| UaError::internal(format!("cannot move existing skill aside for swap: {e}")))?;
+            match renameat_same(&target_fd, &stage_c, &name_c) {
+                Ok(()) => {
+                    cleanup.disarm();
+                    // Re-verify parent chain before unlinking ONLY the verified
+                    // files of the previous registry version inside `backup_fd`.
+                    if verify_dir_chain_identity(sb_root, parts, target_id, shown_target).is_ok()
+                        && let Ok(backup_fd) = openat_dir(target_fd.as_raw_fd(), &backup_c)
+                    {
+                        unlink_known_tree(&target_fd, &backup_c, &backup_fd, &existing_paths, &[]);
+                    }
+                }
+                Err(e) => {
+                    let _ = renameat_same(&target_fd, &backup_c, &name_c);
+                    return Err(UaError::internal(format!("cannot commit staged skill install: {e}")));
+                }
+            }
+        } else {
+            renameat_same(&target_fd, &stage_c, &name_c)
+                .map_err(|e| UaError::internal(format!("cannot commit staged skill install: {e}")))?;
+            cleanup.disarm();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+mod install_fs {
+    use std::collections::BTreeSet;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    use ua_core::{UaError, UaResult};
+
+    use super::{
+        PackageMember, capture_package, portable_collision_key, validate_package_path,
+        verify_existing_matches_registry,
+    };
+
+    fn walk_target_dir(sb_root: &Path, parts: &[String], create: bool, shown: &str) -> UaResult<PathBuf> {
+        let mut cur = sb_root.to_path_buf();
+        for seg in parts {
+            cur.push(seg);
+            match std::fs::symlink_metadata(&cur) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(UaError::invalid(format!(
+                            "target_dir {shown:?} passes through a symlink; symlinks are not followed"
+                        )));
+                    }
+                    if !meta.file_type().is_dir() {
+                        return Err(UaError::invalid(format!(
+                            "target_dir {shown:?} path component is not a directory"
+                        )));
+                    }
+                }
+                Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&cur)
+                        .map_err(|err| UaError::invalid(format!("cannot create target_dir: {err}")))?;
+                }
+                Err(e) => {
+                    return Err(UaError::invalid(format!("cannot inspect target_dir {shown:?}: {e}")));
+                }
+            }
+        }
+        Ok(cur)
+    }
+
+    fn unlink_known_paths(root: &Path, rel_files: &[String], extra_dirs: &[String]) {
+        let mut dirs: BTreeSet<PathBuf> = extra_dirs.iter().map(|d| root.join(d)).collect();
+        for rel in rel_files {
+            let p = root.join(rel);
+            let _ = std::fs::remove_file(&p);
+            let mut cur = p.parent();
+            while let Some(parent) = cur {
+                if parent == root {
+                    break;
+                }
+                dirs.insert(parent.to_path_buf());
+                cur = parent.parent();
+            }
+        }
+        let mut sorted: Vec<PathBuf> = dirs.into_iter().collect();
+        sorted.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        for d in sorted {
+            let _ = std::fs::remove_dir(d);
+        }
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stage_and_swap_members_with_hook(
+        sb_root: &Path,
+        parts: &[String],
+        shown_target: &str,
+        name: &str,
+        members: &[PackageMember],
+        overwrite: bool,
+        known_hashes: &BTreeSet<String>,
+        before_swap: impl FnOnce(),
+    ) -> UaResult<()> {
+        let target_root = walk_target_dir(sb_root, parts, true, shown_target)?;
+        let dest = target_root.join(name);
+        let replacing = match std::fs::symlink_metadata(&dest) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(UaError::invalid(format!(
+                        "install destination {name:?} is a symlink; symlinks are not followed"
+                    )));
+                }
+                if !meta.file_type().is_dir() {
+                    return Err(UaError::invalid(format!(
+                        "install destination {name:?} exists and is not a directory"
+                    )));
+                }
+                if !overwrite {
+                    return Err(UaError::conflict(format!(
+                        "skill directory {name:?} already exists; pass overwrite: true to replace"
+                    )));
+                }
+                let has_entries = std::fs::read_dir(&dest)
+                    .map_err(|e| UaError::invalid(format!("cannot inspect destination {name:?}: {e}")))?
+                    .next()
+                    .is_some();
+                if !has_entries {
+                    Some(Vec::new())
+                } else {
+                    let existing = capture_package(&dest, name).map_err(|e| {
+                        UaError::conflict(format!(
+                            "refusing to overwrite {name:?}: existing directory does not match a published \
+                             registry version of {name:?} ({e})"
+                        ))
+                    })?;
+                    Some(verify_existing_matches_registry(name, &existing, known_hashes)?)
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(UaError::invalid(format!("cannot inspect destination {name:?}: {e}"))),
+        };
+
+        let nonce = &uuid::Uuid::new_v4().simple().to_string()[..12];
+        let stage_dir = target_root.join(format!(".{name}.ua-install-{nonce}"));
+        std::fs::create_dir(&stage_dir)
+            .map_err(|e| UaError::internal(format!("cannot create install staging dir: {e}")))?;
+        let mut created_files = Vec::new();
+        let mut created_dirs = Vec::new();
+        let write_res: UaResult<()> = (|| {
+            let mut seen_portable = BTreeSet::new();
+            for m in members {
+                let clean = validate_package_path(&m.path)?;
+                if !seen_portable.insert(portable_collision_key(&clean)) {
+                    return Err(UaError::conflict(format!("duplicate or colliding member path {clean:?}")));
+                }
+                let full = stage_dir.join(&clean);
+                if let Some(parent) = full.parent()
+                    && parent != stage_dir
+                    && !parent.exists()
+                {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| UaError::internal(format!("cannot create staging subdir: {e}")))?;
+                    if let Ok(rel_d) = parent.strip_prefix(&stage_dir) {
+                        created_dirs.push(rel_d.to_string_lossy().into_owned());
+                    }
+                }
+                let mut f =
+                    OpenOptions::new().write(true).create_new(true).open(&full).map_err(|e| {
+                        UaError::internal(format!("cannot create staged file {clean:?}: {e}"))
+                    })?;
+                created_files.push(clean);
+                f.write_all(&m.bytes)
+                    .map_err(|e| UaError::internal(format!("cannot write staged file: {e}")))?;
+                f.sync_all().map_err(|e| UaError::internal(format!("cannot sync staged file: {e}")))?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            unlink_known_paths(&stage_dir, &created_files, &created_dirs);
+            return Err(e);
+        }
+
+        before_swap();
+
+        if let Err(e) = walk_target_dir(sb_root, parts, false, shown_target) {
+            unlink_known_paths(&stage_dir, &created_files, &created_dirs);
+            return Err(e);
+        }
+        if let Some(existing_paths) = replacing {
+            let backup_dir = target_root.join(format!(".{name}.ua-backup-{nonce}"));
+            std::fs::rename(&dest, &backup_dir)
+                .map_err(|e| UaError::internal(format!("cannot move existing skill aside for swap: {e}")))?;
+            match std::fs::rename(&stage_dir, &dest) {
+                Ok(()) => {
+                    if walk_target_dir(sb_root, parts, false, shown_target).is_ok() {
+                        unlink_known_paths(&backup_dir, &existing_paths, &[]);
+                    }
+                }
+                Err(e) => {
+                    let _ = std::fs::rename(&backup_dir, &dest);
+                    unlink_known_paths(&stage_dir, &created_files, &created_dirs);
+                    return Err(UaError::internal(format!("cannot commit staged skill install: {e}")));
+                }
+            }
+        } else if let Err(e) = std::fs::rename(&stage_dir, &dest) {
+            unlink_known_paths(&stage_dir, &created_files, &created_dirs);
+            return Err(UaError::internal(format!("cannot commit staged skill install: {e}")));
+        }
+        Ok(())
+    }
+}
+
+fn stage_and_swap_members(
+    sb_root: &Path,
+    parts: &[String],
+    shown_target: &str,
+    name: &str,
+    members: &[PackageMember],
+    overwrite: bool,
+    known_hashes: &BTreeSet<String>,
+) -> UaResult<()> {
+    install_fs::stage_and_swap_members_with_hook(
+        sb_root,
+        parts,
+        shown_target,
+        name,
+        members,
+        overwrite,
+        known_hashes,
+        || {},
+    )
+}
+
+/// Catalog `install`: re-verify every package member against `package_manifest`
+/// and `content_hash`, refuse yanked versions or mismatched `expected_hash`,
+/// enforce the caller's workspace sandbox and safety guards (`hook_dir`,
+/// `dependency_dir`, configured `core.hooksPath`), materialize atomically into
+/// `<target_dir>/<name>` via dirfd-anchored `openat`/`mkdirat`/`renameat` at
+/// mode `0o644`, and record `skill.installed` in the ledger
+/// (`docs/skill-sources.md` §4 & §6).
+async fn install(ctx: ToolCtx, p: InstallParams) -> UaResult<Value> {
+    let who = author(&ctx)?;
+    if ctx.caller.enforce_profile && !ctx.caller.profile.allows_tool("fs_write") {
+        return Err(UaError::denied(
+            "profile_denied",
+            "installing a skill writes to the workspace and requires write access",
+        ));
+    }
+    let name = check_name(&p.name)?;
+    let version = positive(p.version)?;
+    let expected_hash = match p.expected_hash {
+        None => None,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(UaError::invalid("expected_hash must be a 64-character hex SHA-256"));
+            }
+            Some(trimmed.to_ascii_lowercase())
+        }
+    };
+
+    // Load and re-verify strictly inside the caller's organization BEFORE
+    // checking workspace sandbox/paths, so another org's skill returns `not_found`.
+    let org = ctx.caller.org_id.clone();
+    let name_q = name.clone();
+    let (loaded, known_hashes) = ctx
+        .hub
+        .db()
+        .read_async(move |c| {
+            let loaded = load_version(c, &org, &name_q, version)?.ok_or_else(|| match version {
+                Some(v) => UaError::not_found(format!("unknown version {v} for skill {name_q:?}")),
+                None => UaError::not_found(format!("unknown skill: {name_q:?}")),
+            })?;
+            let known = known_version_hashes(c, &org, &name_q)?;
+            Ok((loaded, known))
+        })
+        .await?;
+    let verified_hash = loaded.public["content_hash"].as_str().unwrap_or_default().to_string();
+    let verified_version = loaded.public["version"].as_i64().unwrap_or_default();
+    if let Some(exp) = expected_hash.as_deref()
+        && exp != verified_hash
+    {
+        return Err(UaError::conflict_code(
+            "hash_mismatch",
+            format!(
+                "expected_hash {exp} does not match verified registry hash {verified_hash} for {name:?} v{verified_version}"
+            ),
+        ));
+    }
+
+    // Resolve through the caller's workspace sandbox (enforces `agent_workspaces = deny`,
+    // per-agent workspace roots, and non-default org refusal) and apply all
+    // workspace safety guards to target_dir, destination, and every member path.
+    let sb = crate::families::workspace::sandbox(&ctx)?;
+    let (parts, target_rel) = parse_install_target_parts(&sb, &p.target_dir)?;
+    guard_install_paths(&sb, &target_rel, &p.target_dir, &name, &loaded.members).await?;
+
+    let sb_root = sb.root.clone();
+    let shown_target = p.target_dir.clone();
+    let name_w = name.clone();
+    let members_w = loaded.members.clone();
+    let overwrite = p.overwrite;
+    blocking(move || {
+        stage_and_swap_members(&sb_root, &parts, &shown_target, &name_w, &members_w, overwrite, &known_hashes)
+    })
+    .await?;
+
+    let installed_rel = format!("{target_rel}/{name}");
+    let files: Vec<Value> = loaded
+        .members
+        .iter()
+        .map(|m| {
+            json!({
+                "path": m.path,
+                "bytes": m.bytes.len(),
+                "sha256": m.sha256,
+                "mode": MODE_FILE,
+            })
+        })
+        .collect();
+    let file_count = files.len();
+
+    let org_ev = ctx.caller.org_id.clone();
+    let name_ev = name.clone();
+    let hash_ev = verified_hash.clone();
+    let target_ev = installed_rel.clone();
+    ctx.hub
+        .db()
+        .write_async(move |tx| {
+            emit(
+                tx,
+                &org_ev,
+                "skill.installed",
+                json!({
+                    "name": ledger_text(&org_ev, &name_ev),
+                    "version": verified_version,
+                    "content_hash": ledger_text(&org_ev, &hash_ev),
+                    "target": ledger_text(&org_ev, &target_ev),
+                    "file_count": file_count,
+                }),
+                &who,
+            )?;
+            Ok(())
+        })
+        .await?;
+
+    Ok(json!({
+        "ok": true,
+        "name": name,
+        "version": verified_version,
+        "content_hash": verified_hash,
+        "installed_path": installed_rel,
+        "file_count": file_count,
+        "files": files,
+    }))
+}
+
 async fn skill_registry(ctx: ToolCtx, a: SkillRegistryArgs) -> UaResult<Value> {
     let raw = a.action.trim().to_ascii_lowercase();
     let action = crate::routes::action_of("skill_registry", Some(&a.action))?;
+    if action == "install" {
+        return install(ctx, params(a.params)?).await;
+    }
     blocking(move || match action {
         "publish" => publish(&ctx, params(a.params)?),
         "list" => list(&ctx, params(a.params)?),
@@ -2131,10 +4034,14 @@ async fn skill_registry(ctx: ToolCtx, a: SkillRegistryArgs) -> UaResult<Value> {
         "unassign" => unassign(&ctx, params(a.params)?),
         "resolve" => resolve_action(&ctx, params(a.params)?),
         "drift" => drift(&ctx, params(a.params)?),
+        "yank" => yank(&ctx, params(a.params)?),
         "source_add" => super::skill_sources::source_add(&ctx, params(a.params)?),
         "source_revoke" => super::skill_sources::source_revoke(&ctx, params(a.params)?),
         "source_list" => super::skill_sources::source_list(&ctx, params(a.params)?),
-        "catalog" | "install" | "team_install" | "starter_preview" | "starter_install" => {
+        "source_refresh" => super::skill_sources::source_refresh(&ctx, params(a.params)?),
+        "source_discover" => super::skill_sources::source_discover(&ctx, params(a.params)?),
+        "source_import" => super::skill_sources::source_import(&ctx, params(a.params)?),
+        "catalog" | "team_install" | "starter_preview" | "starter_install" => {
             Err(UaError::invalid(format!("action {raw:?} (the skill catalog) is not ported to this hub")))
         }
         "source_" => {
@@ -2154,17 +4061,29 @@ pub fn register(r: &mut Registry) {
              agent label or a profile and pinned to the approved version. publish, assign and unassign are operator \
              actions, each behind a one-time human approval. Actions: publish {name, path} (review a skill directory \
              or SKILL.md in the workspace, stage every file into the hub and ask for approval showing SKILL.md, the \
-             manifest and supporting text files; refused when skill_review finds a high-severity issue, including \
-             permission front matter, hidden text or credentials), publish {staging_id} (version the approved staged \
-             copy without re-reading the workspace), list {name?}, get {name, version?}, assign {skill_name, target, \
-             target_type: agent|profile, version?} (an agent assignment wins over a profile one), unassign \
-             {skill_name, target, target_type}, resolve {agent_label, profile?} (own skills, or any agent's for an \
-             operator), drift {surface_dir, agent_label?, profile?} (read-only: missing, stale, unregistered, \
-             unassigned and synced skills), source_add {url, pinned_sha, tracking_ref?, allowed_subpaths?} (human \
-             operator only, behind human approval: register an https:// Git skill source pinned to an exact 40-char \
-             commit SHA), source_revoke {source_id, reason?} (human operator only, behind human approval: terminally \
-             revoke a skill source), source_list {status?} (list this organization's skill sources). The harness \
-             config bundle served to a node carries the verified skill packages resolved for its agent.",
+             manifest, supporting text files and upgrade diffs; refused when skill_review finds a high-severity \
+             issue, including permission front matter, hidden text or credentials), publish {staging_id} (version \
+             the approved staged copy without re-reading the source), list {name?}, get {name, version?}, assign \
+             {skill_name, target, target_type: agent|profile, version?} (an agent assignment wins over a profile \
+             one), unassign {skill_name, target, target_type}, resolve {agent_label, profile?} (own skills, or any \
+             agent's for an operator; omits yanked versions), drift {surface_dir, agent_label?, profile?} \
+             (read-only: missing, stale, yanked, unregistered, unassigned and synced skills), yank {name, version, \
+             reason?} (human operator only, behind human approval: permanently yank a published version, blocking \
+             assign, install, get, resolve, node_config and re-importing/re-publishing the yanked content_hash), \
+             install {name, version?, expected_hash?, target_dir, overwrite?} (re-verify every member against \
+             package_manifest and content_hash, check optional expected_hash, enforce workspace sandbox and hook / \
+             dependency guards, and atomically materialize into <target_dir>/<name> with O_NOFOLLOW and mode 0o644; \
+             overwrite defaults to false and only replaces unmodified published versions of the skill), source_add \
+             tracking_ref?, allowed_subpaths?} (human operator only, behind human approval: register an https:// Git \
+             skill source pinned to an exact 40-char commit SHA), source_revoke {source_id, reason?} (human operator \
+             only, behind human approval: terminally revoke a skill source), source_list {status?} (list this \
+             organization's skill sources), source_refresh {source_id} (resolve the source's tracking_ref to a \
+             candidate SHA and report changes without moving pinned_sha), source_discover {source_id, sha?} \
+             (plumbing-only discovery of candidate skill packages under allowed_subpaths at pinned_sha), \
+             source_import {source_id, path, name?, sha?} (operator: read blobs by object id, run full D1 screens, \
+             stage into skill_publish_staging with git provenance and upgrade member diff for human publish \
+             approval). The harness config bundle served to a node carries the verified skill packages resolved for \
+             its agent.",
             skill_registry,
         )
         .gates_in_handler()
@@ -2411,5 +4330,210 @@ mod tests {
         let p: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(p["name"], "review-diff", "{payload}");
         assert!(p["content_hash"].is_string(), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn org_b_yank_binds_org_id_redacts_ledger_and_masks_foreign_versions() {
+        use ua_core::{ActorKind, Caller, Profile, identity::Transport};
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = ua_core::Config::for_home(home.path());
+        cfg.human_identities = vec!["operator".into()];
+        let hub = crate::Hub::in_memory(cfg).unwrap();
+        hub.db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES \
+                     ('org-b', 'org-b', 'Org B', '[\"developer\", \"coordinator\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                let md = "---\nname: secret-skill\ndescription: Secret org skill.\n---\nBody.\n";
+                let h = content_hash(md);
+                tx.execute(
+                    "INSERT INTO skill_versions (org_id, name, version, content_hash, source, content, \
+                     published_by, published_at) VALUES ('org-b', 'secret-skill', 1, ?1, 'skills/secret-skill/SKILL.md', \
+                     ?2, 'operator', '2026-01-01T00:00:00+00:00')",
+                    params![h, md],
+                )?;
+                tx.execute(
+                    "INSERT INTO skill_versions (org_id, name, version, content_hash, source, content, \
+                     published_by, published_at) VALUES ('default', 'default-only', 1, ?1, 'skills/default-only/SKILL.md', \
+                     ?2, 'operator', '2026-01-01T00:00:00+00:00')",
+                    params![h, md],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let b_ctx = ToolCtx {
+            hub: hub.clone(),
+            caller: Caller {
+                label: "operator".into(),
+                kind: ActorKind::Human,
+                profile: Profile::Coordinator,
+                enforce_profile: true,
+                session_key: Some("s1".into()),
+                transport: Transport::Mcp,
+                org_id: "org-b".into(),
+            },
+        };
+
+        // Attempting to yank a default-org skill from org-b returns `not_found`.
+        let foreign_err = yank_as(
+            &b_ctx,
+            "operator".into(),
+            YankParams { name: "default-only".into(), version: 1, reason: Some("nope".into()) },
+        )
+        .unwrap_err();
+        assert_eq!(foreign_err.code(), "not_found");
+
+        // Yanking org-b's own version parks an approval bound to org-b.
+        let req_id = match yank_as(
+            &b_ctx,
+            "operator".into(),
+            YankParams { name: "secret-skill".into(), version: 1, reason: Some("secret-leak-note".into()) },
+        ) {
+            Err(UaError::ApprovalRequired { approval_id, .. }) => approval_id,
+            other => panic!("expected pending approval: {other:?}"),
+        };
+        let (a_org, a_payload): (String, Value) = hub
+            .db()
+            .read(move |c| {
+                let (o, p): (String, String) =
+                    c.query_row("SELECT org_id, payload FROM approvals WHERE id = ?1", [req_id], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
+                Ok((o, serde_json::from_str(&p)?))
+            })
+            .unwrap();
+        assert_eq!(a_org, "org-b");
+        assert_eq!(a_payload["org_id"], "org-b");
+        assert_eq!(a_payload["action"], "yank");
+
+        hub.db()
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE approvals SET status = 'approved', resolved_by = 'operator', resolved_at = ?2, \
+                     updated_at = ?2 WHERE id = ?1",
+                    params![req_id, ua_core::time::now()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let res = yank_as(
+            &b_ctx,
+            "operator".into(),
+            YankParams { name: "secret-skill".into(), version: 1, reason: Some("secret-leak-note".into()) },
+        )
+        .unwrap();
+        assert_eq!(res["ok"], true);
+
+        // Verify ORG-EVENT-DEFAULT redaction on `skill.yanked`.
+        let (orig, payload): (String, String) = hub
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT COALESCE(originator, ''), payload FROM event_log \
+                     WHERE channel = 'skill.yanked' ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(orig, crate::approvals::NEUTRAL_ORIGINATOR);
+        for secret in ["secret-skill", "secret-leak-note", "operator"] {
+            assert!(!payload.contains(secret), "skill.yanked leaked {secret}: {payload}");
+        }
+        let p: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(p["name"], Value::Null);
+        assert_eq!(p["content_hash"], Value::Null);
+        assert_eq!(p["reason"], Value::Null);
+        assert_eq!(p["version"], 1);
+    }
+
+    #[test]
+    fn install_stage_failure_leaves_no_partial_package_on_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let ws_real = root.path().canonicalize().unwrap();
+        let parts = vec!["skills".to_string()];
+        let members = vec![
+            PackageMember {
+                path: "SKILL.md".into(),
+                bytes: b"---\nname: atomic-test\ndescription: Test.\n---\nBody.\n".to_vec(),
+                sha256: sha256_bytes(b"---\nname: atomic-test\ndescription: Test.\n---\nBody.\n"),
+                mode: MODE_FILE,
+            },
+            // Invalid path forces a failure mid-staging AFTER SKILL.md has been written.
+            PackageMember {
+                path: "../escape.txt".into(),
+                bytes: b"bad".to_vec(),
+                sha256: sha256_bytes(b"bad"),
+                mode: MODE_FILE,
+            },
+        ];
+        let known = BTreeSet::new();
+        let err = stage_and_swap_members(&ws_real, &parts, "skills", "atomic-test", &members, false, &known)
+            .unwrap_err();
+        assert_eq!(err.code(), "invalid_argument");
+        assert!(!ws_real.join("skills/atomic-test").exists(), "failed install must leave no destination dir");
+        let leftover: Vec<_> = std::fs::read_dir(ws_real.join("skills")).unwrap().collect();
+        assert!(leftover.is_empty(), "failed install must clean up staging dir: {leftover:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_parent_symlink_swap_before_rename_aborts_without_touching_outside() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ws_real = root.path().canonicalize().unwrap();
+        let outside_real = outside.path().canonicalize().unwrap();
+
+        // Plant a decoy skill directory inside `outside` to verify it is neither
+        // overwritten nor deleted if a parent dir is swapped for a symlink.
+        let outside_dest = outside_real.join("swap-skill");
+        std::fs::create_dir_all(&outside_dest).unwrap();
+        std::fs::write(outside_dest.join("SKILL.md"), "outside sentinel").unwrap();
+        std::fs::write(outside_dest.join("precious.txt"), "do not touch").unwrap();
+
+        let md = b"---\nname: swap-skill\ndescription: Test.\n---\nBody.\n";
+        let members = vec![PackageMember {
+            path: "SKILL.md".into(),
+            bytes: md.to_vec(),
+            sha256: sha256_bytes(md),
+            mode: MODE_FILE,
+        }];
+        let parts = vec!["area".to_string(), "skills".to_string()];
+        let known = BTreeSet::new();
+
+        // Deterministically swap `<ws>/area` for a symlink to `outside` right
+        // after staging finishes and right before the `renameat` swap.
+        let area_path = ws_real.join("area");
+        let moved_area = ws_real.join("area-moved");
+        let outside_for_hook = outside_real.clone();
+        let err = install_fs::stage_and_swap_members_with_hook(
+            &ws_real,
+            &parts,
+            "area/skills",
+            "swap-skill",
+            &members,
+            false,
+            &known,
+            move || {
+                std::fs::rename(&area_path, &moved_area).unwrap();
+                symlink(&outside_for_hook, &area_path).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "invalid_argument", "expected symlink refusal, got {err:?}");
+
+        // Outside directory must be completely untouched.
+        assert_eq!(std::fs::read_to_string(outside_dest.join("SKILL.md")).unwrap(), "outside sentinel");
+        assert_eq!(std::fs::read_to_string(outside_dest.join("precious.txt")).unwrap(), "do not touch");
+        // Original moved target dir must have cleaned up its staging dir and have no installed skill.
+        let orig_skills = ws_real.join("area-moved/skills");
+        assert!(!orig_skills.join("swap-skill").exists());
+        let leftover: Vec<_> = std::fs::read_dir(&orig_skills).unwrap().collect();
+        assert!(leftover.is_empty(), "staging dir must be cleaned up on abort: {leftover:?}");
     }
 }

@@ -334,8 +334,12 @@ pub const MANAGERS: &[Manager] = &[
             ("source_add", Own),
             ("source_revoke", Own),
             ("source_list", Own),
+            ("source_refresh", Own),
+            ("source_discover", Own),
+            ("source_import", Own),
+            ("yank", Own),
             ("catalog", Refused),
-            ("install", Refused),
+            ("install", Own),
             ("team_install", Refused),
             ("starter_preview", Refused),
             ("starter_install", Refused),
@@ -845,7 +849,18 @@ mod tests {
         assert_eq!(gate("export_data", "EXPORT_TASKS").as_deref(), Some("export_tasks"));
         assert_eq!(gate("export_data", "manifest"), None, "a nested call is governed by itself");
         assert_eq!(gate("skill_registry", "source_add").as_deref(), Some("skill_registry:source_add"));
-        assert_eq!(gate("skill_registry", "source_discover"), None);
+        assert_eq!(
+            gate("skill_registry", "source_discover").as_deref(),
+            Some("skill_registry:source_discover")
+        );
+        assert_eq!(
+            gate("skill_registry", "source_refresh").as_deref(),
+            Some("skill_registry:source_refresh")
+        );
+        assert_eq!(gate("skill_registry", "source_import").as_deref(), Some("skill_registry:source_import"));
+        assert_eq!(gate("skill_registry", "yank").as_deref(), Some("skill_registry:yank"));
+        assert_eq!(gate("skill_registry", "install").as_deref(), Some("skill_registry:install"));
+        assert_eq!(gate("skill_registry", "source_unknown"), None);
         assert_eq!(gate("coordination_manage", " agent_list").as_deref(), Some("agent_list"));
         // The standalone payload is `params`; an own key binds the call.
         assert_eq!(r("plan_manage", "delete").unwrap().unwrap().args, json!({ "x": 1 }));

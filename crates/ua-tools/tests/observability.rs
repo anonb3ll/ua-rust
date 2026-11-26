@@ -554,6 +554,63 @@ async fn doctor_tells_another_organization_nothing_about_the_hub_filesystem() {
     assert_eq!(seen_default, [json!("DORMANT"), json!("MISCONFIGURED"), json!("DEGRADED")]);
 }
 
+#[tokio::test]
+async fn doctor_hides_hub_configuration_from_other_organizations() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = builtin_registry();
+    let own = agent("reviewer-1", Profile::Lead);
+    let other = Caller { org_id: "org-b".into(), ..own.clone() };
+    let caps = ["http_bind", "approval_gating", "zulip", "slack", "search_provider"];
+    let lines = |report: &Value| {
+        caps.map(|cap| {
+            report["checks"].as_array().unwrap().iter().find(|row| row["capability"] == cap).unwrap().clone()
+        })
+    };
+    let mut org_b = Vec::new();
+    let mut default_org = Vec::new();
+    for configured in [false, true] {
+        let mut cfg = Config::for_home(dir.path().join(if configured { "on" } else { "off" }));
+        cfg.bind = if configured { "0.0.0.0:18765" } else { "0.0.0.0:18766" }.parse().unwrap();
+        cfg.enforce_auth = configured;
+        if configured {
+            cfg.approval_tools = vec!["event_log_verify".into(), "task_list".into()];
+            cfg.human_identities = vec!["operator".into()];
+            cfg.zulip_site = Some("https://chat.example.com".into());
+            cfg.zulip_email = Some("bridge@example.com".into());
+            cfg.zulip_api_key = Some(SecretString::from("doctor-fixture-key".to_string()));
+            cfg.slack_enabled = true;
+            cfg.slack_signing_secret = Some(SecretString::from("doctor-slack-fixture".to_string()));
+        }
+        let hub = Hub::in_memory(cfg).unwrap();
+        exec(
+            &hub,
+            "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) VALUES
+             ('org-b', 'org-b', 'Org B', '[\"lead\"]', '2026-01-01T00:00:00+00:00')",
+        );
+
+        let report = call(&reg, &hub, &other, "system_doctor", json!({})).await;
+        let neutral = lines(&report);
+        for row in &neutral {
+            assert_eq!(row["status"], "DORMANT", "{row}");
+            assert_eq!(row["detail"], "not available to this organization", "{row}");
+        }
+        org_b.push(neutral);
+        default_org.push(lines(&call(&reg, &hub, &own, "system_doctor", json!({})).await));
+    }
+    assert_eq!(org_b[0], org_b[1]);
+
+    let [bind, approval, zulip, slack, search] = &default_org[1];
+    assert_eq!(bind["detail"], "listening beyond loopback on port 18765 with auth enforced");
+    assert!(approval["detail"].as_str().unwrap().starts_with("2 configured gated tool(s)"));
+    assert!(zulip["detail"].as_str().unwrap().starts_with("chat.example.com;"));
+    assert!(slack["detail"].as_str().unwrap().starts_with("HTTP routes mounted;"));
+    assert_ne!(search["detail"], "not available to this organization");
+    assert_eq!(default_org[0][0]["status"], "MISCONFIGURED");
+    assert!(default_org[0][1]["detail"].as_str().unwrap().starts_with("0 configured gated tool(s)"));
+    assert_eq!(default_org[0][2]["status"], "DORMANT");
+    assert_eq!(default_org[0][3]["status"], "DORMANT");
+}
+
 /// The hub's host, its shared database file and the policy file are the
 /// default organization's: another organization's doctor gets no host
 /// name, one neutral `database` line with no statistics (no file or WAL
