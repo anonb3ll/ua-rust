@@ -536,15 +536,18 @@ fn newer_schema_refuses_db_evidence_commands_but_allows_offline_sign() {
         .unwrap();
     }
 
-    // DB-backed evidence commands are refused by the schema fence.
-    for args in [
-        vec!["evidence", "key-list"],
-        vec!["evidence", "verify", "--checkpoint", "cp-1"],
-        vec!["evidence", "attach", "--checkpoint", "cp-1", "--signature", &"0".repeat(128)],
+    // DB-backed evidence commands are refused by the schema fence; `verify` specifically exits 2.
+    for (args, want_code) in [
+        (vec!["evidence", "key-list"], None),
+        (vec!["evidence", "verify", "--checkpoint", "cp-1"], Some(2)),
+        (vec!["evidence", "attach", "--checkpoint", "cp-1", "--signature", &"0".repeat(128)], None),
     ] {
         let out = ua(&home).args(&args).output().unwrap();
         let err = text(&out.stderr);
         assert!(!out.status.success(), "{args:?} must refuse: {err}");
+        if let Some(code) = want_code {
+            assert_eq!(out.status.code(), Some(code), "{args:?} must exit {code}: {err}");
+        }
         assert!(err.contains("written by a newer build"), "{args:?}: {err}");
         assert!(err.contains("[future.evidence.v9]"), "{args:?}: {err}");
     }
@@ -562,4 +565,222 @@ fn newer_schema_refuses_db_evidence_commands_but_allows_offline_sign() {
         .output()
         .unwrap();
     assert!(sign.status.success(), "offline sign must ignore hub DB: {}", text(&sign.stderr));
+}
+
+#[test]
+fn trust_file_unknown_anchor_field_exits_2_and_verify_catches_rewritten_history_under_newer_checkpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("hub");
+    init_hub(&home);
+
+    let key_path = root.path().join("op.key");
+    let keygen =
+        ua(&home).args(["evidence", "key-generate", "--out", key_path.to_str().unwrap()]).output().unwrap();
+    assert!(keygen.status.success(), "{}", text(&keygen.stderr));
+    let pk =
+        serde_json::from_slice::<Value>(&keygen.stdout).unwrap()["public_key"].as_str().unwrap().to_string();
+    assert!(
+        ua(&home)
+            .args(["evidence", "key-add", "--key-id", "k1", "--public-key", &pk])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // 1. Write, sign, and attach cp-1 at seq1.
+    let (seq1, hash1) = latest_ledger_head(&home);
+    let cp1_file = root.path().join("cp1.json");
+    assert!(
+        ua(&home)
+            .args([
+                "evidence",
+                "checkpoint",
+                "--id",
+                "cp-1",
+                "--key-id",
+                "k1",
+                "--seq",
+                &seq1.to_string(),
+                "--hash",
+                &hash1,
+                "--out",
+                cp1_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let sig1 = text(
+        &ua(&home)
+            .args([
+                "evidence",
+                "sign",
+                "--key-file",
+                key_path.to_str().unwrap(),
+                "--checkpoint-file",
+                cp1_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        ua(&home)
+            .args(["evidence", "attach", "--checkpoint", "cp-1", "--signature", &sig1])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // Unknown field inside a `TrustAnchor` entry in `--trust-file` is refused (exit 2).
+    let bad_trust = root.path().join("bad-trust.json");
+    std::fs::write(
+        &bad_trust,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "keys": [{ "key_id": "k1", "public_key": pk, "revoked": true }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let bad_trust_out = ua(&home)
+        .args(["evidence", "verify", "--checkpoint", "cp-1", "--trust-file", bad_trust.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(bad_trust_out.status.code(), Some(2), "{}", text(&bad_trust_out.stderr));
+    assert!(text(&bad_trust_out.stderr).contains("unknown field"), "{}", text(&bad_trust_out.stderr));
+
+    // 2. Attacker with SQL access rewrites `event_log` at seq1 and recomputes the entire hash
+    //    chain through a newer seq2, then tricks the operator into signing cp-2 at seq2.
+    {
+        struct EventRow {
+            seq: i64,
+            ulid: String,
+            channel: String,
+            payload: String,
+            originator: Option<String>,
+            episode_id: Option<String>,
+            causal_parent_id: Option<String>,
+            created_at: String,
+            dedupe_key: Option<String>,
+        }
+        let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+        conn.execute_batch("DROP TRIGGER event_log_no_update;").unwrap();
+        let rows: Vec<EventRow> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, \
+                            created_at, dedupe_key \
+                     FROM event_log ORDER BY seq ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok(EventRow {
+                    seq: r.get(0)?,
+                    ulid: r.get(1)?,
+                    channel: r.get(2)?,
+                    payload: r.get(3)?,
+                    originator: r.get(4)?,
+                    episode_id: r.get(5)?,
+                    causal_parent_id: r.get(6)?,
+                    created_at: r.get(7)?,
+                    dedupe_key: r.get(8)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        };
+        let mut prev: Option<String> = None;
+        for mut row in rows {
+            if row.seq == seq1 {
+                row.payload = r#"{"rewritten":true}"#.to_string();
+            }
+            let prev_val = prev.as_deref().unwrap_or(ua_store::ledger::GENESIS_HASH);
+            let entry_hash = ua_store::ledger::compute_entry_hash(
+                Some(prev_val),
+                &row.ulid,
+                &row.channel,
+                &row.payload,
+                row.originator.as_deref(),
+                row.episode_id.as_deref(),
+                row.causal_parent_id.as_deref(),
+                &row.created_at,
+                row.dedupe_key.as_deref(),
+            );
+            conn.execute(
+                "UPDATE event_log SET payload = ?1, prev_hash = ?2, entry_hash = ?3 WHERE seq = ?4",
+                rusqlite::params![row.payload, prev_val, entry_hash, row.seq],
+            )
+            .unwrap();
+            prev = Some(entry_hash);
+        }
+    }
+
+    let (seq2, hash2) = latest_ledger_head(&home);
+    assert!(seq2 > seq1);
+    let cp2_file = root.path().join("cp2.json");
+    assert!(
+        ua(&home)
+            .args([
+                "evidence",
+                "checkpoint",
+                "--id",
+                "cp-2",
+                "--key-id",
+                "k1",
+                "--seq",
+                &seq2.to_string(),
+                "--hash",
+                &hash2,
+                "--out",
+                cp2_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let sig2 = text(
+        &ua(&home)
+            .args([
+                "evidence",
+                "sign",
+                "--key-file",
+                key_path.to_str().unwrap(),
+                "--checkpoint-file",
+                cp2_file.to_str().unwrap(),
+                "--prev-checkpoint",
+                cp1_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        ua(&home)
+            .args(["evidence", "attach", "--checkpoint", "cp-2", "--signature", &sig2])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // Even though cp-2's own signature and the rewritten event_log[1..=seq2] hash chain check out,
+    // `verify --checkpoint cp-2` re-checks earlier signed hub checkpoint cp-1 against event_log[seq1]
+    // and refuses with `ledger_mismatch` (exit 1).
+    let verify_cp2 = ua(&home)
+        .args(["evidence", "verify", "--checkpoint", "cp-2", "--anchor-key", &pk, "--anchor-key-id", "k1"])
+        .output()
+        .unwrap();
+    assert_eq!(verify_cp2.status.code(), Some(1), "{}", text(&verify_cp2.stdout));
+    let v2: Value = serde_json::from_slice(&verify_cp2.stdout).unwrap();
+    assert_eq!(v2["state"], "ledger_mismatch", "{v2}");
+    assert!(v2["reason"].as_str().unwrap().contains("cp-1"), "{v2}");
 }

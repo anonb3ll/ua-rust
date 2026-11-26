@@ -22,7 +22,6 @@ use rand::RngCore;
 use secrecy::zeroize::Zeroizing;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use ua_core::UaError;
 use ua_store::evidence::{
     CHECKPOINT_FORMAT, Checkpoint, CheckpointClass, CheckpointVerification, TrustAnchor, TrustFile,
     VerifyTrust, Window, checkpoint_attach, checkpoint_write, key_add, key_list, key_retire, key_revoke,
@@ -323,11 +322,10 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
                 };
             let verdict = match hub.db().read(|c| verify_checkpoint_with(c, checkpoint.trim(), &trust)) {
                 Ok(v) => v,
-                Err(UaError::NotFound(msg)) => {
-                    eprintln!("cannot verify: {msg}");
+                Err(e) => {
+                    eprintln!("cannot verify: {e}");
                     return Ok(ExitCode::from(2));
                 }
-                Err(e) => return Err(e.into()),
             };
             println!("{}", serde_json::to_string_pretty(&verdict)?);
             if let CheckpointVerification::ValidInStoreOnly { .. } = verdict {
@@ -753,7 +751,7 @@ fn generate_key_file(out: &Path) -> anyhow::Result<String> {
     let mut seed = Zeroizing::new([0u8; 32]);
     rand::rng().fill_bytes(&mut *seed);
     let key = SigningKey::from_bytes(&seed);
-    let seed_hex = Zeroizing::new(hex::encode(*seed));
+    let seed_hex = Zeroizing::new(hex::encode(seed.as_slice()));
     write_atomic_file(out, seed_hex.as_bytes(), false)?;
     set_owner_only_file(out)?;
     Ok(hex::encode(key.verifying_key().to_bytes()))

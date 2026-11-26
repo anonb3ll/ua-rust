@@ -376,15 +376,19 @@ and the operator signs that digest offline.
   hex text. A row whose stored fields no longer hash to the stored digest is
   reported as a digest mismatch, never as a pass.
 - **The ledger anchor.** A `hub` checkpoint is checked against `event_log`:
-  its `seq` must exist, its `hash` must equal that row's `entry_hash`, and the
-  chain must verify through that `seq`. A made-up sequence or hash is refused
-  at write time (`checkpoint_write`) and reported as a ledger mismatch on
+  its `seq` must exist, its `hash` must equal that row's `entry_hash`, the
+  chain must verify through that `seq`, and every earlier signed `hub`
+  checkpoint (`seq <= checkpoint.seq`) stored in `evidence_checkpoint` is
+  re-checked against the current `event_log` so a rewritten ledger cannot be
+  hidden behind a newer checkpoint. A made-up sequence or hash is refused at
+  write time (`checkpoint_write`) and reported as a ledger mismatch on
   `verify`, never as a pass.
 - **The trust anchor and revocation.** The key row is in the same database as
   the checkpoint, so a verifier that trusts it is trusting the database it
   protects. `verify` takes either a pinned key (`--anchor-key` and
   `--anchor-key-id`, both required together) or a local JSON `--trust-file`
-  (`{"keys": [{"key_id": ..., "public_key": ...}], "revoked_key_ids": [...]}`),
+  (`{"keys": [{"key_id": ..., "public_key": ...}], "revoked_key_ids": [...]}`;
+  unknown fields on the file or any key entry are refused),
   plus optional repeatable `--revoked-key-id` flags. Without a pinned key or
   trust file the verdict is `valid_in_store_only`, which is not authorship.
   Verifier-side revocations (`--revoked-key-id` and `revoked_key_ids`) are
@@ -398,12 +402,20 @@ and the operator signs that digest offline.
   disagrees) and prints every field, the recomputed digest, and the previous
   signed checkpoint head to stderr before signing. Operators should keep a
   local copy of each checkpoint file they sign and pass
-  `--prev-checkpoint <prev-file>` when signing the next one: `sign` verifies
-  that the new checkpoint advances cleanly from the local previous head
-  (strictly higher `seq` for `hub`; matching `global_head_hash` →
-  `global_from_hash` and non-decreasing `org_row_count` for `org`) and refuses
-  if the hub's reported `previous_signed` disagrees with the operator's local
-  copy.
+  `--prev-checkpoint <prev-file>` when signing the next one: `sign` checks
+  offline progression against the local previous head (strictly higher `seq`
+  for `hub`; matching `global_head_hash` → `global_from_hash` and
+  non-decreasing `org_row_count` for `org`) and refuses if the hub's reported
+  `previous_signed` disagrees with the operator's local copy. Because `sign`
+  runs offline without the ledger, `--prev-checkpoint` on a `hub` checkpoint
+  checks `seq` monotonicity and hub-reported `previous_signed` equality only —
+  it does not by itself prove the hub did not rewrite `event_log` prior to the
+  earlier `seq`. Chain continuity against earlier signed `hub` checkpoints is
+  enforced online by `ua evidence verify`, which re-checks every earlier signed
+  `hub` checkpoint in `evidence_checkpoint` against `event_log` (and operators
+  can defend against row deletion in SQLite by retaining local copies of prior
+  checkpoint files and confirming their `(seq, hash)` still matches the hub's
+  ledger).
 - **The commands and exit codes.** `ua evidence key-generate` writes a 0600
   seed file on the operator's machine and prints the public key; `key-add`,
   `key-retire` and `key-revoke` maintain the store; `checkpoint` writes a row
@@ -411,11 +423,12 @@ and the operator signs that digest offline.
   `hub`); `sign --checkpoint-file` recomputes the digest, displays the fields
   and previous head, and signs offline with the seed file; `attach` verifies
   and stores the signature; `verify` recomputes the digest, checks the ledger
-  anchor and the signature against the pinned key or trust file. `verify` exits
-  `0` for `valid`, `1` for refused (`digest_mismatch`, `ledger_mismatch`,
-  `invalid_signature`, `key_mismatch`), and `2` for cannot verify (`unsigned`,
-  `unknown_key`, `key_revoked`, `valid_in_store_only`,
-  `org_class_not_verifiable`, or missing/invalid verifier inputs).
+  anchor (including every earlier signed `hub` checkpoint) and the signature
+  against the pinned key or trust file. `verify` exits `0` for `valid`, `1` for
+  refused (`digest_mismatch`, `ledger_mismatch`, `invalid_signature`,
+  `key_mismatch`), and `2` for cannot verify (`unsigned`, `unknown_key`,
+  `key_revoked`, `valid_in_store_only`, `org_class_not_verifiable`, or any
+  missing/invalid input, config, open/schema-fence, or database error).
   `key-generate` and `sign` are offline: they do not open or create a hub
   database. Key and checkpoint changes are appended to `event_log`
   (`evidence.key.added`, `evidence.key.retired`, `evidence.key.revoked`,
