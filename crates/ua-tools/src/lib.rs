@@ -249,6 +249,10 @@ pub fn schema_parts() -> Vec<Part> {
     // graph edges, and the old table frozen for that organization (C2b).
     // After the goal parts and the graph parts.
     parts.push(families::tasks::SERVES_GOAL_GRAPH.into());
+    // Overlapping chunk vectors for long memory notes (`memory_chunks`, born
+    // tenant-scoped) plus parent-org fences and generated org triggers.
+    parts.push(families::memory::CHUNKS_SCHEMA.into());
+    parts.push(families::memory::CHUNKS_TENANT_PART.into());
     parts
 }
 

@@ -206,8 +206,46 @@ CREATE INDEX IF NOT EXISTS idx_memory_embeddings_org_model ON memory_embeddings(
 ",
 };
 
+/// `memory.chunks.v1`: overlapping chunk vectors for long notes, born
+/// tenant-scoped (`org_id NOT NULL`), plus same-organization parent fences
+/// on both `memory_chunks` and `memory_embeddings`.
+pub const CHUNKS_SCHEMA: SchemaPart = SchemaPart {
+    name: "memory.chunks.v1",
+    sql: "
+CREATE TABLE IF NOT EXISTS memory_chunks (
+    org_id      TEXT NOT NULL,
+    note_id     TEXT NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    idx         INTEGER NOT NULL CHECK (idx >= 0),
+    model       TEXT NOT NULL,
+    dim         INTEGER NOT NULL,
+    embedding   BLOB NOT NULL,
+    content_sha TEXT NOT NULL,
+    PRIMARY KEY (note_id, idx)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_chunks_org_model ON memory_chunks(org_id, model);
+CREATE TRIGGER IF NOT EXISTS memory_chunks_org_fence
+BEFORE INSERT ON memory_chunks
+WHEN NEW.org_id IS NOT (SELECT org_id FROM memory WHERE id = NEW.note_id)
+BEGIN SELECT RAISE(ABORT, 'memory_chunks org_id differs from its note'); END;
+CREATE TRIGGER IF NOT EXISTS memory_chunks_org_fence_update
+BEFORE UPDATE OF note_id ON memory_chunks
+WHEN NEW.org_id IS NOT (SELECT org_id FROM memory WHERE id = NEW.note_id)
+BEGIN SELECT RAISE(ABORT, 'memory_chunks org_id differs from its note'); END;
+CREATE TRIGGER IF NOT EXISTS memory_embeddings_org_fence
+BEFORE INSERT ON memory_embeddings
+WHEN NEW.org_id IS NOT (SELECT org_id FROM memory WHERE id = NEW.note_id)
+BEGIN SELECT RAISE(ABORT, 'memory_embeddings org_id differs from its note'); END;
+",
+};
+
+/// `organization.v1.memory_chunks`: generated `memory_chunks_org_exists` and
+/// `memory_chunks_org_immutable` triggers. `memory_chunks` already carries
+/// `org_id NOT NULL` from [`CHUNKS_SCHEMA`].
+pub const CHUNKS_TENANT_PART: Procedure =
+    ua_store::org::tenant_part("organization.v1.memory_chunks", &["memory_chunks"]);
+
 /// The organization parts, in application order, after [`schema_parts`] and
 /// `organization.v1.store`.
 pub fn org_parts() -> Vec<Part> {
-    vec![TENANT_PART.into(), ORG_SCOPE.into()]
+    vec![TENANT_PART.into(), ORG_SCOPE.into(), CHUNKS_SCHEMA.into(), CHUNKS_TENANT_PART.into()]
 }

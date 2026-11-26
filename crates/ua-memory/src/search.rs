@@ -219,7 +219,7 @@ pub async fn search(db: &Db, cfg: &Config, org: &str, a: SearchRequest) -> UaRes
 
     // Semantic leg: embed the query when an embedder is available.
     let embedder = embedder_for(cfg);
-    let model = embedder.model().to_string();
+    let model = embedder.identity();
     let (qvec, semantic_failure) = if embedder.available() {
         let (e, text) = (embedder.clone(), a.query.clone());
         match blocking(move || Ok(embed::embed_one(&*e, text))).await? {
