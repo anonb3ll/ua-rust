@@ -1352,13 +1352,26 @@ async fn imported_vectors_and_chunks_do_not_score_until_backfill_reembeds() {
 
     register_embedder(Arc::new(ImportTestEmbedder));
     let f = fixture();
+    // Point `note-a`'s source single vector and chunk 0 directly at [1.0, 0.0]
+    // (cosine = 1.0 >= SEMANTIC_MIN_SIMILARITY 0.65 against the "marsupial"
+    // query vector [1.0, 0.0]), so the test fails immediately if imported rows
+    // are ever scored before backfill.
+    {
+        let unit_x: Vec<u8> = [1.0f32, 0.0f32].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let src = Connection::open(&f.path).unwrap();
+        src.execute("UPDATE memory_embeddings SET embedding = ?1 WHERE note_id = 'note-a'", [&unit_x])
+            .unwrap();
+        src.execute(
+            "UPDATE memory_chunks SET embedding = ?1 WHERE note_id = 'note-a' AND chunk_index = 0",
+            [&unit_x],
+        )
+        .unwrap();
+    }
     let db = target();
     ua_import::import(&db, &f.path, &opts()).unwrap();
 
-    // Fixture imported `note-a` ("wombats have cube shaped droppings") with
-    // both `memory_embeddings` and `memory_chunks` holding vector [1.0, 2.0]
-    // (non-zero cosine with [1.0, 0.0]). They must NOT score as-is.
-    let mut cfg = Config::for_home(std::env::temp_dir());
+    let home = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(home.path());
     cfg.embed_model = "import-e2e-embedder".into();
     let hub = Hub::new(cfg, db.clone());
     let caller = Caller {

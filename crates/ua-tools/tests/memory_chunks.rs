@@ -3,8 +3,8 @@
 //!
 //! Every tool call runs through `builtin_registry().call(..)`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -48,19 +48,32 @@ struct TruncatingEmbedder {
     backend: String,
     revision: String,
     fail: Arc<AtomicBool>,
+    seen: Arc<Mutex<Vec<String>>>,
 }
 
 impl TruncatingEmbedder {
     fn new(backend: &str, model: &str, revision: &str) -> (Self, Arc<AtomicBool>) {
+        let (emb, fail, _seen) = Self::with_recorder(backend, model, revision);
+        (emb, fail)
+    }
+
+    fn with_recorder(
+        backend: &str,
+        model: &str,
+        revision: &str,
+    ) -> (Self, Arc<AtomicBool>, Arc<Mutex<Vec<String>>>) {
         let fail = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
                 model: model.into(),
                 backend: backend.into(),
                 revision: revision.into(),
                 fail: fail.clone(),
+                seen: seen.clone(),
             },
             fail,
+            seen,
         )
     }
 }
@@ -82,6 +95,7 @@ impl Embedder for TruncatingEmbedder {
         if self.fail.load(Ordering::SeqCst) {
             return Err(EmbedError::runtime("injected embed failure"));
         }
+        self.seen.lock().unwrap().extend(texts.iter().cloned());
         Ok(texts
             .iter()
             .map(|text| {
@@ -486,11 +500,12 @@ async fn semantic_score_is_exact_max_of_single_and_best_chunk() {
 }
 
 /// Maintenance backfill runs strictly per organization: a backfill in one org
-/// never reads, embeds or writes vectors for another organization's notes.
+/// never reads, sends to the embedder, or writes vectors for another
+/// organization's notes.
 #[tokio::test]
 async fn backfill_is_strictly_per_org_and_never_touches_another_orgs_notes() {
     let model = "chunks-per-org-backfill-model";
-    let (emb, fail_flag) = TruncatingEmbedder::new("local", model, "rev-1");
+    let (emb, fail_flag, seen) = TruncatingEmbedder::with_recorder("local", model, "rev-1");
     register_embedder(Arc::new(emb));
     let t = T::new(hub_with_model(model));
 
@@ -516,7 +531,7 @@ async fn backfill_is_strictly_per_org_and_never_touches_another_orgs_notes() {
         .ok(
             &a_caller,
             "memory_save",
-            json!({ "title": "Org A note", "content": format!("{filler} car car car") }),
+            json!({ "title": "Org A note", "content": format!("org-a-only-sentinel {filler} car car car") }),
         )
         .await["id"]
         .as_str()
@@ -526,7 +541,7 @@ async fn backfill_is_strictly_per_org_and_never_touches_another_orgs_notes() {
         .ok(
             &b_caller,
             "memory_save",
-            json!({ "title": "Org B note", "content": format!("{filler} quokka quokka quokka") }),
+            json!({ "title": "Org B note", "content": format!("org-b-only-sentinel {filler} quokka quokka quokka") }),
         )
         .await["id"]
         .as_str()
@@ -536,10 +551,25 @@ async fn backfill_is_strictly_per_org_and_never_touches_another_orgs_notes() {
     assert_eq!(t.count("SELECT COUNT(*) FROM memory_embeddings"), 0);
     assert_eq!(t.count("SELECT COUNT(*) FROM memory_chunks"), 0);
 
-    // Backfill as default org: only Org A's note is embedded; Org B stays untouched.
+    // Backfill as default org: only Org A's note reaches the embedder and is
+    // written; Org B's text must NEVER reach the embedder (catches a missing
+    // `m.org_id = ?1` filter on the backfill scan).
     fail_flag.store(false, Ordering::SeqCst);
+    seen.lock().unwrap().clear();
     let maint_a = t.ok(&a_caller, "recall_maintenance", json!({})).await;
     assert_eq!(maint_a["embeddings"]["notes_embedded"], 1, "{maint_a}");
+    {
+        let inputs = seen.lock().unwrap();
+        assert!(!inputs.is_empty(), "org-a backfill must have called the embedder");
+        assert!(
+            inputs.iter().any(|s| s.contains("org-a-only-sentinel")),
+            "org-a text must reach the embedder: {inputs:?}"
+        );
+        assert!(
+            inputs.iter().all(|s| !s.contains("org-b-only-sentinel") && !s.contains("Org B note")),
+            "org-b text must NEVER reach the embedder during org-a backfill"
+        );
+    }
     assert_eq!(
         t.count(&format!(
             "SELECT COUNT(*) FROM memory_embeddings WHERE note_id = '{note_a}' AND org_id = 'default'"
@@ -563,8 +593,20 @@ async fn backfill_is_strictly_per_org_and_never_touches_another_orgs_notes() {
     );
 
     // Org B's own backfill embeds Org B's note without touching Org A.
+    seen.lock().unwrap().clear();
     let maint_b = t.ok(&b_caller, "recall_maintenance", json!({})).await;
     assert_eq!(maint_b["embeddings"]["notes_embedded"], 1, "{maint_b}");
+    {
+        let inputs = seen.lock().unwrap();
+        assert!(
+            inputs.iter().any(|s| s.contains("org-b-only-sentinel")),
+            "org-b text must reach the embedder"
+        );
+        assert!(
+            inputs.iter().all(|s| !s.contains("org-a-only-sentinel") && !s.contains("Org A note")),
+            "org-a text must NEVER reach the embedder during org-b backfill"
+        );
+    }
     assert_eq!(
         t.count(&format!(
             "SELECT COUNT(*) FROM memory_embeddings WHERE note_id = '{note_b}' AND org_id = 'org-b'"
@@ -578,4 +620,37 @@ async fn backfill_is_strictly_per_org_and_never_touches_another_orgs_notes() {
     );
     let hit_b = t.ok(&b_caller, "memory_search", json!({ "query": "marsupial" })).await;
     assert_eq!(hit_b["results"][0]["id"], note_b, "{hit_b}");
+}
+
+/// `recall_maintenance` caps backfill batches per call so an identity change on
+/// a large corpus cannot re-embed everything in a single tool invocation.
+#[tokio::test]
+async fn recall_maintenance_caps_backfill_batches_per_call() {
+    let model = "chunks-backfill-batch-cap-model";
+    let (emb, fail_flag) = TruncatingEmbedder::new("local", model, "rev-1");
+    register_embedder(Arc::new(emb));
+    let t = T::new(hub_with_model(model));
+    let b1 = agent("builder-1");
+
+    // 67 unembedded notes = 8 capped batches (64 notes) on pass 1, then 1 batch (3 notes) on pass 2.
+    fail_flag.store(true, Ordering::SeqCst);
+    for i in 0..67 {
+        t.ok(
+            &b1,
+            "memory_save",
+            json!({ "title": format!("Capped {i}"), "content": format!("note body {i} car") }),
+        )
+        .await;
+    }
+
+    fail_flag.store(false, Ordering::SeqCst);
+    let pass1 = t.ok(&b1, "recall_maintenance", json!({})).await;
+    assert_eq!(pass1["embeddings"]["batches"], 8, "pass 1 must cap at 8 batches: {pass1}");
+    assert_eq!(pass1["embeddings"]["notes_embedded"], 64, "{pass1}");
+    assert_eq!(pass1["embeddings"]["has_more"], true, "{pass1}");
+
+    let pass2 = t.ok(&b1, "recall_maintenance", json!({})).await;
+    assert_eq!(pass2["embeddings"]["batches"], 1, "{pass2}");
+    assert_eq!(pass2["embeddings"]["notes_embedded"], 3, "{pass2}");
+    assert_eq!(pass2["embeddings"]["has_more"], false, "{pass2}");
 }

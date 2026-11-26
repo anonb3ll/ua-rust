@@ -127,6 +127,12 @@ fn candidate(n: &Note, reason: &str) -> Value {
     })
 }
 
+/// Maximum number of [`BACKFILL_BATCH`]-sized batches processed in a single
+/// `recall_maintenance` / [`backfill_embeddings`] pass (8 batches × 8 notes =
+/// 64 notes), so one maintenance call cannot stall by re-embedding an entire
+/// corpus after a vector-identity change.
+pub const MAX_BACKFILL_BATCHES_PER_PASS: usize = 8;
+
 /// Summary of one [`backfill_embeddings`] pass over an organization.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackfillReport {
@@ -145,6 +151,9 @@ pub struct BackfillReport {
     /// True when the pass stopped early because the embedder reported
     /// `model_acquisition` or `disabled`.
     pub stopped_unavailable: bool,
+    /// True when the pass reached the per-call batch cap before exhausting
+    /// stale notes; a subsequent pass will continue from the remaining notes.
+    pub has_more: bool,
 }
 
 impl BackfillReport {
@@ -157,6 +166,7 @@ impl BackfillReport {
             "batches": self.batches,
             "failed": self.failed,
             "stopped_unavailable": self.stopped_unavailable,
+            "has_more": self.has_more,
         })
     }
 }
@@ -260,9 +270,22 @@ fn next_stale_batch(
 
 /// Backfill missing or stale single vectors and chunk vectors for live notes
 /// in organization `org`, committing at most [`BACKFILL_BATCH`] (8) notes per
-/// write transaction. Embeddings are computed outside any database lock, and
-/// each write re-verifies the note's text hash before storing.
+/// write transaction and capping the pass at [`MAX_BACKFILL_BATCHES_PER_PASS`]
+/// batches so one call cannot re-embed an unbounded corpus. Embeddings are
+/// computed outside any database lock, and each write re-verifies the note's
+/// text hash before storing.
 pub async fn backfill_embeddings(db: &Db, cfg: &Config, org: &str) -> UaResult<BackfillReport> {
+    backfill_embeddings_capped(db, cfg, org, Some(MAX_BACKFILL_BATCHES_PER_PASS)).await
+}
+
+/// Same as [`backfill_embeddings`] with an explicit optional batch cap
+/// (`None` runs until exhausted).
+pub async fn backfill_embeddings_capped(
+    db: &Db,
+    cfg: &Config,
+    org: &str,
+    max_batches: Option<usize>,
+) -> UaResult<BackfillReport> {
     let embedder = embedder_for(cfg);
     let identity = embedder.identity();
     let mut report =
@@ -272,6 +295,7 @@ pub async fn backfill_embeddings(db: &Db, cfg: &Config, org: &str) -> UaResult<B
     }
 
     let mut cursor: i64 = 0;
+    let mut batches_attempted: usize = 0;
     loop {
         let (org_r, id_r) = (org.to_string(), identity.clone());
         let (batch, next_cursor, exhausted) =
@@ -280,6 +304,13 @@ pub async fn backfill_embeddings(db: &Db, cfg: &Config, org: &str) -> UaResult<B
         if batch.is_empty() {
             break;
         }
+        if let Some(cap) = max_batches
+            && batches_attempted >= cap
+        {
+            report.has_more = true;
+            break;
+        }
+        batches_attempted += 1;
 
         let mut embedded: Vec<EmbeddedNote> = Vec::new();
         for note in batch {
