@@ -149,6 +149,24 @@ pub struct NewGraphNode {
     pub updated_at: String,
 }
 
+/// New values for the mutable columns of an existing `graph_nodes` row
+/// (`docs/graph.md`, C2 slice 1).
+///
+/// Immutable identity and provenance columns (`id`, `org_id`, `kind`,
+/// `external_id`, `asserted_by`, `asserted_by_kind`, `source_kind`,
+/// `source_ref`, `created_at`) are never modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphNodePatch {
+    pub display_label: Option<String>,
+    pub visibility: String,
+    pub team_id: Option<String>,
+    pub owner_type: Option<String>,
+    pub owner_id: Option<String>,
+    pub meta_json: String,
+    pub archived_at: Option<String>,
+    pub updated_at: String,
+}
+
 /// One row of `graph_edges`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphEdgeRow {
@@ -465,10 +483,15 @@ pub trait GraphRead {
 /// rules — endpoint-kind matrix, domain-owned edge fence, generic empty-scope
 /// enforcement, write-time acyclicity checks, quotas, and ledger appends.
 /// Production callers MUST go through `ua-graph` (`graph_node_ensure`,
-/// `assert_edge`, `retract_edge`) rather than calling these methods directly,
+/// `graph_node_update`, `assert_edge`, `graph_edge_update_weight`,
+/// `retract_edge`) rather than calling these methods directly,
 /// except for controlled bulk import/backfill paths that uphold those
 /// invariants themselves.
 pub trait GraphRepo: GraphRead {
+    /// Look up an existing node by `(org_id, id)` without visibility or
+    /// `archived_at` filtering, for domain-internal [`graph_node_update`].
+    fn find_node_by_id_internal(&mut self, org_id: &str, id: &str) -> UaResult<Option<GraphNodeRow>>;
+
     /// Look up an existing node by `(org_id, kind, external_id)` without
     /// visibility filtering, for domain-internal [`ensure_node`] idempotency.
     fn find_node_by_external_internal(
@@ -484,11 +507,31 @@ pub trait GraphRepo: GraphRead {
     /// callers should use `ua_graph::graph_node_ensure`.
     fn ensure_node(&mut self, node: &NewGraphNode) -> UaResult<(GraphNodeRow, bool)>;
 
+    /// **Low-level unchecked storage primitive.** Update only the mutable
+    /// columns of an existing `graph_nodes` row in `org_id`. Callers MUST go
+    /// through `ua_graph::graph_node_update` (enforced by `update_guard`).
+    fn update_node_mutable(
+        &mut self,
+        org_id: &str,
+        id: &str,
+        patch: &GraphNodePatch,
+    ) -> UaResult<Option<GraphNodeRow>>;
+
     /// **Low-level unchecked storage primitive.** Insert a single edge row.
     /// Enforces non-default-org provenance and temporal invariants only; skips
     /// endpoint-kind validation, domain-owned edge fence, acyclicity checks,
     /// quotas, and ledger appends. Callers must use `ua_graph::assert_edge`.
     fn insert_edge(&mut self, edge: &NewGraphEdge) -> UaResult<GraphEdgeRow>;
+
+    /// **Low-level unchecked storage primitive.** Update `weight` on a live
+    /// (`valid_to IS NULL`) edge in `org_id`. Callers MUST go through
+    /// `ua_graph::graph_edge_update_weight` (enforced by `update_guard`).
+    fn update_edge_weight(
+        &mut self,
+        org_id: &str,
+        edge_id: &str,
+        weight: f64,
+    ) -> UaResult<Option<GraphEdgeRow>>;
 
     /// **Low-level unchecked storage primitive.** Batch-insert nodes inside the
     /// caller's open transaction using a cached prepared statement (provenance
@@ -1828,6 +1871,12 @@ const INSERT_EDGE_SQL: &str = "INSERT INTO graph_edges (\
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
 
 impl GraphRepo for WriteTx<'_> {
+    fn find_node_by_id_internal(&mut self, org_id: &str, id: &str) -> UaResult<Option<GraphNodeRow>> {
+        let mut stmt = self
+            .prepare_cached(&format!("SELECT {NODE_COLS} FROM graph_nodes WHERE org_id = ?1 AND id = ?2"))?;
+        Ok(stmt.query_row(params![org_id, id], |r| decode_node(r, 0)).optional()?)
+    }
+
     fn find_node_by_external_internal(
         &mut self,
         org_id: &str,
@@ -1895,6 +1944,53 @@ impl GraphRepo for WriteTx<'_> {
             archived_at: None,
         };
         Ok((row, true))
+    }
+
+    fn update_node_mutable(
+        &mut self,
+        org_id: &str,
+        id: &str,
+        patch: &GraphNodePatch,
+    ) -> UaResult<Option<GraphNodeRow>> {
+        let now_str = now();
+        let updated_at = normalize_ts(&patch.updated_at, "updated_at")?;
+        let archived_at = match patch.archived_at.as_deref() {
+            Some(raw) => {
+                let ts = normalize_ts(raw, "archived_at")?;
+                if ts > now_str {
+                    return Err(UaError::invalid_code(
+                        "future_archived_at",
+                        "archived_at must be <= current hub time",
+                    ));
+                }
+                Some(ts)
+            }
+            None => None,
+        };
+        let changed = {
+            let mut stmt = self.prepare_cached(
+                "UPDATE graph_nodes \
+                 SET display_label = ?1, visibility = ?2, team_id = ?3, owner_type = ?4, \
+                     owner_id = ?5, meta_json = ?6, archived_at = ?7, updated_at = ?8 \
+                 WHERE org_id = ?9 AND id = ?10",
+            )?;
+            stmt.execute(params![
+                patch.display_label,
+                patch.visibility,
+                patch.team_id,
+                patch.owner_type,
+                patch.owner_id,
+                patch.meta_json,
+                archived_at,
+                updated_at,
+                org_id,
+                id,
+            ])?
+        };
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.find_node_by_id_internal(org_id, id)
     }
 
     fn insert_edge(&mut self, edge: &NewGraphEdge) -> UaResult<GraphEdgeRow> {
@@ -2056,6 +2152,42 @@ impl GraphRepo for WriteTx<'_> {
         let mut closed = existing;
         closed.valid_to = Some(vt);
         Ok(Some(closed))
+    }
+
+    fn update_edge_weight(
+        &mut self,
+        org_id: &str,
+        edge_id: &str,
+        weight: f64,
+    ) -> UaResult<Option<GraphEdgeRow>> {
+        if !weight.is_finite() || weight <= 0.0 || weight > 1000.0 {
+            return Err(UaError::invalid("weight must be finite and in (0.0, 1000.0]"));
+        }
+        let Some(existing) = get_edge_by_id_sql(self, org_id, edge_id)? else {
+            return Ok(None);
+        };
+        if existing.valid_to.is_some() {
+            return Err(UaError::conflict_code(
+                "edge_already_closed",
+                format!("graph edge {edge_id} is already closed"),
+            ));
+        }
+        {
+            let mut stmt = self.prepare_cached(
+                "UPDATE graph_edges SET weight = ?1 \
+                 WHERE org_id = ?2 AND id = ?3 AND valid_to IS NULL",
+            )?;
+            let n = stmt.execute(params![weight, org_id, edge_id])?;
+            if n == 0 {
+                return Err(UaError::conflict_code(
+                    "edge_already_closed",
+                    format!("graph edge {edge_id} is already closed"),
+                ));
+            }
+        }
+        let mut updated = existing;
+        updated.weight = weight;
+        Ok(Some(updated))
     }
 
     fn record_event(&mut self, channel: &str, payload: Value, originator: &str) -> UaResult<Option<i64>> {

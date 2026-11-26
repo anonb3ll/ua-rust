@@ -7,21 +7,26 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use ua_core::{DEFAULT_ORG, UaError, UaResult};
 use ua_store::graph::{
-    AcyclicReachOutcome, GraphEdgeRow, GraphNodeRow, GraphRead, GraphRepo, NewGraphEdge, NewGraphNode,
-    VisibilityScope,
+    AcyclicReachOutcome, GraphEdgeRow, GraphNodePatch, GraphNodeRow, GraphRead, GraphRepo, NewGraphEdge,
+    NewGraphNode, VisibilityScope,
 };
 use ulid::Ulid;
 
 use crate::types::{
     ASSERTION_SCOPE_MAX_BYTES, AssertedByKind, DISPLAY_LABEL_MAX_BYTES, EDGE_META_MAX_BYTES,
-    EXTERNAL_ID_MAX_BYTES, EdgeKind, EdgeState, NODE_META_MAX_BYTES, NodeKind, OwnerType, PrincipalId,
-    Provenance, SourceKind, Visibility, encode_meta_json, normalize_timestamp,
+    EXTERNAL_ID_MAX_BYTES, EdgeKind, EdgeState, NODE_META_MAX_BYTES, NodeKind, OWNER_ID_MAX_BYTES, OwnerType,
+    PrincipalId, Provenance, SourceKind, TEAM_ID_MAX_BYTES, Visibility, encode_meta_json,
+    normalize_timestamp,
 };
 
 /// Ledger channel for node creation.
 pub const EVENT_NODE_CREATED: &str = "agent.graph.node_created";
+/// Ledger channel for domain-only node mutable-field updates (C2 slice 1).
+pub const EVENT_NODE_UPDATED: &str = "agent.graph.node_updated";
 /// Ledger channel for edge assertion.
 pub const EVENT_EDGE_ASSERTED: &str = "agent.graph.edge_asserted";
+/// Ledger channel for domain-only edge mutable-field updates (C2 slice 1).
+pub const EVENT_EDGE_UPDATED: &str = "agent.graph.edge_updated";
 /// Ledger channel for edge retraction.
 pub const EVENT_EDGE_RETRACTED: &str = "agent.graph.edge_retracted";
 
@@ -279,6 +284,19 @@ pub fn check_acyclic<R: GraphRead>(
     }
 }
 
+fn validate_optional_id(val: Option<&str>, field: &str, max_bytes: usize) -> UaResult<()> {
+    if let Some(raw) = val {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || raw.len() > max_bytes {
+            return Err(UaError::invalid(format!("{field} must be 1-{max_bytes} bytes")));
+        }
+        if raw.chars().any(char::is_control) {
+            return Err(UaError::invalid(format!("{field} must not contain control characters")));
+        }
+    }
+    Ok(())
+}
+
 /// Domain-only internal primitive: create a `graph_nodes` row if
 /// `(org_id, kind, external_id)` is absent, and touch nothing if it already
 /// exists. Never exposed as a public tool (`docs/graph.md`, Security model §1).
@@ -304,6 +322,8 @@ pub fn graph_node_ensure<R: GraphRepo>(
             "display_label must be at most {DISPLAY_LABEL_MAX_BYTES} bytes"
         )));
     }
+    validate_optional_id(req.team_id.as_deref(), "team_id", TEAM_ID_MAX_BYTES)?;
+    validate_optional_id(req.owner_id.as_deref(), "owner_id", OWNER_ID_MAX_BYTES)?;
     match req.visibility {
         Visibility::Team => {
             if req.team_id.as_deref().map(str::trim).is_none_or(str::is_empty) {
@@ -606,6 +626,322 @@ pub fn assert_edge<R: GraphRepo>(repo: &mut R, req: AssertEdgeRequest) -> UaResu
         meta_json,
     };
     repo.insert_edge(&new_edge)
+}
+
+/// Explicit patch state for a nullable mutable field on `graph_nodes`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FieldPatch<T> {
+    /// Leave the existing column value untouched.
+    #[default]
+    Unchanged,
+    /// Clear the column to `NULL`.
+    Clear,
+    /// Set the column to a new value.
+    Set(T),
+}
+
+impl<T> FieldPatch<T> {
+    fn apply(self, current: Option<T>) -> Option<T> {
+        match self {
+            FieldPatch::Unchanged => current,
+            FieldPatch::Clear => None,
+            FieldPatch::Set(v) => Some(v),
+        }
+    }
+}
+
+/// Request for the domain-only [`graph_node_update`] primitive (`docs/graph.md`, C2 slice 1).
+///
+/// Updates only mutable columns (`visibility`, `team_id`, `owner_type`,
+/// `owner_id`, `display_label`, `meta_json`, `archived_at`) and never touches
+/// identity or provenance columns. Never exposed as a generic or public tool.
+#[derive(Debug, Clone)]
+pub struct UpdateNodeRequest {
+    pub org_id: String,
+    pub node_id: String,
+    /// Verified principal performing the update. Pre-#2790: in non-default
+    /// organizations, only `PrincipalId::system()` with `AssertedByKind::System`
+    /// is permitted.
+    pub actor: PrincipalId,
+    pub actor_kind: AssertedByKind,
+    /// Optional new visibility tier (`private`, `team`, `org`).
+    pub visibility: Option<Visibility>,
+    /// Patch for `team_id` (required when resulting visibility is `team`).
+    pub team_id: FieldPatch<String>,
+    /// Patch for `owner_type` (required when resulting visibility is `private`).
+    pub owner_type: FieldPatch<OwnerType>,
+    /// Patch for `owner_id` (required when resulting visibility is `private`).
+    pub owner_id: FieldPatch<String>,
+    /// Patch for `display_label` (at most `DISPLAY_LABEL_MAX_BYTES` UTF-8 bytes).
+    pub display_label: FieldPatch<String>,
+    /// Optional replacement JSON object for `meta_json` (at most `NODE_META_MAX_BYTES`).
+    pub meta_json: Option<Value>,
+    /// Patch for `archived_at` (RFC 3339 timestamp `<= now`, or `Clear` to unarchive).
+    pub archived_at: FieldPatch<String>,
+}
+
+/// Request for the domain-only [`graph_edge_update_weight`] primitive
+/// (`docs/graph.md`, C2 slice 1).
+///
+/// Updates only `weight` on a live (`valid_to IS NULL`) edge in `org_id` and
+/// appends `agent.graph.edge_updated` in the same write transaction. Never
+/// exposed as a generic or public tool.
+#[derive(Debug, Clone)]
+pub struct UpdateEdgeWeightRequest {
+    pub org_id: String,
+    pub edge_id: String,
+    /// Verified principal performing the update. Pre-#2790: in non-default
+    /// organizations, only `PrincipalId::system()` with `AssertedByKind::System`
+    /// is permitted.
+    pub actor: PrincipalId,
+    pub actor_kind: AssertedByKind,
+    /// New finite edge weight in `(0.0, 1000.0]`.
+    pub weight: f64,
+}
+
+fn validate_actor(org_id: &str, actor: &PrincipalId, actor_kind: AssertedByKind) -> UaResult<()> {
+    if actor.is_system() != (actor_kind == AssertedByKind::System) {
+        return Err(UaError::invalid("actor = 'system' requires actor_kind = 'system' and vice versa"));
+    }
+    if org_id != DEFAULT_ORG && actor_kind != AssertedByKind::System {
+        return Err(UaError::denied(
+            "principal_id_required",
+            format!(
+                "non-system graph writes in non-default organization {org_id:?} are refused until \
+                 immutable principal IDs (#2790) land"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Domain-only internal primitive (`docs/graph.md`, C2 slice 1): update only
+/// the mutable columns (`visibility`, `team_id`, `owner_type`, `owner_id`,
+/// `display_label`, `meta_json`, `archived_at`) of an existing node in
+/// `org_id`, appending an attributed `agent.graph.node_updated` ledger event in
+/// the same write transaction.
+///
+/// Returns `(row, changed)`. When no mutable field actually changes, touches
+/// neither `graph_nodes` nor `event_log` and returns `(existing, false)`.
+/// Never exposed as a generic or public tool.
+pub fn graph_node_update<R: GraphRepo>(
+    repo: &mut R,
+    req: UpdateNodeRequest,
+) -> UaResult<(GraphNodeRow, bool)> {
+    repo.require_org_exists(&req.org_id)?;
+    validate_actor(&req.org_id, &req.actor, req.actor_kind)?;
+
+    let existing = repo
+        .find_node_by_id_internal(&req.org_id, &req.node_id)?
+        .ok_or_else(|| UaError::not_found("graph node not found"))?;
+
+    let new_visibility = match req.visibility {
+        Some(v) => v,
+        None => match existing.visibility.as_str() {
+            "private" => Visibility::Private,
+            "team" => Visibility::Team,
+            "org" => Visibility::Org,
+            other => return Err(UaError::internal(format!("invalid stored node visibility {other:?}"))),
+        },
+    };
+    let new_team_id = req.team_id.apply(existing.team_id.clone());
+    let new_owner_type = match req.owner_type {
+        FieldPatch::Unchanged => existing.owner_type.clone(),
+        FieldPatch::Clear => None,
+        FieldPatch::Set(ot) => Some(ot.as_str().to_string()),
+    };
+    let new_owner_id = req.owner_id.apply(existing.owner_id.clone());
+    let new_display_label = req.display_label.apply(existing.display_label.clone());
+    if let Some(ref lbl) = new_display_label
+        && lbl.len() > DISPLAY_LABEL_MAX_BYTES
+    {
+        return Err(UaError::invalid(format!(
+            "display_label must be at most {DISPLAY_LABEL_MAX_BYTES} bytes"
+        )));
+    }
+    validate_optional_id(new_team_id.as_deref(), "team_id", TEAM_ID_MAX_BYTES)?;
+    validate_optional_id(new_owner_id.as_deref(), "owner_id", OWNER_ID_MAX_BYTES)?;
+    match new_visibility {
+        Visibility::Team => {
+            if new_team_id.as_deref().map(str::trim).is_none_or(str::is_empty) {
+                return Err(UaError::invalid("team visibility requires team_id"));
+            }
+        }
+        Visibility::Private => {
+            if new_owner_type.is_none() || new_owner_id.as_deref().map(str::trim).is_none_or(str::is_empty) {
+                return Err(UaError::invalid("private visibility requires owner_type and owner_id"));
+            }
+        }
+        Visibility::Org => {}
+    }
+    let new_meta_json = match req.meta_json.as_ref() {
+        Some(v) => encode_meta_json(Some(v), NODE_META_MAX_BYTES)?,
+        None => existing.meta_json.clone(),
+    };
+    let now_str = ua_core::time::now();
+    let new_archived_at = match req.archived_at {
+        FieldPatch::Unchanged => existing.archived_at.clone(),
+        FieldPatch::Clear => None,
+        FieldPatch::Set(raw) => {
+            let ts = normalize_timestamp(&raw, "archived_at")?;
+            if ts > now_str {
+                return Err(UaError::invalid_code(
+                    "future_archived_at",
+                    "archived_at must be <= current hub time",
+                ));
+            }
+            Some(ts)
+        }
+    };
+
+    let mut changed_fields: Vec<&'static str> = Vec::new();
+    if new_visibility.as_str() != existing.visibility {
+        changed_fields.push("visibility");
+    }
+    if new_team_id != existing.team_id {
+        changed_fields.push("team_id");
+    }
+    if new_owner_type != existing.owner_type {
+        changed_fields.push("owner_type");
+    }
+    if new_owner_id != existing.owner_id {
+        changed_fields.push("owner_id");
+    }
+    if new_display_label != existing.display_label {
+        changed_fields.push("display_label");
+    }
+    if new_meta_json != existing.meta_json {
+        changed_fields.push("meta_json");
+    }
+    if new_archived_at != existing.archived_at {
+        changed_fields.push("archived_at");
+    }
+    if changed_fields.is_empty() {
+        return Ok((existing, false));
+    }
+
+    let patch = GraphNodePatch {
+        display_label: new_display_label,
+        visibility: new_visibility.as_str().to_string(),
+        team_id: new_team_id,
+        owner_type: new_owner_type,
+        owner_id: new_owner_id,
+        meta_json: new_meta_json,
+        archived_at: new_archived_at,
+        updated_at: now_str,
+    };
+    let updated = repo
+        .update_node_mutable(&req.org_id, &existing.id, &patch)?
+        .ok_or_else(|| UaError::not_found("graph node not found"))?;
+
+    // ORG-EVENT-DEFAULT: non-default org events stamp originator `'system'` and
+    // omit display_label, meta_json, owner_id, team_id, and actor labels — keeping
+    // only org_id, node_id, kind, changed_fields, and safe structural transitions.
+    let is_default = req.org_id == DEFAULT_ORG;
+    let originator = if is_default { req.actor.as_str() } else { "system" };
+    let mut payload = if is_default {
+        json!({
+            "org_id": req.org_id,
+            "node_id": updated.id,
+            "kind": updated.kind,
+            "changed_fields": changed_fields,
+            "updated_by": req.actor.as_str(),
+            "updated_by_kind": req.actor_kind.as_str(),
+        })
+    } else {
+        json!({
+            "org_id": req.org_id,
+            "node_id": updated.id,
+            "kind": updated.kind,
+            "changed_fields": changed_fields,
+        })
+    };
+    if let Some(obj) = payload.as_object_mut() {
+        if existing.visibility != updated.visibility {
+            obj.insert("old_visibility".into(), json!(existing.visibility));
+            obj.insert("new_visibility".into(), json!(updated.visibility));
+        }
+        if is_default && existing.owner_type != updated.owner_type {
+            obj.insert("old_owner_type".into(), json!(existing.owner_type));
+            obj.insert("new_owner_type".into(), json!(updated.owner_type));
+        }
+        if existing.archived_at != updated.archived_at {
+            if is_default {
+                obj.insert("old_archived_at".into(), json!(existing.archived_at));
+                obj.insert("new_archived_at".into(), json!(updated.archived_at));
+            } else {
+                obj.insert("old_archived".into(), json!(existing.archived_at.is_some()));
+                obj.insert("new_archived".into(), json!(updated.archived_at.is_some()));
+            }
+        }
+    }
+    repo.record_event(EVENT_NODE_UPDATED, payload, originator)?;
+    Ok((updated, true))
+}
+
+/// Domain-only internal primitive (`docs/graph.md`, C2 slice 1): update
+/// `graph_edges.weight` on a live (`valid_to IS NULL`) edge in `org_id`,
+/// appending an attributed `agent.graph.edge_updated` ledger event in the same
+/// write transaction.
+///
+/// Returns `(row, changed)`. Closed edges are refused (`edge_already_closed`)
+/// to preserve historical `as_of` snapshots. Never exposed as a public tool.
+pub fn graph_edge_update_weight<R: GraphRepo>(
+    repo: &mut R,
+    req: UpdateEdgeWeightRequest,
+) -> UaResult<(GraphEdgeRow, bool)> {
+    repo.require_org_exists(&req.org_id)?;
+    validate_actor(&req.org_id, &req.actor, req.actor_kind)?;
+    if !req.weight.is_finite() || req.weight <= 0.0 || req.weight > 1000.0 {
+        return Err(UaError::invalid("weight must be finite and in (0.0, 1000.0]"));
+    }
+
+    let existing = repo
+        .get_edge_by_id(&req.org_id, &req.edge_id)?
+        .ok_or_else(|| UaError::not_found("graph edge not found"))?;
+    if existing.valid_to.is_some() {
+        return Err(UaError::conflict_code(
+            "edge_already_closed",
+            format!("graph edge {} is already retracted/closed", existing.id),
+        ));
+    }
+    if existing.weight == req.weight {
+        return Ok((existing, false));
+    }
+
+    let updated = repo
+        .update_edge_weight(&req.org_id, &existing.id, req.weight)?
+        .ok_or_else(|| UaError::not_found("graph edge not found"))?;
+
+    let is_default = req.org_id == DEFAULT_ORG;
+    let originator = if is_default { req.actor.as_str() } else { "system" };
+    let payload = if is_default {
+        json!({
+            "org_id": req.org_id,
+            "edge_id": updated.id,
+            "src_id": updated.src_id,
+            "dst_id": updated.dst_id,
+            "kind": updated.kind,
+            "changed_fields": ["weight"],
+            "old_weight": existing.weight,
+            "new_weight": updated.weight,
+            "updated_by": req.actor.as_str(),
+            "updated_by_kind": req.actor_kind.as_str(),
+        })
+    } else {
+        json!({
+            "org_id": req.org_id,
+            "edge_id": updated.id,
+            "src_id": updated.src_id,
+            "dst_id": updated.dst_id,
+            "kind": updated.kind,
+            "changed_fields": ["weight"],
+            "old_weight": existing.weight,
+            "new_weight": updated.weight,
+        })
+    };
+    repo.record_event(EVENT_EDGE_UPDATED, payload, originator)?;
+    Ok((updated, true))
 }
 
 /// Retract (close with `valid_to`) a live graph edge, preserving `as_of`

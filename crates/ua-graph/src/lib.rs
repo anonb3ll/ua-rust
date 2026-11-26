@@ -32,6 +32,8 @@ pub use types::{
 };
 pub use write::{
     AssertEdgeRequest, CYCLE_CHECK_DEADLINE_MS, CYCLE_CHECK_MAX_EDGES, CYCLE_CHECK_MAX_NODES,
-    CycleCheckBounds, CycleCheckPolicy, EVENT_EDGE_ASSERTED, EVENT_EDGE_RETRACTED, EVENT_NODE_CREATED,
-    EnsureNodeRequest, RetractEdgeRequest, assert_edge, check_acyclic, graph_node_ensure, retract_edge,
+    CycleCheckBounds, CycleCheckPolicy, EVENT_EDGE_ASSERTED, EVENT_EDGE_RETRACTED, EVENT_EDGE_UPDATED,
+    EVENT_NODE_CREATED, EVENT_NODE_UPDATED, EnsureNodeRequest, FieldPatch, RetractEdgeRequest,
+    UpdateEdgeWeightRequest, UpdateNodeRequest, assert_edge, check_acyclic, graph_edge_update_weight,
+    graph_node_ensure, graph_node_update, retract_edge,
 };
