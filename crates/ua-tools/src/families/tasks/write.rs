@@ -801,6 +801,7 @@ async fn delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
             if org != ua_core::DEFAULT_ORG {
                 drop_orphaned_task_rows(tx, &org, &subtree)?;
             }
+            graph::retract_task_dependencies_for_subtree(tx, &org, &subtree)?;
             let n = tx.execute("DELETE FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, a.id])?;
             let children = subtree.len() - 1;
             emit(tx, &org, "agent.task.deleted", json!({ "task_id": a.id, "subtree": subtree }), &by)?;

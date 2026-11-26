@@ -728,6 +728,7 @@ fn check_target(src: &Connection, db: &Db, report: &Report, opts: &Options) -> a
                 check_source_bindings_overlap(src, db, map, rep.last_key)?;
                 check_key_overlap(src, db, map, rep.last_key)?;
             }
+            Kind::TaskDependencies => check_task_dependencies_overlap(src, db, map, rep.last_key)?,
             _ => check_key_overlap(src, db, map, rep.last_key)?,
         }
     }
@@ -811,6 +812,53 @@ fn check_ledger_target(src: &Connection, db: &Db, last: i64) -> anyhow::Result<(
                  (nothing was written)"
             );
         }
+    }
+    Ok(())
+}
+
+fn check_task_dependencies_overlap(
+    src: &Connection,
+    db: &Db,
+    map: &TableMap,
+    last: i64,
+) -> anyhow::Result<()> {
+    let plan = plan_table(src, db, map)?;
+    let sel = format!(
+        "SELECT rowid, {} FROM {} WHERE rowid > ?1 ORDER BY rowid",
+        select_list(&plan.cols),
+        q(map.source)
+    );
+    let id_idx = plan.cols.iter().position(|c| c == "id");
+    let mut stmt = src.prepare(&sel)?;
+    let mut rows = stmt.query([last])?;
+    let mut clash: Option<i64> = None;
+    db.read(|c| {
+        let mut probe = c.prepare(
+            "SELECT 1 FROM graph_edges \
+             WHERE kind = 'depends_on' AND json_extract(meta_json, '$.dependency_id') = ?1 LIMIT 1",
+        )?;
+        while let Some(r) = rows.next()? {
+            let rowid: i64 = r.get(0)?;
+            let vals = row_values(r, 1, plan.cols.len())?;
+            let dep_id = id_idx
+                .and_then(|i| match vals.get(i) {
+                    Some(SqlValue::Integer(n)) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(rowid);
+            if probe.exists([dep_id])? {
+                clash = Some(dep_id);
+                break;
+            }
+        }
+        Ok(())
+    })?;
+    if let Some(dep_id) = clash {
+        bail!(
+            "graph_edges already holds a depends_on edge with dependency_id = {dep_id} that this import \
+             would copy; the target must not hold rows with imported keys. Import into a fresh database \
+             (nothing was written)"
+        );
     }
     Ok(())
 }
@@ -1076,6 +1124,38 @@ fn copy_table(
                                 continue;
                             }
                         }
+                    }
+                    if map.kind == Kind::TaskDependencies {
+                        let dep_id = id_idx
+                            .and_then(|i| match vals.get(i) {
+                                Some(SqlValue::Integer(n)) => Some(*n),
+                                _ => None,
+                            })
+                            .unwrap_or(rowid);
+                        let Some(SqlValue::Integer(task_id)) = col_value(&plan.cols, &vals, "task_id") else {
+                            bump(&mut skipped, "invalid_task_id");
+                            continue;
+                        };
+                        let Some(SqlValue::Integer(depends_on_task_id)) =
+                            col_value(&plan.cols, &vals, "depends_on_task_id")
+                        else {
+                            bump(&mut skipped, "invalid_depends_on_task_id");
+                            continue;
+                        };
+                        let created_by = as_text(col_value(&plan.cols, &vals, "created_by")).unwrap_or("");
+                        let created_at = as_text(col_value(&plan.cols, &vals, "created_at")).unwrap_or("");
+                        match ua_tools::families::tasks::import_task_dependency(
+                            tx,
+                            dep_id,
+                            *task_id,
+                            *depends_on_task_id,
+                            created_by,
+                            created_at,
+                        )? {
+                            None => copied += 1,
+                            Some(reason) => bump(&mut skipped, reason),
+                        }
+                        continue;
                     }
                     tx.execute(&insert, params_from_iter(vals.iter())).map_err(|e| {
                         UaError::conflict(format!(

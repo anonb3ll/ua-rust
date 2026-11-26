@@ -648,7 +648,7 @@ tables, tool contracts, and tests remain untouched until C2.
 
 | Existing surface | Location | Current role | C1 | C2+ disposition |
 | --- | --- | --- | --- | --- |
-| `task_dependencies` | `crates/ua-tools/src/families/core_schema.rs:46`, `tasks/graph.rs` | Explicit task prerequisite DAG (`dependency_add`, `dependency_list`, `dependency_remove`) with CTE cycle check and creator-only delete. | Unchanged | **Move in C2** to `graph_edges(kind = 'depends_on')`, written directly (not mirrored) behind `dependency_*`. **Explicit contract change:** JSON shapes and `cycle_detected` stay identical, but a dependency subgraph exceeding `1,000` reachable nodes / `5,000` reachable edges / `50 ms` from the new edge now returns `invalid_argument` (`cycle_check_bound_exceeded`) where today's CTE has no bound (retrying helps only for the 50 ms deadline; node/edge caps are deterministic). **Sequencing:** in non-default organizations, `dependency_*` waits for `#2790`, because there is no immutable principal ID yet and stamping `'system'` would lose the creator identity that creator-only delete relies on. |
+| `task_dependencies` | `crates/ua-tools/src/families/core_schema.rs:46`, `tasks/graph.rs` | Explicit task prerequisite DAG (`dependency_add`, `dependency_list`, `dependency_remove`), `task_list(frontier=true)`, and `continuity` queue readiness. | Unchanged | **Moved in C2a (`tasks.v3.depends_on_graph`)** for the default organization to `graph_edges(kind = 'depends_on')`, written directly (not mirrored) behind `dependency_*`. Default-org rows of `task_dependencies` are kept **frozen read-only** (not dropped) with default-org write-blocking triggers (`task_dependencies_frozen_insert`, `task_dependencies_frozen_update`, `task_dependencies_frozen_delete`, permitting `ON DELETE CASCADE` when a parent task is deleted). Existing default-org rows are copied into `graph_edges` with task nodes ensured through `graph_node_ensure` and `source_kind = 'import'` (lifting the 50 ms wall-clock deadline during migration/import while keeping deterministic node/edge caps); copied and skipped counts (with row IDs and reasons) are recorded in `schema_procedures` and surfaced by `system_doctor`. `dependency_remove` closes live edges with `valid_to = now` (never deletes) and enforces creator-only retraction against `asserted_by`. `dependency_id` allocation honors `task_dependencies`, `graph_edges`, and `sqlite_sequence` so deleted legacy ids are never reused. **Explicit contract change:** JSON shapes and `cycle_detected` stay identical, while a default-org dependency subgraph exceeding `1,000` reachable nodes / `5,000` reachable edges / `50 ms` (`CycleCheckPolicy`) returns `invalid_argument` (`cycle_check_bound_exceeded`). **Sequencing:** non-default organizations stay entirely on `task_dependencies` (add, list, remove, frontier, and readiness) until `#2790` supplies immutable principal IDs. |
 | `task_goal_links` | `crates/ua-tools/src/families/tasks/mod.rs:93`, `tasks/goals.rs` | Single goal a task serves (`goal_manage` `link`/`unlink`/`ancestry`). | Unchanged | **Move in C2** to `graph_edges(kind = 'serves_goal')`, keeping N:1 uniqueness via `idx_graph_edges_single_out_live` and preserving the `goal_manage` contract. |
 | `goals.parent_goal_id` | `crates/ua-tools/src/families/tasks/mod.rs:84` | Why-chain tree column (max depth 8). | Unchanged | **Stays** authoritative on `goals`; optional read-only mirror to `goal_parent` in C2 if cross-domain traversals need it. |
 | `graph_canvas_scenes`, `graph_canvas_revisions` | `crates/ua-tools/src/families/graph.rs` | Excalidraw scene blob store + deterministic parser emitting `task_suggestions` and `dependency_suggestions` (**proposals only**). | Unchanged | **Stays as-is.** Canvas scenes are visual documents, never an authoritative edge store. Post-C2 UI/tools may render a `ua-graph` subgraph onto a board, while human-approved proposals still create real edges through domain tools. |
@@ -816,7 +816,13 @@ and mid-burst checkpoints, versus `16,383 edges/sec` and `2.53 ms` p95
   default `5,000`, counting live outgoing + incoming edges on both endpoints and
   refusing with `node_edge_limit_exceeded`), JSON metadata byte limits (`8 KiB`
   on nodes, `4 KiB` on edges), `external_id` length limit (256), and standard
-  policy rate limits on write tools.
+  policy rate limits on write tools. **Known limit:** `graph_org_counts.edge_count`
+  is monotonic across all historical rows (because `graph_edges` rows are closed
+  with `valid_to` and never deleted), so repeated add/retract churn on
+  dependencies, goal links, or other edges counts permanently toward the
+  `2,000,000` per-org `graph_max_edges_per_org` cap; operators with high edge
+  churn can raise `graph_max_edges_per_org` until a live-edge quota or archival
+  split is added.
 
 ### Who may create/mutate nodes and assert/retract edges
 
@@ -922,7 +928,7 @@ session profile:
 | --- | --- | --- |
 | **C0** | This document (`docs/graph.md`). | CTO design read + independent diff read. No code. |
 | **C1** | `GraphRepo` (SQLite) in `ua-store`, `crates/ua-graph`, `graph.v1` + `organization.v1.graph`, `org_classification.rs` entry, governed tools (`graph_node_get`, `graph_neighbors`, `graph_traverse`, `graph_shortest_path`, `graph_expand`, `graph_edge_assert`, `graph_edge_retract`), internal `graph_node_ensure`, isolation & DoS tests, benchmark harness meeting [Benchmark floor](#benchmark-floor-c1-acceptance-gate). | Independent review + benchmark floor + CI/Cloud Build green. |
-| **C2** | Consumer migrations, one PR per consumer: `task_dependencies`, `task_goal_links`, Memory §4/§5 graph leg on `GraphRepo`, optional `vault_query` indexed PPR, `team_specs` topology projection. | Per-consumer parity + isolation tests. |
+| **C2** | Consumer migrations, one PR per consumer: C2 slice 1 (landed: `graph_node_update`, `graph_edge_update_weight`, workspace update guard), **C2a (landed: `task_dependencies` → `depends_on`, frozen legacy table)**, C2b (`task_goal_links` → `serves_goal`), Memory §4/§5 graph leg on `GraphRepo`, optional `vault_query` indexed PPR, `team_specs` topology projection. | Per-consumer parity + isolation tests. |
 | **C3** | Dependency-driven workflow graph runner replacing YAML workflow engine and LangGraph surface. | Separate design amendment before code. |
 
 **What C1 must not do:** no consumer rewrites, no `graph.links.v1`, no

@@ -237,11 +237,12 @@ const HUB: &[&str] = &[
     // which predates it).
     "schema_procedures",
     "ledger_meta",
-    // The evidence key store and checkpoint table (`evidence_key_store.v1`,
-    // `docs/evidence-export.md` S2). The key store is hub-wide and holds
-    // public keys only. A checkpoint row is hub-scoped bookkeeping: its
-    // `org_id` is nullable and set only on an `org`-class row, so neither
-    // table is a tenant table and neither takes the tenant triggers.
+    // The evidence key store and checkpoint table (`evidence_key_store.v1` and
+    // `evidence_key_store.v2.checkpoint_checks`, `docs/evidence-export.md` S2).
+    // The key store is hub-wide and holds public keys only. A checkpoint row is
+    // hub-scoped bookkeeping: its `org_id` is nullable and set only on an
+    // `org`-class row (checked against `orgs` by trigger), so neither table is
+    // a tenant table and neither takes the tenant triggers.
     "evidence_key",
     "evidence_checkpoint",
 ];
