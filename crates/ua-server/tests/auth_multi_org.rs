@@ -193,15 +193,18 @@ async fn open_anonymous_event_streams_revoke_when_second_org_appears() {
     assert_eq!(ui_resp.status(), StatusCode::OK);
     let mut ui_body = ui_resp.into_body();
 
-    // Confirm both streams deliver events in single-org mode.
+    // Confirm both streams deliver events in single-org mode and populate the 1 s per-event cache.
     let before = append_event(&h.state.hub, "test.keep");
     read_until_contains(&mut api_body, &format!("id: {before}\n")).await;
     read_until_contains(&mut ui_body, &format!("id: {before}\n")).await;
+    assert!(h.state.auth_policy.is_fresh());
 
     // Insert a second organization while both streams are open.
     insert_org(&h.state.hub, "org-b", "active");
 
-    // Any subsequent event revokes both streams immediately without delivering the post-org event.
+    // Once the ~1 s per-event cache TTL expires, the next event revokes both streams without
+    // delivering the post-TTL event.
+    tokio::time::sleep(ua_server::auth::AUTH_POLICY_CACHE_TTL + Duration::from_millis(50)).await;
     let after = append_event(&h.state.hub, "test.keep");
     let forbidden = format!("id: {after}\n");
     expect_auth_revoked(Response::new(api_body), "auth_required_multi_org", Some(&forbidden)).await;
@@ -212,6 +215,28 @@ async fn open_anonymous_event_streams_revoke_when_second_org_appears() {
         let resp = h.send(get(path, None, None)).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
     }
+}
+
+#[tokio::test]
+async fn open_anonymous_stream_revokes_immediately_on_auth_channel_even_while_cache_is_fresh() {
+    let mut cfg = config();
+    cfg.enforce_auth = false;
+    let h = TestHub::new(cfg);
+
+    let api_resp = h.send(get("/api/events/stream?channel_prefix=test.keep", None, None)).await;
+    assert_eq!(api_resp.status(), StatusCode::OK);
+    let mut api_body = api_resp.into_body();
+
+    let before = append_event(&h.state.hub, "test.keep");
+    read_until_contains(&mut api_body, &format!("id: {before}\n")).await;
+    assert!(h.state.auth_policy.is_fresh());
+
+    insert_org(&h.state.hub, "org-b", "active");
+    // Auth-channel re-check bypasses the 1 s per-event cache and revokes without waiting for TTL.
+    append_event(&h.state.hub, "agent.config.revision");
+    let after = append_event(&h.state.hub, "test.keep");
+    let forbidden = format!("id: {after}\n");
+    expect_auth_revoked(Response::new(api_body), "auth_required_multi_org", Some(&forbidden)).await;
 }
 
 #[tokio::test]

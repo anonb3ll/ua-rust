@@ -7,11 +7,12 @@
 //!
 //! 1. **Domain-update call allowlist:** `graph_node_update` and
 //!    `graph_edge_update_weight` are `pub` for C2 domain consumers, so every
-//!    non-test reference outside `crates/ua-graph/src/{write,lib}.rs` must live
-//!    in [`DOMAIN_UPDATE_CALL_ALLOWLIST`]. The allowlist is empty today; each
-//!    C2 consumer adds its owning file in its own PR. Generic graph tools
-//!    (`crates/ua-tools/src/families/graph_store.rs`) and `crates/ua-server/`
-//!    must **never** appear on it.
+//!    non-test reference outside `crates/ua-graph/src/write.rs` (and the
+//!    `pub use write::{...};` re-export list in `crates/ua-graph/src/lib.rs`)
+//!    must live in [`DOMAIN_UPDATE_CALL_ALLOWLIST`]. The allowlist is empty
+//!    today; each C2 consumer adds its owning file in its own PR. Generic
+//!    graph tools (`crates/ua-tools/src/families/graph_store.rs`) and
+//!    `crates/ua-server/` must **never** appear on it.
 //! 2. **Low-level `GraphRepo` guard:** No non-test code outside
 //!    `crates/ua-graph/src/write.rs` and `crates/ua-store/src/graph.rs` may
 //!    call `update_node_mutable` or `update_edge_weight` directly.
@@ -681,16 +682,72 @@ fn direct_low_level_update_calls(path: &str, masked_non_test: &str) -> Vec<Strin
     findings
 }
 
+/// Return byte ranges of `pub use write::{ ... };` re-export lists in masked
+/// `crates/ua-graph/src/lib.rs` source. Only identifier lists (no `(`, `)`, or
+/// `;` inside the braces) qualify, so executable code or helper functions added
+/// to `lib.rs` are never exempted.
+fn pub_use_write_list_ranges(masked: &str) -> Vec<std::ops::Range<usize>> {
+    let b = masked.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if (i == 0 || !is_ident_byte(b[i - 1]))
+            && let Some(after_pub) = keyword_ci(b, i, "pub")
+            && &masked[i..after_pub] == "pub"
+        {
+            let mut k = skip_space(b, after_pub);
+            if let Some(after_use) = keyword_ci(b, k, "use")
+                && &masked[k..after_use] == "use"
+            {
+                k = skip_space(b, after_use);
+                if let Some(after_write) = keyword_ci(b, k, "write")
+                    && &masked[k..after_write] == "write"
+                {
+                    k = skip_space(b, after_write);
+                    if masked[k..].starts_with("::") {
+                        k = skip_space(b, k + 2);
+                        if b.get(k) == Some(&b'{') {
+                            let open = k;
+                            if let Some(rel_close) = masked[open + 1..].find('}') {
+                                let close = open + 1 + rel_close;
+                                let inner = &masked[open + 1..close];
+                                let after_close = skip_space(b, close + 1);
+                                if b.get(after_close) == Some(&b';')
+                                    && !inner.contains(['(', ')', ';', '{', '}'])
+                                {
+                                    ranges.push(open..close + 1);
+                                    i = after_close + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    ranges
+}
+
 fn domain_update_call_violations(path: &str, masked_non_test: &str, allowlist: &[&str]) -> Vec<String> {
-    if path.ends_with("crates/ua-graph/src/write.rs") || path.ends_with("crates/ua-graph/src/lib.rs") {
+    if path.ends_with("crates/ua-graph/src/write.rs") {
         return Vec::new();
     }
     if allowlist.iter().any(|allowed| path.ends_with(allowed)) {
         return Vec::new();
     }
+    let lib_reexport_ranges = if path.ends_with("crates/ua-graph/src/lib.rs") {
+        pub_use_write_list_ranges(masked_non_test)
+    } else {
+        Vec::new()
+    };
     let mut findings = Vec::new();
     for ident in ["graph_node_update", "graph_edge_update_weight"] {
         for at in find_ident_refs(masked_non_test, ident) {
+            if lib_reexport_ranges.iter().any(|r| r.contains(&at)) {
+                continue;
+            }
             let line = support::line_of(masked_non_test, at);
             findings.push(format!(
                 "{path}:{line}: unauthorized reference to domain-only `{ident}`; \
@@ -1041,6 +1098,41 @@ fn update_guard_catches_all_sql_variants_dynamic_slots_and_call_allowlist_bypass
             DOMAIN_UPDATE_CALL_ALLOWLIST,
         )
         .is_empty()
+    );
+    // In `crates/ua-graph/src/lib.rs`, ONLY the `pub use write::{ ... };` re-export list is
+    // exempt; helper functions or extra uses in `lib.rs` are caught.
+    let ok_lib_reexport = r#"
+        pub mod write;
+        pub use write::{
+            assert_edge, graph_edge_update_weight, graph_node_update,
+        };
+    "#;
+    assert!(
+        domain_update_call_violations(
+            "crates/ua-graph/src/lib.rs",
+            &support::without_tests(ok_lib_reexport),
+            DOMAIN_UPDATE_CALL_ALLOWLIST,
+        )
+        .is_empty()
+    );
+    let bad_lib_helper = r#"
+        pub mod write;
+        pub use write::{
+            assert_edge, graph_edge_update_weight, graph_node_update,
+        };
+        pub fn sneak(tx: &mut WriteTx) {
+            let _ = graph_node_update(tx, req);
+            let _ = graph_edge_update_weight(tx, wreq);
+        }
+    "#;
+    assert_eq!(
+        domain_update_call_violations(
+            "crates/ua-graph/src/lib.rs",
+            &support::without_tests(bad_lib_helper),
+            DOMAIN_UPDATE_CALL_ALLOWLIST,
+        )
+        .len(),
+        2
     );
 
     // MigrationGraph allowlist catches unauthorized usage and permits allowlisted modules.
