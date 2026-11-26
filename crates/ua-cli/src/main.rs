@@ -435,6 +435,24 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
         tracing_subscriber::registry().with(log_layer(filter, std::io::stderr)).init();
     }
 
+    let is_evidence_verify = matches!(
+        &cli.cmd,
+        Cmd::Evidence(ops::evidence::EvidenceArgs { cmd: ops::evidence::EvidenceCmd::Verify { .. } })
+    );
+    match run_cmd(cli, held).await {
+        Ok(code) => Ok(code),
+        Err(e) if is_evidence_verify => {
+            // `ua evidence verify` reserves exit 1 for cryptographic or ledger
+            // refusals; config, lock, open (including newer-schema refusal),
+            // and database errors exit 2 ("cannot verify").
+            eprintln!("Error: {e:#}");
+            Ok(ExitCode::from(2))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn run_cmd(cli: Cli, held: &mut Held) -> anyhow::Result<ExitCode> {
     let explicit_config = cli.config.clone();
     // Read before any `.env` file is loaded (`load_config`): the override comes
     // only from the command line or the real process environment.
