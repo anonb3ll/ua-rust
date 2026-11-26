@@ -93,6 +93,13 @@ pub(crate) enum Kind {
     /// Legacy memory notes and their versions are imported into the default
     /// organization (a source `org_id` is never copied).
     Memory,
+    /// Legacy note embeddings: imported into the default organization as stale
+    /// by construction (`model = "import:<model or unknown>"`, `content_sha = ""`,
+    /// `dim` computed from the blob) so backfill re-embeds them.
+    MemoryEmbeddings,
+    /// Legacy note chunk embeddings (`chunk_index` -> `idx`): imported into the
+    /// default organization as stale by construction, like `MemoryEmbeddings`.
+    MemoryChunks,
 }
 
 impl Kind {
@@ -118,6 +125,8 @@ impl Kind {
                 | Kind::GoalLinks
                 | Kind::WorkProposals
                 | Kind::Memory
+                | Kind::MemoryEmbeddings
+                | Kind::MemoryChunks
                 | Kind::Nodes
                 | Kind::MessageIndex
                 | Kind::MessageReads
@@ -214,6 +223,16 @@ pub(crate) const MAPS: &[TableMap] = &[
         refs: &[Ref { col: "note_id", table: "memory", key: "id" }],
         kind: Kind::Memory,
         ..plain("memory_versions")
+    },
+    TableMap {
+        refs: &[Ref { col: "note_id", table: "memory", key: "id" }],
+        kind: Kind::MemoryEmbeddings,
+        ..plain("memory_embeddings")
+    },
+    TableMap {
+        refs: &[Ref { col: "note_id", table: "memory", key: "id" }],
+        kind: Kind::MemoryChunks,
+        ..plain("memory_chunks")
     },
     TableMap { kind: Kind::Approvals, ..plain("approvals") },
     TableMap { kind: Kind::Nodes, ..plain("nodes") },

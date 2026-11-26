@@ -675,11 +675,15 @@ Landed. The decisions, as built (`crates/ua-tools/src/families/tasks/goal_links.
   asserts the edge with `assert_edge` in the action's write transaction, as a
   domain write: `asserted_by` the acting label (provisional, pre-#2790),
   `asserted_by_kind` `person` for a verified human and `agent` otherwise
-  (`system` only for a label `PrincipalId` refuses), `source_kind = 'event'`
-  and `source_ref = 'event:<seq>'`. Every other organization reads and
+  (never `system`: a label `PrincipalId` refuses — such as the reserved
+  `system` label or an over-long label — is refused on default-organization
+  `link`/`unlink`, as `dependency_add` refuses it), `source_kind = 'event'`
+  and `source_ref = 'tool:goal_manage'`. Every other organization reads and
   writes `task_goal_links` exactly as before; its goal actions never touch
   the graph, so the pre-#2790 non-default rule is never reached.
-- **Contract parity.** Replies and errors are unchanged. A link to the goal
+- **Contract parity.** Replies and errors are unchanged (aside from refusing
+  labels that `PrincipalId` rejects — such as the reserved `system` label — on
+  default-organization `link`/`unlink`). A link to the goal
   the task already serves is a no-op; a link to another goal is still
   refused (`goal_task is single-valued`), so moving a task is `unlink` then
   `link`: the first closes the old edge, the second asserts a new one, and

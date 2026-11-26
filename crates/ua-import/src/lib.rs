@@ -503,14 +503,38 @@ fn survey(src: &Connection, target: &Db, source_hash: String, dry_run: bool) -> 
 /// The columns copied for one table.
 struct Plan<'m> {
     map: &'m TableMap,
-    /// Source columns copied to the same-named target column.
+    /// Source columns selected from the source table, in SELECT order.
     cols: Vec<String>,
     /// Source columns the target does not have.
     unmapped: Vec<String>,
-    /// Target columns, in insert order: `cols`, then the extras below.
+    /// Target columns, in insert order: the 1-to-1 mapped columns for `cols`
+    /// (with any column rename applied, e.g. `chunk_index` -> `idx`), then
+    /// the extras below.
     insert_cols: Vec<String>,
     /// `message_index.event_seq` is absent in the source and filled per row.
     append_event_seq: bool,
+    /// Target columns synthesized and appended for `memory_embeddings` and
+    /// `memory_chunks` when absent from the source table.
+    append_vector_cols: Vec<&'static str>,
+}
+
+fn target_col_for_source(
+    kind: Kind,
+    src_col: &str,
+    src_cols: &[String],
+    dst_cols: &[String],
+) -> Option<String> {
+    if src_col == "org_id" {
+        return None;
+    }
+    if kind == Kind::MemoryChunks
+        && src_col == "chunk_index"
+        && dst_cols.iter().any(|c| c == "idx")
+        && !src_cols.iter().any(|c| c == "idx")
+    {
+        return Some("idx".to_string());
+    }
+    dst_cols.iter().any(|c| c == src_col).then(|| src_col.to_string())
 }
 
 fn plan_table<'m>(src: &Connection, target: &Db, map: &'m TableMap) -> anyhow::Result<Plan<'m>> {
@@ -519,10 +543,19 @@ fn plan_table<'m>(src: &Connection, target: &Db, map: &'m TableMap) -> anyhow::R
     if dst_cols.is_empty() {
         bail!("target table {} does not exist; open the target with ua_import::schema_parts()", map.target);
     }
-    let (cols, unmapped): (Vec<String>, Vec<String>) = src_cols
-        .into_iter()
-        .partition(|c| c != "org_id" && dst_cols.contains(c) && Some(c.as_str()) != map.rowid_to);
-    let mut insert_cols = cols.clone();
+    let mut cols = Vec::new();
+    let mut insert_cols = Vec::new();
+    let mut unmapped = Vec::new();
+    for c in &src_cols {
+        if Some(c.as_str()) != map.rowid_to
+            && let Some(dst_name) = target_col_for_source(map.kind, c, &src_cols, &dst_cols)
+        {
+            cols.push(c.clone());
+            insert_cols.push(dst_name);
+        } else {
+            unmapped.push(c.clone());
+        }
+    }
     if let Some(r) = map.rowid_to {
         insert_cols.push(r.to_string());
     }
@@ -530,13 +563,27 @@ fn plan_table<'m>(src: &Connection, target: &Db, map: &'m TableMap) -> anyhow::R
     if append_event_seq {
         insert_cols.push("event_seq".into());
     }
+    let mut append_vector_cols = Vec::new();
+    if matches!(map.kind, Kind::MemoryEmbeddings | Kind::MemoryChunks) {
+        let required: &[&'static str] = if map.kind == Kind::MemoryEmbeddings {
+            &["model", "dim", "content_sha", "updated_at"]
+        } else {
+            &["model", "dim", "content_sha"]
+        };
+        for &col in required {
+            if !insert_cols.iter().any(|c| c == col) {
+                insert_cols.push(col.to_string());
+                append_vector_cols.push(col);
+            }
+        }
+    }
     if map.kind.writes_default_org() {
         insert_cols.push("org_id".into());
     }
     if map.kind == Kind::MessageIndex && !cols.iter().any(|c| c == "event_ulid") {
         bail!("source message_index has no event_ulid column; cannot link messages to the ledger");
     }
-    Ok(Plan { map, cols, unmapped, insert_cols, append_event_seq })
+    Ok(Plan { map, cols, unmapped, insert_cols, append_event_seq, append_vector_cols })
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +732,24 @@ fn filter(kind: Kind, cols: &[String], vals: &[SqlValue]) -> Option<&'static str
                 Some("invalid_repo")
             } else {
                 None
+            }
+        }
+        Kind::MemoryEmbeddings => match col_value(cols, vals, "embedding") {
+            Some(SqlValue::Blob(b)) if !b.is_empty() && b.len().is_multiple_of(4) => None,
+            _ => Some("invalid_embedding"),
+        },
+        Kind::MemoryChunks => {
+            let blob_ok = matches!(
+                col_value(cols, vals, "embedding"),
+                Some(SqlValue::Blob(b)) if !b.is_empty() && b.len().is_multiple_of(4)
+            );
+            if !blob_ok {
+                return Some("invalid_embedding");
+            }
+            let idx_val = col_value(cols, vals, "chunk_index").or_else(|| col_value(cols, vals, "idx"));
+            match idx_val {
+                Some(SqlValue::Integer(i)) if *i >= 0 => None,
+                _ => Some("invalid_chunk_index"),
             }
         }
         _ => None,
@@ -915,9 +980,10 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
         Ok(rows.collect::<Result<_, _>>()?)
     })?;
     // A key whose values come from copied columns, the default org, or the source rowid.
+    let copied_targets = &plan.insert_cols[..plan.cols.len()];
     let mut keys: Vec<Vec<String>> = Vec::new();
     if !pk.is_empty()
-        && pk.iter().all(|c| plan.cols.contains(c) || (map.kind.writes_default_org() && c == "org_id"))
+        && pk.iter().all(|c| copied_targets.contains(c) || (map.kind.writes_default_org() && c == "org_id"))
     {
         keys.push(pk);
     }
@@ -971,7 +1037,7 @@ fn check_key_overlap(src: &Connection, db: &Db, map: &TableMap, last: i64) -> an
                             if map.kind.writes_default_org() && k == "org_id" {
                                 return SqlValue::Text(ua_core::DEFAULT_ORG.into());
                             }
-                            let raw = col_value(&plan.cols, &vals, k).cloned().unwrap_or(SqlValue::Null);
+                            let raw = col_value(copied_targets, &vals, k).cloned().unwrap_or(SqlValue::Null);
                             if map.kind == Kind::ProjectRepoBindings
                                 && k == "project"
                                 && let Some(norm) =
@@ -1171,6 +1237,41 @@ fn copy_table(
                     }
                     if plan.append_event_seq {
                         vals.push(SqlValue::Null);
+                    }
+                    if matches!(map.kind, Kind::MemoryEmbeddings | Kind::MemoryChunks) {
+                        let copied_targets = &plan.insert_cols[..plan.cols.len()];
+                        let dim = match col_value(copied_targets, &vals, "embedding") {
+                            Some(SqlValue::Blob(b)) => (b.len() / 4) as i64,
+                            _ => 0,
+                        };
+                        let raw_model = as_text(col_value(copied_targets, &vals, "model"))
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("unknown");
+                        let stale_model = SqlValue::Text(format!("import:{raw_model}"));
+                        let dim_val = SqlValue::Integer(dim);
+                        let empty_sha = SqlValue::Text(String::new());
+                        let updated_at = as_text(col_value(copied_targets, &vals, "updated_at"))
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| SqlValue::Text(s.to_string()))
+                            .unwrap_or_else(|| SqlValue::Text(ua_core::time::now()));
+
+                        let value_for = |col: &str| match col {
+                            "model" => stale_model.clone(),
+                            "dim" => dim_val.clone(),
+                            "content_sha" => empty_sha.clone(),
+                            "updated_at" => updated_at.clone(),
+                            _ => SqlValue::Null,
+                        };
+                        for col in ["model", "dim", "content_sha", "updated_at"] {
+                            if let Some(pos) = copied_targets.iter().position(|c| c == col) {
+                                vals[pos] = value_for(col);
+                            }
+                        }
+                        for &col in &plan.append_vector_cols {
+                            vals.push(value_for(col));
+                        }
                     }
                     if map.kind.writes_default_org() {
                         vals.push(SqlValue::Text(ua_core::DEFAULT_ORG.into()));

@@ -17,7 +17,14 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, params};
 use ua_core::{Config, UaResult};
 
-use super::note::Filter;
+use super::chunks;
+use super::note::{Filter, embed_text, text_sha};
+
+/// Format a canonical vector identity (`backend:model@revision`) stored in
+/// `memory_embeddings.model` and `memory_chunks.model`.
+pub fn vector_identity(backend: &str, model: &str, revision: &str) -> String {
+    format!("{backend}:{model}@{revision}")
+}
 
 /// Why an embedding could not be produced.
 #[derive(Debug, Clone)]
@@ -39,9 +46,26 @@ impl EmbedError {
 
 /// Text to vectors. Implementations must be cheap to call from blocking threads.
 pub trait Embedder: Send + Sync {
-    /// The model name vectors are stored under. Only vectors of the same
-    /// model are compared.
+    /// The configured model name (also the lookup key in the embedder registry).
     fn model(&self) -> &str;
+
+    /// Backend identifier (e.g. `local`, `ollama`, `openai_compat`, `custom`).
+    /// Included in [`Embedder::identity`] so two backends with the same model
+    /// name never compare as equal.
+    fn backend(&self) -> &str {
+        "custom"
+    }
+
+    /// Model revision or digest (e.g. a pinned revision or Ollama digest).
+    fn revision(&self) -> &str {
+        "unversioned"
+    }
+
+    /// Canonical vector identity stored in `memory_embeddings.model` and
+    /// `memory_chunks.model`: `<backend>:<model>@<revision>`.
+    fn identity(&self) -> String {
+        vector_identity(self.backend(), self.model(), self.revision())
+    }
 
     /// False when this embedder never produces vectors (the no-op default).
     fn available(&self) -> bool {
@@ -67,6 +91,10 @@ impl NoopEmbedder {
 impl Embedder for NoopEmbedder {
     fn model(&self) -> &str {
         &self.model
+    }
+
+    fn backend(&self) -> &str {
+        "noop"
     }
 
     fn available(&self) -> bool {
@@ -115,12 +143,48 @@ pub fn embedder_for(cfg: &Config) -> Arc<dyn Embedder> {
     }
 }
 
-/// Embed one text, or `None` when the embedder is unavailable or fails.
+/// Embed one text, or an error when the embedder is unavailable or fails.
 pub fn embed_one(e: &dyn Embedder, text: String) -> Result<Vec<f32>, EmbedError> {
     if !e.available() {
         return Err(EmbedError::disabled());
     }
     e.embed(&[text])?.into_iter().next().ok_or_else(|| EmbedError::runtime("embedder returned no vector"))
+}
+
+/// Embed a batch of texts, checking that the embedder returns one vector per input.
+pub fn embed_batch(e: &dyn Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    if !e.available() {
+        return Err(EmbedError::disabled());
+    }
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let out = e.embed(texts)?;
+    if out.len() != texts.len() {
+        return Err(EmbedError::runtime(format!(
+            "embedder returned {} vectors for {} texts",
+            out.len(),
+            texts.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Embed a note's single vector and (when longer than [`chunks::SINGLE_VECTOR_MAX_CHARS`])
+/// its overlapping chunks in a single embedder call.
+pub(crate) fn embed_note(
+    e: &dyn Embedder,
+    title: Option<&str>,
+    content: &str,
+) -> Result<(Vec<f32>, Vec<Vec<f32>>), EmbedError> {
+    let text = embed_text(title, content);
+    let pieces = chunks::chunk_text(&text);
+    let mut inputs = Vec::with_capacity(1 + pieces.len());
+    inputs.push(text);
+    inputs.extend(pieces);
+    let mut vecs = embed_batch(e, &inputs)?;
+    let single = vecs.remove(0);
+    Ok((single, vecs))
 }
 
 #[cfg(feature = "embeddings")]
@@ -137,6 +201,7 @@ mod fast {
     use super::{EmbedError, Embedder};
 
     const RETRY_AFTER: Duration = Duration::from_secs(60);
+    const LOCAL_MODEL_REVISION: &str = "fastembed-7.7";
 
     pub struct FastEmbedder {
         name: String,
@@ -176,6 +241,14 @@ mod fast {
     impl Embedder for FastEmbedder {
         fn model(&self) -> &str {
             &self.name
+        }
+
+        fn backend(&self) -> &str {
+            "local"
+        }
+
+        fn revision(&self) -> &str {
+            LOCAL_MODEL_REVISION
         }
 
         fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
@@ -269,10 +342,43 @@ pub(crate) fn store_vector(
     Ok(())
 }
 
-/// Nearest-neighbour lookup over stored note vectors.
+/// Store (or replace) the chunk vectors of organization `org`'s note.
+/// Existing chunks for the note are deleted first so shrinking a note below
+/// the chunking threshold removes its old chunks. The `memory_chunks_org_fence`
+/// trigger refuses a note of another organization.
+pub(crate) fn store_chunks(
+    conn: &Connection,
+    org: &str,
+    note_id: &str,
+    model: &str,
+    chunks: &[Vec<f32>],
+    content_sha: &str,
+) -> UaResult<usize> {
+    conn.execute("DELETE FROM memory_chunks WHERE org_id = ?1 AND note_id = ?2", params![org, note_id])?;
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare(
+        "INSERT INTO memory_chunks (org_id, note_id, idx, model, dim, embedding, content_sha) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    let mut written = 0usize;
+    for (idx, v) in chunks.iter().take(chunks::MAX_CHUNKS).enumerate() {
+        stmt.execute(params![org, note_id, idx as i64, model, v.len() as i64, to_blob(v), content_sha])?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// Nearest-neighbour lookup over stored note vectors and chunks.
+///
+/// `model` is the active canonical vector identity (`backend:model@revision`).
+/// Only rows whose `model` equals `model` and whose `content_sha` matches the
+/// SHA-256 of the note's current embedded text are scored; a note's score is
+/// `max(single_vector_cosine, best_chunk_cosine)`.
 pub trait VectorIndex: Send + Sync {
     /// The `k` best notes passing `filter` with similarity >= `min_similarity`,
-    /// best first (ties by id). `filter` names the organization, so only its
+    /// best first (ties by insertion order). `filter` names the organization, so only its
     /// notes' vectors are scanned, ranked or returned.
     fn nearest(
         &self,
@@ -284,8 +390,8 @@ pub trait VectorIndex: Send + Sync {
         k: usize,
     ) -> UaResult<Vec<(String, f32)>>;
 
-    /// Similarity of each listed note of organization `org` that has a vector
-    /// of `model`.
+    /// Similarity of each listed note of organization `org` that has a fresh
+    /// vector or chunk of `model`.
     fn similarities(
         &self,
         conn: &Connection,
@@ -296,9 +402,29 @@ pub trait VectorIndex: Send + Sync {
     ) -> UaResult<HashMap<String, f32>>;
 }
 
-/// Scans every eligible vector and computes cosine in Rust.
+/// Scans every eligible fresh single vector and chunk vector and computes
+/// `max(single, best chunk)` cosine in Rust.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BruteForceIndex;
+
+fn note_current_sha<'a>(
+    cache: &'a mut HashMap<String, String>,
+    note_id: &str,
+    title: Option<&str>,
+    content: &str,
+) -> &'a str {
+    cache.entry(note_id.to_string()).or_insert_with(|| text_sha(&embed_text(title, content))).as_str()
+}
+
+fn record_max(best: &mut HashMap<String, f32>, note_id: String, sim: f32) {
+    best.entry(note_id)
+        .and_modify(|cur| {
+            if sim > *cur {
+                *cur = sim;
+            }
+        })
+        .or_insert(sim);
+}
 
 impl VectorIndex for BruteForceIndex {
     fn nearest(
@@ -310,28 +436,88 @@ impl VectorIndex for BruteForceIndex {
         min_similarity: f32,
         k: usize,
     ) -> UaResult<Vec<(String, f32)>> {
-        let sql = format!(
-            "SELECT e.note_id, e.embedding, m.seq FROM memory_embeddings e \
+        let mut sha_cache: HashMap<String, String> = HashMap::new();
+        let mut best: HashMap<String, f32> = HashMap::new();
+        // Insertion order of each scored note, for the tie-break below.
+        let mut seqs: HashMap<String, i64> = HashMap::new();
+
+        // 1. Single-vector scan.
+        let single_sql = format!(
+            "SELECT e.note_id, e.embedding, e.content_sha, m.title, m.content, m.seq \
+             FROM memory_embeddings e \
              JOIN memory m ON m.id = e.note_id AND m.org_id = e.org_id \
-             WHERE e.model = ? AND e.dim = ? AND {}",
+             WHERE e.model = ? AND e.dim = ? AND e.content_sha <> '' AND {}",
             filter.sql
         );
         let mut p = vec![SqlValue::Text(model.into()), SqlValue::Integer(query.len() as i64)];
         p.extend(filter.params.iter().cloned());
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(p), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)?))
-        })?;
-        let mut hits = Vec::new();
-        for row in rows {
-            let (id, blob, seq) = row?;
-            let sim = cosine(query, &from_blob(&blob));
-            if sim >= min_similarity {
-                hits.push((id, sim, seq));
+        {
+            let mut stmt = conn.prepare(&single_sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(p.iter().cloned()), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, blob, stored_sha, title, content, seq) = row?;
+                let current_sha = note_current_sha(&mut sha_cache, &id, title.as_deref(), &content);
+                if stored_sha != current_sha {
+                    continue;
+                }
+                let sim = cosine(query, &from_blob(&blob));
+                seqs.insert(id.clone(), seq);
+                record_max(&mut best, id, sim);
             }
         }
-        // Equal similarities break on insertion order, not the random note
-        // id, so the top-k cut keeps the same notes on every run.
+
+        // 2. Chunk-vector scan: keep max(single, best chunk) per note.
+        let chunk_sql = format!(
+            "SELECT c.note_id, c.embedding, c.content_sha, m.title, m.content, m.seq \
+             FROM memory_chunks c \
+             JOIN memory m ON m.id = c.note_id AND m.org_id = c.org_id \
+             WHERE c.model = ? AND c.dim = ? AND c.content_sha <> '' AND {}",
+            filter.sql
+        );
+        {
+            let mut stmt = conn.prepare(&chunk_sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(p), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, blob, stored_sha, title, content, seq) = row?;
+                let current_sha = note_current_sha(&mut sha_cache, &id, title.as_deref(), &content);
+                if stored_sha != current_sha {
+                    continue;
+                }
+                let sim = cosine(query, &from_blob(&blob));
+                seqs.insert(id.clone(), seq);
+                record_max(&mut best, id, sim);
+            }
+        }
+
+        let mut hits: Vec<(String, f32, i64)> = best
+            .into_iter()
+            .filter(|(_, sim)| *sim >= min_similarity)
+            .map(|(id, sim)| {
+                let seq = seqs.get(&id).copied().unwrap_or(i64::MAX);
+                (id, sim, seq)
+            })
+            .collect();
+        // Equal similarities (after max(single, best chunk)) break on
+        // insertion order, not the random note id, so the top-k cut keeps
+        // the same notes on every run.
         hits.sort_by(|a, b| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.2.cmp(&b.2))
         });
@@ -351,17 +537,62 @@ impl VectorIndex for BruteForceIndex {
         if ids.is_empty() {
             return Ok(out);
         }
-        let mut stmt = conn.prepare(
-            "SELECT note_id, embedding FROM memory_embeddings \
-             WHERE org_id = ?1 AND model = ?2 AND note_id IN (SELECT value FROM json_each(?3))",
-        )?;
+        let dim = query.len() as i64;
         let ids_json = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
-        let rows = stmt.query_map(params![org, model, ids_json], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })?;
-        for row in rows {
-            let (id, blob) = row?;
-            out.insert(id, cosine(query, &from_blob(&blob)));
+        let mut sha_cache: HashMap<String, String> = HashMap::new();
+
+        {
+            let mut stmt = conn.prepare(
+                "SELECT e.note_id, e.embedding, e.content_sha, m.title, m.content \
+                 FROM memory_embeddings e \
+                 JOIN memory m ON m.id = e.note_id AND m.org_id = e.org_id \
+                 WHERE e.org_id = ?1 AND e.model = ?2 AND e.dim = ?3 AND e.content_sha <> '' \
+                   AND e.note_id IN (SELECT value FROM json_each(?4))",
+            )?;
+            let rows = stmt.query_map(params![org, model, dim, &ids_json], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, blob, stored_sha, title, content) = row?;
+                let current_sha = note_current_sha(&mut sha_cache, &id, title.as_deref(), &content);
+                if stored_sha != current_sha {
+                    continue;
+                }
+                record_max(&mut out, id, cosine(query, &from_blob(&blob)));
+            }
+        }
+
+        {
+            let mut stmt = conn.prepare(
+                "SELECT c.note_id, c.embedding, c.content_sha, m.title, m.content \
+                 FROM memory_chunks c \
+                 JOIN memory m ON m.id = c.note_id AND m.org_id = c.org_id \
+                 WHERE c.org_id = ?1 AND c.model = ?2 AND c.dim = ?3 AND c.content_sha <> '' \
+                   AND c.note_id IN (SELECT value FROM json_each(?4))",
+            )?;
+            let rows = stmt.query_map(params![org, model, dim, &ids_json], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, blob, stored_sha, title, content) = row?;
+                let current_sha = note_current_sha(&mut sha_cache, &id, title.as_deref(), &content);
+                if stored_sha != current_sha {
+                    continue;
+                }
+                record_max(&mut out, id, cosine(query, &from_blob(&blob)));
+            }
         }
         Ok(out)
     }

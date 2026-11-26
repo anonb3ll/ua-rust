@@ -35,6 +35,9 @@ pub struct AppState {
     /// The browser-session cookie key, cached so authenticated UI requests
     /// do not read `ui_keys` ([`login::CookieKeyCache`]).
     pub cookie_key: Arc<login::CookieKeyCache>,
+    /// Short-TTL cache (~1 s) for the single-organization auth-policy check
+    /// on live unauthenticated event streams ([`auth::AuthPolicyCache`]).
+    pub auth_policy: Arc<auth::AuthPolicyCache>,
     /// Cancelled when the server shuts down: long-lived responses (event
     /// streams) end on it so a graceful shutdown does not wait on them.
     /// [`router`] sets it to the server's token.
@@ -50,6 +53,7 @@ impl AppState {
             hub,
             registry,
             cookie_key: Arc::new(login::CookieKeyCache::new()),
+            auth_policy: Arc::new(auth::AuthPolicyCache::new()),
             shutdown: CancellationToken::new(),
             calls: TaskTracker::new(),
         }

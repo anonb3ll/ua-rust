@@ -115,6 +115,7 @@ const TENANT: &[&str] = &[
     "memory",
     "memory_versions",
     "memory_embeddings",
+    "memory_chunks",
     // approvals and policy
     "approvals",
     "policy_authorizations",
