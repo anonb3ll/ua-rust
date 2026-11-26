@@ -23,9 +23,9 @@ use secrecy::zeroize::Zeroizing;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use ua_store::evidence::{
-    CHECKPOINT_FORMAT, Checkpoint, CheckpointClass, CheckpointVerification, TrustAnchor, TrustFile,
-    VerifyTrust, Window, checkpoint_attach, checkpoint_write, key_add, key_list, key_retire, key_revoke,
-    latest_signed_checkpoint, verify_checkpoint_with,
+    CHECKPOINT_FORMAT, Checkpoint, CheckpointClass, CheckpointVerification, PinnedCheckpoint, TrustAnchor,
+    TrustFile, VerifyTrust, Window, checkpoint_attach, checkpoint_write, key_add, key_list, key_retire,
+    key_revoke, latest_signed_checkpoint, verify_checkpoint_with,
 };
 use ua_tools::Hub;
 
@@ -115,14 +115,19 @@ pub enum EvidenceCmd {
         /// is set; a mismatch against the checkpoint's key id is refused.
         #[arg(long)]
         anchor_key_id: Option<String>,
-        /// Local JSON trust file holding pinned `keys` and/or authoritative
-        /// `revoked_key_ids`.
+        /// Local JSON trust file holding pinned `keys`, authoritative
+        /// `revoked_key_ids`, and/or out-of-band `signed_checkpoints`.
         #[arg(long)]
         trust_file: Option<PathBuf>,
         /// Mark a key id as revoked at verification time (repeatable). Checked
         /// independently of the database's `revoked_at` column.
         #[arg(long = "revoked-key-id")]
         revoked_key_ids: Vec<String>,
+        /// Local copy of a previously signed hub checkpoint file (repeatable).
+        /// Each supplied record must match `event_log`, exist as a signed row
+        /// in `evidence_checkpoint`, and pass signature verification.
+        #[arg(long = "prev-checkpoint")]
+        prev_checkpoints: Vec<PathBuf>,
     },
 }
 
@@ -311,15 +316,27 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
             println!("{}", json!({ "checkpoint_id": checkpoint, "attached": true }));
             Ok(ExitCode::SUCCESS)
         }
-        EvidenceCmd::Verify { checkpoint, anchor_key, anchor_key_id, trust_file, revoked_key_ids } => {
-            let trust =
-                match build_verify_trust(anchor_key, anchor_key_id, trust_file.as_deref(), revoked_key_ids) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("cannot verify: {e:#}");
-                        return Ok(ExitCode::from(2));
-                    }
-                };
+        EvidenceCmd::Verify {
+            checkpoint,
+            anchor_key,
+            anchor_key_id,
+            trust_file,
+            revoked_key_ids,
+            prev_checkpoints,
+        } => {
+            let trust = match build_verify_trust(
+                anchor_key,
+                anchor_key_id,
+                trust_file.as_deref(),
+                revoked_key_ids,
+                prev_checkpoints,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("cannot verify: {e:#}");
+                    return Ok(ExitCode::from(2));
+                }
+            };
             let verdict = match hub.db().read(|c| verify_checkpoint_with(c, checkpoint.trim(), &trust)) {
                 Ok(v) => v,
                 Err(e) => {
@@ -597,7 +614,7 @@ fn print_prev_head(prev: &PreviousCheckpointHead) {
     eprintln!("  digest (sha256):   {}", prev.digest);
 }
 
-fn validate_public_key_hex(label: &str, raw: &str) -> anyhow::Result<String> {
+fn validate_hex32(label: &str, raw: &str) -> anyhow::Result<String> {
     let trimmed = raw.trim().to_ascii_lowercase();
     let bytes = hex::decode(&trimmed).with_context(|| format!("{label} must be hex-encoded"))?;
     if bytes.len() != 32 {
@@ -611,10 +628,11 @@ fn build_verify_trust(
     anchor_key_id: Option<String>,
     trust_file: Option<&Path>,
     revoked_key_ids: Vec<String>,
+    prev_checkpoints: Vec<PathBuf>,
 ) -> anyhow::Result<VerifyTrust> {
     let anchor = match (anchor_key, anchor_key_id) {
         (Some(public_key), Some(key_id)) => {
-            let public_key = validate_public_key_hex("--anchor-key", &public_key)?;
+            let public_key = validate_hex32("--anchor-key", &public_key)?;
             let key_id = key_id.trim().to_string();
             if key_id.is_empty() {
                 anyhow::bail!("--anchor-key-id must not be empty");
@@ -629,6 +647,7 @@ fn build_verify_trust(
     let mut trust_keys = Vec::new();
     let mut all_revoked: Vec<String> =
         revoked_key_ids.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let mut signed_checkpoints = Vec::new();
 
     if let Some(path) = trust_file {
         let bytes = std::fs::read(path).with_context(|| format!("reading trust file {}", path.display()))?;
@@ -643,7 +662,7 @@ fn build_verify_trust(
             if id.is_empty() {
                 anyhow::bail!("trust file {} contains a key with empty key_id", path.display());
             }
-            let pk = validate_public_key_hex(&format!("trust file key {id:?}"), &k.public_key)?;
+            let pk = validate_hex32(&format!("trust file key {id:?}"), &k.public_key)?;
             if let Some(prev_pk) = seen.insert(id.clone(), pk.clone())
                 && prev_pk != pk
             {
@@ -661,9 +680,60 @@ fn build_verify_trust(
                 all_revoked.push(trimmed.to_string());
             }
         }
+        for cp in parsed.signed_checkpoints {
+            let id = cp.checkpoint_id.trim().to_string();
+            if id.is_empty() {
+                anyhow::bail!(
+                    "trust file {} contains a signed_checkpoints entry with empty checkpoint_id",
+                    path.display()
+                );
+            }
+            if cp.seq <= 0 {
+                anyhow::bail!(
+                    "trust file {} signed_checkpoints entry {id:?} must have seq > 0",
+                    path.display()
+                );
+            }
+            let hash = validate_hex32(&format!("trust file signed_checkpoints[{id:?}].hash"), &cp.hash)?;
+            let digest =
+                validate_hex32(&format!("trust file signed_checkpoints[{id:?}].digest"), &cp.digest)?;
+            signed_checkpoints.push(PinnedCheckpoint { checkpoint_id: id, seq: cp.seq, hash, digest });
+        }
     }
 
-    Ok(VerifyTrust { anchor, trust_keys, revoked_key_ids: all_revoked })
+    for path in prev_checkpoints {
+        let parsed = load_checkpoint_file(&path)?;
+        parsed
+            .checkpoint
+            .validate_fields()
+            .map_err(|e| anyhow::anyhow!("invalid --prev-checkpoint {}: {e}", path.display()))?;
+        let recomputed = parsed.checkpoint.digest();
+        if let Some(claimed) = parsed.digest.as_deref()
+            && !claimed.trim().eq_ignore_ascii_case(&recomputed)
+        {
+            anyhow::bail!(
+                "digest mismatch in --prev-checkpoint {}: file claims {claimed}, recomputed {recomputed}",
+                path.display()
+            );
+        }
+        if parsed.checkpoint.class != CheckpointClass::Hub {
+            anyhow::bail!(
+                "--prev-checkpoint {} has class {:?}; only hub checkpoints can be pinned for ledger verification",
+                path.display(),
+                parsed.checkpoint.class.as_str()
+            );
+        }
+        let seq = parsed.checkpoint.seq.expect("validated hub checkpoint");
+        let hash = parsed.checkpoint.hash.expect("validated hub checkpoint").trim().to_ascii_lowercase();
+        signed_checkpoints.push(PinnedCheckpoint {
+            checkpoint_id: parsed.checkpoint.checkpoint_id,
+            seq,
+            hash,
+            digest: recomputed,
+        });
+    }
+
+    Ok(VerifyTrust { anchor, trust_keys, revoked_key_ids: all_revoked, signed_checkpoints })
 }
 
 fn build_checkpoint(args: CheckpointArgs) -> anyhow::Result<Checkpoint> {

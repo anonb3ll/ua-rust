@@ -783,4 +783,340 @@ fn trust_file_unknown_anchor_field_exits_2_and_verify_catches_rewritten_history_
     let v2: Value = serde_json::from_slice(&verify_cp2.stdout).unwrap();
     assert_eq!(v2["state"], "ledger_mismatch", "{v2}");
     assert!(v2["reason"].as_str().unwrap().contains("cp-1"), "{v2}");
+
+    // Read cp1's original fields from cp1.json for out-of-band `--trust-file` signed_checkpoints.
+    let cp1_json: Value = serde_json::from_slice(&std::fs::read(&cp1_file).unwrap()).unwrap();
+    let cp1_digest = cp1_json["digest"].as_str().unwrap().to_string();
+    let trust_with_pinned = root.path().join("trust-pinned.json");
+    std::fs::write(
+        &trust_with_pinned,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "keys": [{ "key_id": "k1", "public_key": pk }],
+            "signed_checkpoints": [{
+                "checkpoint_id": "cp-1",
+                "seq": seq1,
+                "hash": hash1,
+                "digest": cp1_digest,
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Variant A: attacker drops immutable trigger and rewrites cp-1.hash + cp-1.digest to match
+    // the rewritten event_log[seq1]. Even WITHOUT `--prev-checkpoint`, `verify` checks cp-1's
+    // signature against the pinned key and refuses (exit 1).
+    {
+        let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+        let rewritten_hash1: String =
+            conn.query_row("SELECT entry_hash FROM event_log WHERE seq = ?1", [seq1], |r| r.get(0)).unwrap();
+        let mut cp1: ua_store::evidence::Checkpoint =
+            serde_json::from_value(cp1_json["checkpoint"].clone()).unwrap();
+        cp1.hash = Some(rewritten_hash1.clone());
+        let rewritten_digest1 = cp1.digest();
+        conn.execute_batch("DROP TRIGGER evidence_checkpoint_immutable;").unwrap();
+        conn.execute(
+            "UPDATE evidence_checkpoint SET hash = ?1, digest = ?2 WHERE checkpoint_id = 'cp-1'",
+            rusqlite::params![rewritten_hash1, rewritten_digest1],
+        )
+        .unwrap();
+    }
+    let var_a = ua(&home)
+        .args(["evidence", "verify", "--checkpoint", "cp-2", "--anchor-key", &pk, "--anchor-key-id", "k1"])
+        .output()
+        .unwrap();
+    assert_eq!(var_a.status.code(), Some(1), "Variant A must fail: {}", text(&var_a.stdout));
+    let va_json: Value = serde_json::from_slice(&var_a.stdout).unwrap();
+    assert_eq!(va_json["state"], "ledger_mismatch", "{va_json}");
+    assert!(va_json["reason"].as_str().unwrap().contains("signature"), "{va_json}");
+
+    // Variant C: attacker NULLs cp-1's signature. Refused when the operator supplies
+    // `--prev-checkpoint cp1.json` OR `--trust-file` with `signed_checkpoints`.
+    {
+        let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+        conn.execute("UPDATE evidence_checkpoint SET signature = NULL WHERE checkpoint_id = 'cp-1'", [])
+            .unwrap();
+    }
+    let var_c_flag = ua(&home)
+        .args([
+            "evidence",
+            "verify",
+            "--checkpoint",
+            "cp-2",
+            "--anchor-key",
+            &pk,
+            "--anchor-key-id",
+            "k1",
+            "--prev-checkpoint",
+            cp1_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        var_c_flag.status.code(),
+        Some(1),
+        "Variant C (--prev-checkpoint): {}",
+        text(&var_c_flag.stdout)
+    );
+    let var_c_tf = ua(&home)
+        .args([
+            "evidence",
+            "verify",
+            "--checkpoint",
+            "cp-2",
+            "--trust-file",
+            trust_with_pinned.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(var_c_tf.status.code(), Some(1), "Variant C (trust file): {}", text(&var_c_tf.stdout));
+
+    // Variant B: attacker drops delete trigger and deletes cp-1 entirely. Still refused when
+    // `--prev-checkpoint cp1.json` OR `--trust-file` with `signed_checkpoints` is supplied.
+    {
+        let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+        conn.execute_batch("DROP TRIGGER evidence_checkpoint_no_delete;").unwrap();
+        conn.execute("DELETE FROM evidence_checkpoint WHERE checkpoint_id = 'cp-1'", []).unwrap();
+    }
+    let var_b_flag = ua(&home)
+        .args([
+            "evidence",
+            "verify",
+            "--checkpoint",
+            "cp-2",
+            "--anchor-key",
+            &pk,
+            "--anchor-key-id",
+            "k1",
+            "--prev-checkpoint",
+            cp1_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        var_b_flag.status.code(),
+        Some(1),
+        "Variant B (--prev-checkpoint): {}",
+        text(&var_b_flag.stdout)
+    );
+    let var_b_tf = ua(&home)
+        .args([
+            "evidence",
+            "verify",
+            "--checkpoint",
+            "cp-2",
+            "--trust-file",
+            trust_with_pinned.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(var_b_tf.status.code(), Some(1), "Variant B (trust file): {}", text(&var_b_tf.stdout));
+}
+
+#[test]
+fn verify_with_prev_checkpoint_and_trust_file_signed_checkpoints_succeeds_when_intact_and_catches_delete_or_null()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let key_path = root.path().join("op.key");
+
+    let keygen =
+        ua(&home).args(["evidence", "key-generate", "--out", key_path.to_str().unwrap()]).output().unwrap();
+    assert!(keygen.status.success(), "{}", text(&keygen.stderr));
+    let pk =
+        serde_json::from_slice::<Value>(&keygen.stdout).unwrap()["public_key"].as_str().unwrap().to_string();
+
+    assert!(ua(&home).args(["init"]).output().unwrap().status.success());
+    assert!(
+        ua(&home)
+            .args(["evidence", "key-add", "--key-id", "k1", "--public-key", &pk])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let (seq1, hash1) = latest_ledger_head(&home);
+    let cp1_file = root.path().join("cp1.json");
+    assert!(
+        ua(&home)
+            .args([
+                "evidence",
+                "checkpoint",
+                "--id",
+                "cp-1",
+                "--key-id",
+                "k1",
+                "--seq",
+                &seq1.to_string(),
+                "--hash",
+                &hash1,
+                "--out",
+                cp1_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let sig1 = text(
+        &ua(&home)
+            .args([
+                "evidence",
+                "sign",
+                "--key-file",
+                key_path.to_str().unwrap(),
+                "--checkpoint-file",
+                cp1_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        ua(&home)
+            .args(["evidence", "attach", "--checkpoint", "cp-1", "--signature", &sig1])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let (seq2, hash2) = latest_ledger_head(&home);
+    assert!(seq2 > seq1);
+    let cp2_file = root.path().join("cp2.json");
+    assert!(
+        ua(&home)
+            .args([
+                "evidence",
+                "checkpoint",
+                "--id",
+                "cp-2",
+                "--key-id",
+                "k1",
+                "--seq",
+                &seq2.to_string(),
+                "--hash",
+                &hash2,
+                "--out",
+                cp2_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let sig2 = text(
+        &ua(&home)
+            .args([
+                "evidence",
+                "sign",
+                "--key-file",
+                key_path.to_str().unwrap(),
+                "--checkpoint-file",
+                cp2_file.to_str().unwrap(),
+                "--prev-checkpoint",
+                cp1_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        ua(&home)
+            .args(["evidence", "attach", "--checkpoint", "cp-2", "--signature", &sig2])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let cp1_digest = serde_json::from_slice::<Value>(&std::fs::read(&cp1_file).unwrap()).unwrap()["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let trust_file = root.path().join("trust.json");
+    std::fs::write(
+        &trust_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "keys": [{ "key_id": "k1", "public_key": pk }],
+            "signed_checkpoints": [{
+                "checkpoint_id": "cp-1",
+                "seq": seq1,
+                "hash": hash1,
+                "digest": cp1_digest,
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Happy path: intact ledger + intact cp-1 passes with both `--prev-checkpoint` and `--trust-file`.
+    let ok_flag = ua(&home)
+        .args([
+            "evidence",
+            "verify",
+            "--checkpoint",
+            "cp-2",
+            "--anchor-key",
+            &pk,
+            "--anchor-key-id",
+            "k1",
+            "--prev-checkpoint",
+            cp1_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(ok_flag.status.code(), Some(0), "{}", text(&ok_flag.stdout));
+    let ok_tf = ua(&home)
+        .args(["evidence", "verify", "--checkpoint", "cp-2", "--trust-file", trust_file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(ok_tf.status.code(), Some(0), "{}", text(&ok_tf.stdout));
+
+    // NULLing cp-1.signature without rewriting event_log is caught (exit 1).
+    {
+        let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+        conn.execute_batch("DROP TRIGGER evidence_checkpoint_immutable;").unwrap();
+        conn.execute("UPDATE evidence_checkpoint SET signature = NULL WHERE checkpoint_id = 'cp-1'", [])
+            .unwrap();
+    }
+    let nulled = ua(&home)
+        .args([
+            "evidence",
+            "verify",
+            "--checkpoint",
+            "cp-2",
+            "--anchor-key",
+            &pk,
+            "--anchor-key-id",
+            "k1",
+            "--prev-checkpoint",
+            cp1_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(nulled.status.code(), Some(1), "{}", text(&nulled.stdout));
+    let nulled_v: Value = serde_json::from_slice(&nulled.stdout).unwrap();
+    assert_eq!(nulled_v["state"], "ledger_mismatch", "{nulled_v}");
+    assert!(nulled_v["reason"].as_str().unwrap().contains("no signature"), "{nulled_v}");
+
+    // Deleting cp-1 without rewriting event_log is also caught (exit 1).
+    {
+        let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+        conn.execute_batch("DROP TRIGGER evidence_checkpoint_no_delete;").unwrap();
+        conn.execute("DELETE FROM evidence_checkpoint WHERE checkpoint_id = 'cp-1'", []).unwrap();
+    }
+    let deleted = ua(&home)
+        .args(["evidence", "verify", "--checkpoint", "cp-2", "--trust-file", trust_file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(deleted.status.code(), Some(1), "{}", text(&deleted.stdout));
+    let deleted_v: Value = serde_json::from_slice(&deleted.stdout).unwrap();
+    assert_eq!(deleted_v["state"], "ledger_mismatch", "{deleted_v}");
+    assert!(deleted_v["reason"].as_str().unwrap().contains("missing"), "{deleted_v}");
 }

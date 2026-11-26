@@ -276,10 +276,29 @@ pub struct TrustAnchor {
     pub public_key: String,
 }
 
+/// A previously signed `hub` checkpoint record held outside the hub database
+/// (either in `--trust-file`'s `signed_checkpoints` list or loaded from a
+/// repeatable `--prev-checkpoint <file>`).
+///
+/// Pinning earlier checkpoints out of band turns ledger continuity into real
+/// tamper-evidence: even an attacker with SQLite write access who drops
+/// triggers to delete an earlier checkpoint row, clear its signature, or
+/// rewrite both `event_log` and `evidence_checkpoint` cannot make `verify`
+/// pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedCheckpoint {
+    pub checkpoint_id: String,
+    pub seq: i64,
+    pub hash: String,
+    pub digest: String,
+}
+
 /// Verifier-side trust material loaded from a local trust file
-/// (`--trust-file`). Keeps older public keys across rotations and holds an
+/// (`--trust-file`). Keeps older public keys across rotations, holds an
 /// authoritative list of revoked key ids independent of the database's
-/// `revoked_at` column.
+/// `revoked_at` column, and may pin previously signed `hub` checkpoints held
+/// outside the hub database.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrustFile {
@@ -287,6 +306,8 @@ pub struct TrustFile {
     pub keys: Vec<TrustAnchor>,
     #[serde(default)]
     pub revoked_key_ids: Vec<String>,
+    #[serde(default)]
+    pub signed_checkpoints: Vec<PinnedCheckpoint>,
 }
 
 /// Verifier-side trust options passed to [`verify_checkpoint_with`].
@@ -301,12 +322,23 @@ pub struct VerifyTrust {
     /// naming one returns `KeyRevoked` even if the database's `revoked_at`
     /// column was never set or was cleared.
     pub revoked_key_ids: Vec<String>,
+    /// Out-of-band records of previously signed `hub` checkpoints (from
+    /// `--prev-checkpoint` files and/or `--trust-file`'s `signed_checkpoints`).
+    /// Each record must match `event_log`, exist as a signed row in
+    /// `evidence_checkpoint` with matching `(seq, hash, digest)`, and pass
+    /// signature verification.
+    pub signed_checkpoints: Vec<PinnedCheckpoint>,
 }
 
 impl VerifyTrust {
     /// Build trust options from a single optional pinned anchor.
     pub fn from_anchor(anchor: Option<&TrustAnchor>) -> Self {
-        Self { anchor: anchor.cloned(), trust_keys: Vec::new(), revoked_key_ids: Vec::new() }
+        Self {
+            anchor: anchor.cloned(),
+            trust_keys: Vec::new(),
+            revoked_key_ids: Vec::new(),
+            signed_checkpoints: Vec::new(),
+        }
     }
 
     fn is_revoked(&self, key_id: &str) -> bool {
@@ -937,7 +969,8 @@ pub fn verify_checkpoint(
 }
 
 /// Verify a checkpoint using full verifier-side trust options (pinned anchor
-/// or trust-file keys, plus authoritative verifier-side revocation list).
+/// or trust-file keys, authoritative verifier-side revocation list, and any
+/// out-of-band pinned earlier `hub` checkpoints).
 pub fn verify_checkpoint_with(
     conn: &Connection,
     checkpoint_id: &str,
@@ -955,12 +988,42 @@ pub fn verify_checkpoint_with(
     if checkpoint.class == CheckpointClass::Org {
         return Ok(CheckpointVerification::OrgClassNotVerifiable);
     }
-    if let Some(reason) = ledger_mismatch(conn, &checkpoint)? {
+    let Some(seq) = checkpoint.seq else {
+        return Ok(CheckpointVerification::LedgerMismatch { reason: "hub checkpoint carries no seq".into() });
+    };
+    if let Some(reason) = own_ledger_mismatch(conn, &checkpoint)? {
         return Ok(CheckpointVerification::LedgerMismatch { reason });
     }
     let Some(signature) = signature else {
         return Ok(CheckpointVerification::Unsigned);
     };
+    let verdict = verify_signature_against_trust(conn, &checkpoint, &stored_digest, &signature, trust)?;
+    if !matches!(verdict, CheckpointVerification::Valid | CheckpointVerification::ValidInStoreOnly { .. }) {
+        return Ok(verdict);
+    }
+    // Check every out-of-band pinned checkpoint record supplied by the verifier.
+    if let Some(failure) = verify_pinned_checkpoints(conn, seq, trust)? {
+        return Ok(failure);
+    }
+    // DB-side consistency check over every earlier signed `hub` checkpoint
+    // (`seq <= checkpoint.seq`) still present in `evidence_checkpoint`,
+    // including its signature against the verifier's trust anchor/trust file.
+    if let Some(failure) = verify_earlier_db_checkpoints(conn, &checkpoint, seq, trust)? {
+        return Ok(failure);
+    }
+    Ok(verdict)
+}
+
+/// Verify a single checkpoint's signature and key against the verifier's trust
+/// options (authoritative revocation list, stored key row, pinned anchor or
+/// trust-file keys, or store-only fallback).
+fn verify_signature_against_trust(
+    conn: &Connection,
+    checkpoint: &Checkpoint,
+    stored_digest: &str,
+    signature: &str,
+    trust: &VerifyTrust,
+) -> UaResult<CheckpointVerification> {
     // Verifier-side revocation is authoritative: checked before consulting the
     // database's key row so clearing `revoked_at` in SQLite cannot defeat it.
     if trust.is_revoked(&checkpoint.key_id) {
@@ -990,7 +1053,7 @@ pub fn verify_checkpoint_with(
                 found: key.public_key.clone(),
             });
         }
-        match verify_ed25519(&expected_pk, &stored_digest, &signature) {
+        match verify_ed25519(&expected_pk, stored_digest, signature) {
             Ok(()) => Ok(CheckpointVerification::Valid),
             Err(_) => Ok(CheckpointVerification::InvalidSignature),
         }
@@ -1005,24 +1068,21 @@ pub fn verify_checkpoint_with(
                 found: key.public_key.clone(),
             });
         }
-        match verify_ed25519(&expected_pk, &stored_digest, &signature) {
+        match verify_ed25519(&expected_pk, stored_digest, signature) {
             Ok(()) => Ok(CheckpointVerification::Valid),
             Err(_) => Ok(CheckpointVerification::InvalidSignature),
         }
     } else {
-        match verify_ed25519(&key.public_key, &stored_digest, &signature) {
+        match verify_ed25519(&key.public_key, stored_digest, signature) {
             Ok(()) => Ok(CheckpointVerification::ValidInStoreOnly { key_id: checkpoint.key_id.clone() }),
             Err(_) => Ok(CheckpointVerification::InvalidSignature),
         }
     }
 }
 
-/// Check a hub checkpoint against the ledger it claims to cover, and re-check
-/// every earlier signed hub checkpoint (`seq <= checkpoint.seq`) against the
-/// current ledger so a rewritten chain cannot be hidden behind a newer
-/// checkpoint. Returns the reason it does not match, or `None` when the row,
-/// the chain up to it, and every earlier signed hub checkpoint are intact.
-fn ledger_mismatch(conn: &Connection, checkpoint: &Checkpoint) -> UaResult<Option<String>> {
+/// Check a hub checkpoint's own `(seq, hash)` against `event_log` and verify
+/// the hash chain through `seq`.
+fn own_ledger_mismatch(conn: &Connection, checkpoint: &Checkpoint) -> UaResult<Option<String>> {
     let Some(seq) = checkpoint.seq else {
         return Ok(Some("hub checkpoint carries no seq".into()));
     };
@@ -1039,50 +1099,168 @@ fn ledger_mismatch(conn: &Connection, checkpoint: &Checkpoint) -> UaResult<Optio
     if !report.ok {
         return Ok(Some(report.reason.unwrap_or_else(|| "ledger chain does not verify".into())));
     }
+    Ok(None)
+}
+
+/// Verify every out-of-band pinned checkpoint record supplied by the verifier:
+/// each must match `event_log`, exist as a signed `hub` row in
+/// `evidence_checkpoint` with identical `(seq, hash, digest)`, and pass
+/// cryptographic signature verification against `trust`.
+fn verify_pinned_checkpoints(
+    conn: &Connection,
+    verified_through_seq: i64,
+    trust: &VerifyTrust,
+) -> UaResult<Option<CheckpointVerification>> {
+    for pinned in &trust.signed_checkpoints {
+        let pinned_id = pinned.checkpoint_id.trim();
+        let pinned_hash = pinned.hash.trim();
+        let pinned_digest = pinned.digest.trim();
+        if pinned_id.is_empty() || pinned.seq <= 0 || pinned_hash.is_empty() || pinned_digest.is_empty() {
+            return Err(UaError::invalid(
+                "pinned checkpoint record must carry non-empty checkpoint_id, seq > 0, hash, and digest",
+            ));
+        }
+        let Some(entry) = crate::ledger::entry_hash_at(conn, pinned.seq)? else {
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!(
+                    "pinned checkpoint {pinned_id:?} references seq {}, which is missing from event_log",
+                    pinned.seq
+                ),
+            }));
+        };
+        if !entry.eq_ignore_ascii_case(pinned_hash) {
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!(
+                    "pinned checkpoint {pinned_id:?} at seq {} does not match current \
+                     event_log[{}].entry_hash (ledger history may have been rewritten)",
+                    pinned.seq, pinned.seq
+                ),
+            }));
+        }
+        if pinned.seq > verified_through_seq {
+            let report = crate::ledger::verify_through(conn, pinned.seq)?;
+            if !report.ok {
+                return Ok(Some(CheckpointVerification::LedgerMismatch {
+                    reason: report.reason.unwrap_or_else(|| "ledger chain does not verify".into()),
+                }));
+            }
+        }
+        let Some(db_cp) = checkpoint_get(conn, pinned_id)? else {
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!("pinned checkpoint {pinned_id:?} is missing from evidence_checkpoint"),
+            }));
+        };
+        let Some((db_stored_digest, db_sig)) = checkpoint_signature(conn, pinned_id)? else {
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!("pinned checkpoint {pinned_id:?} is missing from evidence_checkpoint"),
+            }));
+        };
+        if db_cp.class != CheckpointClass::Hub {
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!("pinned checkpoint {pinned_id:?} in evidence_checkpoint is not class hub"),
+            }));
+        }
+        if db_cp.seq != Some(pinned.seq)
+            || !db_cp.hash.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(pinned_hash))
+            || !db_stored_digest.eq_ignore_ascii_case(pinned_digest)
+            || !db_cp.digest().eq_ignore_ascii_case(&db_stored_digest)
+        {
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!(
+                    "pinned checkpoint {pinned_id:?} in evidence_checkpoint does not match the \
+                     verifier's out-of-band record"
+                ),
+            }));
+        }
+        let Some(db_sig) = db_sig else {
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!("pinned checkpoint {pinned_id:?} has no signature in evidence_checkpoint"),
+            }));
+        };
+        match verify_signature_against_trust(conn, &db_cp, &db_stored_digest, &db_sig, trust)? {
+            CheckpointVerification::Valid | CheckpointVerification::ValidInStoreOnly { .. } => {}
+            CheckpointVerification::InvalidSignature => {
+                return Ok(Some(CheckpointVerification::LedgerMismatch {
+                    reason: format!("pinned checkpoint {pinned_id:?} failed signature verification"),
+                }));
+            }
+            other => return Ok(Some(other)),
+        }
+    }
+    Ok(None)
+}
+
+/// DB-side consistency check over every earlier signed `hub` checkpoint
+/// (`seq <= target_seq`) still present in `evidence_checkpoint`: checks stored
+/// digest vs recomputed fields, `event_log[prev_seq].entry_hash`, and
+/// verifies each earlier checkpoint's signature against the verifier's trust
+/// anchor / trust-file key.
+fn verify_earlier_db_checkpoints(
+    conn: &Connection,
+    checkpoint: &Checkpoint,
+    target_seq: i64,
+    trust: &VerifyTrust,
+) -> UaResult<Option<CheckpointVerification>> {
     let mut stmt = conn.prepare(
         "SELECT checkpoint_id, class, org_id, seq, hash, window_start, window_end, \
                 global_from_hash, global_head_hash, org_row_count, org_chain_hash, \
-                key_id, signed_at, digest \
+                key_id, signed_at, digest, signature \
          FROM evidence_checkpoint \
          WHERE class = 'hub' AND signature IS NOT NULL AND seq <= ?1 AND checkpoint_id != ?2 \
          ORDER BY seq ASC, checkpoint_id ASC",
     )?;
-    let earlier: Vec<(Checkpoint, String)> = stmt
-        .query_map(params![seq, checkpoint.checkpoint_id], |r| {
-            Ok((row_to_checkpoint(r)?, r.get::<_, String>(13)?))
+    let earlier: Vec<(Checkpoint, String, String)> = stmt
+        .query_map(params![target_seq, checkpoint.checkpoint_id], |r| {
+            Ok((row_to_checkpoint(r)?, r.get::<_, String>(13)?, r.get::<_, String>(14)?))
         })?
         .collect::<Result<_, _>>()?;
-    for (prev, prev_stored_digest) in earlier {
+    for (prev, prev_stored_digest, prev_signature) in earlier {
         if prev.digest() != prev_stored_digest {
-            return Ok(Some(format!(
-                "earlier signed hub checkpoint {:?} has a stored digest that does not match its fields",
-                prev.checkpoint_id
-            )));
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!(
+                    "earlier signed hub checkpoint {:?} has a stored digest that does not match its fields",
+                    prev.checkpoint_id
+                ),
+            }));
         }
         let Some(prev_seq) = prev.seq else {
-            return Ok(Some(format!(
-                "earlier signed hub checkpoint {:?} carries no seq",
-                prev.checkpoint_id
-            )));
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!("earlier signed hub checkpoint {:?} carries no seq", prev.checkpoint_id),
+            }));
         };
         let Some(prev_hash) = prev.hash.as_deref() else {
-            return Ok(Some(format!(
-                "earlier signed hub checkpoint {:?} carries no hash",
-                prev.checkpoint_id
-            )));
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!("earlier signed hub checkpoint {:?} carries no hash", prev.checkpoint_id),
+            }));
         };
         let Some(prev_entry) = crate::ledger::entry_hash_at(conn, prev_seq)? else {
-            return Ok(Some(format!(
-                "earlier signed hub checkpoint {:?} references seq {prev_seq}, which is missing from event_log",
-                prev.checkpoint_id
-            )));
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!(
+                    "earlier signed hub checkpoint {:?} references seq {prev_seq}, which is missing from event_log",
+                    prev.checkpoint_id
+                ),
+            }));
         };
         if !prev_entry.eq_ignore_ascii_case(prev_hash) {
-            return Ok(Some(format!(
-                "earlier signed hub checkpoint {:?} at seq {prev_seq} does not match current \
-                 event_log[{prev_seq}].entry_hash (ledger history may have been rewritten)",
-                prev.checkpoint_id
-            )));
+            return Ok(Some(CheckpointVerification::LedgerMismatch {
+                reason: format!(
+                    "earlier signed hub checkpoint {:?} at seq {prev_seq} does not match current \
+                     event_log[{prev_seq}].entry_hash (ledger history may have been rewritten)",
+                    prev.checkpoint_id
+                ),
+            }));
+        }
+        match verify_signature_against_trust(conn, &prev, &prev_stored_digest, &prev_signature, trust)? {
+            CheckpointVerification::Valid | CheckpointVerification::ValidInStoreOnly { .. } => {}
+            CheckpointVerification::InvalidSignature => {
+                return Ok(Some(CheckpointVerification::LedgerMismatch {
+                    reason: format!(
+                        "earlier signed hub checkpoint {:?} failed signature verification",
+                        prev.checkpoint_id
+                    ),
+                }));
+            }
+            other => return Ok(Some(other)),
         }
     }
     Ok(None)
@@ -1408,6 +1586,7 @@ mod tests {
             anchor: Some(TrustAnchor { key_id: "k1".into(), public_key: pk }),
             trust_keys: Vec::new(),
             revoked_key_ids: vec![" k1 ".into()],
+            signed_checkpoints: Vec::new(),
         };
         assert_eq!(
             db.read(|c| verify_checkpoint_with(c, "cp-1", &trust)).unwrap(),
@@ -1435,6 +1614,7 @@ mod tests {
                 TrustAnchor { key_id: "k2".into(), public_key: pk2.clone() },
             ],
             revoked_key_ids: Vec::new(),
+            signed_checkpoints: Vec::new(),
         };
         assert_eq!(
             db.read(|c| verify_checkpoint_with(c, "cp-1", &with_both)).unwrap(),
@@ -1446,6 +1626,7 @@ mod tests {
             anchor: None,
             trust_keys: vec![TrustAnchor { key_id: "k2".into(), public_key: pk2 }],
             revoked_key_ids: Vec::new(),
+            signed_checkpoints: Vec::new(),
         };
         assert_eq!(
             db.read(|c| verify_checkpoint_with(c, "cp-1", &only_k2)).unwrap(),
@@ -1751,20 +1932,17 @@ mod tests {
     }
 
     #[test]
-    fn trust_anchor_rejects_unknown_fields() {
-        let raw = r#"{"keys": [{"key_id": "k1", "public_key": "aa", "revoked": true}]}"#;
-        let err = serde_json::from_str::<TrustFile>(raw).unwrap_err().to_string();
+    fn trust_anchor_and_pinned_checkpoint_reject_unknown_fields() {
+        let raw_anchor = r#"{"keys": [{"key_id": "k1", "public_key": "aa", "revoked": true}]}"#;
+        let err = serde_json::from_str::<TrustFile>(raw_anchor).unwrap_err().to_string();
+        assert!(err.contains("unknown field"), "{err}");
+
+        let raw_pinned = r#"{"signed_checkpoints": [{"checkpoint_id": "cp-1", "seq": 1, "hash": "aa", "digest": "bb", "extra": 1}]}"#;
+        let err = serde_json::from_str::<TrustFile>(raw_pinned).unwrap_err().to_string();
         assert!(err.contains("unknown field"), "{err}");
     }
 
-    #[test]
-    fn verify_rechecks_earlier_signed_hub_checkpoints_against_rewritten_ledger() {
-        let (_dir, db) = open();
-        let (sk, pk) = keypair();
-        db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
-        let (seq1, hash1) = ledger_row(&db);
-        signed_checkpoint_id(&db, "cp-1", &sk, "k1", seq1, &hash1);
-
+    fn rewrite_ledger_at(db: &Db, target_seq: i64) -> (i64, String, String) {
         struct EventRow {
             seq: i64,
             ulid: String,
@@ -1776,70 +1954,231 @@ mod tests {
             created_at: String,
             dedupe_key: Option<String>,
         }
-        // Rewrite `event_log` at seq1 and recompute the entire hash chain so `verify_through`
-        // still passes, then sign a newer checkpoint `cp-2` over the rewritten chain.
-        let (seq2, hash2) = db
-            .write(|tx| {
-                tx.execute("DROP TRIGGER event_log_no_update", [])?;
-                let rows: Vec<EventRow> = {
-                    let mut stmt = tx.prepare(
-                        "SELECT seq, ulid, channel, payload, originator, episode_id, \
-                                causal_parent_id, created_at, dedupe_key \
-                         FROM event_log ORDER BY seq ASC",
-                    )?;
-                    stmt.query_map([], |r| {
-                        Ok(EventRow {
-                            seq: r.get(0)?,
-                            ulid: r.get(1)?,
-                            channel: r.get(2)?,
-                            payload: r.get(3)?,
-                            originator: r.get(4)?,
-                            episode_id: r.get(5)?,
-                            causal_parent_id: r.get(6)?,
-                            created_at: r.get(7)?,
-                            dedupe_key: r.get(8)?,
-                        })
-                    })?
-                    .collect::<Result<_, _>>()?
-                };
-                let mut prev: Option<String> = None;
-                let mut last_seq = 0i64;
-                for mut row in rows {
-                    if row.seq == seq1 {
-                        row.payload = r#"{"rewritten":true}"#.to_string();
-                    }
-                    let prev_val = prev.as_deref().unwrap_or(crate::ledger::GENESIS_HASH);
-                    let entry_hash = crate::ledger::compute_entry_hash(
-                        Some(prev_val),
-                        &row.ulid,
-                        &row.channel,
-                        &row.payload,
-                        row.originator.as_deref(),
-                        row.episode_id.as_deref(),
-                        row.causal_parent_id.as_deref(),
-                        &row.created_at,
-                        row.dedupe_key.as_deref(),
-                    );
-                    tx.execute(
-                        "UPDATE event_log SET payload = ?1, prev_hash = ?2, entry_hash = ?3 WHERE seq = ?4",
-                        params![row.payload, prev_val, entry_hash, row.seq],
-                    )?;
-                    prev = Some(entry_hash);
-                    last_seq = row.seq;
+        db.write(|tx| {
+            tx.execute("DROP TRIGGER IF EXISTS event_log_no_update", [])?;
+            let rows: Vec<EventRow> = {
+                let mut stmt = tx.prepare(
+                    "SELECT seq, ulid, channel, payload, originator, episode_id, \
+                            causal_parent_id, created_at, dedupe_key \
+                     FROM event_log ORDER BY seq ASC",
+                )?;
+                stmt.query_map([], |r| {
+                    Ok(EventRow {
+                        seq: r.get(0)?,
+                        ulid: r.get(1)?,
+                        channel: r.get(2)?,
+                        payload: r.get(3)?,
+                        originator: r.get(4)?,
+                        episode_id: r.get(5)?,
+                        causal_parent_id: r.get(6)?,
+                        created_at: r.get(7)?,
+                        dedupe_key: r.get(8)?,
+                    })
+                })?
+                .collect::<Result<_, _>>()?
+            };
+            let mut prev: Option<String> = None;
+            let mut last_seq = 0i64;
+            let mut rewritten_target_hash = String::new();
+            for mut row in rows {
+                if row.seq == target_seq {
+                    row.payload = r#"{"rewritten":true}"#.to_string();
                 }
-                Ok((last_seq, prev.expect("non-empty ledger")))
-            })
-            .unwrap();
+                let prev_val = prev.as_deref().unwrap_or(crate::ledger::GENESIS_HASH);
+                let entry_hash = crate::ledger::compute_entry_hash(
+                    Some(prev_val),
+                    &row.ulid,
+                    &row.channel,
+                    &row.payload,
+                    row.originator.as_deref(),
+                    row.episode_id.as_deref(),
+                    row.causal_parent_id.as_deref(),
+                    &row.created_at,
+                    row.dedupe_key.as_deref(),
+                );
+                tx.execute(
+                    "UPDATE event_log SET payload = ?1, prev_hash = ?2, entry_hash = ?3 WHERE seq = ?4",
+                    params![row.payload, prev_val, entry_hash, row.seq],
+                )?;
+                if row.seq == target_seq {
+                    rewritten_target_hash = entry_hash.clone();
+                }
+                prev = Some(entry_hash);
+                last_seq = row.seq;
+            }
+            Ok((last_seq, prev.expect("non-empty ledger"), rewritten_target_hash))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn verify_catches_rewritten_ledger_and_variant_a_cp1_field_and_digest_rewrite() {
+        let (_dir, db) = open();
+        let (sk, pk) = keypair();
+        db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
+        let (seq1, hash1) = ledger_row(&db);
+        let cp1_digest = signed_checkpoint_id(&db, "cp-1", &sk, "k1", seq1, &hash1);
+
+        // Happy path before any tampering: cp-2 verifies both with and without pinned cp-1.
+        let (seq2_clean, hash2_clean) = ledger_row(&db);
+        assert!(seq2_clean > seq1);
+        signed_checkpoint_id(&db, "cp-2", &sk, "k1", seq2_clean, &hash2_clean);
+        let anchor = TrustAnchor { key_id: "k1".into(), public_key: pk.clone() };
+        let pinned_cp1 = PinnedCheckpoint {
+            checkpoint_id: "cp-1".into(),
+            seq: seq1,
+            hash: hash1.clone(),
+            digest: cp1_digest.clone(),
+        };
+        let trust_with_pinned = VerifyTrust {
+            anchor: Some(anchor.clone()),
+            trust_keys: Vec::new(),
+            revoked_key_ids: Vec::new(),
+            signed_checkpoints: vec![pinned_cp1.clone()],
+        };
+        assert_eq!(
+            db.read(|c| verify_checkpoint(c, "cp-2", Some(&anchor))).unwrap(),
+            CheckpointVerification::Valid
+        );
+        assert_eq!(
+            db.read(|c| verify_checkpoint_with(c, "cp-2", &trust_with_pinned)).unwrap(),
+            CheckpointVerification::Valid
+        );
+
+        // Rewrite `event_log` at seq1 and sign `cp-3` over the rewritten chain.
+        let (seq3, hash3, rewritten_hash1) = rewrite_ledger_at(&db, seq1);
+        assert!(seq3 > seq2_clean);
+        signed_checkpoint_id(&db, "cp-3", &sk, "k1", seq3, &hash3);
+
+        // Careless rewrite (cp-1 untouched): caught by DB-side check.
+        let verdict = db.read(|c| verify_checkpoint(c, "cp-3", Some(&anchor))).unwrap();
+        assert!(matches!(verdict, CheckpointVerification::LedgerMismatch { .. }), "{verdict:?}");
+
+        // Variant A: attacker drops immutable trigger and rewrites cp-1.hash + cp-1.digest
+        // (and cp-2.hash + cp-2.digest) to match the rewritten ledger, leaving old signatures.
+        // Because the re-check verifies every earlier checkpoint's signature against the pinned
+        // key, `verify cp-3` STILL fails even without out-of-band pinned records.
+        db.write(|tx| {
+            tx.execute("DROP TRIGGER evidence_checkpoint_immutable", [])?;
+            let mut cp1 = checkpoint_get(tx, "cp-1")?.unwrap();
+            cp1.hash = Some(rewritten_hash1.clone());
+            let new_digest1 = cp1.digest();
+            tx.execute(
+                "UPDATE evidence_checkpoint SET hash = ?1, digest = ?2 WHERE checkpoint_id = 'cp-1'",
+                params![rewritten_hash1, new_digest1],
+            )?;
+            let rewritten_hash2 = crate::ledger::entry_hash_at(tx, seq2_clean)?.unwrap();
+            let mut cp2 = checkpoint_get(tx, "cp-2")?.unwrap();
+            cp2.hash = Some(rewritten_hash2.clone());
+            let new_digest2 = cp2.digest();
+            tx.execute(
+                "UPDATE evidence_checkpoint SET hash = ?1, digest = ?2 WHERE checkpoint_id = 'cp-2'",
+                params![rewritten_hash2, new_digest2],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let variant_a = db.read(|c| verify_checkpoint(c, "cp-3", Some(&anchor))).unwrap();
+        match variant_a {
+            CheckpointVerification::LedgerMismatch { reason } => {
+                assert!(reason.contains("cp-1") && reason.contains("signature"), "{reason}");
+            }
+            other => panic!("Variant A must be refused via signature check, got {other:?}"),
+        }
+        let variant_a_pinned = db.read(|c| verify_checkpoint_with(c, "cp-3", &trust_with_pinned)).unwrap();
+        assert!(
+            matches!(variant_a_pinned, CheckpointVerification::LedgerMismatch { .. }),
+            "{variant_a_pinned:?}"
+        );
+    }
+
+    #[test]
+    fn pinned_checkpoints_catch_variant_b_deletion_and_variant_c_nulled_signature() {
+        let (_dir, db) = open();
+        let (sk, pk) = keypair();
+        db.write(|tx| key_add(tx, "k1", &pk, "now", None)).unwrap();
+        let (seq1, hash1) = ledger_row(&db);
+        let cp1_digest = signed_checkpoint_id(&db, "cp-1", &sk, "k1", seq1, &hash1);
+
+        let (seq2, hash2) = ledger_row(&db);
         assert!(seq2 > seq1);
         signed_checkpoint_id(&db, "cp-2", &sk, "k1", seq2, &hash2);
 
-        let anchor = TrustAnchor { key_id: "k1".into(), public_key: pk };
-        let verdict = db.read(|c| verify_checkpoint(c, "cp-2", Some(&anchor))).unwrap();
-        match verdict {
+        let trust = VerifyTrust {
+            anchor: Some(TrustAnchor { key_id: "k1".into(), public_key: pk }),
+            trust_keys: Vec::new(),
+            revoked_key_ids: Vec::new(),
+            signed_checkpoints: vec![PinnedCheckpoint {
+                checkpoint_id: "cp-1".into(),
+                seq: seq1,
+                hash: hash1,
+                digest: cp1_digest,
+            }],
+        };
+        assert_eq!(
+            db.read(|c| verify_checkpoint_with(c, "cp-2", &trust)).unwrap(),
+            CheckpointVerification::Valid
+        );
+
+        // Variant C: NULL out cp-1's signature (even without rewriting event_log).
+        db.write(|tx| {
+            tx.execute("DROP TRIGGER evidence_checkpoint_immutable", [])?;
+            tx.execute("UPDATE evidence_checkpoint SET signature = NULL WHERE checkpoint_id = 'cp-1'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let nulled = db.read(|c| verify_checkpoint_with(c, "cp-2", &trust)).unwrap();
+        match nulled {
             CheckpointVerification::LedgerMismatch { reason } => {
-                assert!(reason.contains("cp-1"), "{reason}");
+                assert!(reason.contains("cp-1") && reason.contains("no signature"), "{reason}");
             }
-            other => panic!("expected LedgerMismatch catching rewritten history under cp-1, got {other:?}"),
+            other => panic!("expected LedgerMismatch for NULLed signature, got {other:?}"),
+        }
+
+        // Variant B: delete cp-1 altogether AND rewrite event_log + sign cp-3.
+        let (seq3, hash3, _) = rewrite_ledger_at(&db, seq1);
+        signed_checkpoint_id(&db, "cp-3", &sk, "k1", seq3, &hash3);
+        db.write(|tx| {
+            tx.execute("DROP TRIGGER evidence_checkpoint_no_delete", [])?;
+            tx.execute("DELETE FROM evidence_checkpoint WHERE checkpoint_id = 'cp-1'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let deleted = db.read(|c| verify_checkpoint_with(c, "cp-3", &trust)).unwrap();
+        assert!(matches!(deleted, CheckpointVerification::LedgerMismatch { .. }), "{deleted:?}");
+
+        // Also check deletion alone (without ledger rewrite) on a fresh DB.
+        let (_dir2, db2) = open();
+        let (sk2, pk2) = keypair();
+        db2.write(|tx| key_add(tx, "k1", &pk2, "now", None)).unwrap();
+        let (s1, h1) = ledger_row(&db2);
+        let d1 = signed_checkpoint_id(&db2, "cp-1", &sk2, "k1", s1, &h1);
+        let (s2, h2) = ledger_row(&db2);
+        signed_checkpoint_id(&db2, "cp-2", &sk2, "k1", s2, &h2);
+        db2.write(|tx| {
+            tx.execute("DROP TRIGGER evidence_checkpoint_no_delete", [])?;
+            tx.execute("DELETE FROM evidence_checkpoint WHERE checkpoint_id = 'cp-1'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let trust2 = VerifyTrust {
+            anchor: Some(TrustAnchor { key_id: "k1".into(), public_key: pk2 }),
+            trust_keys: Vec::new(),
+            revoked_key_ids: Vec::new(),
+            signed_checkpoints: vec![PinnedCheckpoint {
+                checkpoint_id: "cp-1".into(),
+                seq: s1,
+                hash: h1,
+                digest: d1,
+            }],
+        };
+        let deleted_only = db2.read(|c| verify_checkpoint_with(c, "cp-2", &trust2)).unwrap();
+        match deleted_only {
+            CheckpointVerification::LedgerMismatch { reason } => {
+                assert!(reason.contains("cp-1") && reason.contains("missing"), "{reason}");
+            }
+            other => panic!("expected LedgerMismatch for deleted pinned cp-1, got {other:?}"),
         }
     }
 }
