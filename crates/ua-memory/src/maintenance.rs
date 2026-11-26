@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 use rusqlite::params;
 use serde_json::{Value, json};
+use ua_core::time::Clock;
 use ua_core::{Config, UaError, UaResult};
 use ua_store::Db;
 
@@ -137,15 +137,16 @@ fn candidate(n: &Note, reason: &str) -> Value {
 pub const MAX_BACKFILL_BATCHES_PER_PASS: usize = 8;
 
 /// Cooldown before retrying a note that failed to embed with a runtime error
-/// for the same `(identity, content_sha)`. Editing the note (new `content_sha`)
-/// or changing the active vector identity bypasses the cooldown immediately.
-const FAILED_NOTE_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+/// for the same `(identity, content_sha)`. Measured on `Config.clock` so tests
+/// can advance time deterministically; editing the note (new `content_sha`) or
+/// changing the active vector identity bypasses the cooldown immediately.
+const FAILED_NOTE_COOLDOWN_MS: i64 = 15 * 60 * 1000;
 const MAX_TRACKED_CURSORS: usize = 4096;
 const MAX_TRACKED_FAILURES: usize = 8192;
 
 type CursorKey = (u64, String, String);
 type FailedKey = (u64, String, String);
-type FailedEntry = (String, String, Instant);
+type FailedEntry = (String, String, i64);
 
 fn cursor_map() -> &'static Mutex<HashMap<CursorKey, i64>> {
     static MAP: OnceLock<Mutex<HashMap<CursorKey, i64>>> = OnceLock::new();
@@ -179,25 +180,37 @@ fn save_cursor(db_id: u64, org: &str, identity: &str, cursor: i64) {
     }
 }
 
-fn is_in_failed_cooldown(db_id: u64, org: &str, note_id: &str, identity: &str, sha: &str) -> bool {
-    let Ok(m) = failed_map().lock() else { return false };
-    let Some((f_id, f_sha, at)) = m.get(&(db_id, org.to_string(), note_id.to_string())) else {
-        return false;
-    };
-    f_id == identity && f_sha == sha && at.elapsed() < FAILED_NOTE_COOLDOWN
+fn cooldown_active(now_ms: i64, recorded_ms: i64) -> bool {
+    now_ms >= recorded_ms && (now_ms - recorded_ms) < FAILED_NOTE_COOLDOWN_MS
 }
 
-fn record_failed_note(db_id: u64, org: &str, note_id: &str, identity: &str, sha: &str) {
+fn is_in_failed_cooldown(
+    db_id: u64,
+    org: &str,
+    note_id: &str,
+    identity: &str,
+    sha: &str,
+    now_ms: i64,
+) -> bool {
+    let Ok(m) = failed_map().lock() else { return false };
+    let Some((f_id, f_sha, at_ms)) = m.get(&(db_id, org.to_string(), note_id.to_string())) else {
+        return false;
+    };
+    f_id == identity && f_sha == sha && cooldown_active(now_ms, *at_ms)
+}
+
+fn record_failed_note(db_id: u64, org: &str, note_id: &str, identity: &str, sha: &str, clock: Clock) {
+    let now_ms = clock.now_ms();
     if let Ok(mut m) = failed_map().lock() {
         if m.len() >= MAX_TRACKED_FAILURES {
-            m.retain(|_, (_, _, at)| at.elapsed() < FAILED_NOTE_COOLDOWN);
+            m.retain(|_, (_, _, at_ms)| cooldown_active(now_ms, *at_ms));
             if m.len() >= MAX_TRACKED_FAILURES {
                 m.clear();
             }
         }
         m.insert(
             (db_id, org.to_string(), note_id.to_string()),
-            (identity.to_string(), sha.to_string(), Instant::now()),
+            (identity.to_string(), sha.to_string(), now_ms),
         );
     }
 }
@@ -279,6 +292,7 @@ fn next_stale_batch(
     org: &str,
     identity: &str,
     mut cursor: i64,
+    now_ms: i64,
 ) -> UaResult<(Vec<PendingNote>, i64, bool)> {
     const PAGE_SIZE: i64 = 64;
     let mut pending = Vec::new();
@@ -330,7 +344,8 @@ fn next_stale_batch(
             let (total_chunks, fresh_chunks): (i64, i64) = chunk_stmt
                 .query_row(params![org, &row.id, identity, &sha], |r| Ok((r.get(0)?, r.get(1)?)))?;
             let chunks_fresh = total_chunks == expected_chunks && fresh_chunks == expected_chunks;
-            if (!single_fresh || !chunks_fresh) && !is_in_failed_cooldown(db_id, org, &row.id, identity, &sha)
+            if (!single_fresh || !chunks_fresh)
+                && !is_in_failed_cooldown(db_id, org, &row.id, identity, &sha, now_ms)
             {
                 pending.push(PendingNote { id: row.id, title: row.title, content: row.content, sha });
                 if pending.len() == BACKFILL_BATCH {
@@ -378,9 +393,9 @@ pub async fn backfill_embeddings_capped(
     let mut cursor: i64 = load_cursor(db_id, org, &identity);
     let mut batches_attempted: usize = 0;
     loop {
-        let (org_r, id_r) = (org.to_string(), identity.clone());
+        let (org_r, id_r, now_ms) = (org.to_string(), identity.clone(), cfg.clock.now_ms());
         let (batch, next_cursor, exhausted) =
-            db.read_async(move |c| next_stale_batch(c, db_id, &org_r, &id_r, cursor)).await?;
+            db.read_async(move |c| next_stale_batch(c, db_id, &org_r, &id_r, cursor, now_ms)).await?;
         if batch.is_empty() {
             save_cursor(db_id, org, &identity, 0);
             break;
@@ -420,7 +435,7 @@ pub async fn backfill_embeddings_capped(
                         note_id = %note.id,
                         "memory backfill: note embed failed"
                     );
-                    record_failed_note(db_id, org, &note.id, &identity, &note.sha);
+                    record_failed_note(db_id, org, &note.id, &identity, &note.sha, cfg.clock);
                     report.failed += 1;
                 }
             }

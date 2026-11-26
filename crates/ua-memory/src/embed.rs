@@ -204,18 +204,22 @@ pub fn local_embedder(cfg: &Config) -> Option<Arc<dyn Embedder>> {
         else {
             return None;
         };
-        let key = format!("{}|{}|{}", cfg.home.display(), spec.canonical_id, spec.revision);
+        let clock_tag = match cfg.clock {
+            ua_core::time::Clock::System => "sys".to_string(),
+            ua_core::time::Clock::Fixed(ts) => ts.as_millisecond().to_string(),
+        };
+        let key = format!("{}|{}|{}|{}", cfg.home.display(), spec.canonical_id, spec.revision, clock_tag);
         static LOCAL_CACHE: OnceLock<Mutex<HashMap<String, Arc<dyn Embedder>>>> = OnceLock::new();
         let cache = LOCAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         if let Ok(mut map) = cache.lock() {
             if let Some(e) = map.get(&key) {
                 return Some(e.clone());
             }
-            let e: Arc<dyn Embedder> = Arc::new(fast::FastEmbedder::new(cfg.home.clone(), spec));
+            let e: Arc<dyn Embedder> = Arc::new(fast::FastEmbedder::new(cfg.home.clone(), spec, cfg.clock));
             map.insert(key, e.clone());
             return Some(e);
         }
-        Some(Arc::new(fast::FastEmbedder::new(cfg.home.clone(), spec)))
+        Some(Arc::new(fast::FastEmbedder::new(cfg.home.clone(), spec, cfg.clock)))
     }
     #[cfg(not(any(feature = "embeddings", feature = "embeddings-dynamic")))]
     {
@@ -338,31 +342,32 @@ mod fast {
 
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
 
     use fastembed::{
         InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
     };
+    use ua_core::time::Clock;
 
     use super::{EmbedError, Embedder, models};
 
-    const RETRY_AFTER: Duration = Duration::from_secs(60);
+    const RETRY_AFTER_MS: i64 = 60_000;
 
     pub struct FastEmbedder {
         home: PathBuf,
         spec: &'static models::PinnedModel,
+        clock: Clock,
         state: Mutex<State>,
     }
 
     #[derive(Default)]
     struct State {
         model: Option<TextEmbedding>,
-        last_failure: Option<(Instant, String)>,
+        last_failure: Option<(i64, String)>,
     }
 
     impl FastEmbedder {
-        pub fn new(home: PathBuf, spec: &'static models::PinnedModel) -> Self {
-            Self { home, spec, state: Mutex::new(State::default()) }
+        pub fn new(home: PathBuf, spec: &'static models::PinnedModel, clock: Clock) -> Self {
+            Self { home, spec, clock, state: Mutex::new(State::default()) }
         }
     }
 
@@ -389,15 +394,17 @@ mod fast {
         fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
             let mut st = self.state.lock().map_err(|_| EmbedError::runtime("embedder lock poisoned"))?;
             if st.model.is_none() {
-                if let Some((at, msg)) = &st.last_failure
-                    && at.elapsed() < RETRY_AFTER
+                let now_ms = self.clock.now_ms();
+                if let Some((at_ms, msg)) = &st.last_failure
+                    && now_ms >= *at_ms
+                    && (now_ms - *at_ms) < RETRY_AFTER_MS
                 {
                     return Err(EmbedError { category: "model_acquisition", message: msg.clone() });
                 }
                 let verified = match models::load_verified_local_model(&self.home, self.spec.canonical_id) {
                     Ok(v) => v,
                     Err(msg) => {
-                        st.last_failure = Some((Instant::now(), msg.clone()));
+                        st.last_failure = Some((now_ms, msg.clone()));
                         return Err(EmbedError { category: "model_acquisition", message: msg });
                     }
                 };
@@ -418,7 +425,7 @@ mod fast {
                     Err(e) => {
                         let msg =
                             format!("could not load local embedding model {}: {e}", self.spec.canonical_id);
-                        st.last_failure = Some((Instant::now(), msg.clone()));
+                        st.last_failure = Some((now_ms, msg.clone()));
                         return Err(EmbedError { category: "model_acquisition", message: msg });
                     }
                 }
