@@ -351,16 +351,15 @@ fn the_triggers_refuse_every_cross_organization_task_reference() {
     );
     refused("UPDATE tasks SET parent_id = 10 WHERE id = 21");
     refused("UPDATE tasks SET folded_into = 10 WHERE id = 21");
-    // Legacy `task_dependencies` is frozen read-only under C2a (`tasks.v3.depends_on_graph`);
-    // every direct write to it is refused, and `graph_edges` enforces cross-org endpoints.
-    for sql in [
+    // Both ends of a dependency.
+    refused(
         "INSERT INTO task_dependencies (org_id, task_id, depends_on_task_id, created_by, created_at) VALUES ('org-b', 20, 10, 'b', 'x')",
+    );
+    refused(
         "INSERT INTO task_dependencies (org_id, task_id, depends_on_task_id, created_by, created_at) VALUES ('org-b', 10, 20, 'b', 'x')",
-        "INSERT INTO task_dependencies (id, org_id, task_id, depends_on_task_id, created_by, created_at) VALUES (5, 'org-b', 21, 20, 'b', 'x')",
-    ] {
-        let e = h.sql(sql).unwrap_err();
-        assert!(e.contains("frozen read-only"), "{sql}: {e}");
-    }
+    );
+    h.sql("INSERT INTO task_dependencies (id, org_id, task_id, depends_on_task_id, created_by, created_at) VALUES (5, 'org-b', 21, 20, 'b', 'x')").unwrap();
+    refused("UPDATE task_dependencies SET depends_on_task_id = 10 WHERE id = 5");
     // A comment's task and parent comment, and a thread.
     refused(
         "INSERT INTO task_comments (org_id, task_id, author, body, thread_revision, created_at) VALUES ('org-b', 10, 'b', 'b', 1, 'x')",
@@ -393,18 +392,19 @@ fn the_triggers_refuse_every_cross_organization_task_reference() {
     refused(
         "INSERT INTO deliverables (org_id, task_id, kind, title, repo, created_by, created_at) VALUES ('org-b', 10, 'file', 't', NULL, 'b', 'x')",
     );
-    // The same rows inside one organization are accepted.
+    // The same rows inside one organization are accepted (for `task_dependencies`,
+    // default-org rows are frozen under C2a while non-default orgs stay on it).
+    h.sql("INSERT INTO task_dependencies (org_id, task_id, depends_on_task_id, created_by, created_at) VALUES ('org-b', 20, 20, 'b', 'x')").ok();
     h.sql("INSERT INTO deliverables (org_id, task_id, kind, title, repo, created_by, created_at) VALUES ('org-b', 20, 'file', 't', NULL, 'b', 'x')").unwrap();
 }
 
 // --- isolation ---------------------------------------------------------------------------------
 
-/// One organization's task, optional default-org dependency, comments and
-/// subtree, through the tools.
+/// One organization's task, dependency, comments and subtree, through the tools.
 struct Fixture {
     task: i64,
     child: i64,
-    dep: Option<i64>,
+    dep: i64,
     comment: i64,
 }
 
@@ -417,20 +417,10 @@ async fn fixture(h: &H, who: &Caller) -> Fixture {
         .await;
     let child = h.add(who, json!({ "title": "Child", "parent_id": task })).await;
     let other = h.add(who, json!({ "title": "Other" })).await;
-    // C2a (`docs/graph.md`): `dependency_add` writes directly to `graph_edges`
-    // and is default-org only until `#2790` supplies immutable principal IDs.
-    let dep = if who.org_id == DEFAULT_ORG {
-        Some(
-            h.ok(who, "dependency_add", json!({ "task_id": child, "depends_on_task_id": other })).await
-                ["dependency"]["id"]
-                .as_i64()
-                .unwrap(),
-        )
-    } else {
-        let e = h.err(who, "dependency_add", json!({ "task_id": child, "depends_on_task_id": other })).await;
-        assert_eq!(reason(&e), "principal_id_required", "{e}");
-        None
-    };
+    let dep = h.ok(who, "dependency_add", json!({ "task_id": child, "depends_on_task_id": other })).await
+        ["dependency"]["id"]
+        .as_i64()
+        .unwrap();
     let comment = h.comment(who, json!({ "task_id": task, "body": "hello" })).await.unwrap()["comment"]["id"]
         .as_i64()
         .unwrap();
@@ -466,6 +456,11 @@ async fn each_organization_sees_only_its_own_tasks_through_every_tool() {
                 json!({ "id": absent, "append_note": "x" }),
             ),
             ("task_claim", json!({ "id": t }), json!({ "id": absent })),
+            (
+                "dependency_add",
+                json!({ "task_id": mine.task, "depends_on_task_id": t }),
+                json!({ "task_id": mine.task, "depends_on_task_id": absent }),
+            ),
             ("project_build", json!({ "parent_task_id": t }), json!({ "parent_task_id": absent })),
             (
                 "task_add",
@@ -477,20 +472,9 @@ async fn each_organization_sees_only_its_own_tasks_through_every_tool() {
             let m = h.err(me, tool, missing_args).await;
             same_as_missing(&e, &m, t, absent);
         }
-        if org == DEFAULT_ORG {
-            let e =
-                h.err(me, "dependency_add", json!({ "task_id": mine.task, "depends_on_task_id": t })).await;
-            let m = h
-                .err(me, "dependency_add", json!({ "task_id": mine.task, "depends_on_task_id": absent }))
-                .await;
-            same_as_missing(&e, &m, t, absent);
-        } else {
-            let e =
-                h.err(me, "dependency_add", json!({ "task_id": mine.task, "depends_on_task_id": t })).await;
-            assert_eq!(reason(&e), "principal_id_required", "{e}");
-            let e = h.err(me, "dependency_remove", json!({ "dependency_id": theirs.dep.unwrap() })).await;
-            assert_eq!(reason(&e), "principal_id_required", "{e}");
-        }
+        let e = h.err(me, "dependency_remove", json!({ "dependency_id": theirs.dep })).await;
+        let m = h.err(me, "dependency_remove", json!({ "dependency_id": absent })).await;
+        same_as_missing(&e, &m, theirs.dep, absent);
         // A move under another organization's task is refused like a missing parent.
         let e = h.err(me, "task_update", json!({ "id": mine.child, "parent_id": t })).await;
         let m = h.err(me, "task_update", json!({ "id": mine.child, "parent_id": absent })).await;
@@ -531,8 +515,7 @@ async fn each_organization_sees_only_its_own_tasks_through_every_tool() {
         let deps = h.ok(me, "dependency_list", json!({})).await;
         let dep_ids: Vec<i64> =
             deps["dependencies"].as_array().unwrap().iter().map(|d| d["id"].as_i64().unwrap()).collect();
-        let want_deps: Vec<i64> = mine.dep.into_iter().collect();
-        assert_eq!(dep_ids, want_deps, "{org}");
+        assert_eq!(dep_ids, [mine.dep], "{org}");
         assert_eq!(
             h.ok(me, "dependency_list", json!({ "task_id": theirs.child })).await["dependencies"],
             json!([])
@@ -567,12 +550,7 @@ async fn each_organization_sees_only_its_own_tasks_through_every_tool() {
 
     // Every row stayed in its organization.
     assert_eq!(h.count("SELECT COUNT(*) FROM tasks WHERE org_id = 'org-b'"), 3);
-    assert_eq!(h.count("SELECT COUNT(*) FROM task_dependencies"), 0);
-    assert_eq!(
-        h.count("SELECT COUNT(*) FROM graph_edges WHERE org_id = 'default' AND kind = 'depends_on'"),
-        1
-    );
-    assert_eq!(h.count("SELECT COUNT(*) FROM graph_edges WHERE org_id = 'org-b' AND kind = 'depends_on'"), 0);
+    assert_eq!(h.count("SELECT COUNT(*) FROM task_dependencies WHERE org_id = 'org-b'"), 1);
     assert_eq!(h.count("SELECT COUNT(*) FROM task_comments WHERE org_id = 'org-b'"), 1);
     assert_eq!(h.count("SELECT COUNT(*) FROM task_comment_threads WHERE org_id = 'org-b'"), 1);
 }
@@ -652,7 +630,7 @@ async fn an_unknown_organization_is_refused_before_any_write() {
         ("task_claim", json!({ "id": f.task })),
         ("task_delete", json!({ "id": f.task })),
         ("dependency_add", json!({ "task_id": f.task, "depends_on_task_id": f.child })),
-        ("dependency_remove", json!({ "dependency_id": f.dep.unwrap() })),
+        ("dependency_remove", json!({ "dependency_id": f.dep })),
         ("project_build", json!({ "parent_task_id": f.task })),
         ("task_comment", json!({ "action": "append", "params": { "task_id": f.task, "body": "x" } })),
     ] {
@@ -853,8 +831,7 @@ async fn organization_b_text_and_labels_never_reach_the_default_ledger() {
     h.ok(&b, "task_claim", json!({ "id": child })).await;
     h.ok(&b, "task_update", json!({ "id": child, "append_note": B_NOTES, "title": format!("{B_TITLE} 2") }))
         .await;
-    let e = h.err(&b, "dependency_add", json!({ "task_id": other, "depends_on_task_id": id })).await;
-    assert_eq!(reason(&e), "principal_id_required", "{e}");
+    h.ok(&b, "dependency_add", json!({ "task_id": other, "depends_on_task_id": id })).await;
     h.comment(&b, json!({ "task_id": id, "body": B_BODY, "mentions": [B_MENTION] })).await.unwrap();
     h.ok(&b, "project_build", json!({ "parent_task_id": id })).await;
     h.ok(&b, "task_update", json!({ "id": child, "status": "done", "release_claim": true })).await;

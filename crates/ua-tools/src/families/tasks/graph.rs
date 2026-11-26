@@ -1,12 +1,14 @@
 //! `dependency_add`, `dependency_list`, `dependency_remove`, `lineage` and
 //! `project_build`.
 //!
-//! C2a (`docs/graph.md`): `dependency_add`, `dependency_list` and
-//! `dependency_remove` read and write `graph_edges(kind = 'depends_on')`
-//! directly (default organization only until immutable principal IDs land in
-//! `#2790`). The legacy `task_dependencies` table is migrated once by
+//! C2a (`docs/graph.md`): in the default organization, `dependency_add`,
+//! `dependency_list` and `dependency_remove` read and write
+//! `graph_edges(kind = 'depends_on')` directly, and default-org rows of the
+//! legacy `task_dependencies` table are migrated once by
 //! [`DEPENDS_ON_GRAPH_PART`] (`tasks.v3.depends_on_graph`) and frozen
-//! read-only by write-blocking triggers.
+//! read-only by default-org write-blocking triggers. Non-default organizations
+//! stay entirely on `task_dependencies` (add, list, remove, frontier, and
+//! readiness) until immutable principal IDs land in `#2790`.
 
 use std::collections::BTreeMap;
 
@@ -37,20 +39,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_depends_on_dep_id
 const TASK_DEPENDENCIES_FREEZE_SQL: &str = "\
 CREATE TRIGGER IF NOT EXISTS task_dependencies_frozen_insert
 BEFORE INSERT ON task_dependencies
+WHEN NEW.org_id = 'default'
 BEGIN
-    SELECT RAISE(ABORT, 'task_dependencies is frozen read-only; use graph_edges (depends_on)');
+    SELECT RAISE(ABORT, 'task_dependencies is frozen read-only for default org; use graph_edges (depends_on)');
 END;
 CREATE TRIGGER IF NOT EXISTS task_dependencies_frozen_update
 BEFORE UPDATE ON task_dependencies
+WHEN OLD.org_id = 'default' OR NEW.org_id = 'default'
 BEGIN
-    SELECT RAISE(ABORT, 'task_dependencies is frozen read-only; use graph_edges (depends_on)');
+    SELECT RAISE(ABORT, 'task_dependencies is frozen read-only for default org; use graph_edges (depends_on)');
 END;
 CREATE TRIGGER IF NOT EXISTS task_dependencies_frozen_delete
 BEFORE DELETE ON task_dependencies
-WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
+WHEN OLD.org_id = 'default'
+  AND EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
   AND EXISTS (SELECT 1 FROM tasks WHERE id = OLD.depends_on_task_id)
 BEGIN
-    SELECT RAISE(ABORT, 'task_dependencies is frozen read-only; use graph_edges (depends_on)');
+    SELECT RAISE(ABORT, 'task_dependencies is frozen read-only for default org; use graph_edges (depends_on)');
 END;";
 
 /// `tasks.v3.depends_on_graph` (C2a): additive migration that copies existing
@@ -58,15 +63,14 @@ END;";
 /// `graph_edges(kind = 'depends_on')` (with task nodes ensured via
 /// [`ua_graph::graph_node_ensure`] and provenance `source_kind = 'import'`),
 /// installs the unique partial index on `dependency_id`, and freezes
-/// `task_dependencies` read-only with triggers that block new writes, edits,
-/// and direct deletes while permitting `ON DELETE CASCADE` when a parent
-/// `tasks` row is deleted.
+/// default-organization rows of `task_dependencies` read-only with triggers
+/// that block new writes, edits, and direct deletes while permitting
+/// `ON DELETE CASCADE` when a parent `tasks` row is deleted. Non-default
+/// organizations remain live on `task_dependencies` until `#2790` lands.
 ///
 /// Every copied and skipped row (with reason and row id) is counted and
 /// recorded atomically in `schema_procedures.generated_sql` and surfaced by
 /// `system_doctor` (`docs/organization.md`, item 11; `docs/graph.md`).
-/// Non-default-organization rows are skipped (`non_default_org`) and remain
-/// intact in the frozen table until `#2790` lands.
 pub const DEPENDS_ON_GRAPH_PART: Procedure = Procedure {
     name: MIGRATION_PART_NAME,
     version: 1,
@@ -109,7 +113,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
 
 fn creator_principal_for_import(raw: &str) -> Result<(PrincipalId, AssertedByKind), &'static str> {
     let trimmed = raw.trim();
-    if trimmed == "system" {
+    if trimmed.eq_ignore_ascii_case("system") {
         return Ok((PrincipalId::system(), AssertedByKind::System));
     }
     PrincipalId::new(trimmed).map(|p| (p, AssertedByKind::Agent)).map_err(|_| "invalid_creator")
@@ -119,15 +123,6 @@ fn creator_principal_for_caller(caller: &Caller, by: &str) -> UaResult<(Principa
     let principal = PrincipalId::new(by)?;
     let kind = if human(caller) { AssertedByKind::Person } else { AssertedByKind::Agent };
     Ok((principal, kind))
-}
-
-fn non_default_org_refusal(tool_name: &str, org: &str) -> UaError {
-    UaError::denied(
-        "principal_id_required",
-        format!(
-            "{tool_name} in non-default organization {org:?} is refused until immutable principal IDs (#2790) land"
-        ),
-    )
 }
 
 fn ensure_task_node<R: GraphRepo>(
@@ -175,9 +170,15 @@ fn live_depends_on_edge_id(
 }
 
 fn next_dependency_id(conn: &Connection) -> UaResult<i64> {
+    // Honor task_dependencies.id, graph_edges dependency_id, AND SQLite's
+    // AUTOINCREMENT counter in sqlite_sequence so a legacy deleted row id is
+    // never reused (docs/organization.md).
     let max_id: i64 = conn.query_row(
         "SELECT MAX(v) FROM ( \
              SELECT COALESCE(MAX(id), 0) AS v FROM task_dependencies \
+             UNION ALL \
+             SELECT COALESCE(MAX(seq), 0) AS v FROM sqlite_sequence \
+             WHERE name = 'task_dependencies' AND typeof(seq) = 'integer' \
              UNION ALL \
              SELECT COALESCE(MAX(json_extract(meta_json, '$.dependency_id')), 0) AS v \
              FROM graph_edges \
@@ -187,6 +188,29 @@ fn next_dependency_id(conn: &Connection) -> UaResult<i64> {
         |r| r.get(0),
     )?;
     Ok(max_id + 1)
+}
+
+/// Keep `sqlite_sequence('task_dependencies')` at or above `dep_id` when the
+/// default organization allocates a `depends_on` id in `graph_edges`, so
+/// non-default organizations still writing to `task_dependencies` never
+/// collide on `dependency_id` (and never collide when `#2790` migrates them).
+fn advance_dependency_sequence(conn: &Connection, dep_id: i64) -> UaResult<()> {
+    let (existing_seq, row_count): (Option<i64>, i64) = conn.query_row(
+        "SELECT MAX(seq), COUNT(*) FROM sqlite_sequence WHERE name = 'task_dependencies'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if dep_id > existing_seq.unwrap_or(0) {
+        if row_count == 0 {
+            conn.execute(
+                "INSERT INTO sqlite_sequence (name, seq) VALUES ('task_dependencies', ?1)",
+                [dep_id],
+            )?;
+        } else {
+            conn.execute("UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'task_dependencies'", [dep_id])?;
+        }
+    }
+    Ok(())
 }
 
 /// Copy one legacy `task_dependencies` row into `graph_edges(kind = 'depends_on')`
@@ -272,9 +296,17 @@ fn copy_dependency_row_import(
     }
 
     let now_str = now();
-    let (valid_from, meta_json) = match normalize_timestamp(created_at, "valid_from") {
-        Ok(ts) if ts <= now_str => (Some(ts), json!({ "dependency_id": dep_id })),
-        _ => (None, json!({ "dependency_id": dep_id, "legacy_created_at": created_at })),
+    let mut meta = Map::new();
+    meta.insert("dependency_id".into(), json!(dep_id));
+    if created_by != creator.as_str() {
+        meta.insert("legacy_created_by".into(), json!(created_by));
+    }
+    let valid_from = match normalize_timestamp(created_at, "valid_from") {
+        Ok(ts) if ts <= now_str => Some(ts),
+        _ => {
+            meta.insert("legacy_created_at".into(), json!(created_at));
+            None
+        }
     };
 
     let req = AssertEdgeRequest {
@@ -293,12 +325,12 @@ fn copy_dependency_row_import(
         },
         valid_from,
         valid_to: None,
-        meta_json: Some(meta_json),
+        meta_json: Some(Value::Object(meta)),
         scope: VisibilityScope::org_only(),
         generic: false,
         max_edges_per_org: 0,
         max_live_edges_per_node: 0,
-        cycle_bounds: CycleCheckPolicy::default(),
+        cycle_bounds: CycleCheckPolicy::for_import(),
     };
     match ua_graph::assert_edge(&mut repo, req) {
         Ok(_) => Ok(Ok(nodes_created)),
@@ -408,7 +440,7 @@ pub(crate) fn retract_task_dependencies_for_subtree(
     org: &str,
     subtree: &[i64],
 ) -> UaResult<()> {
-    if subtree.is_empty() {
+    if org != DEFAULT_ORG || subtree.is_empty() {
         return Ok(());
     }
     let ids_json = serde_json::to_string(subtree)?;
@@ -539,13 +571,37 @@ pub fn register(r: &mut Registry) {
     );
 }
 
+/// Legacy `task_dependencies` edge lookup for non-default organizations (which
+/// stay on `task_dependencies` until `#2790` lands).
+fn legacy_edge(conn: &Connection, org: &str, id: i64) -> UaResult<Option<Map<String, Value>>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, task_id, depends_on_task_id, created_by, created_at FROM task_dependencies \
+             WHERE org_id = ?1 AND id = ?2",
+            params![org, id],
+            row_object,
+        )
+        .optional()?)
+}
+
 fn dep_list(conn: &Connection, org: &str, a: DepListArgs) -> UaResult<Value> {
     let limit = a.limit.unwrap_or(500).clamp(1, 2000);
+    if org != DEFAULT_ORG {
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, depends_on_task_id, created_by, created_at FROM task_dependencies \
+             WHERE org_id = ?3 AND (?1 IS NULL OR task_id = ?1) ORDER BY id LIMIT ?2",
+        )?;
+        let mut rows: Vec<Map<String, Value>> =
+            stmt.query_map(params![a.task_id, limit + 1, org], row_object)?.collect::<Result<_, _>>()?;
+        let truncated = rows.len() as i64 > limit;
+        rows.truncate(limit as usize);
+        return Ok(json!({ "dependencies": rows, "truncated": truncated }));
+    }
     let mut stmt = conn.prepare(
         "SELECT COALESCE(json_extract(e.meta_json, '$.dependency_id'), e.rowid) AS id, \
                 CAST(src.external_id AS INTEGER) AS task_id, \
                 CAST(dst.external_id AS INTEGER) AS depends_on_task_id, \
-                e.asserted_by AS created_by, \
+                COALESCE(json_extract(e.meta_json, '$.legacy_created_by'), e.asserted_by) AS created_by, \
                 COALESCE(json_extract(e.meta_json, '$.legacy_created_at'), e.valid_from) AS created_at \
          FROM graph_edges e \
          JOIN graph_nodes src ON src.org_id = e.org_id AND src.id = e.src_id AND src.kind = 'task' \
@@ -567,14 +623,64 @@ fn dep_list(conn: &Connection, org: &str, a: DepListArgs) -> UaResult<Value> {
 
 async fn dep_add(ctx: ToolCtx, a: DepAddArgs) -> UaResult<Value> {
     let org = ctx.caller.org_id.clone();
-    if org != DEFAULT_ORG {
-        return Err(non_default_org_refusal("dependency_add", &org));
-    }
     let by = acting_identity(&ctx.caller, a.agent.as_deref())?;
-    let (principal, asserted_by_kind) = creator_principal_for_caller(&ctx.caller, &by)?;
     if a.task_id == a.depends_on_task_id {
         return Err(UaError::invalid("a task cannot depend on itself"));
     }
+    if org != DEFAULT_ORG {
+        return ctx
+            .hub
+            .db()
+            .write_async(move |tx| {
+                require_org(tx, &org)?;
+                require_task(tx, &org, a.task_id)?;
+                require_task(tx, &org, a.depends_on_task_id)?;
+                let cycle: Option<i64> = tx
+                    .query_row(
+                        "WITH RECURSIVE reachable(id) AS (
+                            SELECT depends_on_task_id FROM task_dependencies WHERE org_id = ?3 AND task_id = ?1
+                            UNION
+                            SELECT d.depends_on_task_id FROM task_dependencies d JOIN reachable r ON d.task_id = r.id
+                            WHERE d.org_id = ?3
+                        ) SELECT 1 FROM reachable WHERE id = ?2 LIMIT 1",
+                        params![a.depends_on_task_id, a.task_id, org],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if cycle.is_some() {
+                    return Err(UaError::invalid(format!(
+                        "dependency would create a cycle: task {} already depends on task {}",
+                        a.depends_on_task_id, a.task_id
+                    )));
+                }
+                let exists: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM task_dependencies WHERE org_id = ?3 AND task_id = ?1 AND depends_on_task_id = ?2",
+                        params![a.task_id, a.depends_on_task_id, org],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(id) = exists {
+                    return Err(UaError::conflict(format!("dependency already exists (id {id})")));
+                }
+                tx.execute(
+                    "INSERT INTO task_dependencies (org_id, task_id, depends_on_task_id, created_by, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![org, a.task_id, a.depends_on_task_id, by, now()],
+                )?;
+                let id = tx.last_insert_rowid();
+                emit(
+                    tx,
+                    &org,
+                    "agent.task.dependency_added",
+                    json!({ "dependency_id": id, "task_id": a.task_id, "depends_on_task_id": a.depends_on_task_id }),
+                    &by,
+                )?;
+                Ok(json!({ "dependency": legacy_edge(tx, &org, id)? }))
+            })
+            .await;
+    }
+    let (principal, asserted_by_kind) = creator_principal_for_caller(&ctx.caller, &by)?;
     let max_nodes_per_org = ctx.hub.cfg().graph_max_nodes_per_org;
     let max_edges_per_org = ctx.hub.cfg().graph_max_edges_per_org;
     let max_live_edges_per_node = ctx.hub.cfg().graph_max_live_edges_per_node;
@@ -639,6 +745,7 @@ async fn dep_add(ctx: ToolCtx, a: DepAddArgs) -> UaResult<Value> {
                     cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
+            advance_dependency_sequence(tx, dep_id)?;
 
             emit(
                 tx,
@@ -662,21 +769,53 @@ async fn dep_add(ctx: ToolCtx, a: DepAddArgs) -> UaResult<Value> {
 
 async fn dep_remove(ctx: ToolCtx, a: DepRemoveArgs) -> UaResult<Value> {
     let org = ctx.caller.org_id.clone();
-    if org != DEFAULT_ORG {
-        return Err(non_default_org_refusal("dependency_remove", &org));
-    }
     let by = acting_identity(&ctx.caller, a.agent.as_deref())?;
+    if org != DEFAULT_ORG {
+        return ctx
+            .hub
+            .db()
+            .write_async(move |tx| {
+                require_org(tx, &org)?;
+                let row = legacy_edge(tx, &org, a.dependency_id)?.ok_or_else(|| {
+                    UaError::not_found(format!("no dependency with id {}", a.dependency_id))
+                })?;
+                if str_field(&row, "created_by") != Some(by.as_str()) {
+                    return Err(UaError::denied(
+                        "not_dependency_creator",
+                        "only the dependency creator may remove this edge",
+                    ));
+                }
+                tx.execute(
+                    "DELETE FROM task_dependencies WHERE org_id = ?1 AND id = ?2",
+                    params![org, a.dependency_id],
+                )?;
+                emit(
+                    tx,
+                    &org,
+                    "agent.task.dependency_removed",
+                    json!({
+                        "dependency_id": a.dependency_id,
+                        "task_id": row["task_id"],
+                        "depends_on_task_id": row["depends_on_task_id"],
+                    }),
+                    &by,
+                )?;
+                Ok(json!({ "removed": true, "dependency_id": a.dependency_id }))
+            })
+            .await;
+    }
     let (retractor, retractor_kind) = creator_principal_for_caller(&ctx.caller, &by)?;
     ctx.hub
         .db()
         .write_async(move |tx| {
             require_org(tx, &org)?;
-            let found: Option<(String, i64, i64, String)> = tx
+            let found: Option<(String, i64, i64, String, Option<String>)> = tx
                 .query_row(
                     "SELECT e.id, \
                             CAST(src.external_id AS INTEGER), \
                             CAST(dst.external_id AS INTEGER), \
-                            e.asserted_by \
+                            e.asserted_by, \
+                            json_extract(e.meta_json, '$.legacy_created_by') \
                      FROM graph_edges e \
                      JOIN graph_nodes src ON src.org_id = e.org_id AND src.id = e.src_id AND src.kind = 'task' \
                      JOIN graph_nodes dst ON dst.org_id = e.org_id AND dst.id = e.dst_id AND dst.kind = 'task' \
@@ -686,12 +825,14 @@ async fn dep_remove(ctx: ToolCtx, a: DepRemoveArgs) -> UaResult<Value> {
                        AND e.valid_to IS NULL \
                        AND COALESCE(json_extract(e.meta_json, '$.dependency_id'), e.rowid) = ?2",
                     params![org, a.dependency_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?;
-            let (edge_id, task_id, depends_on_task_id, created_by) = found
+            let (edge_id, task_id, depends_on_task_id, created_by, legacy_created_by) = found
                 .ok_or_else(|| UaError::not_found(format!("no dependency with id {}", a.dependency_id)))?;
-            if created_by != by {
+            let matches_creator =
+                created_by == by || legacy_created_by.as_deref() == Some(by.as_str());
+            if !matches_creator {
                 return Err(UaError::denied(
                     "not_dependency_creator",
                     "only the dependency creator may remove this edge",

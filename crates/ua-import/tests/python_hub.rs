@@ -526,6 +526,12 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM task_dependencies"), 0);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM graph_edges WHERE kind = 'depends_on' AND valid_to IS NULL"), 1);
     assert_eq!(table(&r, "task_dependencies").skipped.get("missing_depends_on_task_id"), Some(&1));
+    // Source task_dependencies had 2 AUTOINCREMENT rows (row 2 was skipped); carrying
+    // sqlite_sequence ensures post-import dependency_add never reuses id 2.
+    assert_eq!(
+        n(&db, "SELECT COALESCE(MAX(seq), 0) FROM sqlite_sequence WHERE name = 'task_dependencies'"),
+        2
+    );
     assert_eq!(n(&db, "SELECT COUNT(*) FROM task_comments"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM task_comment_threads"), 1);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM goals"), 1);

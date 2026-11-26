@@ -386,7 +386,8 @@ async fn migration_copies_counts_records_skips_freezes_table_and_surfaces_in_doc
     let doc_b = reg.call(&hub, &coord_b, "system_doctor", json!({})).await.unwrap();
     assert!(doc_b["database"]["depends_on_migration"].is_null(), "{doc_b}");
 
-    // Freeze triggers block direct INSERT, UPDATE, and DELETE on task_dependencies.
+    // Freeze triggers block direct INSERT, UPDATE, and DELETE for default-org rows
+    // on task_dependencies, while leaving non-default-org rows writable until #2790.
     for sql in [
         "INSERT INTO task_dependencies (org_id, task_id, depends_on_task_id, created_by, created_at) \
          VALUES ('default', 4, 2, 'builder-1', '2026-01-04T00:00:00+00:00')",
@@ -401,7 +402,7 @@ async fn migration_copies_counts_records_skips_freezes_table_and_surfaces_in_doc
             })
             .unwrap_err()
             .to_string();
-        assert!(err.contains("frozen read-only"), "{sql}: {err}");
+        assert!(err.contains("frozen read-only for default org"), "{sql}: {err}");
     }
 
     // New dependency_add allocates an id strictly greater than max legacy id (14).
@@ -422,46 +423,230 @@ async fn migration_copies_counts_records_skips_freezes_table_and_surfaces_in_doc
 }
 
 #[tokio::test]
-async fn org_fence_blocks_non_default_dependency_writes_and_isolates_reads() {
-    let h = H::new();
+async fn upgraded_hub_never_reuses_deleted_legacy_dependency_ids_and_preserves_legacy_creators() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config::for_home(dir.path());
+
+    // Pre-C2a database with legacy ids 5, 7, and a removed id 9 (so sqlite_sequence = 9),
+    // plus legacy creators `"System"` and `" builder-1 "`.
+    let pre_c2a: Vec<ua_store::Part> =
+        ua_tools::schema_parts().into_iter().filter(|p| p.name != "tasks.v3.depends_on_graph").collect();
+    {
+        let db = ua_store::Db::open(&cfg.db_path(), &pre_c2a).unwrap();
+        db.write(|tx| {
+            tx.execute_batch(
+                "INSERT INTO tasks (id, org_id, title, created_at, updated_at) VALUES
+                     (1, 'default', 'T1', '2026-01-02T00:00:00+00:00', '2026-01-02T00:00:00+00:00'),
+                     (2, 'default', 'T2', '2026-01-02T00:00:00+00:00', '2026-01-02T00:00:00+00:00'),
+                     (3, 'default', 'T3', '2026-01-02T00:00:00+00:00', '2026-01-02T00:00:00+00:00'),
+                     (4, 'default', 'T4', '2026-01-02T00:00:00+00:00', '2026-01-02T00:00:00+00:00');
+                 INSERT INTO task_dependencies (id, org_id, task_id, depends_on_task_id, created_by, created_at)
+                     VALUES (5, 'default', 2, 1, 'System', '2026-01-03T12:00:00+00:00');
+                 INSERT INTO task_dependencies (id, org_id, task_id, depends_on_task_id, created_by, created_at)
+                     VALUES (7, 'default', 3, 2, ' builder-1 ', '2026-01-03T12:01:00+00:00');
+                 INSERT INTO task_dependencies (id, org_id, task_id, depends_on_task_id, created_by, created_at)
+                     VALUES (9, 'default', 4, 3, 'builder-2', '2026-01-03T12:02:00+00:00');
+                 DELETE FROM task_dependencies WHERE id = 9;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    let hub = Hub::open(cfg).unwrap();
+    let reg = builtin_registry();
+    let b1 = agent("builder-1", DEFAULT_ORG);
+
+    // M1: sqlite_sequence was 9 even though MAX(id) is 7; next dependency_add must be 10.
+    let added = reg
+        .call(&hub, &b1, "dependency_add", json!({ "task_id": 4, "depends_on_task_id": 1 }))
+        .await
+        .unwrap();
+    assert_eq!(added["dependency"]["id"], 10, "must honor sqlite_sequence floor 9: {added}");
+
+    // Low 3: `"System"` and `" builder-1 "` migrated cleanly (zero skips) and preserve created_by.
+    let summary =
+        hub.db().read(|c| Ok(ua_tools::families::tasks::depends_on_migration_summary(c))).unwrap().unwrap();
+    assert_eq!(summary["copied"], 2, "{summary}");
+    assert_eq!(summary["skipped_total"], 0, "{summary}");
+
+    let listed = reg.call(&hub, &b1, "dependency_list", json!({})).await.unwrap();
+    let deps = listed["dependencies"].as_array().unwrap();
+    assert_eq!(deps[0]["id"], 5);
+    assert_eq!(deps[0]["created_by"], "System");
+    assert_eq!(deps[1]["id"], 7);
+    assert_eq!(deps[1]["created_by"], " builder-1 ");
+
+    // Creator `builder-1` can still remove the legacy `" builder-1 "` dependency.
+    let removed = reg.call(&hub, &b1, "dependency_remove", json!({ "dependency_id": 7 })).await.unwrap();
+    assert_eq!(removed, json!({ "removed": true, "dependency_id": 7 }));
+}
+
+#[tokio::test]
+async fn non_default_org_stays_on_task_dependencies_with_full_readiness_parity() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config::for_home(dir.path());
+
+    // Pre-C2a database with an existing org-b dependency: 21 depends on 20 (both open).
+    let pre_c2a: Vec<ua_store::Part> =
+        ua_tools::schema_parts().into_iter().filter(|p| p.name != "tasks.v3.depends_on_graph").collect();
+    {
+        let db = ua_store::Db::open(&cfg.db_path(), &pre_c2a).unwrap();
+        db.write(|tx| {
+            tx.execute_batch(
+                "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at)
+                     VALUES ('org-b', 'org-b', 'Org B', '[\"developer\",\"coordinator\"]', '2026-01-01T00:00:00+00:00');
+                 INSERT INTO tasks (id, org_id, title, status, created_at, updated_at) VALUES
+                     (10, 'default', 'Default 10', 'open', '2026-01-02T00:00:00+00:00', '2026-01-02T00:00:00+00:00'),
+                     (11, 'default', 'Default 11', 'open', '2026-01-02T00:00:00+00:00', '2026-01-02T00:00:00+00:00'),
+                     (20, 'org-b', 'OrgB 20', 'open', '2026-01-02T00:00:00+00:00', '2026-01-02T00:00:00+00:00'),
+                     (21, 'org-b', 'OrgB 21', 'open', '2026-01-02T00:00:00+00:00', '2026-01-02T00:00:00+00:00');
+                 INSERT INTO task_dependencies (id, org_id, task_id, depends_on_task_id, created_by, created_at)
+                     VALUES (14, 'org-b', 21, 20, 'builder-1', '2026-01-03T12:07:00+00:00');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    let hub = Hub::open(cfg).unwrap();
+    let reg = builtin_registry();
     let a = agent("builder-1", DEFAULT_ORG);
     let b = agent("builder-1", ORG_B);
+    let b2 = agent("builder-2", ORG_B);
+    let coord_b = coordinator("lead-1", ORG_B);
     let ghost = agent("builder-1", "missing-org");
 
-    let ta1 = h.add_task(&a, "A1").await;
-    let ta2 = h.add_task(&a, "A2").await;
-    let tb1 = h.add_task(&b, "B1").await;
-    let tb2 = h.add_task(&b, "B2").await;
+    // Pre-existing org-b dependency survives upgrade and blocks task 21 in the frontier.
+    let list_b = reg.call(&hub, &b, "dependency_list", json!({})).await.unwrap();
+    assert_eq!(list_b["dependencies"].as_array().unwrap().len(), 1, "{list_b}");
+    assert_eq!(list_b["dependencies"][0]["id"], 14);
+    assert_eq!(list_b["dependencies"][0]["task_id"], 21);
+    assert_eq!(list_b["dependencies"][0]["depends_on_task_id"], 20);
 
-    let dep_a =
-        h.ok(&a, "dependency_add", json!({ "task_id": ta1, "depends_on_task_id": ta2 })).await["dependency"]
-            ["id"]
-            .as_i64()
-            .unwrap();
+    let frontier_before = reg.call(&hub, &b, "task_list", json!({ "frontier": true })).await.unwrap();
+    let frontier_ids_before: Vec<i64> =
+        frontier_before["tasks"].as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect();
+    assert_eq!(frontier_ids_before, vec![20], "blocked task 21 must stay out of org-b frontier");
 
-    // Non-default org writes refuse with principal_id_required.
-    let e_add = h.err(&b, "dependency_add", json!({ "task_id": tb1, "depends_on_task_id": tb2 })).await;
-    assert_eq!(e_add.code(), "denied");
-    assert_eq!(e_add.reason_code(), Some("principal_id_required"));
+    // Completing prerequisite 20 makes 21 appear in frontier AND continuity ready_unowned.
+    reg.call(&hub, &b, "task_update", json!({ "id": 20, "status": "done" })).await.unwrap();
+    let frontier_after = reg.call(&hub, &b, "task_list", json!({ "frontier": true })).await.unwrap();
+    let frontier_ids_after: Vec<i64> =
+        frontier_after["tasks"].as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect();
+    assert_eq!(frontier_ids_after, vec![21], "unblocked task 21 must appear in org-b frontier");
 
-    let e_rem = h.err(&b, "dependency_remove", json!({ "dependency_id": dep_a })).await;
-    assert_eq!(e_rem.code(), "denied");
-    assert_eq!(e_rem.reason_code(), Some("principal_id_required"));
+    let queue_b =
+        reg.call(&hub, &coord_b, "coordination_manage", json!({ "action": "queue_health" })).await.unwrap();
+    assert_eq!(queue_b["ready_unowned"], 1, "unblocked task 21 must count in org-b ready_unowned: {queue_b}");
 
-    // Non-default org reads see nothing from default org.
-    let list_b = h.ok(&b, "dependency_list", json!({})).await;
-    assert!(list_b["dependencies"].as_array().unwrap().is_empty());
-    let list_b_filtered = h.ok(&b, "dependency_list", json!({ "task_id": ta1 })).await;
-    assert!(list_b_filtered["dependencies"].as_array().unwrap().is_empty());
+    // Default org writes to graph_edges (id 15) and advances sqlite_sequence so org-b's
+    // next task_dependencies insert gets 16 (zero id collision across orgs).
+    let dep_a = reg
+        .call(&hub, &a, "dependency_add", json!({ "task_id": 11, "depends_on_task_id": 10 }))
+        .await
+        .unwrap()["dependency"]["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(dep_a, 15);
 
-    // Default org naming a foreign task answers identically to a missing task.
-    let e_foreign = h.err(&a, "dependency_add", json!({ "task_id": ta1, "depends_on_task_id": tb1 })).await;
-    let e_missing =
-        h.err(&a, "dependency_add", json!({ "task_id": ta1, "depends_on_task_id": 999_999 })).await;
+    let tb3 =
+        reg.call(&hub, &b, "task_add", json!({ "title": "OrgB 3" })).await.unwrap()["id"].as_i64().unwrap();
+    let dep_b2 = reg
+        .call(&hub, &b, "dependency_add", json!({ "task_id": tb3, "depends_on_task_id": 21 }))
+        .await
+        .unwrap()["dependency"]["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(dep_b2, 16, "org-b dependency_add must not collide with default-org dep_id 15");
+
+    // Cycle check and creator-only remove still work for org-b on task_dependencies.
+    let cyc = reg
+        .call(&hub, &b, "dependency_add", json!({ "task_id": 21, "depends_on_task_id": tb3 }))
+        .await
+        .unwrap_err();
+    assert_eq!(cyc.code(), "invalid_argument");
+
+    let denied =
+        reg.call(&hub, &b2, "dependency_remove", json!({ "dependency_id": dep_b2 })).await.unwrap_err();
+    assert_eq!(denied.reason_code(), Some("not_dependency_creator"));
+
+    let removed = reg.call(&hub, &b, "dependency_remove", json!({ "dependency_id": dep_b2 })).await.unwrap();
+    assert_eq!(removed, json!({ "removed": true, "dependency_id": dep_b2 }));
+
+    // Cross-org isolation: default org cannot see org-b edges or tasks, and unknown org is refused.
+    let list_a = reg.call(&hub, &a, "dependency_list", json!({})).await.unwrap();
+    let a_ids: Vec<i64> =
+        list_a["dependencies"].as_array().unwrap().iter().map(|d| d["id"].as_i64().unwrap()).collect();
+    assert_eq!(a_ids, vec![dep_a]);
+
+    let e_foreign = reg
+        .call(&hub, &a, "dependency_add", json!({ "task_id": 10, "depends_on_task_id": 20 }))
+        .await
+        .unwrap_err();
     assert_eq!(e_foreign.code(), "not_found");
-    assert_eq!(e_missing.code(), "not_found");
 
-    // Unknown org is refused before the handler runs.
-    let e_ghost = h.err(&ghost, "dependency_add", json!({ "task_id": ta1, "depends_on_task_id": ta2 })).await;
+    let e_ghost = reg
+        .call(&hub, &ghost, "dependency_add", json!({ "task_id": 10, "depends_on_task_id": 11 }))
+        .await
+        .unwrap_err();
     assert_eq!(e_ghost.reason_code(), Some("unknown_organization"));
+}
+
+#[tokio::test]
+async fn default_org_readiness_queries_use_integer_primary_key_lookup_for_prerequisites() {
+    let h = H::new();
+    let b1 = agent("builder-1", DEFAULT_ORG);
+    let t1 = h.add_task(&b1, "Prereq").await;
+    let t2 = h.add_task(&b1, "Dependent").await;
+    h.ok(&b1, "dependency_add", json!({ "task_id": t2, "depends_on_task_id": t1 })).await;
+
+    let frontier_sql = "EXPLAIN QUERY PLAN \
+        SELECT * FROM tasks WHERE org_id = 'default' \
+        AND status NOT IN ('done', 'cancelled') AND NOT EXISTS ( \
+            SELECT 1 FROM graph_nodes gn_src \
+            JOIN graph_edges ge ON ge.org_id = gn_src.org_id AND ge.src_id = gn_src.id \
+                AND ge.kind = 'depends_on' AND ge.state = 'active' AND ge.valid_to IS NULL \
+            JOIN graph_nodes gn_dst ON gn_dst.org_id = ge.org_id AND gn_dst.id = ge.dst_id \
+                AND gn_dst.kind = 'task' \
+            JOIN tasks pre ON pre.id = CAST(gn_dst.external_id AS INTEGER) \
+                AND pre.org_id = tasks.org_id \
+            WHERE gn_src.org_id = tasks.org_id AND gn_src.kind = 'task' \
+              AND gn_src.external_id = CAST(tasks.id AS TEXT) \
+              AND pre.status NOT IN ('done', 'cancelled') \
+        )";
+    let ready_unowned_sql = "EXPLAIN QUERY PLAN \
+        SELECT * FROM tasks WHERE org_id = 'default' AND archived_at IS NULL AND parked_at IS NULL \
+        AND status NOT IN ('done','cancelled') \
+        AND NOT EXISTS ( \
+            SELECT 1 FROM graph_nodes gn_src \
+            JOIN graph_edges ge ON ge.org_id = gn_src.org_id AND ge.src_id = gn_src.id \
+                AND ge.kind = 'depends_on' AND ge.state = 'active' AND ge.valid_to IS NULL \
+            JOIN graph_nodes gn_dst ON gn_dst.org_id = ge.org_id AND gn_dst.id = ge.dst_id \
+                AND gn_dst.kind = 'task' \
+            JOIN tasks p ON p.id = CAST(gn_dst.external_id AS INTEGER) AND p.org_id = 'default' \
+            WHERE gn_src.org_id = 'default' AND gn_src.kind = 'task' \
+              AND gn_src.external_id = CAST(tasks.id AS TEXT) \
+              AND p.status NOT IN ('done','cancelled') \
+        )";
+
+    for (label, sql, alias) in
+        [("task_list(frontier)", frontier_sql, "pre"), ("ready_unowned", ready_unowned_sql, "p")]
+    {
+        let plan: Vec<String> = h
+            .hub
+            .db()
+            .read(|c| {
+                let mut stmt = c.prepare(sql)?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        let joined = plan.join("\n");
+        let want = format!("SEARCH {alias} USING INTEGER PRIMARY KEY (rowid=?)");
+        assert!(
+            joined.contains(&want),
+            "{label} must look up prerequisite task `{alias}` by INTEGER PRIMARY KEY, got:\n{joined}"
+        );
+    }
 }

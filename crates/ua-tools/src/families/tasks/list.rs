@@ -241,20 +241,33 @@ fn list(conn: &Connection, org: &str, a: ListArgs, pin: Option<Option<i64>>) -> 
         f.push("completed_at IS NOT NULL AND completed_at >= ?", [Sql::Text(c.clone())]);
     }
     if a.frontier {
-        f.push(
-            "status NOT IN ('done', 'cancelled') AND NOT EXISTS ( \
-                 SELECT 1 FROM graph_nodes gn_src \
-                 JOIN graph_edges ge ON ge.org_id = gn_src.org_id AND ge.src_id = gn_src.id \
-                     AND ge.kind = 'depends_on' AND ge.state = 'active' AND ge.valid_to IS NULL \
-                 JOIN graph_nodes gn_dst ON gn_dst.org_id = ge.org_id AND gn_dst.id = ge.dst_id \
-                     AND gn_dst.kind = 'task' \
-                 JOIN tasks pre ON pre.org_id = tasks.org_id AND CAST(pre.id AS TEXT) = gn_dst.external_id \
-                 WHERE gn_src.org_id = tasks.org_id AND gn_src.kind = 'task' \
-                   AND gn_src.external_id = CAST(tasks.id AS TEXT) \
-                   AND pre.status NOT IN ('done', 'cancelled') \
-             )",
-            [],
-        );
+        if org == ua_core::DEFAULT_ORG {
+            f.push(
+                "status NOT IN ('done', 'cancelled') AND NOT EXISTS ( \
+                     SELECT 1 FROM graph_nodes gn_src \
+                     JOIN graph_edges ge ON ge.org_id = gn_src.org_id AND ge.src_id = gn_src.id \
+                         AND ge.kind = 'depends_on' AND ge.state = 'active' AND ge.valid_to IS NULL \
+                     JOIN graph_nodes gn_dst ON gn_dst.org_id = ge.org_id AND gn_dst.id = ge.dst_id \
+                         AND gn_dst.kind = 'task' \
+                     JOIN tasks pre ON pre.id = CAST(gn_dst.external_id AS INTEGER) \
+                         AND pre.org_id = tasks.org_id \
+                     WHERE gn_src.org_id = tasks.org_id AND gn_src.kind = 'task' \
+                       AND gn_src.external_id = CAST(tasks.id AS TEXT) \
+                       AND pre.status NOT IN ('done', 'cancelled') \
+                 )",
+                [],
+            );
+        } else {
+            f.push(
+                "status NOT IN ('done', 'cancelled') AND NOT EXISTS ( \
+                     SELECT 1 FROM task_dependencies d \
+                     JOIN tasks pre ON pre.id = d.depends_on_task_id AND pre.org_id = tasks.org_id \
+                     WHERE d.org_id = tasks.org_id AND d.task_id = tasks.id \
+                       AND pre.status NOT IN ('done', 'cancelled') \
+                 )",
+                [],
+            );
+        }
     }
     if a.stale_claims {
         f.push(

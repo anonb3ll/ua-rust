@@ -1430,7 +1430,7 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
         let copied = summary.get("copied").and_then(Value::as_u64).unwrap_or(0);
         detail.push_str(&format!(
             "; tasks.v3.depends_on_graph migrated {copied} dependency edge(s) and skipped {skipped} row(s) \
-             (kept frozen in task_dependencies)"
+             (kept in task_dependencies)"
         ));
     }
     let stats = json!({

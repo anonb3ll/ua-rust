@@ -294,7 +294,7 @@ pub fn import(db: &Db, source: &Path, opts: &Options) -> anyhow::Result<Report> 
             if let Some(sr) = map.self_ref {
                 fix_self_ref(&src, db, map, sr)?;
             }
-            if src_has_sqlite_sequence && map.kind != Kind::TaskDependencies {
+            if src_has_sqlite_sequence {
                 carry_sqlite_sequence(&src, db, map)?;
             }
         }

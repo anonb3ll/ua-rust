@@ -575,6 +575,11 @@ impl<'a> SqliteGraph<'a> {
 /// migrations and importers still run full `ua-graph` domain validation
 /// (`graph_node_ensure`, `assert_edge`). Update and close operations are
 /// refused.
+///
+/// **Guarded:** `crates/ua-graph/tests/update_guard.rs` enforces that only
+/// explicitly allowlisted migration/import modules may reference
+/// `MigrationGraph`; runtime tool handlers and `ua-server` must always write
+/// through `&mut WriteTx<'_>` so ledger events are recorded.
 pub struct MigrationGraph<'a> {
     conn: &'a Connection,
 }
