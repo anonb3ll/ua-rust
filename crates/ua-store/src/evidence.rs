@@ -352,11 +352,22 @@ impl VerifyTrust {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum CheckpointVerification {
     /// The signature is present and checks out against a pinned key.
-    Valid,
+    /// `warnings` is empty in the normal case and omitted from JSON; it is
+    /// populated when an earlier DB checkpoint was skipped (for example because
+    /// its signing key was revoked or not supplied in the verifier's trust
+    /// material).
+    Valid {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
     /// The signature matches the key in the same store, but no trust anchor
     /// was supplied. This is not authorship: the key row could have been
     /// swapped with the checkpoint.
-    ValidInStoreOnly { key_id: String },
+    ValidInStoreOnly {
+        key_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
+    },
     /// The row exists but no signature was attached yet.
     Unsigned,
     /// The named key is not in the store (or not in the verifier's trust file).
@@ -378,6 +389,21 @@ pub enum CheckpointVerification {
 }
 
 impl CheckpointVerification {
+    /// A [`CheckpointVerification::Valid`] verdict with no warnings.
+    pub fn valid() -> Self {
+        Self::Valid { warnings: Vec::new() }
+    }
+
+    /// Any non-fatal continuity warnings attached to a `Valid` or
+    /// `ValidInStoreOnly` verdict.
+    pub fn warnings(&self) -> &[String] {
+        match self {
+            CheckpointVerification::Valid { warnings }
+            | CheckpointVerification::ValidInStoreOnly { warnings, .. } => warnings,
+            _ => &[],
+        }
+    }
+
     /// Process exit code per `docs/evidence-export.md`:
     /// - `0`: verified (`Valid`)
     /// - `1`: refused (`DigestMismatch`, `LedgerMismatch`, `InvalidSignature`, `KeyMismatch`)
@@ -385,7 +411,7 @@ impl CheckpointVerification {
     ///   `OrgClassNotVerifiable`)
     pub fn exit_code(&self) -> u8 {
         match self {
-            CheckpointVerification::Valid => 0,
+            CheckpointVerification::Valid { .. } => 0,
             CheckpointVerification::DigestMismatch
             | CheckpointVerification::LedgerMismatch { .. }
             | CheckpointVerification::InvalidSignature
@@ -997,19 +1023,30 @@ pub fn verify_checkpoint_with(
     let Some(signature) = signature else {
         return Ok(CheckpointVerification::Unsigned);
     };
-    let verdict = verify_signature_against_trust(conn, &checkpoint, &stored_digest, &signature, trust)?;
-    if !matches!(verdict, CheckpointVerification::Valid | CheckpointVerification::ValidInStoreOnly { .. }) {
+    let mut verdict = verify_signature_against_trust(conn, &checkpoint, &stored_digest, &signature, trust)?;
+    if !matches!(
+        verdict,
+        CheckpointVerification::Valid { .. } | CheckpointVerification::ValidInStoreOnly { .. }
+    ) {
         return Ok(verdict);
     }
     // Check every out-of-band pinned checkpoint record supplied by the verifier.
+    // Pinned records fail hard on any mismatch, including a revoked signer.
     if let Some(failure) = verify_pinned_checkpoints(conn, seq, trust)? {
         return Ok(failure);
     }
     // DB-side consistency check over every earlier signed `hub` checkpoint
-    // (`seq <= checkpoint.seq`) still present in `evidence_checkpoint`,
-    // including its signature against the verifier's trust anchor/trust file.
-    if let Some(failure) = verify_earlier_db_checkpoints(conn, &checkpoint, seq, trust)? {
-        return Ok(failure);
+    // (`seq <= checkpoint.seq`) still present in `evidence_checkpoint`.
+    let warnings = match verify_earlier_db_checkpoints(conn, &checkpoint, seq, trust)? {
+        Ok(warnings) => warnings,
+        Err(failure) => return Ok(failure),
+    };
+    match &mut verdict {
+        CheckpointVerification::Valid { warnings: out }
+        | CheckpointVerification::ValidInStoreOnly { warnings: out, .. } => {
+            *out = warnings;
+        }
+        _ => {}
     }
     Ok(verdict)
 }
@@ -1054,7 +1091,7 @@ fn verify_signature_against_trust(
             });
         }
         match verify_ed25519(&expected_pk, stored_digest, signature) {
-            Ok(()) => Ok(CheckpointVerification::Valid),
+            Ok(()) => Ok(CheckpointVerification::valid()),
             Err(_) => Ok(CheckpointVerification::InvalidSignature),
         }
     } else if !trust.trust_keys.is_empty() {
@@ -1069,14 +1106,27 @@ fn verify_signature_against_trust(
             });
         }
         match verify_ed25519(&expected_pk, stored_digest, signature) {
-            Ok(()) => Ok(CheckpointVerification::Valid),
+            Ok(()) => Ok(CheckpointVerification::valid()),
             Err(_) => Ok(CheckpointVerification::InvalidSignature),
         }
     } else {
         match verify_ed25519(&key.public_key, stored_digest, signature) {
-            Ok(()) => Ok(CheckpointVerification::ValidInStoreOnly { key_id: checkpoint.key_id.clone() }),
+            Ok(()) => Ok(CheckpointVerification::ValidInStoreOnly {
+                key_id: checkpoint.key_id.clone(),
+                warnings: Vec::new(),
+            }),
             Err(_) => Ok(CheckpointVerification::InvalidSignature),
         }
+    }
+}
+
+/// Look up the pinned public key the verifier explicitly supplied for `key_id`
+/// (either via `--anchor-key-id`/`--anchor-key` or via `--trust-file`'s `keys`).
+fn supplied_key_for<'a>(trust: &'a VerifyTrust, key_id: &str) -> Option<&'a str> {
+    if let Some(anchor) = &trust.anchor {
+        (anchor.key_id.trim() == key_id).then_some(anchor.public_key.trim())
+    } else {
+        trust.trust_keys.iter().find(|k| k.key_id.trim() == key_id).map(|k| k.public_key.trim())
     }
 }
 
@@ -1178,7 +1228,7 @@ fn verify_pinned_checkpoints(
             }));
         };
         match verify_signature_against_trust(conn, &db_cp, &db_stored_digest, &db_sig, trust)? {
-            CheckpointVerification::Valid | CheckpointVerification::ValidInStoreOnly { .. } => {}
+            CheckpointVerification::Valid { .. } | CheckpointVerification::ValidInStoreOnly { .. } => {}
             CheckpointVerification::InvalidSignature => {
                 return Ok(Some(CheckpointVerification::LedgerMismatch {
                     reason: format!("pinned checkpoint {pinned_id:?} failed signature verification"),
@@ -1191,16 +1241,23 @@ fn verify_pinned_checkpoints(
 }
 
 /// DB-side consistency check over every earlier signed `hub` checkpoint
-/// (`seq <= target_seq`) still present in `evidence_checkpoint`: checks stored
-/// digest vs recomputed fields, `event_log[prev_seq].entry_hash`, and
-/// verifies each earlier checkpoint's signature against the verifier's trust
-/// anchor / trust-file key.
+/// (`seq <= target_seq`) still present in `evidence_checkpoint`:
+/// - An earlier checkpoint signed by a revoked key (either in `trust` or in
+///   `evidence_key.revoked_at`) is not a continuity witness: skip it and
+///   record a warning rather than failing the target checkpoint forever.
+/// - For non-revoked earlier checkpoints, check stored digest vs recomputed
+///   fields and `event_log[prev_seq].entry_hash`.
+/// - Check the earlier checkpoint's Ed25519 signature when the verifier
+///   supplied a key for `prev.key_id` (or in store-only mode); when the
+///   verifier supplied pinned trust for a newer key only (e.g. after key
+///   rotation), record a warning instead of returning `KeyMismatch` for the
+///   target.
 fn verify_earlier_db_checkpoints(
     conn: &Connection,
     checkpoint: &Checkpoint,
     target_seq: i64,
     trust: &VerifyTrust,
-) -> UaResult<Option<CheckpointVerification>> {
+) -> UaResult<Result<Vec<String>, CheckpointVerification>> {
     let mut stmt = conn.prepare(
         "SELECT checkpoint_id, class, org_id, seq, hash, window_start, window_end, \
                 global_from_hash, global_head_hash, org_row_count, org_chain_hash, \
@@ -1214,9 +1271,19 @@ fn verify_earlier_db_checkpoints(
             Ok((row_to_checkpoint(r)?, r.get::<_, String>(13)?, r.get::<_, String>(14)?))
         })?
         .collect::<Result<_, _>>()?;
+    let has_pinned_trust = trust.anchor.is_some() || !trust.trust_keys.is_empty();
+    let mut warnings = Vec::new();
     for (prev, prev_stored_digest, prev_signature) in earlier {
+        let key_row = key_get(conn, &prev.key_id)?;
+        if trust.is_revoked(&prev.key_id) || key_row.as_ref().is_some_and(|k| k.revoked_at.is_some()) {
+            warnings.push(format!(
+                "skipped earlier checkpoint {:?}: signing key {:?} is revoked (not a continuity witness)",
+                prev.checkpoint_id, prev.key_id
+            ));
+            continue;
+        }
         if prev.digest() != prev_stored_digest {
-            return Ok(Some(CheckpointVerification::LedgerMismatch {
+            return Ok(Err(CheckpointVerification::LedgerMismatch {
                 reason: format!(
                     "earlier signed hub checkpoint {:?} has a stored digest that does not match its fields",
                     prev.checkpoint_id
@@ -1224,17 +1291,17 @@ fn verify_earlier_db_checkpoints(
             }));
         }
         let Some(prev_seq) = prev.seq else {
-            return Ok(Some(CheckpointVerification::LedgerMismatch {
+            return Ok(Err(CheckpointVerification::LedgerMismatch {
                 reason: format!("earlier signed hub checkpoint {:?} carries no seq", prev.checkpoint_id),
             }));
         };
         let Some(prev_hash) = prev.hash.as_deref() else {
-            return Ok(Some(CheckpointVerification::LedgerMismatch {
+            return Ok(Err(CheckpointVerification::LedgerMismatch {
                 reason: format!("earlier signed hub checkpoint {:?} carries no hash", prev.checkpoint_id),
             }));
         };
         let Some(prev_entry) = crate::ledger::entry_hash_at(conn, prev_seq)? else {
-            return Ok(Some(CheckpointVerification::LedgerMismatch {
+            return Ok(Err(CheckpointVerification::LedgerMismatch {
                 reason: format!(
                     "earlier signed hub checkpoint {:?} references seq {prev_seq}, which is missing from event_log",
                     prev.checkpoint_id
@@ -1242,7 +1309,7 @@ fn verify_earlier_db_checkpoints(
             }));
         };
         if !prev_entry.eq_ignore_ascii_case(prev_hash) {
-            return Ok(Some(CheckpointVerification::LedgerMismatch {
+            return Ok(Err(CheckpointVerification::LedgerMismatch {
                 reason: format!(
                     "earlier signed hub checkpoint {:?} at seq {prev_seq} does not match current \
                      event_log[{prev_seq}].entry_hash (ledger history may have been rewritten)",
@@ -1250,20 +1317,57 @@ fn verify_earlier_db_checkpoints(
                 ),
             }));
         }
-        match verify_signature_against_trust(conn, &prev, &prev_stored_digest, &prev_signature, trust)? {
-            CheckpointVerification::Valid | CheckpointVerification::ValidInStoreOnly { .. } => {}
-            CheckpointVerification::InvalidSignature => {
-                return Ok(Some(CheckpointVerification::LedgerMismatch {
+        if let Some(expected_pk) = supplied_key_for(trust, &prev.key_id) {
+            let Some(key) = key_row else {
+                return Ok(Err(CheckpointVerification::LedgerMismatch {
+                    reason: format!(
+                        "earlier signed hub checkpoint {:?} names key {:?}, which is missing from evidence_key",
+                        prev.checkpoint_id, prev.key_id
+                    ),
+                }));
+            };
+            if key.algorithm != ALGORITHM_ED25519 {
+                return Ok(Err(CheckpointVerification::LedgerMismatch {
+                    reason: format!(
+                        "earlier signed hub checkpoint {:?} uses unsupported key algorithm",
+                        prev.checkpoint_id
+                    ),
+                }));
+            }
+            if !expected_pk.eq_ignore_ascii_case(&key.public_key) {
+                return Ok(Err(CheckpointVerification::LedgerMismatch {
+                    reason: format!(
+                        "earlier signed hub checkpoint {:?} stored public key for {:?} disagrees with verifier's pinned key",
+                        prev.checkpoint_id, prev.key_id
+                    ),
+                }));
+            }
+            if verify_ed25519(expected_pk, &prev_stored_digest, &prev_signature).is_err() {
+                return Ok(Err(CheckpointVerification::LedgerMismatch {
                     reason: format!(
                         "earlier signed hub checkpoint {:?} failed signature verification",
                         prev.checkpoint_id
                     ),
                 }));
             }
-            other => return Ok(Some(other)),
+        } else if has_pinned_trust {
+            warnings.push(format!(
+                "earlier checkpoint {:?} (key {:?}) signature not verified: no pinned key supplied for {:?}",
+                prev.checkpoint_id, prev.key_id, prev.key_id
+            ));
+        } else if let Some(key) = key_row
+            && (key.algorithm != ALGORITHM_ED25519
+                || verify_ed25519(&key.public_key, &prev_stored_digest, &prev_signature).is_err())
+        {
+            return Ok(Err(CheckpointVerification::LedgerMismatch {
+                reason: format!(
+                    "earlier signed hub checkpoint {:?} failed signature verification",
+                    prev.checkpoint_id
+                ),
+            }));
         }
     }
-    Ok(None)
+    Ok(Ok(warnings))
 }
 
 /// Verify an Ed25519 signature over the raw digest bytes. Public so the offline
@@ -1471,13 +1575,13 @@ mod tests {
         // No anchor: the signature checks against the store, but authorship is not proven.
         assert_eq!(
             db.read(|c| verify_checkpoint(c, "cp-1", None)).unwrap(),
-            CheckpointVerification::ValidInStoreOnly { key_id: "k1".into() }
+            CheckpointVerification::ValidInStoreOnly { key_id: "k1".into(), warnings: Vec::new() }
         );
         // A pinned anchor proves it.
         let anchor = TrustAnchor { key_id: "k1".into(), public_key: pk.clone() };
         assert_eq!(
             db.read(|c| verify_checkpoint(c, "cp-1", Some(&anchor))).unwrap(),
-            CheckpointVerification::Valid
+            CheckpointVerification::valid()
         );
         // A different pinned key is refused.
         let wrong = TrustAnchor { key_id: "k1".into(), public_key: hex::encode([9u8; 32]) };
@@ -1539,7 +1643,7 @@ mod tests {
             TrustAnchor { key_id: "  k1 \n".into(), public_key: format!("  {} \n", pk.to_uppercase()) };
         assert_eq!(
             db.read(|c| verify_checkpoint(c, "cp-1", Some(&padded))).unwrap(),
-            CheckpointVerification::Valid
+            CheckpointVerification::valid()
         );
 
         // Wrong key_id: expected = anchor, found = checkpoint.
@@ -1618,7 +1722,7 @@ mod tests {
         };
         assert_eq!(
             db.read(|c| verify_checkpoint_with(c, "cp-1", &with_both)).unwrap(),
-            CheckpointVerification::Valid
+            CheckpointVerification::valid()
         );
 
         // Trust file without k1: UnknownKey (exit 2).
@@ -1668,7 +1772,7 @@ mod tests {
         let anchor = TrustAnchor { key_id: "k1".into(), public_key: pk };
         assert_eq!(
             db.read(|c| verify_checkpoint(c, "cp-1", Some(&anchor))).unwrap(),
-            CheckpointVerification::Valid
+            CheckpointVerification::valid()
         );
     }
 
@@ -1783,7 +1887,7 @@ mod tests {
 
     #[test]
     fn verification_exit_codes_match_spec() {
-        assert_eq!(CheckpointVerification::Valid.exit_code(), 0);
+        assert_eq!(CheckpointVerification::valid().exit_code(), 0);
         for refused in [
             CheckpointVerification::DigestMismatch,
             CheckpointVerification::LedgerMismatch { reason: "x".into() },
@@ -1796,7 +1900,7 @@ mod tests {
             CheckpointVerification::Unsigned,
             CheckpointVerification::UnknownKey { key_id: "k1".into() },
             CheckpointVerification::KeyRevoked { key_id: "k1".into() },
-            CheckpointVerification::ValidInStoreOnly { key_id: "k1".into() },
+            CheckpointVerification::ValidInStoreOnly { key_id: "k1".into(), warnings: Vec::new() },
             CheckpointVerification::OrgClassNotVerifiable,
         ] {
             assert_eq!(cannot_verify.exit_code(), 2, "{cannot_verify:?}");
@@ -2038,11 +2142,11 @@ mod tests {
         };
         assert_eq!(
             db.read(|c| verify_checkpoint(c, "cp-2", Some(&anchor))).unwrap(),
-            CheckpointVerification::Valid
+            CheckpointVerification::valid()
         );
         assert_eq!(
             db.read(|c| verify_checkpoint_with(c, "cp-2", &trust_with_pinned)).unwrap(),
-            CheckpointVerification::Valid
+            CheckpointVerification::valid()
         );
 
         // Rewrite `event_log` at seq1 and sign `cp-3` over the rewritten chain.
@@ -2118,7 +2222,7 @@ mod tests {
         };
         assert_eq!(
             db.read(|c| verify_checkpoint_with(c, "cp-2", &trust)).unwrap(),
-            CheckpointVerification::Valid
+            CheckpointVerification::valid()
         );
 
         // Variant C: NULL out cp-1's signature (even without rewriting event_log).
@@ -2180,5 +2284,90 @@ mod tests {
             }
             other => panic!("expected LedgerMismatch for deleted pinned cp-1, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn verify_succeeds_after_key_rotation_and_revocation_while_pinned_revoked_still_fails() {
+        let (_dir, db) = open();
+        let (sk1, pk1) = keypair();
+        let sk2 = SigningKey::from_bytes(&[8u8; 32]);
+        let pk2 = hex::encode(sk2.verifying_key().to_bytes());
+        db.write(|tx| key_add(tx, "k1", &pk1, "now", None)).unwrap();
+        let (seq1, hash1) = ledger_row(&db);
+        let cp1_digest = signed_checkpoint_id(&db, "cp-1", &sk1, "k1", seq1, &hash1);
+
+        // Rotate: retire k1, add k2, sign cp-2 with k2.
+        db.write(|tx| key_retire(tx, "k1", "now")).unwrap();
+        db.write(|tx| key_add(tx, "k2", &pk2, "now", None)).unwrap();
+        let (seq2, hash2) = ledger_row(&db);
+        assert!(seq2 > seq1);
+        signed_checkpoint_id(&db, "cp-2", &sk2, "k2", seq2, &hash2);
+
+        let anchor_k2 = TrustAnchor { key_id: "k2".into(), public_key: pk2.clone() };
+        let trust_both = VerifyTrust {
+            anchor: None,
+            trust_keys: vec![
+                TrustAnchor { key_id: "k1".into(), public_key: pk1.clone() },
+                TrustAnchor { key_id: "k2".into(), public_key: pk2.clone() },
+            ],
+            revoked_key_ids: Vec::new(),
+            signed_checkpoints: Vec::new(),
+        };
+        let trust_only_k2 = VerifyTrust {
+            anchor: None,
+            trust_keys: vec![TrustAnchor { key_id: "k2".into(), public_key: pk2.clone() }],
+            revoked_key_ids: Vec::new(),
+            signed_checkpoints: Vec::new(),
+        };
+
+        // 1. After retirement: anchor=k2 and trust={k2} succeed with a warning that cp-1's
+        //    older key k1 was not in trust; trust={k1, k2} verifies both with zero warnings.
+        let v_anchor_retired = db.read(|c| verify_checkpoint(c, "cp-2", Some(&anchor_k2))).unwrap();
+        assert_eq!(v_anchor_retired.exit_code(), 0, "{v_anchor_retired:?}");
+        assert!(
+            v_anchor_retired.warnings().iter().any(|w| w.contains("cp-1") && w.contains("k1")),
+            "{v_anchor_retired:?}"
+        );
+
+        let v_only_k2 = db.read(|c| verify_checkpoint_with(c, "cp-2", &trust_only_k2)).unwrap();
+        assert_eq!(v_only_k2.exit_code(), 0, "{v_only_k2:?}");
+        assert!(v_only_k2.warnings().iter().any(|w| w.contains("cp-1") && w.contains("k1")), "{v_only_k2:?}");
+
+        assert_eq!(
+            db.read(|c| verify_checkpoint_with(c, "cp-2", &trust_both)).unwrap(),
+            CheckpointVerification::valid()
+        );
+
+        // 2. Revoke k1 (compromise): cp-1 itself is still KeyRevoked, but cp-2 signed by k2
+        //    verifies under anchor=k2, trust={k1, k2}, and trust={k2}, skipping cp-1 with a
+        //    warning instead of permanently bricking verification.
+        db.write(|tx| key_revoke(tx, "k1", "now")).unwrap();
+        assert_eq!(
+            db.read(|c| verify_checkpoint_with(c, "cp-1", &trust_both)).unwrap(),
+            CheckpointVerification::KeyRevoked { key_id: "k1".into() }
+        );
+        for trust in [VerifyTrust::from_anchor(Some(&anchor_k2)), trust_both.clone(), trust_only_k2] {
+            let v = db.read(|c| verify_checkpoint_with(c, "cp-2", &trust)).unwrap();
+            assert_eq!(v.exit_code(), 0, "{v:?}");
+            assert!(
+                v.warnings().iter().any(|w| w.contains("cp-1") && w.contains("k1") && w.contains("revoked")),
+                "{v:?}"
+            );
+        }
+
+        // 3. Pinned record signed by a revoked key STILL fails hard.
+        let trust_pinned_revoked = VerifyTrust {
+            signed_checkpoints: vec![PinnedCheckpoint {
+                checkpoint_id: "cp-1".into(),
+                seq: seq1,
+                hash: hash1,
+                digest: cp1_digest,
+            }],
+            ..trust_both
+        };
+        assert_eq!(
+            db.read(|c| verify_checkpoint_with(c, "cp-2", &trust_pinned_revoked)).unwrap(),
+            CheckpointVerification::KeyRevoked { key_id: "k1".into() }
+        );
     }
 }

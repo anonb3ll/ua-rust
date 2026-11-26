@@ -383,12 +383,18 @@ and the operator signs that digest offline.
   - *DB-side consistency check:* `verify` also re-checks every earlier signed
     `hub` checkpoint (`seq <= checkpoint.seq`) still present in
     `evidence_checkpoint` — recomputing its digest, checking
-    `event_log[prev_seq].entry_hash`, and verifying its Ed25519 signature
-    against the verifier's pinned key or trust file. This catches both a
-    careless ledger rewrite and a field-and-digest rewrite of an earlier
-    checkpoint row, but because an attacker with SQLite write access could drop
-    triggers to delete an earlier row or clear its `signature`, the DB-side
-    check alone is a consistency check rather than full tamper-evidence.
+    `event_log[prev_seq].entry_hash`, and verifying its Ed25519 signature when
+    the verifier supplied a key for that `key_id`. An earlier checkpoint signed
+    by a revoked key is no longer a continuity witness and is skipped with a
+    `warnings` entry on the `valid` verdict (rather than permanently preventing
+    newer checkpoints signed by a replacement key from verifying); an earlier
+    checkpoint signed by a rotated-out key not present in the verifier's trust
+    material is also noted in `warnings` without failing the target. This
+    catches both a careless ledger rewrite and a field-and-digest rewrite of an
+    earlier checkpoint row signed by a key the verifier supplied, but because an
+    attacker with SQLite write access could drop triggers to delete an earlier
+    row or clear its `signature`, the DB-side check alone is a consistency check
+    rather than full tamper-evidence.
   - *Out-of-band tamper-evidence:* `verify` accepts records held outside the
     hub database via repeatable `--prev-checkpoint <file>` flags (pointing at
     local copies of previously signed checkpoint files) and/or a
@@ -396,7 +402,8 @@ and the operator signs that digest offline.
     entries in `--trust-file`. Every supplied record must match `event_log`,
     exist as a signed `hub` row in `evidence_checkpoint` with matching
     `(seq, hash, digest)`, and pass signature verification against the pinned
-    key. Supplying out-of-band records closes history rewrites combined with
+    key — pinned records always fail hard on any mismatch, including a revoked
+    signer. Supplying out-of-band records closes history rewrites combined with
     checkpoint deletion or cleared signatures.
 - **The trust anchor and revocation.** The key row is in the same database as
   the checkpoint, so a verifier that trusts it is trusting the database it

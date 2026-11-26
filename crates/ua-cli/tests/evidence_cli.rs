@@ -1120,3 +1120,215 @@ fn verify_with_prev_checkpoint_and_trust_file_signed_checkpoints_succeeds_when_i
     assert_eq!(deleted_v["state"], "ledger_mismatch", "{deleted_v}");
     assert!(deleted_v["reason"].as_str().unwrap().contains("missing"), "{deleted_v}");
 }
+
+#[test]
+fn anchor_mode_verify_succeeds_after_key_rotation_and_revocation_and_pinned_revoked_fails() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let key1_path = root.path().join("op1.key");
+    let key2_path = root.path().join("op2.key");
+
+    let g1 =
+        ua(&home).args(["evidence", "key-generate", "--out", key1_path.to_str().unwrap()]).output().unwrap();
+    assert!(g1.status.success(), "{}", text(&g1.stderr));
+    let pk1 =
+        serde_json::from_slice::<Value>(&g1.stdout).unwrap()["public_key"].as_str().unwrap().to_string();
+
+    let g2 =
+        ua(&home).args(["evidence", "key-generate", "--out", key2_path.to_str().unwrap()]).output().unwrap();
+    assert!(g2.status.success(), "{}", text(&g2.stderr));
+    let pk2 =
+        serde_json::from_slice::<Value>(&g2.stdout).unwrap()["public_key"].as_str().unwrap().to_string();
+
+    assert!(ua(&home).args(["init"]).output().unwrap().status.success());
+    assert!(
+        ua(&home)
+            .args(["evidence", "key-add", "--key-id", "k1", "--public-key", &pk1])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // Sign cp-1 with k1.
+    let (seq1, hash1) = latest_ledger_head(&home);
+    let cp1_file = root.path().join("cp1.json");
+    assert!(
+        ua(&home)
+            .args([
+                "evidence",
+                "checkpoint",
+                "--id",
+                "cp-1",
+                "--key-id",
+                "k1",
+                "--seq",
+                &seq1.to_string(),
+                "--hash",
+                &hash1,
+                "--out",
+                cp1_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let sig1 = text(
+        &ua(&home)
+            .args([
+                "evidence",
+                "sign",
+                "--key-file",
+                key1_path.to_str().unwrap(),
+                "--checkpoint-file",
+                cp1_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        ua(&home)
+            .args(["evidence", "attach", "--checkpoint", "cp-1", "--signature", &sig1])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // Rotate: retire k1, add k2, sign cp-2 with k2.
+    assert!(ua(&home).args(["evidence", "key-retire", "--key-id", "k1"]).output().unwrap().status.success());
+    assert!(
+        ua(&home)
+            .args(["evidence", "key-add", "--key-id", "k2", "--public-key", &pk2])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let (seq2, hash2) = latest_ledger_head(&home);
+    assert!(seq2 > seq1);
+    let cp2_file = root.path().join("cp2.json");
+    assert!(
+        ua(&home)
+            .args([
+                "evidence",
+                "checkpoint",
+                "--id",
+                "cp-2",
+                "--key-id",
+                "k2",
+                "--seq",
+                &seq2.to_string(),
+                "--hash",
+                &hash2,
+                "--out",
+                cp2_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let sig2 = text(
+        &ua(&home)
+            .args([
+                "evidence",
+                "sign",
+                "--key-file",
+                key2_path.to_str().unwrap(),
+                "--checkpoint-file",
+                cp2_file.to_str().unwrap(),
+                "--prev-checkpoint",
+                cp1_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        ua(&home)
+            .args(["evidence", "attach", "--checkpoint", "cp-2", "--signature", &sig2])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // 1. Anchor-mode verify of cp-2 with only k2 succeeds (exit 0) and warns about cp-1 / k1.
+    let v_rot = ua(&home)
+        .args(["evidence", "verify", "--checkpoint", "cp-2", "--anchor-key", &pk2, "--anchor-key-id", "k2"])
+        .output()
+        .unwrap();
+    assert_eq!(v_rot.status.code(), Some(0), "stdout={} stderr={}", text(&v_rot.stdout), text(&v_rot.stderr));
+    let v_rot_json: Value = serde_json::from_slice(&v_rot.stdout).unwrap();
+    assert_eq!(v_rot_json["state"], "valid", "{v_rot_json}");
+    assert!(
+        v_rot_json["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("cp-1")),
+        "{v_rot_json}"
+    );
+
+    // 2. Trust file with both {k1, k2} verifies cp-2 with zero warnings (no warnings field in JSON).
+    let trust_both = root.path().join("trust-both.json");
+    std::fs::write(
+        &trust_both,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "keys": [
+                { "key_id": "k1", "public_key": pk1 },
+                { "key_id": "k2", "public_key": pk2 }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let v_both = ua(&home)
+        .args(["evidence", "verify", "--checkpoint", "cp-2", "--trust-file", trust_both.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(v_both.status.code(), Some(0), "{}", text(&v_both.stdout));
+    let v_both_json: Value = serde_json::from_slice(&v_both.stdout).unwrap();
+    assert_eq!(v_both_json, serde_json::json!({ "state": "valid" }));
+
+    // 3. Revoke k1: anchor-mode verify of cp-2 with k2 STILL succeeds (exit 0) with a warning
+    //    that cp-1 was skipped because k1 is revoked.
+    assert!(ua(&home).args(["evidence", "key-revoke", "--key-id", "k1"]).output().unwrap().status.success());
+    let v_rev = ua(&home)
+        .args(["evidence", "verify", "--checkpoint", "cp-2", "--anchor-key", &pk2, "--anchor-key-id", "k2"])
+        .output()
+        .unwrap();
+    assert_eq!(v_rev.status.code(), Some(0), "stdout={} stderr={}", text(&v_rev.stdout), text(&v_rev.stderr));
+    let v_rev_json: Value = serde_json::from_slice(&v_rev.stdout).unwrap();
+    assert_eq!(v_rev_json["state"], "valid", "{v_rev_json}");
+    assert!(
+        v_rev_json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("cp-1") && w.as_str().unwrap().contains("revoked")),
+        "{v_rev_json}"
+    );
+
+    // 4. Pinning cp-1 via `--prev-checkpoint` after k1 is revoked STILL fails hard (exit 2 key_revoked).
+    let v_pinned_rev = ua(&home)
+        .args([
+            "evidence",
+            "verify",
+            "--checkpoint",
+            "cp-2",
+            "--trust-file",
+            trust_both.to_str().unwrap(),
+            "--prev-checkpoint",
+            cp1_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(v_pinned_rev.status.code(), Some(2), "{}", text(&v_pinned_rev.stdout));
+    let v_pinned_rev_json: Value = serde_json::from_slice(&v_pinned_rev.stdout).unwrap();
+    assert_eq!(v_pinned_rev_json["state"], "key_revoked", "{v_pinned_rev_json}");
+    assert_eq!(v_pinned_rev_json["key_id"], "k1", "{v_pinned_rev_json}");
+}

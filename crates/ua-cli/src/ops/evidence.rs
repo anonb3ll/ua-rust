@@ -345,6 +345,9 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
                 }
             };
             println!("{}", serde_json::to_string_pretty(&verdict)?);
+            for warning in verdict.warnings() {
+                eprintln!("warning: {warning}");
+            }
             if let CheckpointVerification::ValidInStoreOnly { .. } = verdict {
                 eprintln!(
                     "not authorship: the key came from the same database; pass --anchor-key and --anchor-key-id (or --trust-file)"
