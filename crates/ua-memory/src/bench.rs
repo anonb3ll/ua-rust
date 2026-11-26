@@ -2,13 +2,14 @@
 //!
 //! [`Kind::Fixture`] scores the checked-in corpus and compares each class with
 //! `bench/floor.json`. [`Kind::LongMemEval`] scores the pinned LongMemEval-S
-//! file. Neither path changes ranking. The fixture run is deterministic: note
-//! text, `valid_from` and `as_of` are fixed, and ties break on title before
-//! the random note id.
+//! file. Neither path changes ranking. Both runs are deterministic: note text,
+//! `valid_from` and `as_of` are fixed, the clock is fixed at [`BENCH_NOW`],
+//! and search breaks score ties on title, then insertion order.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -26,6 +27,13 @@ const PIN_JSON: &str = include_str!("../bench/longmemeval.json");
 const SEARCH_LIMIT: i64 = 10;
 const RECALL_K: usize = 5;
 
+/// The instant both bench runs treat as now. Search reads the clock for the
+/// recency leg and the prior's age discount, so a wall clock would let the
+/// same corpus score differently on different days. Every LongMemEval session
+/// predates it by more than 19.5 months, where the age discount is clamped,
+/// as it was under the wall clock when the recorded baseline ran.
+pub const BENCH_NOW: &str = "2026-03-01T00:00:00+00:00";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// Checked-in notes and labelled queries. No network.
@@ -37,15 +45,24 @@ pub enum Kind {
 #[derive(Debug, Clone)]
 pub struct Options {
     pub kind: Kind,
-    /// Existing dataset file. Hash-checked. Not downloaded.
+    /// LongMemEval only: a local copy of the dataset file. It must match the
+    /// pinned sha256. When `None`, the run uses the cache file and, if that
+    /// is missing, downloads it with `curl` (the only network access in this
+    /// module; the fixture run and the tests never take it).
     pub data: Option<PathBuf>,
-    /// LongMemEval only: score this many answerable questions, in file order.
+    /// LongMemEval only: score this many answerable questions, in file order
+    /// (after `ids`, when both are given).
     pub limit: Option<usize>,
+    /// LongMemEval only: score exactly these question ids, in file order. An
+    /// unknown or abstention id is an error. This is how a stratified sample
+    /// drawn elsewhere (the predecessor's `--per-category 20 --seed 2145`) is
+    /// reproduced.
+    pub ids: Option<Vec<String>>,
 }
 
 impl Options {
     pub fn fixture() -> Self {
-        Self { kind: Kind::Fixture, data: None, limit: None }
+        Self { kind: Kind::Fixture, data: None, limit: None, ids: None }
     }
 }
 
@@ -68,6 +85,9 @@ struct CorpusNote {
     content: String,
     tags: Vec<String>,
     valid_from: Option<String>,
+    /// When the note was written (`created_at`). Defaults to `valid_from`;
+    /// see [`backdate_created`].
+    recorded_at: Option<String>,
     supersedes: Option<String>,
     contradicts: Vec<String>,
 }
@@ -78,7 +98,12 @@ struct CorpusQuery {
     query: String,
     as_of: Option<String>,
     must: Vec<String>,
+    /// Notes that must not be in the top 5.
     must_not: Vec<String>,
+    /// Notes that share the query's terms and are retrieved, but must rank
+    /// below every `must` note. Each must actually be retrieved, or the
+    /// negative tests nothing and the floor check fails.
+    outranked: Vec<String>,
 }
 
 struct FloorFile {
@@ -88,6 +113,7 @@ struct FloorFile {
 
 struct FloorClass {
     class: String,
+    n: usize,
     recall_at_5: f64,
     mrr: f64,
 }
@@ -119,7 +145,7 @@ struct SessionScore {
 pub async fn run(opts: Options) -> UaResult<Value> {
     match opts.kind {
         Kind::Fixture => run_fixture().await,
-        Kind::LongMemEval => run_longmemeval(opts.data.as_deref(), opts.limit).await,
+        Kind::LongMemEval => run_longmemeval(opts.data.as_deref(), opts.limit, opts.ids.as_deref()).await,
     }
 }
 
@@ -173,11 +199,20 @@ fn score_sessions(ranked: &[String], evidence: &[String]) -> UaResult<SessionSco
     })
 }
 
-fn score_fixture(ranked: &[String], must: &[String], must_not: &[String]) -> (f64, f64) {
+fn score_fixture(
+    ranked: &[String],
+    must: &[String],
+    must_not: &[String],
+    outranked: &[String],
+) -> (f64, f64) {
     let top: Vec<&str> = ranked.iter().take(RECALL_K).map(String::as_str).collect();
     let all = must.iter().all(|m| top.contains(&m.as_str()));
     let clean = must_not.iter().all(|m| !top.contains(&m.as_str()));
-    let recall = if all && clean && !must.is_empty() { 1.0 } else { 0.0 };
+    let last_must = must.iter().filter_map(|m| ranked.iter().position(|r| r == m)).max();
+    let below = outranked
+        .iter()
+        .all(|o| ranked.iter().position(|r| r == o).is_none_or(|p| last_must.is_some_and(|l| p > l)));
+    let recall = if all && clean && below && !must.is_empty() { 1.0 } else { 0.0 };
     let mrr = ranked
         .iter()
         .position(|r| must.iter().any(|m| m == r))
@@ -285,7 +320,7 @@ fn parse_note(v: &Value) -> UaResult<CorpusNote> {
     let obj = object(v, "fixture note")?;
     only_keys(
         obj,
-        &["key", "title", "content", "tags", "valid_from", "supersedes", "contradicts"],
+        &["key", "title", "content", "tags", "valid_from", "recorded_at", "supersedes", "contradicts"],
         "fixture note",
     )?;
     let key = req_str(obj, "key", "fixture note")?;
@@ -294,6 +329,7 @@ fn parse_note(v: &Value) -> UaResult<CorpusNote> {
         content: req_str(obj, "content", &key)?,
         tags: opt_strings(obj, "tags", &key)?,
         valid_from: opt_str(obj, "valid_from", &key)?,
+        recorded_at: opt_str(obj, "recorded_at", &key)?,
         supersedes: opt_str(obj, "supersedes", &key)?,
         contradicts: opt_strings(obj, "contradicts", &key)?,
         key,
@@ -302,7 +338,7 @@ fn parse_note(v: &Value) -> UaResult<CorpusNote> {
 
 fn parse_query(v: &Value) -> UaResult<CorpusQuery> {
     let obj = object(v, "fixture query")?;
-    only_keys(obj, &["id", "class", "query", "as_of", "must", "must_not"], "fixture query")?;
+    only_keys(obj, &["id", "class", "query", "as_of", "must", "must_not", "outranked"], "fixture query")?;
     let id = req_str(obj, "id", "fixture query")?;
     Ok(CorpusQuery {
         class: req_str(obj, "class", &id)?,
@@ -310,6 +346,7 @@ fn parse_query(v: &Value) -> UaResult<CorpusQuery> {
         as_of: opt_str(obj, "as_of", &id)?,
         must: req_strings(obj, "must", &id)?,
         must_not: opt_strings(obj, "must_not", &id)?,
+        outranked: opt_strings(obj, "outranked", &id)?,
         id,
     })
 }
@@ -329,9 +366,13 @@ fn parse_floor(raw: &str) -> UaResult<FloorFile> {
         .iter()
         .map(|item| {
             let row = object(item, "floor class")?;
-            only_keys(row, &["class", "recall_at_5", "mrr"], "floor class")?;
+            only_keys(row, &["class", "n", "recall_at_5", "mrr"], "floor class")?;
             Ok(FloorClass {
                 class: req_str(row, "class", "floor class")?,
+                n: row
+                    .get("n")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| UaError::invalid("floor class is missing n"))? as usize,
                 recall_at_5: row
                     .get("recall_at_5")
                     .and_then(Value::as_f64)
@@ -499,6 +540,7 @@ fn bench_config(home: &Path) -> Config {
     let mut cfg = Config::for_home(home);
     // A name nothing registers, so a default build stays lexical.
     cfg.embed_model = "bench-lexical".into();
+    cfg.clock = ua_core::time::Clock::fixed(BENCH_NOW).expect("BENCH_NOW is a valid instant");
     cfg
 }
 
@@ -526,11 +568,16 @@ fn open_db(path: &Path) -> UaResult<Db> {
     Db::open(path, &schema()).map_err(|e| UaError::internal(format!("open {}: {e}", path.display())))
 }
 
-/// `created_at` is stamped at save time. An `as_of` in the past would then
-/// hide every note (`created_at <= as_of`). Move `created_at` back to
-/// `valid_from` so temporal queries see the note's own date. Recency already
-/// reads `valid_from` when it is set, so this does not change ranking for a
-/// query without `as_of`.
+/// `created_at` is stamped at save time (the bench clock). `as_of` keeps a
+/// note only when `created_at <= as_of`, so an `as_of` before the save would
+/// hide every note. Move `created_at` back to `valid_from` so temporal queries
+/// see the note's own date. Recency already reads `valid_from` when it is
+/// set, so this does not change ranking for a query without `as_of`.
+///
+/// This is why the temporal class passes: it measures `as_of` over notes
+/// recorded when they became valid. A note recorded late (saved today with a
+/// past `valid_from`) stays invisible to an `as_of` between the two. The
+/// fixture keeps one such note (`recorded_at`) as a recorded gap.
 async fn backdate_created(db: &Db) -> UaResult<()> {
     db.write_async(|tx| {
         tx.execute("UPDATE memory SET created_at = valid_from WHERE valid_from IS NOT NULL", [])?;
@@ -539,16 +586,52 @@ async fn backdate_created(db: &Db) -> UaResult<()> {
     .await
 }
 
+/// Set `created_at` of fixture notes that name a `recorded_at`.
+async fn set_recorded(db: &Db, recorded: Vec<(String, String)>) -> UaResult<()> {
+    if recorded.is_empty() {
+        return Ok(());
+    }
+    db.write_async(move |tx| {
+        for (id, at) in &recorded {
+            tx.execute("UPDATE memory SET created_at = ?1 WHERE id = ?2", rusqlite::params![at, id])?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// A scratch directory for one bench run, removed on drop. The name carries
+/// the pid, a per-process counter and the start time, so concurrent runs in
+/// one process or across processes never share it.
 struct Scratch {
     dir: PathBuf,
 }
 
+static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl Scratch {
     fn new(name: &str) -> UaResult<Self> {
-        let dir = std::env::temp_dir().join(format!("ua-memory-bench-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| UaError::internal(format!("create {}: {e}", dir.display())))?;
+        let n = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("ua-memory-bench-{name}-{}-{n}-{nanos}", std::process::id()));
+        std::fs::create_dir(&dir).map_err(|e| UaError::internal(format!("create {}: {e}", dir.display())))?;
         Ok(Self { dir })
+    }
+
+    /// A fresh subdirectory for one database. SQLite writes `-wal` and
+    /// `-shm` files next to it; [`Scratch::release`] removes all of them.
+    fn sub(&self, name: &str) -> UaResult<PathBuf> {
+        let dir = self.dir.join(name.replace(['/', '\\'], "_"));
+        std::fs::create_dir(&dir).map_err(|e| UaError::internal(format!("create {}: {e}", dir.display())))?;
+        Ok(dir)
+    }
+
+    fn release(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -595,7 +678,20 @@ async fn load_fixture(db: &Db, cfg: &Config, notes: &[CorpusNote]) -> UaResult<H
         ids.insert(note.key.clone(), id);
     }
     backdate_created(db).await?;
+    let recorded = notes
+        .iter()
+        .filter_map(|n| n.recorded_at.clone().map(|at| (ids[&n.key].clone(), at)))
+        .collect::<Vec<_>>();
+    set_recorded(db, recorded).await?;
     Ok(ids)
+}
+
+/// True when note `key` is superseded by a note already valid at `at`: a hit
+/// on `key` then is a stale result (`docs/memory.md`, target under 2%).
+fn stale_at(corpus: &Corpus, key: &str, at: &str) -> bool {
+    corpus.notes.iter().any(|n| {
+        n.supersedes.as_deref() == Some(key) && n.valid_from.as_deref().is_none_or(|from| from <= at)
+    })
 }
 
 async fn search_keys(
@@ -637,11 +733,16 @@ async fn run_fixture() -> UaResult<Value> {
         if q.must.is_empty() {
             return Err(UaError::invalid(format!("fixture query {} has no must notes", q.id)));
         }
+        for key in q.must.iter().chain(&q.must_not).chain(&q.outranked) {
+            if !corpus.notes.iter().any(|n| &n.key == key) {
+                return Err(UaError::invalid(format!("fixture query {} names unknown note {key}", q.id)));
+            }
+        }
     }
 
     let scratch = Scratch::new("fixture")?;
     let cfg = bench_config(&scratch.dir);
-    let base = scratch.dir.join("corpus.db");
+    let base = scratch.sub("corpus")?.join("corpus.db");
     let ids = {
         let db = open_db(&base)?;
         let ids = load_fixture(&db, &cfg, &corpus.notes).await?;
@@ -655,14 +756,18 @@ async fn run_fixture() -> UaResult<Value> {
     let mut query_rows = Vec::new();
     let mut mode = String::new();
     let mut stale_hits = 0usize;
+    let mut must_not_hits = 0usize;
     let mut shown = 0usize;
+    let mut vacuous = Vec::new();
     for (i, q) in corpus.queries.iter().enumerate() {
-        let path = scratch.dir.join(format!("q{i}.db"));
+        let dir = scratch.sub(&format!("q{i}"))?;
+        let path = dir.join("q.db");
         std::fs::copy(&base, &path).map_err(|e| UaError::internal(format!("copy fixture database: {e}")))?;
         let db = open_db(&path)?;
-        let (ranked, qmode) = search_keys(&db, &cfg, &ids, &q.query, q.as_of.clone()).await?;
+        let searched = search_keys(&db, &cfg, &ids, &q.query, q.as_of.clone()).await;
         drop(db);
-        let _ = std::fs::remove_file(&path);
+        Scratch::release(&dir);
+        let (ranked, qmode) = searched?;
         if mode.is_empty() {
             mode = qmode.clone();
         } else if mode != qmode {
@@ -670,8 +775,18 @@ async fn run_fixture() -> UaResult<Value> {
         }
         let n = ranked.len().min(RECALL_K);
         shown += n;
-        stale_hits += ranked.iter().take(n).filter(|id| q.must_not.iter().any(|m| m == *id)).count();
-        let (recall, mrr) = score_fixture(&ranked, &q.must, &q.must_not);
+        let at = q.as_of.as_deref().unwrap_or(BENCH_NOW);
+        stale_hits += ranked.iter().take(n).filter(|key| stale_at(&corpus, key, at)).count();
+        must_not_hits += ranked.iter().take(n).filter(|key| q.must_not.iter().any(|m| m == *key)).count();
+        for key in &q.outranked {
+            if !ranked.contains(key) {
+                vacuous.push(json!({
+                    "query": q.id,
+                    "reason": format!("outranked note {key} was not retrieved, so it no longer tests ranking"),
+                }));
+            }
+        }
+        let (recall, mrr) = score_fixture(&ranked, &q.must, &q.must_not, &q.outranked);
         query_rows.push(json!({
             "id": q.id,
             "class": q.class,
@@ -697,6 +812,12 @@ async fn run_fixture() -> UaResult<Value> {
         classes.push(json!({"class": name, "n": rows.len(), "recall_at_5": recall, "mrr": mrr}));
         match floors.get(name.as_str()) {
             None => failures.push(json!({"class": name, "reason": "no floor"})),
+            // A deleted or added query would otherwise move the class mean
+            // without anyone changing the floor.
+            Some(f) if f.n != rows.len() => failures.push(json!({
+                "class": name,
+                "reason": format!("bench/floor.json records n={} but the corpus has {} queries", f.n, rows.len()),
+            })),
             Some(f) if recall + 1e-9 < f.recall_at_5 || mrr + 1e-9 < f.mrr => failures.push(json!({
                 "class": name,
                 "recall_at_5": recall,
@@ -712,15 +833,24 @@ async fn run_fixture() -> UaResult<Value> {
             failures.push(json!({"class": f.class, "reason": "floor class has no queries"}));
         }
     }
+    failures.extend(vacuous);
 
+    let share = |hits: usize| if shown == 0 { 0.0 } else { round4(hits as f64 / shown as f64) };
     let recalls: Vec<f64> = query_rows.iter().map(|r| r["recall_at_5"].as_f64().unwrap_or(0.0)).collect();
     let mrrs: Vec<f64> = query_rows.iter().map(|r| r["mrr"].as_f64().unwrap_or(0.0)).collect();
     Ok(json!({
         "bench": "fixture",
         "build": {"embeddings": crate::EMBEDDINGS_ENABLED},
         "retrieval": {"mode": mode},
+        "clock": BENCH_NOW,
         "k": RECALL_K,
-        "stale_share": if shown == 0 { 0.0 } else { round4(stale_hits as f64 / shown as f64) },
+        "stale_share": {
+            "definition": "share of top-5 hits superseded by a note already valid at the query instant (as_of, else the bench clock)",
+            "stale": stale_hits,
+            "hits": shown,
+            "share": share(stale_hits),
+        },
+        "must_not_share": share(must_not_hits),
         "overall": {"n": query_rows.len(), "recall_at_5": mean(&recalls), "mrr": mean(&mrrs)},
         "classes": classes,
         "queries": query_rows,
@@ -745,6 +875,13 @@ fn fixture_table(report: &Value) -> String {
         }
     }
     push("overall", &report["overall"]);
+    lines.push(format!(
+        "stale share {} ({}/{}), must_not share {}",
+        report["stale_share"]["share"].as_f64().unwrap_or(0.0),
+        report["stale_share"]["stale"].as_u64().unwrap_or(0),
+        report["stale_share"]["hits"].as_u64().unwrap_or(0),
+        report["must_not_share"].as_f64().unwrap_or(0.0),
+    ));
     if report["floor"]["ok"] != json!(true) {
         lines.push(format!("floor: below bench/floor.json {}", report["floor"]["failures"]));
     }
@@ -781,18 +918,26 @@ struct QuestionRun {
     mode: String,
     search_ms: f64,
     as_of: Option<f64>,
-    stale: usize,
-    stale_seen: usize,
+    older: usize,
+    older_seen: usize,
 }
 
+/// Score one question on its own database in its own scratch subdirectory,
+/// which is removed (database, `-wal` and `-shm`) before this returns.
 async fn score_question(q: &LmeQuestion, scratch: &Scratch, cfg: &Config) -> UaResult<QuestionRun> {
     if q.haystack_session_ids.len() != q.haystack_dates.len()
         || q.haystack_session_ids.len() != q.haystack_sessions.len()
     {
         return Err(UaError::invalid(format!("question {} has mismatched haystack arrays", q.question_id)));
     }
-    let path = scratch.dir.join(format!("{}.db", q.question_id.replace('/', "_")));
-    let db = open_db(&path)?;
+    let dir = scratch.sub(&q.question_id)?;
+    let run = score_question_in(q, &dir.join("q.db"), cfg).await;
+    Scratch::release(&dir);
+    run
+}
+
+async fn score_question_in(q: &LmeQuestion, path: &Path, cfg: &Config) -> UaResult<QuestionRun> {
+    let db = open_db(path)?;
     let who = caller("longmemeval-harness");
     let mut session_of: HashMap<String, String> = HashMap::new();
     let mut date_of: HashMap<String, String> = HashMap::new();
@@ -861,9 +1006,8 @@ async fn score_question(q: &LmeQuestion, scratch: &Scratch, cfg: &Config) -> UaR
         None
     };
 
-    let (stale, stale_seen) = stale_hits(q, &ranked, &date_of)?;
+    let (older, older_seen) = older_non_evidence(q, &ranked, &date_of);
     drop(db);
-    let _ = std::fs::remove_file(&path);
     Ok(QuestionRun {
         row: LmeRow {
             id: q.question_id.clone(),
@@ -877,8 +1021,8 @@ async fn score_question(q: &LmeQuestion, scratch: &Scratch, cfg: &Config) -> UaR
         mode,
         search_ms,
         as_of: as_of_hit,
-        stale,
-        stale_seen,
+        older,
+        older_seen,
     })
 }
 
@@ -892,18 +1036,23 @@ fn rank_sessions(hits: &Value, session_of: &HashMap<String, String>) -> Vec<Stri
         .collect()
 }
 
-fn stale_hits(
+/// Knowledge-update top-5 hits that are not evidence and predate the newest
+/// evidence session, out of all top-5 hits. Not the design's stale share:
+/// LongMemEval has no supersession links, so most of these are unrelated
+/// filler sessions from the 50-session haystack, not superseded facts. The
+/// fixture's `stale_share` is the design's metric.
+fn older_non_evidence(
     q: &LmeQuestion,
     ranked: &[String],
     date_of: &HashMap<String, String>,
-) -> UaResult<(usize, usize)> {
+) -> (usize, usize) {
     if q.question_type != "knowledge-update" {
-        return Ok((0, 0));
+        return (0, 0);
     }
     let evidence: HashSet<&str> = q.answer_session_ids.iter().map(String::as_str).collect();
     let newest = evidence.iter().filter_map(|sid| date_of.get(*sid)).max().cloned();
-    let Some(newest) = newest else { return Ok((0, 0)) };
-    let mut stale = 0;
+    let Some(newest) = newest else { return (0, 0) };
+    let mut older = 0;
     let mut seen = 0;
     for sid in ranked.iter().take(RECALL_K) {
         seen += 1;
@@ -911,10 +1060,42 @@ fn stale_hits(
             continue;
         }
         if date_of.get(sid).is_some_and(|d| d.as_str() < newest.as_str()) {
-            stale += 1;
+            older += 1;
         }
     }
-    Ok((stale, seen))
+    (older, seen)
+}
+
+/// The answerable questions to score: `ids` (in file order) when given, then
+/// the first `limit`. Returns the selection and its name for the report.
+fn select<'a>(
+    questions: &'a [LmeQuestion],
+    limit: Option<usize>,
+    ids: Option<&[String]>,
+) -> UaResult<(Vec<&'a LmeQuestion>, &'static str)> {
+    let mut chosen: Vec<&LmeQuestion> =
+        questions.iter().filter(|q| !q.question_id.ends_with("_abs")).collect();
+    let mut how = "full";
+    if let Some(ids) = ids {
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        if wanted.len() != ids.len() {
+            return Err(UaError::invalid("--ids lists a question id more than once"));
+        }
+        for id in ids {
+            if !chosen.iter().any(|q| &q.question_id == id) {
+                return Err(UaError::invalid(format!(
+                    "--ids names {id}, which is not an answerable question in this file"
+                )));
+            }
+        }
+        chosen.retain(|q| wanted.contains(q.question_id.as_str()));
+        how = "ids";
+    }
+    if let Some(n) = limit {
+        chosen.truncate(n);
+        how = if how == "ids" { "ids+limit" } else { "limit" };
+    }
+    Ok((chosen, how))
 }
 
 fn p95(mut xs: Vec<f64>) -> f64 {
@@ -926,7 +1107,11 @@ fn p95(mut xs: Vec<f64>) -> f64 {
     (xs[idx.min(xs.len() - 1)] * 10.0).round() / 10.0
 }
 
-async fn run_longmemeval(data: Option<&Path>, limit: Option<usize>) -> UaResult<Value> {
+async fn run_longmemeval(
+    data: Option<&Path>,
+    limit: Option<usize>,
+    ids: Option<&[String]>,
+) -> UaResult<Value> {
     let pin = pin()?;
     let path = locate_dataset(data, &pin)?;
     let file =
@@ -935,12 +1120,8 @@ async fn run_longmemeval(data: Option<&Path>, limit: Option<usize>) -> UaResult<
         .map_err(|e| UaError::invalid(format!("{} is not JSON: {e}", path.display())))?;
     let questions = parse_questions(&raw)?;
     let total = questions.len();
-    let mut chosen: Vec<&LmeQuestion> =
-        questions.iter().filter(|q| !q.question_id.ends_with("_abs")).collect();
-    let answerable = chosen.len();
-    if let Some(n) = limit {
-        chosen.truncate(n);
-    }
+    let answerable = questions.iter().filter(|q| !q.question_id.ends_with("_abs")).count();
+    let (chosen, selection) = select(&questions, limit, ids)?;
     if chosen.is_empty() {
         return Err(UaError::invalid(format!(
             "{} has no answerable questions. {}",
@@ -954,8 +1135,8 @@ async fn run_longmemeval(data: Option<&Path>, limit: Option<usize>) -> UaResult<
     let mut rows = Vec::new();
     let mut times = Vec::new();
     let mut as_of_hits = Vec::new();
-    let mut stale = 0usize;
-    let mut stale_seen = 0usize;
+    let mut older = 0usize;
+    let mut older_seen = 0usize;
     let mut mode = String::new();
     for (i, q) in chosen.iter().enumerate() {
         let run = score_question(q, &scratch, &cfg).await?;
@@ -976,8 +1157,8 @@ async fn run_longmemeval(data: Option<&Path>, limit: Option<usize>) -> UaResult<
         if let Some(hit) = run.as_of {
             as_of_hits.push(hit);
         }
-        stale += run.stale;
-        stale_seen += run.stale_seen;
+        older += run.older;
+        older_seen += run.older_seen;
         rows.push(run.row);
     }
 
@@ -1002,6 +1183,7 @@ async fn run_longmemeval(data: Option<&Path>, limit: Option<usize>) -> UaResult<
         "bench": "longmemeval-s",
         "build": {"embeddings": crate::EMBEDDINGS_ENABLED},
         "retrieval": {"mode": mode, "search_limit": SEARCH_LIMIT, "granularity": "session"},
+        "clock": BENCH_NOW,
         "dataset": {
             "repo": pin.repo,
             "revision": pin.revision,
@@ -1011,7 +1193,7 @@ async fn run_longmemeval(data: Option<&Path>, limit: Option<usize>) -> UaResult<
             "questions": total,
             "answerable": answerable,
             "scored": n,
-            "selection": if limit.is_some() { "limit" } else { "full" },
+            "selection": selection,
         },
         "strict_recall_at_5": {"hits": hits, "n": n, "recall": recall},
         "mrr_at_10": mrr,
@@ -1023,11 +1205,11 @@ async fn run_longmemeval(data: Option<&Path>, limit: Option<usize>) -> UaResult<
             "n": as_of_hits.len(),
             "recall_at_5": mean(&as_of_hits),
         },
-        "stale_share": {
-            "definition": "share of knowledge-update top-5 hits that are not evidence and predate the newest evidence session",
-            "hits": stale_seen,
-            "stale": stale,
-            "share": if stale_seen == 0 { 0.0 } else { round4(stale as f64 / stale_seen as f64) },
+        "older_non_evidence_share": {
+            "definition": "share of knowledge-update top-5 hits that are not evidence and predate the newest evidence session; not the design's stale share (no supersession links in LongMemEval), so not comparable with its 2% target",
+            "hits": older_seen,
+            "older": older,
+            "share": if older_seen == 0 { 0.0 } else { round4(older as f64 / older_seen as f64) },
         },
         "latency_ms": {
             "definition": "p95 of memory_search only, excluding ingest",
@@ -1085,10 +1267,10 @@ fn longmemeval_table(report: &Value) -> String {
         report["as_of_accuracy"]["n"].as_u64().unwrap_or(0),
     ));
     lines.push(format!(
-        "stale share (knowledge-update): {} ({}/{})",
-        report["stale_share"]["share"].as_f64().unwrap_or(0.0),
-        report["stale_share"]["stale"].as_u64().unwrap_or(0),
-        report["stale_share"]["hits"].as_u64().unwrap_or(0),
+        "older non-evidence share (knowledge-update, not the design's stale share): {} ({}/{})",
+        report["older_non_evidence_share"]["share"].as_f64().unwrap_or(0.0),
+        report["older_non_evidence_share"]["older"].as_u64().unwrap_or(0),
+        report["older_non_evidence_share"]["hits"].as_u64().unwrap_or(0),
     ));
     lines.push(format!(
         "search p95: {} ms (n={})",
@@ -1128,6 +1310,120 @@ mod tests {
         let at = note.content.find("violet-orchid-88").unwrap();
         assert!(at > 4096, "{at}");
         assert!(at > note.content.chars().count() * 2 / 3);
+    }
+
+    /// Lowercased alphanumeric words, as FTS5's unicode61 tokenizer splits them.
+    fn words(text: &str) -> Vec<String> {
+        text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect()
+    }
+
+    /// Two words match when equal or when they share a five-letter stem
+    /// (`archives` / `archive`), so a stem-only negative still counts.
+    fn shares_a_term(query: &str, note: &str) -> bool {
+        let stem = |w: &str| w.chars().take(5).collect::<String>();
+        let note_words = words(note);
+        words(query).iter().any(|q| note_words.iter().any(|n| n == q || (q.len() >= 5 && stem(n) == stem(q))))
+    }
+
+    #[test]
+    fn fixture_negatives_share_their_query_terms() {
+        let corpus = parse_corpus(CORPUS).unwrap();
+        let text = |key: &str| {
+            let n = corpus.notes.iter().find(|n| n.key == key).unwrap();
+            format!("{} {}", n.title, n.content)
+        };
+        let mut negatives = 0;
+        for q in &corpus.queries {
+            for key in q.must_not.iter().chain(&q.outranked) {
+                negatives += 1;
+                assert!(shares_a_term(&q.query, &text(key)), "{}: negative {key} shares no term", q.id);
+            }
+        }
+        assert!(negatives >= 5, "{negatives}");
+        // A stem-only query: no query word appears verbatim in its must note.
+        let q = corpus.queries.iter().find(|q| q.id == "para-stem").unwrap();
+        let must = words(&text(&q.must[0]));
+        assert!(words(&q.query).iter().all(|w| !must.contains(w)), "{}", q.query);
+    }
+
+    #[test]
+    fn an_outranked_note_above_a_must_note_fails_recall() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let (must, none) = (s(&["m"]), s(&[]));
+        assert_eq!(score_fixture(&s(&["m", "o"]), &must, &none, &s(&["o"])), (1.0, 1.0));
+        assert_eq!(score_fixture(&s(&["o", "m"]), &must, &none, &s(&["o"])), (0.0, 0.5));
+        assert_eq!(score_fixture(&s(&["m"]), &must, &none, &s(&["o"])), (1.0, 1.0));
+        assert_eq!(score_fixture(&s(&["m", "x"]), &must, &s(&["x"]), &none), (0.0, 1.0));
+    }
+
+    #[test]
+    fn floor_records_n_for_every_class() {
+        let corpus = parse_corpus(CORPUS).unwrap();
+        let floor = parse_floor(FLOOR).unwrap();
+        for f in &floor.classes {
+            let n = corpus.queries.iter().filter(|q| q.class == f.class).count();
+            assert_eq!(f.n, n, "{}", f.class);
+        }
+        let missing_n = r#"{"k": 5, "classes": [{"class": "x", "recall_at_5": 1.0, "mrr": 1.0}]}"#;
+        assert!(parse_floor(missing_n).is_err());
+    }
+
+    #[test]
+    fn scratch_dirs_are_unique_and_removed() {
+        let (a, b) = (Scratch::new("t").unwrap(), Scratch::new("t").unwrap());
+        assert_ne!(a.dir, b.dir);
+        let kept = a.dir.clone();
+        drop(a);
+        assert!(!kept.exists());
+    }
+
+    fn question(id: &str, sessions: usize) -> LmeQuestion {
+        // Same date and same text: every session ties on score and title.
+        let turns =
+            || vec![LmeTurn { role: "user".into(), content: "I repotted the fern on the balcony.".into() }];
+        LmeQuestion {
+            question_id: id.into(),
+            question_type: "knowledge-update".into(),
+            question: "Where is the fern?".into(),
+            question_date: None,
+            answer_session_ids: vec!["s3".into()],
+            haystack_session_ids: (0..sessions).map(|i| format!("s{i}")).collect(),
+            haystack_dates: vec!["2023/05/20 (Sat) 02:21".into(); sessions],
+            haystack_sessions: (0..sessions).map(|_| turns()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn longmemeval_ties_follow_session_order_and_leave_no_files() {
+        let scratch = Scratch::new("lme-test").unwrap();
+        let cfg = bench_config(&scratch.dir);
+        let q = question("tie/1", 8);
+        let first = score_question(&q, &scratch, &cfg).await.unwrap();
+        let again = score_question(&q, &scratch, &cfg).await.unwrap();
+        let want: Vec<String> = (0..8).map(|i| format!("s{i}")).collect();
+        assert_eq!(first.row.ranked, want);
+        assert_eq!(again.row.ranked, want);
+        // The question's database, -wal and -shm are gone, not left for exit.
+        let left: Vec<_> = std::fs::read_dir(&scratch.dir).unwrap().collect();
+        assert!(left.is_empty(), "{left:?}");
+        // Older non-evidence: s0-s2 and s4 are not evidence and none predates s3.
+        assert_eq!((first.older, first.older_seen), (0, 5));
+    }
+
+    #[test]
+    fn ids_select_answerable_questions_in_file_order() {
+        let qs = vec![question("a", 1), question("b_abs", 1), question("c", 1), question("d", 1)];
+        let (all, how) = select(&qs, None, None).unwrap();
+        assert_eq!((all.len(), how), (3, "full"));
+        let ids = vec!["d".to_string(), "a".to_string()];
+        let (picked, how) = select(&qs, None, Some(&ids)).unwrap();
+        let got: Vec<&str> = picked.iter().map(|q| q.question_id.as_str()).collect();
+        assert_eq!((got, how), (vec!["a", "d"], "ids"));
+        let (picked, how) = select(&qs, Some(1), Some(&ids)).unwrap();
+        assert_eq!((picked.len(), how), (1, "ids+limit"));
+        assert!(select(&qs, None, Some(&["b_abs".to_string()])).is_err());
+        assert!(select(&qs, None, Some(&["zz".to_string()])).is_err());
+        assert!(select(&qs, None, Some(&["a".to_string(), "a".to_string()])).is_err());
     }
 
     #[test]

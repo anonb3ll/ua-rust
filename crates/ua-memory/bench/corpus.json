@@ -11,8 +11,17 @@
     },
     {
       "key": "exact-noise",
-      "title": "Harbor status",
-      "content": "The harbor build finished on schedule.",
+      "title": "Harbor token rota",
+      "content": "Token quartz-falcon-71 was retired; falcon quartz 17 is the rota slot.",
+      "valid_from": "2026-01-15T00:00:00+00:00",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "exact-near",
+      "title": "Checklist for release",
+      "content": "Check the signing step, then rotate the key.",
       "valid_from": "2026-01-15T00:00:00+00:00",
       "tags": [
         "bench"
@@ -37,6 +46,15 @@
       ]
     },
     {
+      "key": "para-stem-near",
+      "title": "Archive index",
+      "content": "The archive index is rebuilt every week.",
+      "valid_from": "2026-01-15T00:00:00+00:00",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
       "key": "temporal-old",
       "title": "Badge maple",
       "content": "The office badge code is maple-2024 for the east wing.",
@@ -51,6 +69,16 @@
       "content": "The office badge code is cedar-2025 for the east wing.",
       "valid_from": "2025-06-01T00:00:00+00:00",
       "supersedes": "temporal-old",
+      "tags": [
+        "bench"
+      ]
+    },
+    {
+      "key": "temporal-recorded",
+      "title": "Locker code",
+      "content": "The west wing locker code is birch-2024.",
+      "valid_from": "2024-03-01T00:00:00+00:00",
+      "recorded_at": "2026-02-15T00:00:00+00:00",
       "tags": [
         "bench"
       ]
@@ -107,7 +135,7 @@
     {
       "key": "long-noise",
       "title": "Recovery preface",
-      "content": "The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. ",
+      "content": "The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The weekly rollup lists owners and dates. The violet planter by the orchid shelf holds 88 bulbs.",
       "valid_from": "2026-01-15T00:00:00+00:00",
       "tags": [
         "bench"
@@ -134,22 +162,24 @@
       "must": [
         "exact-key"
       ],
-      "must_not": [
-        "exact-noise"
-      ],
-      "as_of": null
+      "must_not": [],
+      "as_of": null,
+      "outranked": [
+        "exact-near"
+      ]
     },
     {
       "id": "para-stem",
       "class": "paraphrase",
-      "query": "running nightly",
+      "query": "running archives",
       "must": [
         "para-stem"
       ],
-      "must_not": [
-        "para-auto"
-      ],
-      "as_of": null
+      "must_not": [],
+      "as_of": null,
+      "outranked": [
+        "para-stem-near"
+      ]
     },
     {
       "id": "para-gap",
@@ -184,6 +214,16 @@
       "must_not": [
         "temporal-old"
       ]
+    },
+    {
+      "id": "temporal-recorded",
+      "class": "temporal",
+      "query": "locker code",
+      "as_of": "2024-06-01T00:00:00+00:00",
+      "must": [
+        "temporal-recorded"
+      ],
+      "must_not": []
     },
     {
       "id": "contra-supersede",
