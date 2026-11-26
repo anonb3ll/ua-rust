@@ -27,7 +27,7 @@ use ua_store::SchemaPart;
 
 pub use ua_memory::embed::{
     BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embed_batch, embedder_for,
-    embedder_for_org, register_embedder, vector_identity,
+    embedder_for_org, openai_compat_revision, register_embedder, register_remote_embedder, vector_identity,
 };
 pub use ua_memory::maintenance::{
     BackfillReport, EmbeddingCounts, MAX_BACKFILL_BATCHES_PER_PASS, backfill_all_orgs_step,
@@ -522,7 +522,8 @@ pub fn spawn_backfill(
                                 "memory background backfill completed pass"
                             );
                         }
-                        let any_more = reports.iter().any(|(_, r)| r.has_more && !r.stopped_unavailable);
+                        let any_more = total_notes > 0
+                            && reports.iter().any(|(_, r)| r.has_more && !r.stopped_unavailable);
                         if !any_more {
                             break;
                         }

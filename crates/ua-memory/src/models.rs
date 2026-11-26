@@ -161,6 +161,15 @@ pub fn load_verified_local_model(home: &Path, model_name: &str) -> Result<Verifi
     let Some(spec) = lookup_pinned_model(model_name) else {
         return Err(format!("unknown pinned local embedding model {model_name:?}"));
     };
+    load_verified_pinned_model(home, spec)
+}
+
+/// Read and SHA-256 verify every file of a specific [`PinnedModel`] manifest on
+/// disk. Never touches the network.
+pub fn load_verified_pinned_model(
+    home: &Path,
+    spec: &'static PinnedModel,
+) -> Result<VerifiedLocalModel, String> {
     let dir = model_dir(home, spec);
     let mut loaded: Vec<(&'static str, Vec<u8>)> = Vec::with_capacity(spec.files.len());
     for f in spec.files {
@@ -248,5 +257,68 @@ mod tests {
         assert!(matches!(status, LocalModelPresence::Missing { .. }), "{status:?}");
         let err = load_verified_local_model(dir.path(), "BAAI/bge-small-en-v1.5").unwrap_err();
         assert!(err.contains("ua memory models fetch"), "{err}");
+    }
+
+    #[test]
+    fn load_verified_pinned_model_rejects_same_size_corruption_and_size_mismatch() {
+        const ONNX: &[u8] = b"fake-onnx-bytes-0123";
+        const TOK: &[u8] = b"{\"tok\":1}";
+        const CFG: &[u8] = b"{\"cfg\":1}";
+        const SPEC: &[u8] = b"{\"spc\":1}";
+        const TCFG: &[u8] = b"{\"tcf\":1}";
+
+        let sha = |b: &[u8]| -> &'static str { Box::leak(hex::encode(Sha256::digest(b)).into_boxed_str()) };
+        let files: &'static [PinnedFile] = Box::leak(
+            vec![
+                PinnedFile { rel_path: "onnx/model.onnx", size_bytes: ONNX.len() as u64, sha256: sha(ONNX) },
+                PinnedFile { rel_path: "tokenizer.json", size_bytes: TOK.len() as u64, sha256: sha(TOK) },
+                PinnedFile { rel_path: "config.json", size_bytes: CFG.len() as u64, sha256: sha(CFG) },
+                PinnedFile {
+                    rel_path: "special_tokens_map.json",
+                    size_bytes: SPEC.len() as u64,
+                    sha256: sha(SPEC),
+                },
+                PinnedFile {
+                    rel_path: "tokenizer_config.json",
+                    size_bytes: TCFG.len() as u64,
+                    sha256: sha(TCFG),
+                },
+            ]
+            .into_boxed_slice(),
+        );
+        let pinned: &'static PinnedModel = Box::leak(Box::new(PinnedModel {
+            canonical_id: "test/tiny-local",
+            aliases: &[],
+            slug: "tiny-local",
+            hf_repo: "test/tiny-local",
+            revision: "deadbeef1234",
+            files,
+        }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mdir = model_dir(dir.path(), pinned);
+        fs::create_dir_all(mdir.join("onnx")).unwrap();
+        fs::write(mdir.join("onnx/model.onnx"), ONNX).unwrap();
+        fs::write(mdir.join("tokenizer.json"), TOK).unwrap();
+        fs::write(mdir.join("config.json"), CFG).unwrap();
+        fs::write(mdir.join("special_tokens_map.json"), SPEC).unwrap();
+        fs::write(mdir.join("tokenizer_config.json"), TCFG).unwrap();
+
+        // Valid files load cleanly.
+        let ok = load_verified_pinned_model(dir.path(), pinned).expect("valid model loads");
+        assert_eq!(ok.onnx_file, ONNX);
+
+        // Same-size 1-byte corruption MUST be refused by SHA-256 verification (catches M10).
+        let mut corrupt = ONNX.to_vec();
+        corrupt[0] ^= 0xff;
+        assert_eq!(corrupt.len(), ONNX.len());
+        fs::write(mdir.join("onnx/model.onnx"), &corrupt).unwrap();
+        let err = load_verified_pinned_model(dir.path(), pinned).unwrap_err();
+        assert!(err.contains("SHA-256 verification"), "expected SHA-256 failure, got: {err}");
+
+        // Wrong-size file is refused before hashing.
+        fs::write(mdir.join("onnx/model.onnx"), b"short").unwrap();
+        let err_sz = load_verified_pinned_model(dir.path(), pinned).unwrap_err();
+        assert!(err_sz.contains("has size 5 bytes"), "expected size failure, got: {err_sz}");
     }
 }

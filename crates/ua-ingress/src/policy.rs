@@ -436,7 +436,7 @@ impl Policy {
             return bad("the policy has no name");
         }
         if self.max_body_bytes == 0 || self.max_body_bytes > MAX_BODY_CEILING {
-            return bad("the body cap must be between 1 byte and 64 MiB");
+            return bad("the body cap must be between 1 byte and 256 MiB");
         }
         for t in [self.connect_timeout, self.request_timeout, self.total_timeout] {
             if t.is_zero() || t > MAX_TIMEOUT_CEILING {

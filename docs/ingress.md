@@ -98,7 +98,7 @@ class.
 A policy is relaxed when it uses `OperatorConfigured` or sets
 `accept_invalid_certs` (`Policy::is_relaxed`). There are four:
 `github.enterprise`, `notify.webhook`, `obsidian.local_rest` and
-`embedder.remote`. By construction:
+`memory.embedder_remote`. By construction:
 
 - **Not obtainable by name.** They are not in `policy::POLICIES` (the
   public list, every entry of which is strict); `policy::lookup` and

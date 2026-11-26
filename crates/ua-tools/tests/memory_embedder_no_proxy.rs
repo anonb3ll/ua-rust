@@ -43,6 +43,7 @@ async fn http_proxy_env_cannot_divert_embedder_requests() {
                 }
             }),
         )
+        .route("/api/show", post(|| async { Json(json!({ "digest": "sha256:no-proxy-rev" })) }))
         .route(
             "/v1/embeddings",
             post(move |Json(body): Json<Value>| async move {

@@ -1062,10 +1062,19 @@ impl Config {
                 "slack_identities",
                 "embed_api_key",
             ]));
-            // `[memory]` table overrides: `UA_MEMORY_EMBEDDER`,
-            // `UA_MEMORY_OLLAMA_MODEL`, `UA_MEMORY_OLLAMA_URL`, etc.
+            // `[memory]` table overrides: map ONLY the five supported keys so
+            // unrelated `UA_MEMORY_*` variables (e.g. from a shared Python hub
+            // env file such as `UA_MEMORY_PROVIDER` or `UA_MEMORY_RRF_K`) do
+            // not collide with `MemoryConfig`'s `deny_unknown_fields`.
             fig = fig.merge(
                 Env::prefixed("UA_MEMORY_")
+                    .only(&[
+                        "embedder",
+                        "ollama_model",
+                        "ollama_url",
+                        "openai_compat_url",
+                        "openai_compat_model",
+                    ])
                     .map(|k| format!("memory.{}", k.as_str().to_ascii_lowercase()).into()),
             );
         }

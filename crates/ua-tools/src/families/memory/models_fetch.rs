@@ -177,7 +177,10 @@ pub async fn fetch_pinned_with_client(
             anyhow::bail!("fetching {} returned HTTP {}", file.rel_path, status.as_u16());
         }
 
-        let tmp_path: PathBuf = dest.with_extension("part");
+        static PART_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let seq = PART_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base_name = dest.file_name().and_then(|s| s.to_str()).unwrap_or("model");
+        let tmp_path: PathBuf = dest.with_file_name(format!("{base_name}.{}.{seq}.part", std::process::id()));
         let write_res = async {
             let f = File::create(&tmp_path)?;
             let mut hw = HashingWriter { inner: f, hasher: Sha256::new() };

@@ -501,14 +501,14 @@ pub struct EmbeddingCounts {
 }
 
 /// Count live notes, fresh (scorable) embeddings, and stale embeddings for
-/// organization `org` using `cfg`'s active vector identity rule. Never loads a
-/// model or touches the network.
+/// organization `org` against the exact `active_identity` that semantic search
+/// uses for that organization (`None` when no embedder is available for `org`).
+/// Never loads a model or touches the network.
 pub fn embedding_freshness_counts(
     conn: &rusqlite::Connection,
     org: &str,
-    cfg: &Config,
+    active_identity: Option<&str>,
 ) -> UaResult<EmbeddingCounts> {
-    let rule = embed::expected_identity_rule(cfg);
     let mut counts = EmbeddingCounts::default();
     let mut stmt = conn.prepare(
         "SELECT m.id, m.title, m.content, e.model, e.content_sha \
@@ -539,16 +539,20 @@ pub fn embedding_freshness_counts(
         let Some(model) = emb_model else {
             continue;
         };
+        let Some(want) = active_identity else {
+            counts.stale_embedded += 1;
+            continue;
+        };
         let text = embed_text(title.as_deref(), &content);
         let sha = text_sha(&text);
-        let single_fresh = rule.matches(&model) && emb_sha.as_deref() == Some(sha.as_str());
+        let single_fresh = model == want && emb_sha.as_deref() == Some(sha.as_str());
         if !single_fresh {
             counts.stale_embedded += 1;
             continue;
         }
         let expected_chunks = chunks::chunk_text(&text).len() as i64;
         let (total_chunks, fresh_chunks): (i64, i64) =
-            chunk_stmt.query_row(params![org, &id, &model, &sha], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            chunk_stmt.query_row(params![org, &id, want, &sha], |r| Ok((r.get(0)?, r.get(1)?)))?;
         if total_chunks == expected_chunks && fresh_chunks == expected_chunks {
             counts.fresh_embedded += 1;
         } else {

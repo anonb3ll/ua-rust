@@ -19,7 +19,9 @@ use ua_ingress::policy::MODEL_DOWNLOAD;
 use ua_ingress::{Lookup, Outbound};
 use ua_tools::families::memory::models::{PinnedFile, PinnedModel};
 use ua_tools::families::memory::models_fetch::{fetch_pinned_with_client, local_model_status};
-use ua_tools::families::memory::remote::{build_guarded_client, build_ollama_embedder};
+use ua_tools::families::memory::remote::{
+    build_guarded_client, build_ollama_embedder, build_openai_compat_embedder,
+};
 use ua_tools::{Hub, builtin_registry};
 
 fn agent(label: &str, org: &str) -> Caller {
@@ -88,6 +90,14 @@ openai_compat_url = "https://embeddings.example.com/"
     let secret_in_toml = dir.path().join("secret.toml");
     std::fs::write(&secret_in_toml, "[memory]\napi_key = \"sk-test\"\n").unwrap();
     assert!(Config::load_from(&secret_in_toml).is_err());
+
+    // Even naming the internal Rust field (`embed_api_key_value`) in TOML MUST
+    // NOT populate the secret (`#[serde(skip)]`, never `skip_serializing` — catches M5).
+    let raw_field_toml = dir.path().join("raw_field.toml");
+    std::fs::write(&raw_field_toml, "embed_api_key_value = \"sk-leaked-from-toml\"\n").unwrap();
+    let cfg_raw = Config::load_from(&raw_field_toml).unwrap();
+    assert!(cfg_raw.embed_api_key_value.is_none(), "embed_api_key_value must never deserialize from TOML");
+    assert!(cfg_raw.embed_api_key().is_none(), "TOML value must never surface via embed_api_key()");
 }
 
 /// Acceptance item 6: with no local model present, `system_doctor` reports
@@ -265,13 +275,77 @@ async fn remote_endpoint_is_blocked_without_org_allow_remote_embedder() {
     });
     assert!(build_guarded_client("http://meta.test:80", true, Some(meta_lookup)).await.is_err());
 
-    // End-to-end org gate check: explicit `ollama` pointing at a remote IP literal
-    // is refused for an org with `allow_remote_embedder = 0` (lexical fallback)
-    // and accepted for an org with `allow_remote_embedder = 1`.
+    // Plain `http://` to a remote `openai_compat` endpoint with an API key is REFUSED
+    // so Bearer credentials never travel in cleartext.
+    let remote_only_lookup: Lookup = Arc::new(|_| {
+        Box::pin(async { Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)), 0)]) })
+    });
+    let cleartext_err = build_openai_compat_embedder(
+        "http://embed.internal:8080",
+        "text-embedding-3-small",
+        Some(SecretString::from("sk-never-cleartext".to_string())),
+        true,
+        Some(remote_only_lookup.clone()),
+    )
+    .await
+    .err()
+    .expect("remote http:// with API key must be refused");
+    assert!(cleartext_err.contains("plain http"), "{cleartext_err}");
+
+    // Same remote endpoint over `https://` succeeds and binds endpoint host:port into revision.
+    let https_remote = build_openai_compat_embedder(
+        "https://embed.internal:8443",
+        "text-embedding-3-small",
+        Some(SecretString::from("sk-over-tls".to_string())),
+        true,
+        Some(remote_only_lookup),
+    )
+    .await
+    .expect("https remote with allow_remote=true succeeds");
+    assert_eq!(https_remote.revision(), "embed.internal:8443/v1");
+
+    // Ollama probe failure refuses to embed when no prior good revision is cached,
+    // and keeps the last good revision (no `@unpinned` churn) once one has been seen.
+    let fail_probe = Arc::new(AtomicUsize::new(1));
+    let fail_probe_cl = fail_probe.clone();
+    let probe_app = Router::new().route(
+        "/api/show",
+        post(move || {
+            let f = fail_probe_cl.clone();
+            async move {
+                if f.load(Ordering::SeqCst) == 1 {
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "down" }))).into_response()
+                } else {
+                    Json(json!({ "digest": "sha256:stable-ollama-rev" })).into_response()
+                }
+            }
+        }),
+    );
+    let (probe_addr, _probe_srv) = bind_axum(probe_app).await;
+    let probe_url = format!("http://{probe_addr}");
+    assert!(
+        build_ollama_embedder(&probe_url, "probe-test-model", false, false, None).await.is_err(),
+        "must refuse to embed with unpinned revision when probe has never succeeded"
+    );
+    fail_probe.store(0, Ordering::SeqCst);
+    let ok_ollama = build_ollama_embedder(&probe_url, "probe-test-model", false, false, None)
+        .await
+        .expect("probe succeeds");
+    assert_eq!(ok_ollama.revision(), "sha256:stable-ollama-rev");
+    fail_probe.store(1, Ordering::SeqCst);
+    let cached_ollama = build_ollama_embedder(&probe_url, "probe-test-model", false, false, None)
+        .await
+        .expect("keeps last good revision on transient probe failure");
+    assert_eq!(cached_ollama.revision(), "sha256:stable-ollama-rev");
+
+    // End-to-end org gate check: remote endpoints are refused for an org with
+    // `allow_remote_embedder = 0` (lexical fallback) and accepted for an org
+    // with `allow_remote_embedder = 1`.
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::for_home(dir.path());
-    cfg.memory.embedder = "ollama".into();
-    cfg.memory.ollama_url = "http://10.20.30.40:11434".into();
+    cfg.memory.embedder = "openai_compat".into();
+    cfg.memory.openai_compat_url = Some("https://10.20.30.40:8443".into());
+    cfg.memory.openai_compat_model = Some("remote-embed-v1".into());
     let hub = Hub::in_memory(cfg.clone()).unwrap();
     hub.db()
         .write(|tx| {
@@ -284,15 +358,29 @@ async fn remote_endpoint_is_blocked_without_org_allow_remote_embedder() {
         })
         .unwrap();
 
-    // Default org (`allow_remote_embedder = 0`): gets unavailable NoopEmbedder.
+    // Default org (`allow_remote_embedder = 0`): gets unavailable NoopEmbedder,
+    // and `system_doctor` reports DEGRADED (not LIVE).
     let default_emb = ua_tools::families::memory::embedder_for_org(hub.db(), &cfg, DEFAULT_ORG).await;
     assert!(!default_emb.available(), "org without allow_remote_embedder must stay lexical-only");
     assert_eq!(default_emb.backend(), "noop");
+    let reg = builtin_registry();
+    let doc_def = reg.call(&hub, &agent("builder-1", DEFAULT_ORG), "system_doctor", json!({})).await.unwrap();
+    let sem_def =
+        doc_def["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "semantic_search").unwrap();
+    assert_eq!(sem_def["status"], "DEGRADED", "blocked remote org must show DEGRADED: {sem_def}");
 
-    // `org-remote` (`allow_remote_embedder = 1`): gets the `ollama` embedder.
+    // `org-remote` (`allow_remote_embedder = 1`): gets the `openai_compat` embedder.
     let remote_emb = ua_tools::families::memory::embedder_for_org(hub.db(), &cfg, "org-remote").await;
     assert!(remote_emb.available());
-    assert_eq!(remote_emb.backend(), "ollama");
+    assert_eq!(remote_emb.backend(), "openai_compat");
+
+    // Explicit `ollama` pointing at a remote IP is also blocked for default org.
+    let mut cfg_ol = cfg.clone();
+    cfg_ol.memory.embedder = "ollama".into();
+    cfg_ol.memory.ollama_url = "http://10.20.30.40:11434".into();
+    let default_ol = ua_tools::families::memory::embedder_for_org(hub.db(), &cfg_ol, DEFAULT_ORG).await;
+    assert!(!default_ol.available());
+    assert_eq!(default_ol.backend(), "noop");
 }
 
 /// Acceptance item 6: DNS rebinding after the check, a 302 redirect, and an
@@ -361,13 +449,15 @@ async fn dns_rebinding_redirect_and_http_proxy_cannot_move_request_off_checked_a
     let (trap_addr, _trap_srv) = bind_axum(trap_app).await;
 
     let redirect_target = format!("http://{trap_addr}/api/embed");
-    let redir_app = Router::new().route(
-        "/api/embed",
-        post(move || {
-            let target = redirect_target.clone();
-            async move { Redirect::temporary(&target) }
-        }),
-    );
+    let redir_app = Router::new()
+        .route("/api/show", post(|| async { Json(json!({ "digest": "sha256:redir-rev" })) }))
+        .route(
+            "/api/embed",
+            post(move || {
+                let target = redirect_target.clone();
+                async move { Redirect::temporary(&target) }
+            }),
+        );
     let (redir_addr, _redir_srv) = bind_axum(redir_app).await;
 
     let redir_emb =
@@ -479,30 +569,60 @@ async fn doctor_embedded_count_excludes_stale_vectors_until_backfill() {
     let (addr, _srv) = bind_axum(app).await;
 
     let dir = tempfile::tempdir().unwrap();
+    let reg = builtin_registry();
+    let caller = agent("builder-1", DEFAULT_ORG);
+
+    // First confirm userinfo in `ollama_url` is redacted in `system_doctor` output.
+    {
+        let mut cfg_ui = Config::for_home(dir.path());
+        cfg_ui.memory.embedder = "ollama".into();
+        cfg_ui.memory.ollama_model = "nomic-embed-text".into();
+        cfg_ui.memory.ollama_url = format!("http://secret-user:secret-pass@{addr}");
+        let hub_ui = Hub::in_memory(cfg_ui).unwrap();
+        let doc_ui = reg.call(&hub_ui, &caller, "system_doctor", json!({})).await.unwrap();
+        let row_ui = doc_ui["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["capability"] == "semantic_search")
+            .unwrap();
+        let detail_ui = row_ui["detail"].as_str().unwrap();
+        assert!(
+            !detail_ui.contains("secret-user") && !detail_ui.contains("secret-pass"),
+            "doctor must redact URL userinfo: {detail_ui}"
+        );
+    }
+
     let mut cfg = Config::for_home(dir.path());
     cfg.memory.embedder = "ollama".into();
     cfg.memory.ollama_model = "nomic-embed-text".into();
     cfg.memory.ollama_url = format!("http://{addr}");
 
     let hub = Hub::in_memory(cfg).unwrap();
-    let reg = builtin_registry();
-    let caller = agent("builder-1", DEFAULT_ORG);
 
-    // Plant two live notes with stale embeddings: one imported, one with an
-    // outdated content_sha under the active Ollama identity.
+    // Plant two live notes in `default` with stale embeddings (one imported,
+    // one with outdated content_sha), PLUS a live embedded note in `org-other`
+    // so dropping the org filter in `embedding_freshness_counts` fails (catches P3).
     let vec_bytes: Vec<u8> = [1.0f32, 0.0f32].iter().flat_map(|f| f.to_le_bytes()).collect();
     hub.db()
         .write(|tx| {
             tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
+                 VALUES ('org-other', 'org-other', 'Org Other', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            tx.execute(
                 "INSERT INTO memory (id, org_id, title, content, tags, created_at, updated_at) VALUES \
                  ('n-imp', 'default', 'Imported', 'imported body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'), \
-                 ('n-sha', 'default', 'Edited', 'edited body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                 ('n-sha', 'default', 'Edited', 'edited body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'), \
+                 ('n-other', 'org-other', 'Other org', 'other body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
                 [],
             )?;
             tx.execute(
                 "INSERT INTO memory_embeddings (org_id, note_id, model, dim, embedding, content_sha, updated_at) VALUES \
                  ('default', 'n-imp', 'import:bge-small', 2, ?1, '', '2026-01-01T00:00:00+00:00'), \
-                 ('default', 'n-sha', 'ollama:nomic-embed-text@sha256:doc-rev-1', 2, ?1, 'stale-sha', '2026-01-01T00:00:00+00:00')",
+                 ('default', 'n-sha', 'ollama:nomic-embed-text@sha256:doc-rev-1', 2, ?1, 'stale-sha', '2026-01-01T00:00:00+00:00'), \
+                 ('org-other', 'n-other', 'ollama:nomic-embed-text@sha256:doc-rev-1', 2, ?1, 'other-sha', '2026-01-01T00:00:00+00:00')",
                 [&vec_bytes],
             )?;
             Ok(())
@@ -518,8 +638,12 @@ async fn doctor_embedded_count_excludes_stale_vectors_until_backfill() {
         .unwrap();
     let detail_before = row_before["detail"].as_str().unwrap();
     assert!(
+        !detail_before.contains("secret-user") && !detail_before.contains("secret-pass"),
+        "doctor must redact URL userinfo: {detail_before}"
+    );
+    assert!(
         detail_before.contains("0 of 2 notes embedded (2 stale)"),
-        "doctor must exclude stale vectors from embedded count: {detail_before}"
+        "doctor must exclude stale vectors and other orgs from embedded count: {detail_before}"
     );
 
     // Backfill re-embeds both; doctor now reports 2 of 2 embedded and no stale count.
@@ -537,6 +661,37 @@ async fn doctor_embedded_count_excludes_stale_vectors_until_backfill() {
     assert!(
         detail_after.contains("2 of 2 notes embedded") && !detail_after.contains("stale"),
         "after backfill, doctor should report 2 of 2 fresh: {detail_after}"
+    );
+
+    // Verify `openai_compat` doctor freshness uses the EXACT same revision as `OpenAiCompatEmbedder`
+    // (no `v1` vs `remote` drift).
+    let oa_app = Router::new().route(
+        "/v1/embeddings",
+        post(|Json(body): Json<Value>| async move {
+            let n = body["input"].as_array().unwrap().len();
+            let data: Vec<Value> =
+                (0..n).map(|i| json!({ "index": i, "embedding": [1.0f32, 0.0] })).collect();
+            Json(json!({ "data": data }))
+        }),
+    );
+    let (oa_addr, _oa_srv) = bind_axum(oa_app).await;
+    let oa_dir = tempfile::tempdir().unwrap();
+    let mut oa_cfg = Config::for_home(oa_dir.path());
+    oa_cfg.memory.embedder = "openai_compat".into();
+    oa_cfg.memory.openai_compat_url = Some(format!("http://{oa_addr}"));
+    oa_cfg.memory.openai_compat_model = Some("text-embedding-3-small".into());
+    let oa_hub = Hub::in_memory(oa_cfg).unwrap();
+    reg.call(&oa_hub, &caller, "memory_save", json!({ "title": "OA", "content": "fresh openai note" }))
+        .await
+        .unwrap();
+    let oa_doc = reg.call(&oa_hub, &caller, "system_doctor", json!({})).await.unwrap();
+    let oa_row =
+        oa_doc["checks"].as_array().unwrap().iter().find(|c| c["capability"] == "semantic_search").unwrap();
+    let oa_detail = oa_row["detail"].as_str().unwrap();
+    assert_eq!(oa_row["status"], "LIVE", "{oa_row}");
+    assert!(
+        oa_detail.contains("1 of 1 notes embedded") && !oa_detail.contains("stale"),
+        "openai_compat doctor must count freshly embedded note as fresh: {oa_detail}"
     );
 }
 
@@ -571,20 +726,22 @@ async fn startup_backfill_automatically_reembeds_active_orgs_and_skips_suspended
     cfg.memory.ollama_url = format!("http://{addr}");
     let hub = Hub::in_memory(cfg).unwrap();
 
-    // Seed active second org and suspended org, plus stale/missing notes in all three.
+    // Seed suspended org that sorts BEFORE the active org (`org-0-suspended` < `org-z-active`)
+    // so checking `embedded_active == 2` can never race ahead of processing the suspended org
+    // (catches P2).
     hub.db()
         .write(|tx| {
             tx.execute(
                 "INSERT INTO orgs (id, slug, display_name, status, allowed_profiles, created_at) VALUES \
-                 ('org-active', 'org-active', 'Org Active', 'active', '[\"developer\"]', '2026-01-01T00:00:00+00:00'), \
-                 ('org-suspended', 'org-suspended', 'Org Suspended', 'suspended', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                 ('org-0-suspended', 'org-0-suspended', 'Org Suspended', 'suspended', '[\"developer\"]', '2026-01-01T00:00:00+00:00'), \
+                 ('org-z-active', 'org-z-active', 'Org Active', 'active', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
                 [],
             )?;
             tx.execute(
                 "INSERT INTO memory (id, org_id, title, content, tags, created_at, updated_at) VALUES \
                  ('n-def', 'default', 'Default', 'default body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'), \
-                 ('n-act', 'org-active', 'Active', 'active body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'), \
-                 ('n-sus', 'org-suspended', 'Suspended', 'suspended body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                 ('n-sus', 'org-0-suspended', 'Suspended', 'suspended body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'), \
+                 ('n-act', 'org-z-active', 'Active', 'active body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
                 [],
             )?;
             Ok(())
@@ -594,7 +751,7 @@ async fn startup_backfill_automatically_reembeds_active_orgs_and_skips_suspended
     let ct = tokio_util::sync::CancellationToken::new();
     let handle = ua_tools::families::memory::spawn_backfill(&hub, ct.clone()).expect("spawns backfill");
 
-    // Wait briefly for the startup pass to embed both active orgs automatically.
+    // Wait for `org-z-active` (which sorts AFTER `org-0-suspended`) to be embedded.
     let mut embedded_active = 0i64;
     for _ in 0..40 {
         embedded_active = hub
@@ -604,7 +761,7 @@ async fn startup_backfill_automatically_reembeds_active_orgs_and_skips_suspended
                     "SELECT COUNT(*) FROM memory_embeddings \
                      WHERE model = 'ollama:nomic-embed-text@sha256:startup-rev' \
                        AND content_sha <> '' \
-                       AND org_id IN ('default', 'org-active')",
+                       AND org_id IN ('default', 'org-z-active')",
                     [],
                     |r| r.get(0),
                 )?)
@@ -621,7 +778,7 @@ async fn startup_backfill_automatically_reembeds_active_orgs_and_skips_suspended
         .db()
         .read(|c| {
             Ok(c.query_row(
-                "SELECT COUNT(*) FROM memory_embeddings WHERE org_id = 'org-suspended'",
+                "SELECT COUNT(*) FROM memory_embeddings WHERE org_id = 'org-0-suspended'",
                 [],
                 |r| r.get(0),
             )?)
@@ -634,6 +791,12 @@ async fn startup_backfill_automatically_reembeds_active_orgs_and_skips_suspended
         .await
         .expect("backfill task exits promptly on cancellation")
         .expect("backfill task does not panic");
+
+    // Deterministic check: `backfill_all_orgs_step` never includes `org-0-suspended`.
+    let step_reports =
+        ua_tools::families::memory::backfill_all_orgs_step(hub.db(), hub.cfg(), 8).await.unwrap();
+    let step_orgs: Vec<&str> = step_reports.iter().map(|(o, _)| o.as_str()).collect();
+    assert_eq!(step_orgs, vec!["default", "org-z-active"]);
 }
 
 /// Persistently failing notes (e.g. a remote backend rejecting oversized notes)
@@ -750,5 +913,225 @@ async fn failing_notes_never_starve_later_notes_and_avoid_retry_storm() {
     assert_eq!(
         only_bad["embeddings"]["has_more"], false,
         "no untried stale notes remain past the 64th note: {only_bad}"
+    );
+}
+
+/// Catches M6 (`save.rs` ignoring org `allow_remote_embedder`) and P1
+/// (`maintenance.rs` backfill ignoring org `allow_remote_embedder`).
+#[tokio::test]
+async fn save_and_backfill_enforce_per_org_allow_remote_embedder_gate() {
+    use std::sync::Mutex;
+    use ua_tools::families::memory::{EmbedError, Embedder, register_remote_embedder};
+
+    struct RecordingRemoteEmbedder {
+        model: String,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+    impl Embedder for RecordingRemoteEmbedder {
+        fn model(&self) -> &str {
+            &self.model
+        }
+        fn backend(&self) -> &str {
+            "openai_compat"
+        }
+        fn revision(&self) -> &str {
+            "remote.test:443/v1"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.seen.lock().unwrap().extend(texts.iter().cloned());
+            Ok(vec![vec![1.0, 0.0]; texts.len()])
+        }
+    }
+
+    let model = "remote-gated-save-and-backfill-test";
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    register_remote_embedder(Arc::new(RecordingRemoteEmbedder { model: model.into(), seen: seen.clone() }));
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path());
+    cfg.embed_model = model.into();
+    let hub = Hub::in_memory(cfg).unwrap();
+    hub.db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, allowed_profiles, allow_remote_embedder, created_at) \
+                 VALUES ('org-remote-ok', 'org-remote-ok', 'Org Remote OK', '[\"developer\"]', 1, '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let reg = builtin_registry();
+    let c_def = agent("b-def", DEFAULT_ORG);
+    let c_rem = agent("b-rem", "org-remote-ok");
+
+    // 1. M6: `memory_save` in `default` (`allow_remote_embedder = 0`) MUST NOT
+    //    send text to the remote embedder or write a vector; `org-remote-ok` MUST.
+    seen.lock().unwrap().clear();
+    reg.call(&hub, &c_def, "memory_save", json!({ "title": "DefSave", "content": "default-secret-save" }))
+        .await
+        .unwrap();
+    reg.call(&hub, &c_rem, "memory_save", json!({ "title": "RemSave", "content": "remote-allowed-save" }))
+        .await
+        .unwrap();
+    {
+        let inputs = seen.lock().unwrap();
+        assert!(
+            inputs.iter().all(|s| !s.contains("default-secret-save")),
+            "default org leaked on save: {inputs:?}"
+        );
+        assert!(
+            inputs.iter().any(|s| s.contains("remote-allowed-save")),
+            "remote org must embed on save: {inputs:?}"
+        );
+    }
+    let def_vecs: i64 = hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM memory_embeddings WHERE org_id = 'default'", [], |r| {
+                r.get(0)
+            })?)
+        })
+        .unwrap();
+    let rem_vecs: i64 = hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE org_id = 'org-remote-ok'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(def_vecs, 0);
+    assert_eq!(rem_vecs, 1);
+
+    // 2. P1: plant unembedded notes in both orgs, run `backfill_all_orgs_step`:
+    //    `default` MUST NOT send text to the remote embedder; `org-remote-ok` MUST.
+    hub.db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO memory (id, org_id, title, content, tags, created_at, updated_at) VALUES \
+                 ('bf-def', 'default', 'DefBF', 'default-secret-backfill', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'), \
+                 ('bf-rem', 'org-remote-ok', 'RemBF', 'remote-allowed-backfill', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    seen.lock().unwrap().clear();
+    let reports = ua_tools::families::memory::backfill_all_orgs_step(hub.db(), hub.cfg(), 8).await.unwrap();
+    let def_rep = reports.iter().find(|(o, _)| o == "default").unwrap();
+    let rem_rep = reports.iter().find(|(o, _)| o == "org-remote-ok").unwrap();
+    assert!(!def_rep.1.available, "default org must see unavailable remote embedder");
+    assert_eq!(def_rep.1.notes_embedded, 0);
+    assert!(rem_rep.1.available);
+    assert_eq!(rem_rep.1.notes_embedded, 1);
+    {
+        let inputs = seen.lock().unwrap();
+        assert!(
+            inputs.iter().all(|s| !s.contains("default-secret-backfill")),
+            "default org leaked during backfill: {inputs:?}"
+        );
+        assert!(
+            inputs.iter().any(|s| s.contains("remote-allowed-backfill")),
+            "remote org must embed during backfill: {inputs:?}"
+        );
+    }
+}
+
+/// Background `spawn_backfill` must NEVER hot-loop on HTTP 401 (revoked key)
+/// or on a corpus of 70 permanently-failing notes (HTTP 400).
+#[tokio::test]
+async fn spawn_backfill_stops_without_hot_looping_on_401_or_failing_corpus() {
+    // 1. Revoked key (HTTP 401): stops after the VERY FIRST request, never
+    //    re-sending note text and the Bearer key 64+ times.
+    let hits_401 = Arc::new(AtomicUsize::new(0));
+    let hits_401_cl = hits_401.clone();
+    let app_401 = Router::new().route(
+        "/v1/embeddings",
+        post(move || {
+            let h = hits_401_cl.clone();
+            async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid api key" })))
+            }
+        }),
+    );
+    let (addr_401, _srv_401) = bind_axum(app_401).await;
+    let dir1 = tempfile::tempdir().unwrap();
+    let mut cfg1 = Config::for_home(dir1.path());
+    cfg1.memory.embedder = "openai_compat".into();
+    cfg1.memory.openai_compat_url = Some(format!("http://{addr_401}"));
+    cfg1.memory.openai_compat_model = Some("m".into());
+    let hub1 = Hub::in_memory(cfg1).unwrap();
+    hub1.db()
+        .write(|tx| {
+            for i in 0..70 {
+                tx.execute(
+                    "INSERT INTO memory (id, org_id, title, content, tags, created_at, updated_at) \
+                     VALUES (?1, 'default', 'T', 'body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                    [format!("n401-{i:02}")],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let ct1 = tokio_util::sync::CancellationToken::new();
+    let h1 = ua_tools::families::memory::spawn_backfill(&hub1, ct1.clone()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    ct1.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), h1).await.unwrap().unwrap();
+    assert_eq!(
+        hits_401.load(Ordering::SeqCst),
+        1,
+        "401 auth failure must stop backfill after 1 request without hot-looping"
+    );
+
+    // 2. 70 permanently-rejected notes (HTTP 400): bounded to 1 pass (<= 64 calls)
+    //    because zero progress stops the tight catch-up loop (no 64 -> 128 -> 192 storm).
+    let hits_400 = Arc::new(AtomicUsize::new(0));
+    let hits_400_cl = hits_400.clone();
+    let app_400 = Router::new().route(
+        "/v1/embeddings",
+        post(move || {
+            let h = hits_400_cl.clone();
+            async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::BAD_REQUEST, Json(json!({ "error": "too long" })))
+            }
+        }),
+    );
+    let (addr_400, _srv_400) = bind_axum(app_400).await;
+    let dir2 = tempfile::tempdir().unwrap();
+    let mut cfg2 = Config::for_home(dir2.path());
+    cfg2.memory.embedder = "openai_compat".into();
+    cfg2.memory.openai_compat_url = Some(format!("http://{addr_400}"));
+    cfg2.memory.openai_compat_model = Some("m".into());
+    let hub2 = Hub::in_memory(cfg2).unwrap();
+    hub2.db()
+        .write(|tx| {
+            for i in 0..70 {
+                tx.execute(
+                    "INSERT INTO memory (id, org_id, title, content, tags, created_at, updated_at) \
+                     VALUES (?1, 'default', 'T', 'body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                    [format!("n400-{i:02}")],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let ct2 = tokio_util::sync::CancellationToken::new();
+    let h2 = ua_tools::families::memory::spawn_backfill(&hub2, ct2.clone()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    ct2.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), h2).await.unwrap().unwrap();
+    let total_400 = hits_400.load(Ordering::SeqCst);
+    assert!(
+        (1..=64).contains(&total_400),
+        "zero-progress catch-up loop must stop after at most 1 bounded pass (64), got {total_400}"
     );
 }

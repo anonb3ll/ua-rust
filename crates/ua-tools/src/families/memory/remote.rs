@@ -13,7 +13,8 @@
 //! - API keys for `openai_compat` come exclusively from `UA_EMBED_API_KEY`
 //!   (`Config::embed_api_key`) and are attached via `Request::secret_header`.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -88,6 +89,8 @@ struct OllamaShowResponse {
     #[serde(default)]
     digest: Option<String>,
     #[serde(default)]
+    modified_at: Option<String>,
+    #[serde(default)]
     details: Option<OllamaShowDetails>,
 }
 
@@ -95,6 +98,21 @@ struct OllamaShowResponse {
 struct OllamaShowDetails {
     #[serde(default)]
     quantization_level: Option<String>,
+}
+
+fn ollama_revision_cache() -> &'static Mutex<HashMap<(String, String), String>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, String), String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_ollama_revision(origin: &str, model: &str) -> Option<String> {
+    ollama_revision_cache().lock().ok()?.get(&(origin.to_string(), model.to_string())).cloned()
+}
+
+fn store_ollama_revision(origin: &str, model: &str, rev: &str) {
+    if let Ok(mut map) = ollama_revision_cache().lock() {
+        map.insert((origin.to_string(), model.to_string()), rev.to_string());
+    }
 }
 
 fn ollama_endpoint(base: &Url, suffix: &str) -> Result<Url, EmbedError> {
@@ -125,7 +143,8 @@ async fn probe_ollama_model(base: &Url, client: &Outbound, model: &str, timeout:
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         })
-        .unwrap_or("unpinned")
+        .or_else(|| parsed.modified_at.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("present")
         .to_string();
     Some(rev)
 }
@@ -143,16 +162,25 @@ pub async fn build_ollama_embedder(
         return Err("memory.ollama_model is empty".into());
     }
     let (url, _resolved, client) = build_guarded_client(base_url, allow_remote, lookup).await?;
+    let origin = url.origin().ascii_serialization();
     let probe_timeout = if require_probe { AUTO_PROBE_TIMEOUT } else { Duration::from_secs(3) };
     let revision = match probe_ollama_model(&url, &client, model, probe_timeout).await {
-        Some(rev) => rev,
-        None if require_probe => {
-            return Err(format!(
-                "loopback Ollama at {} does not serve model {model:?}",
-                url.origin().ascii_serialization()
-            ));
+        Some(rev) => {
+            store_ollama_revision(&origin, model, &rev);
+            rev
         }
-        None => "unpinned".into(),
+        None if require_probe => {
+            return Err(format!("loopback Ollama at {origin} does not serve model {model:?}"));
+        }
+        None => match cached_ollama_revision(&origin, model) {
+            Some(last_good) => last_good,
+            None => {
+                return Err(format!(
+                    "Ollama at {origin} is unreachable or does not serve model {model:?}; \
+                     refusing to embed without a pinned revision"
+                ));
+            }
+        },
     };
     Ok(Arc::new(OllamaEmbedder { base_url: url, model: model.to_string(), revision, client }))
 }
@@ -178,7 +206,10 @@ impl Embedder for OllamaEmbedder {
         let req = Request::post(url)
             .json(&json!({ "model": self.model, "input": texts }))
             .map_err(|e| EmbedError::runtime(e.to_string()))?;
-        let resp = block_on(self.client.send(req)).map_err(|e| EmbedError::runtime(e.to_string()))?;
+        let resp = block_on(self.client.send(req)).map_err(|e| EmbedError {
+            category: "model_acquisition",
+            message: format!("ollama embedder unreachable: {e}"),
+        })?;
         let status = resp.status();
         if !status.is_success() {
             return Err(EmbedError::runtime(format!("ollama embedder returned HTTP {}", status.as_u16())));
@@ -201,6 +232,7 @@ impl Embedder for OllamaEmbedder {
 pub struct OpenAiCompatEmbedder {
     endpoint_url: Url,
     model: String,
+    revision: String,
     api_key: Option<SecretString>,
     client: Outbound,
 }
@@ -241,9 +273,16 @@ pub async fn build_openai_compat_embedder(
     if model.is_empty() {
         return Err("embedder model name is empty".into());
     }
-    let (url, _resolved, client) = build_guarded_client(base_url, allow_remote, lookup).await?;
+    let (url, resolved, client) = build_guarded_client(base_url, allow_remote, lookup).await?;
+    if resolved.is_remote && api_key.is_some() && url.scheme() != "https" {
+        return Err(
+            "refusing to send UA_EMBED_API_KEY over plain http to a remote openai_compat endpoint; use https"
+                .into(),
+        );
+    }
     let endpoint_url = openai_endpoint(&url);
-    Ok(Arc::new(OpenAiCompatEmbedder { endpoint_url, model: model.to_string(), api_key, client }))
+    let revision = ua_memory::openai_compat_revision(base_url);
+    Ok(Arc::new(OpenAiCompatEmbedder { endpoint_url, model: model.to_string(), revision, api_key, client }))
 }
 
 impl Embedder for OpenAiCompatEmbedder {
@@ -256,7 +295,7 @@ impl Embedder for OpenAiCompatEmbedder {
     }
 
     fn revision(&self) -> &str {
-        "v1"
+        &self.revision
     }
 
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
@@ -271,8 +310,17 @@ impl Embedder for OpenAiCompatEmbedder {
                 .secret_header("authorization", &format!("Bearer {}", key.expose_secret()))
                 .map_err(|e| EmbedError::runtime(e.to_string()))?;
         }
-        let resp = block_on(self.client.send(req)).map_err(|e| EmbedError::runtime(e.to_string()))?;
+        let resp = block_on(self.client.send(req)).map_err(|e| EmbedError {
+            category: "model_acquisition",
+            message: format!("openai_compat embedder unreachable: {e}"),
+        })?;
         let status = resp.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            return Err(EmbedError {
+                category: "model_acquisition",
+                message: format!("openai_compat embedder authentication refused (HTTP {})", status.as_u16()),
+            });
+        }
         if !status.is_success() {
             return Err(EmbedError::runtime(format!(
                 "openai_compat embedder returned HTTP {}",
