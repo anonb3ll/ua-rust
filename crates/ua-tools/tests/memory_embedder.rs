@@ -635,3 +635,120 @@ async fn startup_backfill_automatically_reembeds_active_orgs_and_skips_suspended
         .expect("backfill task exits promptly on cancellation")
         .expect("backfill task does not panic");
 }
+
+/// Persistently failing notes (e.g. a remote backend rejecting oversized notes)
+/// never starve later notes, report attempted batches so stalls are visible,
+/// set `has_more` only when untried stale notes remain, and avoid infinite
+/// retry storms until the note's content or active identity changes.
+#[tokio::test]
+async fn failing_notes_never_starve_later_notes_and_avoid_retry_storm() {
+    let app = Router::new()
+        .route("/api/show", post(|| async { Json(json!({ "digest": "sha256:starve-rev" })) }))
+        .route(
+            "/api/embed",
+            post(|Json(body): Json<Value>| async move {
+                let inputs = body["input"].as_array().unwrap();
+                if inputs.iter().any(|v| v.as_str().is_some_and(|s| s.contains("REJECT_ME"))) {
+                    return (StatusCode::BAD_REQUEST, Json(json!({ "error": "input rejected" })))
+                        .into_response();
+                }
+                Json(json!({ "embeddings": vec![vec![1.0f32, 0.0]; inputs.len()] })).into_response()
+            }),
+        );
+    let (addr, _srv) = bind_axum(app).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path());
+    cfg.memory.embedder = "ollama".into();
+    cfg.memory.ollama_model = "nomic-embed-text".into();
+    cfg.memory.ollama_url = format!("http://{addr}");
+
+    // Case 1: 64 always-failing notes followed by 1 good note.
+    let hub = Hub::in_memory(cfg.clone()).unwrap();
+    let reg = builtin_registry();
+    let caller = agent("builder-1", DEFAULT_ORG);
+    hub.db()
+        .write(|tx| {
+            for i in 0..64 {
+                tx.execute(
+                    "INSERT INTO memory (id, org_id, title, content, tags, created_at, updated_at) \
+                     VALUES (?1, 'default', ?2, 'REJECT_ME payload', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                    rusqlite::params![format!("bad-{i:02}"), format!("Bad {i}")],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO memory (id, org_id, title, content, tags, created_at, updated_at) \
+                 VALUES ('good-65', 'default', 'Good tail', 'valid tail body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Pass 1: hits the 8-batch cap on the 64 failing notes, reports attempted
+    // batches = 8 and has_more = true because good-65 is untried past the cursor.
+    let p1 = reg.call(&hub, &caller, "recall_maintenance", json!({})).await.unwrap();
+    assert_eq!(p1["embeddings"]["batches"], 8, "attempted batches must be visible: {p1}");
+    assert_eq!(p1["embeddings"]["notes_embedded"], 0, "{p1}");
+    assert_eq!(p1["embeddings"]["failed"], 64, "{p1}");
+    assert_eq!(p1["embeddings"]["has_more"], true, "{p1}");
+
+    // Pass 2: resumes past the cursor and embeds good-65 instead of starving it!
+    let p2 = reg.call(&hub, &caller, "recall_maintenance", json!({})).await.unwrap();
+    assert_eq!(p2["embeddings"]["batches"], 1, "{p2}");
+    assert_eq!(p2["embeddings"]["notes_embedded"], 1, "good-65 must not be starved: {p2}");
+    assert_eq!(p2["embeddings"]["failed"], 0, "{p2}");
+    assert_eq!(p2["embeddings"]["has_more"], false, "{p2}");
+
+    let good_embedded: i64 = hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE note_id = 'good-65' AND content_sha <> ''",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(good_embedded, 1);
+
+    // Pass 3: failing notes are in (identity, content_sha) cooldown -> no retry storm.
+    let p3 = reg.call(&hub, &caller, "recall_maintenance", json!({})).await.unwrap();
+    assert_eq!(p3["embeddings"]["batches"], 0, "{p3}");
+    assert_eq!(p3["embeddings"]["failed"], 0, "{p3}");
+    assert_eq!(p3["embeddings"]["has_more"], false, "{p3}");
+
+    // Editing bad-00 changes its content_sha so it leaves cooldown immediately.
+    hub.db()
+        .write(|tx| {
+            tx.execute("UPDATE memory SET content = 'now valid body' WHERE id = 'bad-00'", [])?;
+            Ok(())
+        })
+        .unwrap();
+    let p4 = reg.call(&hub, &caller, "recall_maintenance", json!({})).await.unwrap();
+    assert_eq!(p4["embeddings"]["batches"], 1, "{p4}");
+    assert_eq!(p4["embeddings"]["notes_embedded"], 1, "edited note must retry immediately: {p4}");
+    assert_eq!(p4["embeddings"]["has_more"], false, "{p4}");
+
+    // Case 2: 64 always-failing notes with NO untried notes after them -> has_more = false.
+    let hub2 = Hub::in_memory(cfg).unwrap();
+    hub2.db()
+        .write(|tx| {
+            for i in 0..64 {
+                tx.execute(
+                    "INSERT INTO memory (id, org_id, title, content, tags, created_at, updated_at) \
+                     VALUES (?1, 'default', ?2, 'REJECT_ME payload', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                    rusqlite::params![format!("only-bad-{i:02}"), format!("Only Bad {i}")],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let only_bad = reg.call(&hub2, &caller, "recall_maintenance", json!({})).await.unwrap();
+    assert_eq!(only_bad["embeddings"]["batches"], 8, "{only_bad}");
+    assert_eq!(only_bad["embeddings"]["failed"], 64, "{only_bad}");
+    assert_eq!(
+        only_bad["embeddings"]["has_more"], false,
+        "no untried stale notes remain past the 64th note: {only_bad}"
+    );
+}
