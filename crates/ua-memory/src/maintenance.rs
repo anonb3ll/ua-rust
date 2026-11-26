@@ -41,14 +41,15 @@ fn live_notes(conn: &rusqlite::Connection, org: &str, extra: &str) -> UaResult<V
 
 /// Organization `org`'s live notes that look superseded, low-salience, or
 /// old and never accessed, most reasons first.
-pub async fn prune_candidates(db: &Db, org: &str, a: PruneRequest) -> UaResult<Value> {
+/// `cfg.clock` dates the age cutoff.
+pub async fn prune_candidates(db: &Db, cfg: &Config, org: &str, a: PruneRequest) -> UaResult<Value> {
     let threshold = a.salience_threshold.unwrap_or(0.3);
     let max_age = a.max_age_days.unwrap_or(30.0);
     if !threshold.is_finite() || !max_age.is_finite() {
         return Err(UaError::invalid("salience_threshold and max_age_days must be finite numbers"));
     }
     let limit = a.limit.unwrap_or(50).max(0) as usize;
-    let cutoff = days_ago(max_age);
+    let cutoff = days_ago(&cfg.clock, max_age);
     let org = org.to_string();
     db.read_async(move |c| {
         let mut candidates: Vec<(usize, f64, Value)> = Vec::new();
@@ -342,9 +343,11 @@ pub async fn backfill_embeddings_capped(
         }
 
         if !embedded.is_empty() {
-            let (org_w, id_w) = (org.to_string(), identity.clone());
+            let (org_w, id_w, clock) = (org.to_string(), identity.clone(), cfg.clock);
             let (written_notes, written_chunks) = db
                 .write_async(move |tx| {
+                    // Read inside the write, so vector timestamps follow commit order.
+                    let ts = clock.now();
                     let mut notes_n = 0usize;
                     let mut chunks_n = 0usize;
                     let mut seen_ids: HashMap<String, ()> = HashMap::new();
@@ -364,6 +367,7 @@ pub async fn backfill_embeddings_capped(
                                 &id_w,
                                 &item.single,
                                 &item.expected_sha,
+                                &ts,
                             )?;
                             chunks_n += embed::store_chunks(
                                 tx,
@@ -395,7 +399,7 @@ pub async fn backfill_embeddings_capped(
 /// Organization `org`'s stale (old, never recalled, salience <= 0.5) and
 /// low-confidence notes, plus a best-effort embedding backfill pass in batches
 /// of [`BACKFILL_BATCH`] (8) notes. Refuses `dry_run = false`: it never
-/// deletes or modifies any note.
+/// deletes or modifies any note. `cfg.clock` dates the staleness cutoff.
 pub async fn recall_maintenance(db: &Db, cfg: &Config, org: &str, a: MaintenanceRequest) -> UaResult<Value> {
     if !a.dry_run {
         return Err(UaError::invalid(
@@ -409,7 +413,7 @@ pub async fn recall_maintenance(db: &Db, cfg: &Config, org: &str, a: Maintenance
         return Err(UaError::invalid("stale_days and confidence_floor must be finite numbers"));
     }
     let limit = a.limit.unwrap_or(100).max(0) as usize;
-    let cutoff = days_ago(stale_days);
+    let cutoff = days_ago(&cfg.clock, stale_days);
     let org_owned = org.to_string();
     let mut out = db
         .read_async(move |c| {

@@ -480,6 +480,12 @@ pub struct Config {
     /// Gate runs (`check` and `draft`) one caller may make per hour, so the
     /// private denylist cannot be probed term by term. 0 refuses every run.
     pub relay_checks_per_hour: u32,
+    /// The clock the memory domain reads for "now" (search recency and age
+    /// discount, expiry, stored timestamps). Always the wall clock in a
+    /// running hub; tests and the retrieval bench inject a fixed one. Not
+    /// configurable from a file or the environment.
+    #[serde(skip)]
+    pub clock: crate::time::Clock,
 }
 
 /// One Slack user the Slack routes accept, and the hub identity it acts as.
@@ -833,6 +839,7 @@ impl Default for Config {
             relay_mention_allowlist: Vec::new(),
             relay_redirector_hosts: DEFAULT_REDIRECTOR_HOSTS.iter().map(|h| h.to_string()).collect(),
             relay_checks_per_hour: 60,
+            clock: crate::time::Clock::System,
         }
     }
 }

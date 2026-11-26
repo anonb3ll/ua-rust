@@ -75,9 +75,16 @@ Facts the first draft did not record:
   parseable proposal file became `apply` commands.
 - **Memory scope is not one code path.** About a dozen tools read the `memory`
   table directly, not through `Filter`. See the inventory in §3.
-- **The clock is called directly.** `ua_core::time::now()` is called in
-  `search.rs` (search and list), `similar_notes`, `maintenance.rs`
-  (`days_ago`), `save.rs` and `lifecycle.rs`; `Filter` itself receives `now`.
+- **The clock is injected.** Every memory operation reads `Config.clock`
+  (`ua_core::time::Clock`): search, list and get, `similar_notes`,
+  `maintenance.rs` (`days_ago` and the embedding backfill), `save.rs` and
+  `lifecycle.rs`. Writes read it inside the write transaction, so timestamps
+  follow commit order. A hub uses the wall clock; tests and the retrieval
+  bench fix it. The
+  `memory_versions_capture` trigger still writes SQLite's wall clock into
+  `recorded_at`; its schema part is checksum-locked, so the write path
+  restamps the captured version from `Config.clock` in the same transaction.
+  Ledger event timestamps still come from `ua-store`.
 
 A note on the honest ceiling: this ranker is competitive. The claim that the
 result is "as good as or better than a leading memory system" is currently
@@ -97,21 +104,23 @@ result is "as good as or better than a leading memory system" is currently
 
 ### 1. Evidence
 
-**Landed, not yet gating.** `crates/ua-memory/src/bench.rs`, the fixture corpus
+**Landed and gating.** `crates/ua-memory/src/bench.rs`, the fixture corpus
 and `floor.json` are in PR #53 (merged `e84f4b03`), and
-`docs/evals/memory-bench.md` records the runs. The harness does not gate merges
-until task #2798 lands: it still breaks LongMemEval ties nondeterministically,
-leaks a scratch database per question, and has fixture negatives that lexical
-search cannot fail.
+`docs/evals/memory-bench.md` records the runs. Task #2798 made the harness fit
+to gate merges: search breaks score ties on insertion order, the clock is
+injected and fixed in the bench, each LongMemEval question's scratch files are
+removed when it finishes, and every fixture negative shares its query's terms.
 
 Measured on that head, lexical-only, release build, all 470 answerable
 LongMemEval questions: strict recall@5 0.8489 (399/470), MRR@10 0.8389, `as_of`
-accuracy 0.48, search p95 18 ms. The fixture floor is overall recall@5 0.8889,
-with the paraphrase class at 0.5. Multi-session (0.686) and `as_of` (0.48) are
-the weak classes; the chunked-embedding step targets the first.
+accuracy 0.48, search p95 18 ms. The fixture floor is overall recall@5 0.8000,
+with two recorded gaps: the paraphrase class at 0.5 (`sedan` and
+`automobile`) and the temporal class at 0.6667 (a note recorded after its
+`valid_from` is invisible to an `as_of` between the two). Multi-session
+(0.686) and `as_of` (0.48) are the weak classes; the chunked-embedding step
+targets the first.
 
-The product claim still cannot be tested until the harness is deterministic:
-unit tests prove that the code does what it says, not that retrieval is good.
+Unit tests prove that the code does what it says, not that retrieval is good.
 This step gates everything after it.
 
 **Corpus.** A checked-in fixture corpus (`ua-memory/bench/`): notes, labelled
@@ -147,8 +156,8 @@ difference fails outright.
 - The bench registers a lookup embedder with `register_embedder`, so CI needs
   no model and no network. It asserts the search ran in hybrid mode for the
   paraphrase class, so a lexical-only run cannot pass it silently.
-- The clock is injected: threading one clock through the direct `now()`
-  callers listed above is named work in this step, not an assumption.
+- The clock is injected: one clock (`Config.clock`) is threaded through the
+  `now()` callers listed above, and the bench fixes it.
 - Search writes access counters as a side effect, so each query runs against a
   fresh copy of the fixture database.
 - The consolidation class uses checked-in summaries, since model-written ones

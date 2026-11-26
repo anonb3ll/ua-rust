@@ -329,6 +329,7 @@ pub(crate) fn store_vector(
     model: &str,
     v: &[f32],
     content_sha: &str,
+    ts: &str,
 ) -> UaResult<()> {
     conn.execute(
         "INSERT INTO memory_embeddings (org_id, note_id, model, dim, embedding, content_sha, updated_at) \
@@ -336,7 +337,7 @@ pub(crate) fn store_vector(
          ON CONFLICT(note_id) DO UPDATE SET model = excluded.model, dim = excluded.dim, \
            embedding = excluded.embedding, content_sha = excluded.content_sha, updated_at = excluded.updated_at \
          WHERE memory_embeddings.org_id = excluded.org_id",
-        params![org, note_id, model, v.len() as i64, to_blob(v), content_sha, ua_core::time::now()],
+        params![org, note_id, model, v.len() as i64, to_blob(v), content_sha, ts],
     )?;
     Ok(())
 }
@@ -377,7 +378,7 @@ pub(crate) fn store_chunks(
 /// `max(single_vector_cosine, best_chunk_cosine)`.
 pub trait VectorIndex: Send + Sync {
     /// The `k` best notes passing `filter` with similarity >= `min_similarity`,
-    /// best first (ties by id). `filter` names the organization, so only its
+    /// best first (ties by insertion order). `filter` names the organization, so only its
     /// notes' vectors are scanned, ranked or returned.
     fn nearest(
         &self,
@@ -437,10 +438,12 @@ impl VectorIndex for BruteForceIndex {
     ) -> UaResult<Vec<(String, f32)>> {
         let mut sha_cache: HashMap<String, String> = HashMap::new();
         let mut best: HashMap<String, f32> = HashMap::new();
+        // Insertion order of each scored note, for the tie-break below.
+        let mut seqs: HashMap<String, i64> = HashMap::new();
 
         // 1. Single-vector scan.
         let single_sql = format!(
-            "SELECT e.note_id, e.embedding, e.content_sha, m.title, m.content \
+            "SELECT e.note_id, e.embedding, e.content_sha, m.title, m.content, m.seq \
              FROM memory_embeddings e \
              JOIN memory m ON m.id = e.note_id AND m.org_id = e.org_id \
              WHERE e.model = ? AND e.dim = ? AND e.content_sha <> '' AND {}",
@@ -457,22 +460,24 @@ impl VectorIndex for BruteForceIndex {
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
             })?;
             for row in rows {
-                let (id, blob, stored_sha, title, content) = row?;
+                let (id, blob, stored_sha, title, content, seq) = row?;
                 let current_sha = note_current_sha(&mut sha_cache, &id, title.as_deref(), &content);
                 if stored_sha != current_sha {
                     continue;
                 }
                 let sim = cosine(query, &from_blob(&blob));
+                seqs.insert(id.clone(), seq);
                 record_max(&mut best, id, sim);
             }
         }
 
         // 2. Chunk-vector scan: keep max(single, best chunk) per note.
         let chunk_sql = format!(
-            "SELECT c.note_id, c.embedding, c.content_sha, m.title, m.content \
+            "SELECT c.note_id, c.embedding, c.content_sha, m.title, m.content, m.seq \
              FROM memory_chunks c \
              JOIN memory m ON m.id = c.note_id AND m.org_id = c.org_id \
              WHERE c.model = ? AND c.dim = ? AND c.content_sha <> '' AND {}",
@@ -487,26 +492,37 @@ impl VectorIndex for BruteForceIndex {
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
             })?;
             for row in rows {
-                let (id, blob, stored_sha, title, content) = row?;
+                let (id, blob, stored_sha, title, content, seq) = row?;
                 let current_sha = note_current_sha(&mut sha_cache, &id, title.as_deref(), &content);
                 if stored_sha != current_sha {
                     continue;
                 }
                 let sim = cosine(query, &from_blob(&blob));
+                seqs.insert(id.clone(), seq);
                 record_max(&mut best, id, sim);
             }
         }
 
-        let mut hits: Vec<(String, f32)> =
-            best.into_iter().filter(|(_, sim)| *sim >= min_similarity).collect();
+        let mut hits: Vec<(String, f32, i64)> = best
+            .into_iter()
+            .filter(|(_, sim)| *sim >= min_similarity)
+            .map(|(id, sim)| {
+                let seq = seqs.get(&id).copied().unwrap_or(i64::MAX);
+                (id, sim, seq)
+            })
+            .collect();
+        // Equal similarities (after max(single, best chunk)) break on
+        // insertion order, not the random note id, so the top-k cut keeps
+        // the same notes on every run.
         hits.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.2.cmp(&b.2))
         });
         hits.truncate(k);
-        Ok(hits)
+        Ok(hits.into_iter().map(|(id, sim, _)| (id, sim)).collect())
     }
 
     fn similarities(
