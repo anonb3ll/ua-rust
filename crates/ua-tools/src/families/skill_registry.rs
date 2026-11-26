@@ -3036,15 +3036,34 @@ mod install_fs {
         validate_package_path, verify_existing_matches_registry,
     };
 
-    const DIR_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    /// Flags for directory handles used only for path traversal and `*at`
+    /// syscalls (`openat`, `mkdirat`, `fstat`, `fstatat`, `renameat`,
+    /// `unlinkat`). `O_PATH` on Linux allows traversing execute-only (`0711` /
+    /// `0111`) ancestor directories without requiring read permission on them.
+    #[cfg(target_os = "linux")]
+    const ANCESTOR_DIR_FLAGS: libc::c_int =
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    const ANCESTOR_DIR_FLAGS: libc::c_int =
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    /// Flags for directory handles whose entries will be read (`fdopendir`).
+    const READ_DIR_FLAGS: libc::c_int =
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
     fn c_seg(s: &str) -> UaResult<CString> {
         CString::new(s).map_err(|_| UaError::invalid(format!("path segment {s:?} contains a NUL byte")))
     }
 
+    fn openat_ancestor_dir(at: libc::c_int, name: &CStr) -> io::Result<OwnedFd> {
+        // SAFETY: `name` is a valid NUL-terminated string; non-negative fd is owned by us.
+        let fd = unsafe { libc::openat(at, name.as_ptr(), ANCESTOR_DIR_FLAGS) };
+        if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
+    }
+
     fn openat_dir(at: libc::c_int, name: &CStr) -> io::Result<OwnedFd> {
         // SAFETY: `name` is a valid NUL-terminated string; non-negative fd is owned by us.
-        let fd = unsafe { libc::openat(at, name.as_ptr(), DIR_FLAGS) };
+        let fd = unsafe { libc::openat(at, name.as_ptr(), READ_DIR_FLAGS) };
         if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
     }
 
@@ -3144,8 +3163,10 @@ mod install_fs {
     }
 
     /// Open `sb_root` component-by-component from `/` with
-    /// `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, then walk (and optionally
-    /// create) each validated segment of `parts` relative to its parent dirfd.
+    /// `O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` (on Linux; `O_RDONLY`
+    /// elsewhere), so execute-only (`0711` / `0111`) ancestors work, then walk
+    /// (and optionally create) each validated segment of `parts` relative to
+    /// its parent dirfd.
     fn open_dir_chain(
         sb_root: &Path,
         parts: &[String],
@@ -3155,7 +3176,7 @@ mod install_fs {
         let mut cur: Option<OwnedFd> = None;
         for comp in sb_root.components() {
             let next = match comp {
-                Component::RootDir => openat_dir(libc::AT_FDCWD, c"/")
+                Component::RootDir => openat_ancestor_dir(libc::AT_FDCWD, c"/")
                     .map_err(|e| UaError::internal(format!("cannot open root directory: {e}")))?,
                 Component::Normal(seg) => {
                     let at = cur
@@ -3164,7 +3185,7 @@ mod install_fs {
                         .as_raw_fd();
                     let cname = CString::new(seg.as_bytes())
                         .map_err(|_| UaError::invalid("sandbox root contains a NUL byte"))?;
-                    openat_dir(at, &cname).map_err(|e| {
+                    openat_ancestor_dir(at, &cname).map_err(|e| {
                         if e.raw_os_error() == Some(libc::ELOOP) {
                             UaError::invalid(
                                 "sandbox root passes through a symlink; symlinks are not followed",
@@ -3182,7 +3203,7 @@ mod install_fs {
 
         for seg in parts {
             let cseg = c_seg(seg)?;
-            let next_fd = match openat_dir(cur_fd.as_raw_fd(), &cseg) {
+            let next_fd = match openat_ancestor_dir(cur_fd.as_raw_fd(), &cseg) {
                 Ok(fd) => fd,
                 Err(e) if create_missing && e.kind() == io::ErrorKind::NotFound => {
                     match mkdirat_0755(&cur_fd, &cseg) {
@@ -3194,7 +3215,7 @@ mod install_fs {
                             )));
                         }
                     }
-                    openat_dir(cur_fd.as_raw_fd(), &cseg).map_err(|oe| {
+                    openat_ancestor_dir(cur_fd.as_raw_fd(), &cseg).map_err(|oe| {
                         if oe.raw_os_error() == Some(libc::ELOOP) {
                             UaError::invalid(format!(
                                 "target_dir {shown:?} passes through a symlink; symlinks are not followed"
@@ -3536,12 +3557,56 @@ mod install_fs {
         }
     }
 
+    /// Sweep any leftover `.<name>.ua-backup-*` directories inside `target_fd`
+    /// left behind by a prior interrupted overwrite, unlinking ONLY entries
+    /// whose files verify against a published registry version of `name` (or
+    /// empty backup directories). Symlinks and directories containing unknown
+    /// or modified files are left untouched.
+    fn cleanup_verified_leftover_backups(target_fd: &OwnedFd, name: &str, known_hashes: &BTreeSet<String>) {
+        let Ok(entries) = read_dir_names(target_fd) else {
+            return;
+        };
+        let prefix = format!(".{name}.ua-backup-");
+        for entry_name in entries {
+            if !entry_name.starts_with(&prefix) {
+                continue;
+            }
+            let Ok(entry_c) = CString::new(entry_name.as_str()) else {
+                continue;
+            };
+            let Ok(st) = fstatat_nofollow(target_fd, &entry_c) else {
+                continue;
+            };
+            if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+                continue;
+            }
+            let Ok(b_fd) = openat_dir(target_fd.as_raw_fd(), &entry_c) else {
+                continue;
+            };
+            let Ok(child_names) = read_dir_names(&b_fd) else {
+                continue;
+            };
+            if child_names.is_empty() {
+                let _ = unlinkat_entry(target_fd, &entry_c, true);
+                continue;
+            }
+            if let Ok(captured) = capture_package_from_dirfd(&b_fd, name)
+                && let Ok(verified_paths) = verify_existing_matches_registry(name, &captured, known_hashes)
+            {
+                unlink_known_tree(target_fd, &entry_c, &b_fd, &verified_paths, &[]);
+            }
+        }
+    }
+
     /// Dirfd-anchored atomic stage-and-swap inside `sb_root/parts/<name>`.
     ///
     /// Anchors every `mkdirat`, `openat`, `fstatat`, `renameat`, and `unlinkat`
     /// to open directory file descriptors (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`),
-    /// re-verifies the full parent chain identity immediately before swap and
-    /// before removing a verified backup, and unlinks only verified files.
+    /// re-verifies the full parent chain identity immediately before swap,
+    /// invokes `record_audit` before committing the swap (so a failed ledger
+    /// append aborts cleanly without leaving an unaudited install on disk),
+    /// unlinks only verified files from the backup, and sweeps verified
+    /// leftover `.<name>.ua-backup-*` directories.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn stage_and_swap_members_with_hook(
         sb_root: &Path,
@@ -3552,6 +3617,7 @@ mod install_fs {
         overwrite: bool,
         known_hashes: &BTreeSet<String>,
         before_swap: impl FnOnce(),
+        record_audit: impl FnOnce() -> UaResult<()>,
     ) -> UaResult<()> {
         let target_fd = open_dir_chain(sb_root, parts, true, shown_target)?;
         let target_id = fstat_dev_ino(&target_fd)
@@ -3660,6 +3726,10 @@ mod install_fs {
             _ => {}
         }
 
+        // Write `skill.installed` to the ledger BEFORE committing the renameat
+        // swap so a failed ledger append never leaves an unaudited install on disk.
+        record_audit()?;
+
         if let Some(existing_paths) = replacing {
             let backup_name = format!(".{name}.ua-backup-{nonce}");
             let backup_c = c_seg(&backup_name)?;
@@ -3669,11 +3739,13 @@ mod install_fs {
                 Ok(()) => {
                     cleanup.disarm();
                     // Re-verify parent chain before unlinking ONLY the verified
-                    // files of the previous registry version inside `backup_fd`.
-                    if verify_dir_chain_identity(sb_root, parts, target_id, shown_target).is_ok()
-                        && let Ok(backup_fd) = openat_dir(target_fd.as_raw_fd(), &backup_c)
-                    {
-                        unlink_known_tree(&target_fd, &backup_c, &backup_fd, &existing_paths, &[]);
+                    // files of the previous registry version inside `backup_fd`,
+                    // and sweep any verified leftover backup dirs.
+                    if verify_dir_chain_identity(sb_root, parts, target_id, shown_target).is_ok() {
+                        if let Ok(backup_fd) = openat_dir(target_fd.as_raw_fd(), &backup_c) {
+                            unlink_known_tree(&target_fd, &backup_c, &backup_fd, &existing_paths, &[]);
+                        }
+                        cleanup_verified_leftover_backups(&target_fd, name, known_hashes);
                     }
                 }
                 Err(e) => {
@@ -3685,6 +3757,9 @@ mod install_fs {
             renameat_same(&target_fd, &stage_c, &name_c)
                 .map_err(|e| UaError::internal(format!("cannot commit staged skill install: {e}")))?;
             cleanup.disarm();
+            if verify_dir_chain_identity(sb_root, parts, target_id, shown_target).is_ok() {
+                cleanup_verified_leftover_backups(&target_fd, name, known_hashes);
+            }
         }
         Ok(())
     }
@@ -3755,6 +3830,36 @@ mod install_fs {
         let _ = std::fs::remove_dir(root);
     }
 
+    fn cleanup_verified_leftover_backups(target_root: &Path, name: &str, known_hashes: &BTreeSet<String>) {
+        let Ok(rd) = std::fs::read_dir(target_root) else {
+            return;
+        };
+        let prefix = format!(".{name}.ua-backup-");
+        for entry in rd.flatten() {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if !fname.starts_with(&prefix) {
+                continue;
+            }
+            let p = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                continue;
+            }
+            let has_entries = std::fs::read_dir(&p).ok().is_some_and(|mut it| it.next().is_some());
+            if !has_entries {
+                let _ = std::fs::remove_dir(&p);
+                continue;
+            }
+            if let Ok(captured) = capture_package(&p, name)
+                && let Ok(verified_paths) = verify_existing_matches_registry(name, &captured, known_hashes)
+            {
+                unlink_known_paths(&p, &verified_paths, &[]);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn stage_and_swap_members_with_hook(
         sb_root: &Path,
@@ -3765,6 +3870,7 @@ mod install_fs {
         overwrite: bool,
         known_hashes: &BTreeSet<String>,
         before_swap: impl FnOnce(),
+        record_audit: impl FnOnce() -> UaResult<()>,
     ) -> UaResult<()> {
         let target_root = walk_target_dir(sb_root, parts, true, shown_target)?;
         let dest = target_root.join(name);
@@ -3851,6 +3957,10 @@ mod install_fs {
             unlink_known_paths(&stage_dir, &created_files, &created_dirs);
             return Err(e);
         }
+        if let Err(e) = record_audit() {
+            unlink_known_paths(&stage_dir, &created_files, &created_dirs);
+            return Err(e);
+        }
         if let Some(existing_paths) = replacing {
             let backup_dir = target_root.join(format!(".{name}.ua-backup-{nonce}"));
             std::fs::rename(&dest, &backup_dir)
@@ -3859,6 +3969,7 @@ mod install_fs {
                 Ok(()) => {
                     if walk_target_dir(sb_root, parts, false, shown_target).is_ok() {
                         unlink_known_paths(&backup_dir, &existing_paths, &[]);
+                        cleanup_verified_leftover_backups(&target_root, name, known_hashes);
                     }
                 }
                 Err(e) => {
@@ -3867,14 +3978,20 @@ mod install_fs {
                     return Err(UaError::internal(format!("cannot commit staged skill install: {e}")));
                 }
             }
-        } else if let Err(e) = std::fs::rename(&stage_dir, &dest) {
-            unlink_known_paths(&stage_dir, &created_files, &created_dirs);
-            return Err(UaError::internal(format!("cannot commit staged skill install: {e}")));
+        } else {
+            if let Err(e) = std::fs::rename(&stage_dir, &dest) {
+                unlink_known_paths(&stage_dir, &created_files, &created_dirs);
+                return Err(UaError::internal(format!("cannot commit staged skill install: {e}")));
+            }
+            if walk_target_dir(sb_root, parts, false, shown_target).is_ok() {
+                cleanup_verified_leftover_backups(&target_root, name, known_hashes);
+            }
         }
         Ok(())
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_and_swap_members(
     sb_root: &Path,
     parts: &[String],
@@ -3883,6 +4000,7 @@ fn stage_and_swap_members(
     members: &[PackageMember],
     overwrite: bool,
     known_hashes: &BTreeSet<String>,
+    record_audit: impl FnOnce() -> UaResult<()>,
 ) -> UaResult<()> {
     install_fs::stage_and_swap_members_with_hook(
         sb_root,
@@ -3893,6 +4011,7 @@ fn stage_and_swap_members(
         overwrite,
         known_hashes,
         || {},
+        record_audit,
     )
 }
 
@@ -3960,16 +4079,6 @@ async fn install(ctx: ToolCtx, p: InstallParams) -> UaResult<Value> {
     let (parts, target_rel) = parse_install_target_parts(&sb, &p.target_dir)?;
     guard_install_paths(&sb, &target_rel, &p.target_dir, &name, &loaded.members).await?;
 
-    let sb_root = sb.root.clone();
-    let shown_target = p.target_dir.clone();
-    let name_w = name.clone();
-    let members_w = loaded.members.clone();
-    let overwrite = p.overwrite;
-    blocking(move || {
-        stage_and_swap_members(&sb_root, &parts, &shown_target, &name_w, &members_w, overwrite, &known_hashes)
-    })
-    .await?;
-
     let installed_rel = format!("{target_rel}/{name}");
     let files: Vec<Value> = loaded
         .members
@@ -3985,29 +4094,46 @@ async fn install(ctx: ToolCtx, p: InstallParams) -> UaResult<Value> {
         .collect();
     let file_count = files.len();
 
+    let sb_root = sb.root.clone();
+    let shown_target = p.target_dir.clone();
+    let name_w = name.clone();
+    let members_w = loaded.members.clone();
+    let overwrite = p.overwrite;
+    let hub_w = ctx.hub.clone();
     let org_ev = ctx.caller.org_id.clone();
     let name_ev = name.clone();
     let hash_ev = verified_hash.clone();
     let target_ev = installed_rel.clone();
-    ctx.hub
-        .db()
-        .write_async(move |tx| {
-            emit(
-                tx,
-                &org_ev,
-                "skill.installed",
-                json!({
-                    "name": ledger_text(&org_ev, &name_ev),
-                    "version": verified_version,
-                    "content_hash": ledger_text(&org_ev, &hash_ev),
-                    "target": ledger_text(&org_ev, &target_ev),
-                    "file_count": file_count,
-                }),
-                &who,
-            )?;
-            Ok(())
-        })
-        .await?;
+    blocking(move || {
+        stage_and_swap_members(
+            &sb_root,
+            &parts,
+            &shown_target,
+            &name_w,
+            &members_w,
+            overwrite,
+            &known_hashes,
+            move || {
+                hub_w.db().write(|tx| {
+                    emit(
+                        tx,
+                        &org_ev,
+                        "skill.installed",
+                        json!({
+                            "name": ledger_text(&org_ev, &name_ev),
+                            "version": verified_version,
+                            "content_hash": ledger_text(&org_ev, &hash_ev),
+                            "target": ledger_text(&org_ev, &target_ev),
+                            "file_count": file_count,
+                        }),
+                        &who,
+                    )?;
+                    Ok(())
+                })
+            },
+        )
+    })
+    .await?;
 
     Ok(json!({
         "ok": true,
@@ -4471,12 +4597,48 @@ mod tests {
             },
         ];
         let known = BTreeSet::new();
-        let err = stage_and_swap_members(&ws_real, &parts, "skills", "atomic-test", &members, false, &known)
-            .unwrap_err();
+        let err = stage_and_swap_members(
+            &ws_real,
+            &parts,
+            "skills",
+            "atomic-test",
+            &members,
+            false,
+            &known,
+            || Ok(()),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), "invalid_argument");
         assert!(!ws_real.join("skills/atomic-test").exists(), "failed install must leave no destination dir");
         let leftover: Vec<_> = std::fs::read_dir(ws_real.join("skills")).unwrap().collect();
         assert!(leftover.is_empty(), "failed install must clean up staging dir: {leftover:?}");
+    }
+
+    #[test]
+    fn install_audit_failure_prevents_swap_and_cleans_up_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let ws_real = root.path().canonicalize().unwrap();
+        let parts = vec!["skills".to_string()];
+        let md = b"---\nname: audit-fail\ndescription: Test.\n---\nBody.\n";
+        let members = vec![PackageMember {
+            path: "SKILL.md".into(),
+            bytes: md.to_vec(),
+            sha256: sha256_bytes(md),
+            mode: MODE_FILE,
+        }];
+        let known = BTreeSet::new();
+        let err =
+            stage_and_swap_members(&ws_real, &parts, "skills", "audit-fail", &members, false, &known, || {
+                Err(UaError::internal("simulated ledger write failure"))
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "internal");
+        assert!(
+            !ws_real.join("skills/audit-fail").exists(),
+            "failed ledger append must prevent swap and leave no unaudited install"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(ws_real.join("skills")).unwrap().collect();
+        assert!(leftover.is_empty(), "failed ledger append must clean up staging dir: {leftover:?}");
     }
 
     #[cfg(unix)]
@@ -4511,6 +4673,8 @@ mod tests {
         let area_path = ws_real.join("area");
         let moved_area = ws_real.join("area-moved");
         let outside_for_hook = outside_real.clone();
+        let audit_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let audit_flag = audit_called.clone();
         let err = install_fs::stage_and_swap_members_with_hook(
             &ws_real,
             &parts,
@@ -4523,9 +4687,17 @@ mod tests {
                 std::fs::rename(&area_path, &moved_area).unwrap();
                 symlink(&outside_for_hook, &area_path).unwrap();
             },
+            move || {
+                audit_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
         )
         .unwrap_err();
         assert_eq!(err.code(), "invalid_argument", "expected symlink refusal, got {err:?}");
+        assert!(
+            !audit_called.load(std::sync::atomic::Ordering::SeqCst),
+            "aborted symlink swap must not record an audit event"
+        );
 
         // Outside directory must be completely untouched.
         assert_eq!(std::fs::read_to_string(outside_dest.join("SKILL.md")).unwrap(), "outside sentinel");
@@ -4535,5 +4707,128 @@ mod tests {
         assert!(!orig_skills.join("swap-skill").exists());
         let leftover: Vec<_> = std::fs::read_dir(&orig_skills).unwrap().collect();
         assert!(leftover.is_empty(), "staging dir must be cleaned up on abort: {leftover:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_traverses_execute_only_ancestor_with_o_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let ws_real = root.path().canonicalize().unwrap();
+        let exec_only_ancestor = ws_real.join("exec-only");
+        let target_dir = exec_only_ancestor.join("skills");
+        std::fs::create_dir_all(&target_dir).unwrap();
+
+        struct RestoreMode(PathBuf);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        // Mode 0o111 denies O_RDONLY even to the owner while allowing O_PATH traversal.
+        std::fs::set_permissions(&exec_only_ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let _restore = RestoreMode(exec_only_ancestor.clone());
+
+        let md = b"---\nname: exec-ancestor\ndescription: Test.\n---\nBody.\n";
+        let members = vec![PackageMember {
+            path: "SKILL.md".into(),
+            bytes: md.to_vec(),
+            sha256: sha256_bytes(md),
+            mode: MODE_FILE,
+        }];
+        let parts = vec!["exec-only".to_string(), "skills".to_string()];
+        let known = BTreeSet::new();
+        stage_and_swap_members(
+            &ws_real,
+            &parts,
+            "exec-only/skills",
+            "exec-ancestor",
+            &members,
+            false,
+            &known,
+            || Ok(()),
+        )
+        .expect("O_PATH ancestor walk must traverse execute-only (0111/0711) ancestors");
+
+        assert_eq!(std::fs::read(target_dir.join("exec-ancestor/SKILL.md")).unwrap(), md);
+    }
+
+    #[test]
+    fn install_cleans_verified_leftover_backups_and_preserves_unverified_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let ws_real = root.path().canonicalize().unwrap();
+        let target_dir = ws_real.join("skills");
+        std::fs::create_dir_all(&target_dir).unwrap();
+
+        let old_md = b"---\nname: sweep-skill\ndescription: Old v1.\n---\nOld.\n";
+        let old_ref = b"old reference\n";
+        let mut old_map = BTreeMap::new();
+        old_map.insert(
+            "SKILL.md".into(),
+            PackageMember {
+                path: "SKILL.md".into(),
+                bytes: old_md.to_vec(),
+                sha256: sha256_bytes(old_md),
+                mode: MODE_FILE,
+            },
+        );
+        old_map.insert(
+            "references/a.md".into(),
+            PackageMember {
+                path: "references/a.md".into(),
+                bytes: old_ref.to_vec(),
+                sha256: sha256_bytes(old_ref),
+                mode: MODE_FILE,
+            },
+        );
+        let old_hash = package_hash(&build_manifest(&old_map));
+        let mut known = BTreeSet::new();
+        known.insert(old_hash);
+
+        // 1. Legitimate leftover backup matching published v1 -> MUST be cleaned up.
+        let valid_backup = target_dir.join(".sweep-skill.ua-backup-deadbeef1234");
+        std::fs::create_dir_all(valid_backup.join("references")).unwrap();
+        std::fs::write(valid_backup.join("SKILL.md"), old_md).unwrap();
+        std::fs::write(valid_backup.join("references/a.md"), old_ref).unwrap();
+
+        // 2. Empty leftover backup -> MUST be cleaned up.
+        let empty_backup = target_dir.join(".sweep-skill.ua-backup-empty0000000");
+        std::fs::create_dir_all(&empty_backup).unwrap();
+
+        // 3. Unverified backup dir holding an extra unknown file -> MUST NOT be deleted.
+        let trap_backup = target_dir.join(".sweep-skill.ua-backup-trap99999999");
+        std::fs::create_dir_all(trap_backup.join("references")).unwrap();
+        std::fs::write(trap_backup.join("SKILL.md"), old_md).unwrap();
+        std::fs::write(trap_backup.join("references/a.md"), old_ref).unwrap();
+        std::fs::write(trap_backup.join("unknown.txt"), "keep me").unwrap();
+
+        let new_md = b"---\nname: sweep-skill\ndescription: New v2.\n---\nNew.\n";
+        let new_members = vec![PackageMember {
+            path: "SKILL.md".into(),
+            bytes: new_md.to_vec(),
+            sha256: sha256_bytes(new_md),
+            mode: MODE_FILE,
+        }];
+        let parts = vec!["skills".to_string()];
+        stage_and_swap_members(
+            &ws_real,
+            &parts,
+            "skills",
+            "sweep-skill",
+            &new_members,
+            false,
+            &known,
+            || Ok(()),
+        )
+        .expect("install succeeds and sweeps verified leftover backups");
+
+        assert!(!valid_backup.exists(), "verified leftover backup must be removed");
+        assert!(!empty_backup.exists(), "empty leftover backup must be removed");
+        assert_eq!(
+            std::fs::read_to_string(trap_backup.join("unknown.txt")).unwrap(),
+            "keep me",
+            "unverified backup containing unknown files must never be deleted"
+        );
     }
 }
