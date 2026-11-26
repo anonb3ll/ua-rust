@@ -30,6 +30,7 @@
 //! off and search is lexical only.
 
 pub mod bench;
+pub mod chunks;
 pub mod embed;
 pub mod lifecycle;
 pub mod maintenance;
@@ -40,15 +41,18 @@ pub mod schema;
 pub mod search;
 
 pub use embed::{
-    BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
+    BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embed_batch, embedder_for,
+    register_embedder, vector_identity,
 };
+pub use maintenance::{BackfillReport, backfill_embeddings};
 pub use note::{Filter, mark_untrusted};
 /// The ORG-EVENT-DEFAULT rule for memory events, exposed so `ua-tools` can
 /// test it against its own copy; not an API for other callers.
 #[doc(hidden)]
 pub use note::{ledger_label, ledger_originator, ledger_text};
 pub use schema::{
-    EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA, org_parts, schema_parts,
+    CHUNKS_SCHEMA, CHUNKS_TENANT_PART, EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA,
+    org_parts, schema_parts,
 };
 
 use ua_core::{UaError, UaResult};

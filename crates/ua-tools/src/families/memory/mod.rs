@@ -23,10 +23,14 @@ use ua_memory::search::{GetRequest, ListRequest, SearchRequest};
 use ua_store::SchemaPart;
 
 pub use ua_memory::embed::{
-    BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
+    BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embed_batch, embedder_for,
+    register_embedder, vector_identity,
 };
+pub use ua_memory::maintenance::{BackfillReport, backfill_embeddings};
 pub(crate) use ua_memory::mark_untrusted;
-pub use ua_memory::schema::{EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA};
+pub use ua_memory::schema::{
+    CHUNKS_SCHEMA, CHUNKS_TENANT_PART, EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA,
+};
 
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -432,7 +436,8 @@ async fn prune_candidates(ctx: ToolCtx, a: PruneArgs) -> UaResult<Value> {
 }
 
 async fn recall_maintenance(ctx: ToolCtx, a: MaintenanceArgs) -> UaResult<Value> {
-    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
+    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller.org_id, a.into())
+        .await
 }
 
 fn register_maintenance(r: &mut Registry) {
@@ -449,12 +454,15 @@ fn register_maintenance(r: &mut Registry) {
     r.add(
         tool(
             "recall_maintenance",
-            "Report stale (old, never recalled, salience <= 0.5) and low-confidence memory notes for human review. \
+            "Report stale (old, never recalled, salience <= 0.5) and low-confidence memory notes for human review, \
+             and run a best-effort backfill of missing or stale embeddings and chunks in batches of 8. \
              Deletes nothing: dry_run=false is refused; prune with memory_delete per id after review.",
             recall_maintenance,
         )
         .family("memory")
-        .read_only(),
+        .read_only()
+        // Backfills missing/stale derived vector indexes; never modifies or deletes notes.
+        .side_effects(|_| true),
     );
 }
 

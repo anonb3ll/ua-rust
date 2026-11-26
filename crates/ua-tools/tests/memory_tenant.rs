@@ -22,8 +22,9 @@ use ua_tools::{Hub, Registry, builtin_registry};
 
 const ORG_B: &str = "org-b";
 const UNKNOWN: &str = "missing-org";
-const PARTS: [&str; 2] = ["organization.v1.memory", "memory.v2.org_scope"];
-const TABLES: [&str; 3] = ["memory", "memory_versions", "memory_embeddings"];
+const PARTS: [&str; 4] =
+    ["organization.v1.memory", "memory.v2.org_scope", "memory.chunks.v1", "organization.v1.memory_chunks"];
+const TABLES: [&str; 4] = ["memory", "memory_versions", "memory_embeddings", "memory_chunks"];
 /// A note id no row has, to compare another organization's answers with.
 const ABSENT: &str = "abcdef012345";
 
@@ -292,6 +293,11 @@ async fn a_legacy_database_upgrades_every_note_into_the_default_organization() {
                     "memory_embeddings_org_immutable",
                     "memory_embeddings_org_parent",
                     "memory_embeddings_org_parent_update",
+                    "memory_embeddings_org_fence",
+                    "memory_chunks_org_exists",
+                    "memory_chunks_org_immutable",
+                    "memory_chunks_org_fence",
+                    "memory_chunks_org_fence_update",
                     "memory_fts_ai",
                     "memory_fts_ad",
                     "memory_fts_au",
@@ -315,7 +321,11 @@ async fn a_legacy_database_upgrades_every_note_into_the_default_organization() {
                     )?;
                     assert!(sql.contains(head) && sql.contains("id = NEW.superseded_by"), "{name}: {sql}");
                 }
-                for ix in ["idx_memory_org_updated", "idx_memory_embeddings_org_model"] {
+                for ix in [
+                    "idx_memory_org_updated",
+                    "idx_memory_embeddings_org_model",
+                    "idx_memory_chunks_org_model",
+                ] {
                     let n: i64 = c.query_row(
                         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
                         [ix],
@@ -396,6 +406,10 @@ async fn versions_vectors_and_pointers_follow_their_note() {
             "INSERT INTO memory_embeddings (org_id, note_id, model, dim, embedding, content_sha, updated_at) \
              VALUES ('default', '{nb}', 'm', 1, x'00', 's', 'x')"
         ),
+        format!(
+            "INSERT INTO memory_chunks (org_id, note_id, idx, model, dim, embedding, content_sha) \
+             VALUES ('default', '{nb}', 0, 'm', 1, x'00', 's')"
+        ),
         format!("UPDATE memory SET superseded_by = '{nb}' WHERE id = '{na}'"),
         format!(
             "INSERT INTO memory (org_id, id, content, superseded_by, created_at, updated_at) \
@@ -410,6 +424,7 @@ async fn versions_vectors_and_pointers_follow_their_note() {
         let e = h.sql(&sql).unwrap_err();
         assert!(
             e.contains("another organization")
+                || e.contains("differs from its note")
                 || e.contains("org_id cannot change")
                 || e.contains("unknown organization"),
             "{sql}: {e}"

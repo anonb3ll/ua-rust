@@ -232,6 +232,14 @@ CREATE TABLE memory_embeddings (
   embedding BLOB NOT NULL,
   model TEXT
 );
+CREATE TABLE memory_chunks (
+  note_id TEXT NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+  embedding BLOB NOT NULL,
+  model TEXT,
+  org_id TEXT,
+  PRIMARY KEY (note_id, chunk_index)
+);
 CREATE TABLE approvals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tool TEXT NOT NULL,
@@ -440,7 +448,12 @@ INSERT INTO memory (id, title, content, tags, author, created_at, updated_at) VA
   ('note-b', 'Other', 'nothing to see', '[]', 'agent-2', '{T0}', '{T0}');
 INSERT INTO memory_versions (note_id, version, content, tags, updated_at, recorded_at) VALUES
   ('note-a', 1, 'old text', '[]', '{T0}', '{T0}');
-INSERT INTO memory_embeddings (note_id, embedding, model) VALUES ('note-a', x'00000000', 'm');
+INSERT INTO memory_embeddings (note_id, embedding, model) VALUES
+  ('note-a', x'0000803f00000040', 'm'),
+  ('note-b', x'0000803f', NULL);
+INSERT INTO memory_chunks (note_id, chunk_index, embedding, model, org_id) VALUES
+  ('note-a', 0, x'0000803f00000040', 'm', NULL),
+  ('note-a', 1, x'000000000000803f', NULL, NULL);
 INSERT INTO approvals (id, tool, requested_by, status, created_at, updated_at) VALUES
   (1, 'fs_write', 'agent-1', 'consumed', '{T0}', '{T0}'),
   (2, 'fs_write', 'agent-1', 'denied', '{T0}', '{T0}'),
@@ -572,8 +585,44 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(n(&db, "SELECT COUNT(*) FROM delegations WHERE org_id <> 'default'"), 0);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM memory"), 2);
     assert_eq!(n(&db, "SELECT COUNT(*) FROM memory_versions"), 1);
-    // Notes and their versions land in the default organization.
-    for t in ["memory", "memory_versions"] {
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM memory_embeddings"), 2);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM memory_chunks"), 2);
+    // Imported vectors and chunks are stale by construction: `import:<model or unknown>`,
+    // empty `content_sha`, `dim` computed from the blob, and default org.
+    assert_eq!(
+        n(
+            &db,
+            "SELECT COUNT(*) FROM memory_embeddings \
+             WHERE note_id = 'note-a' AND model = 'import:m' AND dim = 2 AND content_sha = '' AND org_id = 'default'"
+        ),
+        1
+    );
+    assert_eq!(
+        n(
+            &db,
+            "SELECT COUNT(*) FROM memory_embeddings \
+             WHERE note_id = 'note-b' AND model = 'import:unknown' AND dim = 1 AND content_sha = '' AND org_id = 'default'"
+        ),
+        1
+    );
+    assert_eq!(
+        n(
+            &db,
+            "SELECT COUNT(*) FROM memory_chunks \
+             WHERE note_id = 'note-a' AND idx = 0 AND model = 'import:m' AND dim = 2 AND content_sha = '' AND org_id = 'default'"
+        ),
+        1
+    );
+    assert_eq!(
+        n(
+            &db,
+            "SELECT COUNT(*) FROM memory_chunks \
+             WHERE note_id = 'note-a' AND idx = 1 AND model = 'import:unknown' AND dim = 2 AND content_sha = '' AND org_id = 'default'"
+        ),
+        1
+    );
+    // Notes, versions, embeddings and chunks land in the default organization.
+    for t in ["memory", "memory_versions", "memory_embeddings", "memory_chunks"] {
         assert_eq!(n(&db, &format!("SELECT COUNT(*) FROM {t} WHERE org_id <> 'default'")), 0, "{t}");
     }
     assert_eq!(n(&db, "SELECT COUNT(*) FROM message_index"), 1);
@@ -673,7 +722,8 @@ async fn import_copies_mapped_tables_and_the_chain_verifies() {
     assert_eq!(r.unmapped_columns["delegations"]["org_id"], 1);
     assert_eq!(r.unmapped_columns["goals"]["org_id"], 1);
     assert!(r.unmapped_tables.contains(&"zulip_cursors".to_string()));
-    assert!(r.unmapped_tables.contains(&"memory_embeddings".to_string()));
+    assert!(!r.unmapped_tables.contains(&"memory_embeddings".to_string()));
+    assert!(!r.unmapped_tables.contains(&"memory_chunks".to_string()));
     assert!(r.derived_tables.contains(&"memory_fts".to_string()));
     // SQLite's own bookkeeping tables are neither unmapped nor derived.
     assert!(!r.unmapped_tables.iter().chain(&r.derived_tables).any(|t| t.starts_with("sqlite_")), "{r:?}");
@@ -985,7 +1035,7 @@ fn dry_run_reports_without_writing() {
     assert_eq!(table(&r, "agent_tokens").skipped.get("unsupported_token_hash"), Some(&1));
     assert_eq!(table(&r, "event_log").copied, 3);
     assert!(r.source_ledger.ok && r.source_ledger.checked == 3, "{:?}", r.source_ledger);
-    assert_eq!(r.unmapped_tables, ["memory_embeddings", "zulip_cursors"]);
+    assert_eq!(r.unmapped_tables, ["zulip_cursors"]);
     assert!(r.derived_tables.iter().all(|t| t.starts_with("memory_fts")), "{:?}", r.derived_tables);
     assert_eq!(r.unmapped_columns["agent_tokens"].keys().collect::<Vec<_>>(), ["agent_kind", "org_id"]);
     assert_eq!(r.unmapped_columns["tasks"]["org_id"], 1);
