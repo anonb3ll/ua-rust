@@ -48,6 +48,22 @@ jobs:
       - run: cargo nextest run --workspace --no-tests=pass --no-default-features
       - run: cargo test --workspace --doc
 
+  # Local ONNX embeddings (`--features embeddings`, off by default): compile
+  # and run unit and integration tests so the feature stays exercised on every PR.
+  embeddings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p ua-memory -p ua-tools -p ua-cli --all-targets --features embeddings -- -D warnings
+      - run: cargo test -p ua-memory --features embeddings
+      - run: cargo test -p ua-tools --features embeddings --test memory --test memory_chunks --test memory_embedder --test memory_embedder_no_proxy --test observability
+      - run: cargo build -p ua-cli --release --features embeddings
+      - run: scripts/check-binary-size.sh target/release/ua
+
   # The hub also runs on macOS, where orphan recovery and the stale-worktree
   # sweep read processes through proc_pidinfo instead of /proc, and where the
   # file system ignores letter case.

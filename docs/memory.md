@@ -284,7 +284,9 @@ addresses it checked (`ClientBuilder::resolve`), follows no redirects
 rebinding, a redirect or an `HTTP(S)_PROXY` cannot move the request elsewhere.
 A remote endpoint is used only for the notes and queries of organizations whose
 `allow_remote_embedder` setting is on (an `org_owner` decision, see the
-organization doc); every other organization gets `local` or lexical-only, and
+organization doc; `orgs.allow_remote_embedder` defaults to `0` and currently
+requires a direct operator database update until an admin setter tool is added);
+every other organization gets `local` or lexical-only, and
 their vectors carry a different identity. An explicit `ollama` with a remote
 URL is remote like any other.
 

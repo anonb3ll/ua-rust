@@ -567,3 +567,25 @@ fn auth_off_refuses_serve_and_fails_doctor_when_second_org_exists_and_keeps_sing
     assert_eq!(find_check(&rep_enforced, "auth_lockout")["status"], "pass");
     assert_eq!(find_check(&rep_enforced, "origin_security")["status"], "pass");
 }
+
+/// Stray `UA_MEMORY_*` environment variables (e.g. Python hub vars such as
+/// `UA_MEMORY_PROVIDER` or `UA_MEMORY_RRF_K`) must NOT break config loading,
+/// while the five supported `UA_MEMORY_*` overrides still apply.
+#[test]
+fn stray_ua_memory_env_vars_do_not_break_config_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = ua_cmd(dir.path())
+        .env("UA_MEMORY_PROVIDER", "fastembed")
+        .env("UA_MEMORY_RRF_K", "60")
+        .env("UA_MEMORY_EMBEDDER", "off")
+        .env("UA_MEMORY_OLLAMA_MODEL", "custom-ollama-model")
+        .arg("config")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "ua config failed with stray UA_MEMORY_* vars:\n{stderr}\n{stdout}");
+    let cfg: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("invalid JSON ({e}): {stdout}"));
+    assert_eq!(cfg["memory"]["embedder"], "off");
+    assert_eq!(cfg["memory"]["ollama_model"], "custom-ollama-model");
+}

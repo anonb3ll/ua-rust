@@ -206,3 +206,70 @@ async fn writes_read_the_clock_inside_the_transaction() {
     let note = get(&db, &cfg, &id, None).await;
     assert!(note["updated_at"].as_str().unwrap() >= released.as_str(), "restore: {note} vs {released}");
 }
+
+/// Backfill failure cooldown runs on `Config.clock`: a runtime-failing note is
+/// skipped while within 15 minutes on the injected clock and retried once the
+/// injected clock advances past the cooldown window.
+#[tokio::test]
+async fn backfill_failure_cooldown_uses_injected_clock() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use ua_memory::{EmbedError, Embedder, register_embedder};
+
+    struct FlakyEmbedder {
+        model: String,
+        fail: Arc<AtomicBool>,
+    }
+    impl Embedder for FlakyEmbedder {
+        fn model(&self) -> &str {
+            &self.model
+        }
+        fn backend(&self) -> &str {
+            "local"
+        }
+        fn revision(&self) -> &str {
+            "clock-test"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(EmbedError::runtime("transient failure"));
+            }
+            Ok(vec![vec![1.0, 0.0]; texts.len()])
+        }
+    }
+
+    let model = "clock-cooldown-embedder-test";
+    let fail = Arc::new(AtomicBool::new(true));
+    register_embedder(Arc::new(FlakyEmbedder { model: model.into(), fail: fail.clone() }));
+
+    let cfg_at = |ts: &str| {
+        let mut c = at(ts);
+        c.embed_model = model.into();
+        c
+    };
+
+    let db = db();
+    let t0 = "2026-01-10T00:00:00+00:00";
+    let t_plus_5m = "2026-01-10T00:05:00+00:00";
+    let t_plus_16m = "2026-01-10T00:16:00+00:00";
+
+    // Save fails to embed; note is stored without a vector.
+    put(&db, &cfg_at(t0), SaveRequest { content: "cooldown test note".into(), ..Default::default() }).await;
+
+    // Backfill at T0 fails -> enters 15-minute cooldown on injected clock.
+    let rep0 = maintenance::backfill_embeddings(&db, &cfg_at(t0), ua_core::DEFAULT_ORG).await.unwrap();
+    assert_eq!(rep0.failed, 1);
+    assert_eq!(rep0.notes_embedded, 0);
+
+    // Embedder recovers, but at T0 + 5m the note is still in cooldown.
+    fail.store(false, Ordering::SeqCst);
+    let rep5 = maintenance::backfill_embeddings(&db, &cfg_at(t_plus_5m), ua_core::DEFAULT_ORG).await.unwrap();
+    assert_eq!(rep5.batches, 0, "still in cooldown at +5m: {rep5:?}");
+    assert_eq!(rep5.notes_embedded, 0);
+
+    // At T0 + 16m (> 15m cooldown), backfill retries and embeds cleanly.
+    let rep16 =
+        maintenance::backfill_embeddings(&db, &cfg_at(t_plus_16m), ua_core::DEFAULT_ORG).await.unwrap();
+    assert_eq!(rep16.batches, 1, "cooldown expired at +16m: {rep16:?}");
+    assert_eq!(rep16.notes_embedded, 1);
+}

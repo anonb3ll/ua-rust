@@ -278,19 +278,84 @@ pub const NOTIFY_WEBHOOK: Policy = Policy {
     total_timeout: Duration::from_secs(120),
 };
 
+/// Loopback-only HTTP embedder endpoint (local Ollama or loopback
+/// OpenAI-compatible server): http or https, loopback addresses only,
+/// no redirects, 16 MiB body cap, 30 seconds for the call.
+pub const EMBEDDER_LOCAL: Policy = Policy {
+    name: "memory.embedder_local",
+    schemes: Schemes::HttpOrHttps,
+    hosts: Hosts::Any,
+    default_port_only: false,
+    addresses: Addresses::LoopbackOnly,
+    max_redirects: 0,
+    allow_scheme_downgrade: false,
+    accept_invalid_certs: false,
+    max_body_bytes: 16 * 1024 * 1024,
+    connect_timeout: Duration::from_secs(5),
+    request_timeout: Duration::from_secs(30),
+    total_timeout: Duration::from_secs(30),
+};
+
+/// Remote HTTP embedder endpoint (`ollama` on another host or
+/// `openai_compat`): operator-configured destination, no redirects,
+/// 16 MiB body cap, 30 seconds for the call. Used only for organizations
+/// whose `allow_remote_embedder` flag is enabled.
+pub const EMBEDDER_REMOTE: Policy = Policy {
+    name: "memory.embedder_remote",
+    schemes: Schemes::HttpOrHttps,
+    hosts: Hosts::Any,
+    default_port_only: false,
+    addresses: Addresses::OperatorConfigured,
+    max_redirects: 0,
+    allow_scheme_downgrade: false,
+    accept_invalid_certs: false,
+    max_body_bytes: 16 * 1024 * 1024,
+    connect_timeout: Duration::from_secs(10),
+    request_timeout: Duration::from_secs(30),
+    total_timeout: Duration::from_secs(30),
+};
+
+/// Offline model preparation (`ua memory models fetch`): HTTPS only, public
+/// addresses only, follows up to 5 HTTPS redirects (Hugging Face LFS blob CDN),
+/// never downgrades to HTTP, 200 MiB body cap, 300s total timeout.
+pub const MODEL_DOWNLOAD: Policy = Policy {
+    name: "memory.model_download",
+    schemes: Schemes::HttpsOnly,
+    hosts: Hosts::Any,
+    default_port_only: false,
+    addresses: Addresses::Public,
+    max_redirects: 5,
+    allow_scheme_downgrade: false,
+    accept_invalid_certs: false,
+    max_body_bytes: 200 * 1024 * 1024,
+    connect_timeout: Duration::from_secs(15),
+    request_timeout: Duration::from_secs(300),
+    total_timeout: Duration::from_secs(300),
+};
+
 /// Every named policy.
 ///
 /// These are the policies obtainable by name ([`lookup`],
 /// [`crate::Outbound::named`]). None of them is relaxed
 /// ([`Policy::is_relaxed`]); the relaxed ones are in [`RELAXED`], which is
 /// not public, and only [`crate::Outbound::pinned`] builds a client from one.
-pub const POLICIES: &[&Policy] =
-    &[&SLACK_RESPONSE_URL, &SLACK_WEB_API, &WEB_PAGE, &WEB_SEARCH, &ZULIP_API, &RELAY_GITHUB, &GITHUB_REST];
+pub const POLICIES: &[&Policy] = &[
+    &SLACK_RESPONSE_URL,
+    &SLACK_WEB_API,
+    &WEB_PAGE,
+    &WEB_SEARCH,
+    &ZULIP_API,
+    &RELAY_GITHUB,
+    &GITHUB_REST,
+    &EMBEDDER_LOCAL,
+    &MODEL_DOWNLOAD,
+];
 
 /// The relaxed policies: an operator-configured address class or
 /// unverified certificates. Not obtainable by name; a client built from one
 /// is pinned to the one origin it was built for.
-pub(crate) const RELAXED: &[&Policy] = &[&GITHUB_ENTERPRISE, &OBSIDIAN_LOCAL, &NOTIFY_WEBHOOK];
+pub(crate) const RELAXED: &[&Policy] =
+    &[&GITHUB_ENTERPRISE, &OBSIDIAN_LOCAL, &NOTIFY_WEBHOOK, &EMBEDDER_REMOTE];
 
 /// The policy called `name`. An unknown name, or the name of a relaxed
 /// policy, is refused.
@@ -303,7 +368,7 @@ pub fn lookup(name: &str) -> Result<&'static Policy, OutboundError> {
 }
 
 /// Largest values a policy may carry: a policy is a bound, not a way out.
-const MAX_BODY_CEILING: usize = 64 * 1024 * 1024;
+const MAX_BODY_CEILING: usize = 256 * 1024 * 1024;
 const MAX_TIMEOUT_CEILING: Duration = Duration::from_secs(300);
 const MAX_REDIRECTS_CEILING: u8 = 10;
 
@@ -371,7 +436,7 @@ impl Policy {
             return bad("the policy has no name");
         }
         if self.max_body_bytes == 0 || self.max_body_bytes > MAX_BODY_CEILING {
-            return bad("the body cap must be between 1 byte and 64 MiB");
+            return bad("the body cap must be between 1 byte and 256 MiB");
         }
         for t in [self.connect_timeout, self.request_timeout, self.total_timeout] {
             if t.is_zero() || t > MAX_TIMEOUT_CEILING {
@@ -607,7 +672,7 @@ mod tests {
         // The class is only used by policies for operator-set destinations.
         let users: Vec<&str> =
             RELAXED.iter().filter(|p| p.addresses == Addresses::OperatorConfigured).map(|p| p.name).collect();
-        assert_eq!(users, ["github.enterprise", "notify.webhook"]);
+        assert_eq!(users, ["github.enterprise", "notify.webhook", "memory.embedder_remote"]);
     }
 
     #[test]

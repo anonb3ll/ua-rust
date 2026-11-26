@@ -28,7 +28,7 @@ pub const BACKFILL_BATCH: usize = 8;
 
 /// The exact text embedded for a note: title, a blank line, then content.
 pub fn embed_source(title: Option<&str>, content: &str) -> String {
-    format!("{}\n\n{}", title.unwrap_or(""), content)
+    crate::note::embed_text(title, content)
 }
 
 /// True when a note's embedded source exceeds the single-vector threshold.

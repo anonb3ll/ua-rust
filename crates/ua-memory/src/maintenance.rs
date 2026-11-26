@@ -2,16 +2,18 @@
 //! None of these ever deletes or rewrites a note.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use rusqlite::params;
 use serde_json::{Value, json};
+use ua_core::time::Clock;
 use ua_core::{Config, UaError, UaResult};
 use ua_store::Db;
 
 use crate::blocking;
 
 use super::chunks::{self, BACKFILL_BATCH};
-use super::embed::{self, embedder_for};
+use super::embed::{self, embedder_for_org};
 use super::note::{DELETED_TAG, NOTE_COLS, Note, days_ago, embed_text, fetch, text_sha};
 
 /// Thresholds for [`prune_candidates`]. The `memory_prune_candidates` tool
@@ -134,6 +136,91 @@ fn candidate(n: &Note, reason: &str) -> Value {
 /// corpus after a vector-identity change.
 pub const MAX_BACKFILL_BATCHES_PER_PASS: usize = 8;
 
+/// Cooldown before retrying a note that failed to embed with a runtime error
+/// for the same `(identity, content_sha)`. Measured on `Config.clock` so tests
+/// can advance time deterministically; editing the note (new `content_sha`) or
+/// changing the active vector identity bypasses the cooldown immediately.
+const FAILED_NOTE_COOLDOWN_MS: i64 = 15 * 60 * 1000;
+const MAX_TRACKED_CURSORS: usize = 4096;
+const MAX_TRACKED_FAILURES: usize = 8192;
+
+type CursorKey = (u64, String, String);
+type FailedKey = (u64, String, String);
+type FailedEntry = (String, String, i64);
+
+fn cursor_map() -> &'static Mutex<HashMap<CursorKey, i64>> {
+    static MAP: OnceLock<Mutex<HashMap<CursorKey, i64>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn failed_map() -> &'static Mutex<HashMap<FailedKey, FailedEntry>> {
+    static MAP: OnceLock<Mutex<HashMap<FailedKey, FailedEntry>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn load_cursor(db_id: u64, org: &str, identity: &str) -> i64 {
+    cursor_map()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&(db_id, org.to_string(), identity.to_string())).copied())
+        .unwrap_or(0)
+}
+
+fn save_cursor(db_id: u64, org: &str, identity: &str, cursor: i64) {
+    if let Ok(mut m) = cursor_map().lock() {
+        let key = (db_id, org.to_string(), identity.to_string());
+        if cursor <= 0 {
+            m.remove(&key);
+        } else {
+            if m.len() >= MAX_TRACKED_CURSORS && !m.contains_key(&key) {
+                m.clear();
+            }
+            m.insert(key, cursor);
+        }
+    }
+}
+
+fn cooldown_active(now_ms: i64, recorded_ms: i64) -> bool {
+    now_ms >= recorded_ms && (now_ms - recorded_ms) < FAILED_NOTE_COOLDOWN_MS
+}
+
+fn is_in_failed_cooldown(
+    db_id: u64,
+    org: &str,
+    note_id: &str,
+    identity: &str,
+    sha: &str,
+    now_ms: i64,
+) -> bool {
+    let Ok(m) = failed_map().lock() else { return false };
+    let Some((f_id, f_sha, at_ms)) = m.get(&(db_id, org.to_string(), note_id.to_string())) else {
+        return false;
+    };
+    f_id == identity && f_sha == sha && cooldown_active(now_ms, *at_ms)
+}
+
+fn record_failed_note(db_id: u64, org: &str, note_id: &str, identity: &str, sha: &str, clock: Clock) {
+    let now_ms = clock.now_ms();
+    if let Ok(mut m) = failed_map().lock() {
+        if m.len() >= MAX_TRACKED_FAILURES {
+            m.retain(|_, (_, _, at_ms)| cooldown_active(now_ms, *at_ms));
+            if m.len() >= MAX_TRACKED_FAILURES {
+                m.clear();
+            }
+        }
+        m.insert(
+            (db_id, org.to_string(), note_id.to_string()),
+            (identity.to_string(), sha.to_string(), now_ms),
+        );
+    }
+}
+
+fn clear_failed_note(db_id: u64, org: &str, note_id: &str) {
+    if let Ok(mut m) = failed_map().lock() {
+        m.remove(&(db_id, org.to_string(), note_id.to_string()));
+    }
+}
+
 /// Summary of one [`backfill_embeddings`] pass over an organization.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackfillReport {
@@ -196,13 +283,16 @@ struct EmbeddedNote {
 }
 
 /// Collect up to [`BACKFILL_BATCH`] live notes of `org` with `seq > cursor`
-/// whose single vector or chunk vectors are missing or stale for `identity`.
+/// whose single vector or chunk vectors are missing or stale for `identity`,
+/// skipping notes in per-`(identity, content_sha)` failure cooldown.
 /// Returns `(notes_to_embed, next_cursor, exhausted)`.
 fn next_stale_batch(
     conn: &rusqlite::Connection,
+    db_id: u64,
     org: &str,
     identity: &str,
     mut cursor: i64,
+    now_ms: i64,
 ) -> UaResult<(Vec<PendingNote>, i64, bool)> {
     const PAGE_SIZE: i64 = 64;
     let mut pending = Vec::new();
@@ -254,7 +344,9 @@ fn next_stale_batch(
             let (total_chunks, fresh_chunks): (i64, i64) = chunk_stmt
                 .query_row(params![org, &row.id, identity, &sha], |r| Ok((r.get(0)?, r.get(1)?)))?;
             let chunks_fresh = total_chunks == expected_chunks && fresh_chunks == expected_chunks;
-            if !single_fresh || !chunks_fresh {
+            if (!single_fresh || !chunks_fresh)
+                && !is_in_failed_cooldown(db_id, org, &row.id, identity, &sha, now_ms)
+            {
                 pending.push(PendingNote { id: row.id, title: row.title, content: row.content, sha });
                 if pending.len() == BACKFILL_BATCH {
                     break;
@@ -272,9 +364,11 @@ fn next_stale_batch(
 /// Backfill missing or stale single vectors and chunk vectors for live notes
 /// in organization `org`, committing at most [`BACKFILL_BATCH`] (8) notes per
 /// write transaction and capping the pass at [`MAX_BACKFILL_BATCHES_PER_PASS`]
-/// batches so one call cannot re-embed an unbounded corpus. Embeddings are
-/// computed outside any database lock, and each write re-verifies the note's
-/// text hash before storing.
+/// batches so one call cannot re-embed an unbounded corpus. Keeps a per-org
+/// cursor across passes and places runtime-failing notes on a per-`(identity,
+/// content_sha)` cooldown so persistently failing notes never starve later
+/// notes. Embeddings are computed outside any database lock, and each write
+/// re-verifies the note's text hash before storing.
 pub async fn backfill_embeddings(db: &Db, cfg: &Config, org: &str) -> UaResult<BackfillReport> {
     backfill_embeddings_capped(db, cfg, org, Some(MAX_BACKFILL_BATCHES_PER_PASS)).await
 }
@@ -287,7 +381,7 @@ pub async fn backfill_embeddings_capped(
     org: &str,
     max_batches: Option<usize>,
 ) -> UaResult<BackfillReport> {
-    let embedder = embedder_for(cfg);
+    let embedder = embedder_for_org(db, cfg, org).await;
     let identity = embedder.identity();
     let mut report =
         BackfillReport { identity: identity.clone(), available: embedder.available(), ..Default::default() };
@@ -295,23 +389,26 @@ pub async fn backfill_embeddings_capped(
         return Ok(report);
     }
 
-    let mut cursor: i64 = 0;
+    let db_id = db.instance_id();
+    let mut cursor: i64 = load_cursor(db_id, org, &identity);
     let mut batches_attempted: usize = 0;
     loop {
-        let (org_r, id_r) = (org.to_string(), identity.clone());
+        let (org_r, id_r, now_ms) = (org.to_string(), identity.clone(), cfg.clock.now_ms());
         let (batch, next_cursor, exhausted) =
-            db.read_async(move |c| next_stale_batch(c, &org_r, &id_r, cursor)).await?;
-        cursor = next_cursor;
+            db.read_async(move |c| next_stale_batch(c, db_id, &org_r, &id_r, cursor, now_ms)).await?;
         if batch.is_empty() {
+            save_cursor(db_id, org, &identity, 0);
             break;
         }
         if let Some(cap) = max_batches
             && batches_attempted >= cap
         {
+            save_cursor(db_id, org, &identity, cursor);
             report.has_more = true;
             break;
         }
         batches_attempted += 1;
+        report.batches += 1;
 
         let mut embedded: Vec<EmbeddedNote> = Vec::new();
         for note in batch {
@@ -319,7 +416,8 @@ pub async fn backfill_embeddings_capped(
             let (title, content) = (note.title, note.content);
             match blocking(move || Ok(embed::embed_note(&*e, title.as_deref(), &content))).await? {
                 Ok((single, chunks)) => {
-                    embedded.push(EmbeddedNote { id: note.id, expected_sha: note.sha, single, chunks })
+                    clear_failed_note(db_id, org, &note.id);
+                    embedded.push(EmbeddedNote { id: note.id, expected_sha: note.sha, single, chunks });
                 }
                 Err(err) if matches!(err.category, "disabled" | "model_acquisition") => {
                     tracing::debug!(
@@ -337,6 +435,7 @@ pub async fn backfill_embeddings_capped(
                         note_id = %note.id,
                         "memory backfill: note embed failed"
                     );
+                    record_failed_note(db_id, org, &note.id, &identity, &note.sha, cfg.clock);
                     report.failed += 1;
                 }
             }
@@ -385,15 +484,121 @@ pub async fn backfill_embeddings_capped(
                 .await?;
             report.notes_embedded += written_notes;
             report.chunks_written += written_chunks;
-            report.batches += 1;
         }
 
-        if report.stopped_unavailable || exhausted {
+        if report.stopped_unavailable {
+            save_cursor(db_id, org, &identity, cursor);
+            break;
+        }
+        cursor = next_cursor;
+        if exhausted {
+            save_cursor(db_id, org, &identity, 0);
             break;
         }
     }
 
     Ok(report)
+}
+
+/// Freshness breakdown of live memory notes for an organization, computed
+/// without network calls or model loading (for `system_doctor`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbeddingCounts {
+    /// Live (non-deleted, non-superseded) notes in the organization.
+    pub live_notes: i64,
+    /// Live notes whose single vector and every expected chunk vector match
+    /// both the active vector identity and the note's current `content_sha`.
+    pub fresh_embedded: i64,
+    /// Live notes that have a `memory_embeddings` row, but it is stale
+    /// (imported, wrong identity, mismatched `content_sha`, or missing/stale
+    /// chunks) and therefore excluded from semantic scoring.
+    pub stale_embedded: i64,
+}
+
+/// Count live notes, fresh (scorable) embeddings, and stale embeddings for
+/// organization `org` against the exact `active_identity` that semantic search
+/// uses for that organization (`None` when no embedder is available for `org`).
+/// Never loads a model or touches the network.
+pub fn embedding_freshness_counts(
+    conn: &rusqlite::Connection,
+    org: &str,
+    active_identity: Option<&str>,
+) -> UaResult<EmbeddingCounts> {
+    let mut counts = EmbeddingCounts::default();
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.title, m.content, e.model, e.content_sha \
+         FROM memory m \
+         LEFT JOIN memory_embeddings e ON e.note_id = m.id AND e.org_id = m.org_id \
+         WHERE m.org_id = ?1 \
+           AND m.superseded_by IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM json_each(m.tags) WHERE value = ?2)",
+    )?;
+    let mut chunk_stmt = conn.prepare(
+        "SELECT COUNT(*), \
+                COALESCE(SUM(CASE WHEN model = ?3 AND content_sha = ?4 THEN 1 ELSE 0 END), 0) \
+         FROM memory_chunks \
+         WHERE org_id = ?1 AND note_id = ?2",
+    )?;
+    let rows = stmt.query_map(params![org, DELETED_TAG], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, title, content, emb_model, emb_sha) = row?;
+        counts.live_notes += 1;
+        let Some(model) = emb_model else {
+            continue;
+        };
+        let Some(want) = active_identity else {
+            counts.stale_embedded += 1;
+            continue;
+        };
+        let text = embed_text(title.as_deref(), &content);
+        let sha = text_sha(&text);
+        let single_fresh = model == want && emb_sha.as_deref() == Some(sha.as_str());
+        if !single_fresh {
+            counts.stale_embedded += 1;
+            continue;
+        }
+        let expected_chunks = chunks::chunk_text(&text).len() as i64;
+        let (total_chunks, fresh_chunks): (i64, i64) =
+            chunk_stmt.query_row(params![org, &id, want, &sha], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        if total_chunks == expected_chunks && fresh_chunks == expected_chunks {
+            counts.fresh_embedded += 1;
+        } else {
+            counts.stale_embedded += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// Run one bounded backfill step across every active organization, resolving
+/// each organization's embedder independently (honoring its own
+/// `orgs.allow_remote_embedder` setting) and never touching suspended orgs.
+pub async fn backfill_all_orgs_step(
+    db: &Db,
+    cfg: &Config,
+    max_batches_per_org: usize,
+) -> UaResult<Vec<(String, BackfillReport)>> {
+    let orgs: Vec<String> = db
+        .read_async(|c| {
+            let mut stmt =
+                c.prepare("SELECT id FROM orgs WHERE status = 'active' ORDER BY id = ?1 DESC, id")?;
+            let rows = stmt.query_map([ua_core::DEFAULT_ORG], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await?;
+    let mut reports = Vec::with_capacity(orgs.len());
+    for org in orgs {
+        let rep = backfill_embeddings_capped(db, cfg, &org, Some(max_batches_per_org)).await?;
+        reports.push((org, rep));
+    }
+    Ok(reports)
 }
 
 /// Organization `org`'s stale (old, never recalled, salience <= 0.5) and

@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use ua_core::{Config, UaError, UaResult};
 use ua_store::Db;
 
-use super::embed::{self, BruteForceIndex, VectorIndex, embedder_for};
+use super::embed::{self, BruteForceIndex, VectorIndex, embedder_for_org};
 use super::note::{self, Eligibility, NOTE_COLS, Note, json_list, json_text, mark_untrusted};
 use super::rank;
 use crate::blocking;
@@ -217,8 +217,8 @@ pub async fn search(db: &Db, cfg: &Config, org: &str, a: SearchRequest) -> UaRes
         now: now.clone(),
     };
 
-    // Semantic leg: embed the query when an embedder is available.
-    let embedder = embedder_for(cfg);
+    // Semantic leg: embed the query when an embedder is available for this org.
+    let embedder = embedder_for_org(db, cfg, org).await;
     let model = embedder.identity();
     let (qvec, semantic_failure) = if embedder.available() {
         let (e, text) = (embedder.clone(), a.query.clone());

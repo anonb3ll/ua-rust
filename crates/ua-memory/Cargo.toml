@@ -12,9 +12,15 @@ readme.workspace = true
 
 [features]
 default = []
-# Local semantic memory search with fastembed. Off by default: without it,
-# memory search is lexical (FTS5) only. `ua-tools/embeddings` turns it on.
-embeddings = ["dep:fastembed"]
+# Local semantic memory search with fastembed (pre-built ONNX Runtime).
+# Off by default: without it, memory search is lexical (FTS5) only unless an
+# HTTP embedder is configured. `hf-hub` is deliberately omitted so save, search
+# and system_doctor can never download models at runtime; `ua memory models fetch`
+# prepares the verified local files offline.
+embeddings = ["dep:fastembed", "fastembed/onnx", "fastembed/ort-download-binaries-rustls-tls"]
+# Local semantic memory search loading ONNX Runtime dynamically (`ort/load-dynamic`)
+# for release builds that ship or point to a verified runtime library.
+embeddings-dynamic = ["dep:fastembed", "fastembed/onnx", "fastembed/ort-load-dynamic"]
 
 [dependencies]
 ua-core = { workspace = true, features = ["rusqlite"] }
@@ -28,8 +34,7 @@ jiff.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
-fastembed = { version = "7.7", optional = true, default-features = false, features = [
-    "hf-hub-rustls-tls",
-    "onnx",
-    "ort-download-binaries-rustls-tls",
-] }
+fastembed = { version = "7.7", optional = true, default-features = false }
+
+[dev-dependencies]
+tempfile.workspace = true

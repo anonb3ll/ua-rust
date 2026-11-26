@@ -25,6 +25,11 @@ mcp-server = ["ua-server/mcp-server"]
 slack-socket = ["ua-server/slack-socket"]
 # Off by default: semantic memory search with fastembed.
 embeddings = ["ua-tools/embeddings", "ua-server/embeddings", "ua-import/embeddings"]
+embeddings-dynamic = [
+    "ua-tools/embeddings-dynamic",
+    "ua-server/embeddings-dynamic",
+    "ua-import/embeddings-dynamic",
+]
 
 [dependencies]
 anyhow.workspace = true

@@ -995,6 +995,9 @@ struct DbFacts {
     chain: Option<ledger::VerifyReport>,
     notes: i64,
     embedded: i64,
+    stale_embedded: i64,
+    embedder_available: bool,
+    allow_remote_embedder: bool,
     active_tokens: i64,
     /// The default organization's only.
     last_delivery: Option<(String, Option<String>)>,
@@ -1033,7 +1036,7 @@ struct DbFacts {
 /// nothing of the hub's other notes or nodes. The hub-wide facts (schema,
 /// the full ledger verify, the webhook's last delivery) are read for the
 /// default organization only.
-fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
+fn db_facts(c: &Connection, org: &str, active_identity: Option<&str>, deep: bool) -> UaResult<DbFacts> {
     let hub_reader = org == ua_core::DEFAULT_ORG;
     let schema_compat = hub_reader.then(|| {
         ua_store::backup::check_schema_compatibility(
@@ -1058,6 +1061,8 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
     };
     let quick_check =
         if deep { Some(c.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))?) } else { None };
+    let mem_counts = ua_memory::embedding_freshness_counts(c, org, active_identity).unwrap_or_default();
+    let allow_remote_embedder = ua_memory::org_allows_remote_embedder(c, org);
     Ok(DbFacts {
         journal_mode: c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?,
         page_count: pragma_i64(c, "page_count")?,
@@ -1065,19 +1070,17 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
         freelist: pragma_i64(c, "freelist_count")?,
         schema_compat,
         chain: if hub_reader { Some(ledger::verify(c)?) } else { None },
-        notes: c.query_row("SELECT COUNT(*) FROM memory WHERE org_id = ?1", [org], |r| r.get(0)).unwrap_or(0),
-        embedded: c
+        notes: mem_counts.live_notes,
+        embedded: mem_counts.fresh_embedded,
+        stale_embedded: mem_counts.stale_embedded,
+        embedder_available: active_identity.is_some(),
+        allow_remote_embedder,
+        active_tokens: c
             .query_row(
-                "SELECT COUNT(*) FROM memory_embeddings e JOIN memory m ON m.id = e.note_id AND m.org_id = e.org_id \
-                 WHERE e.org_id = ?1",
+                "SELECT COUNT(*) FROM agent_tokens WHERE org_id = ?1 AND status = 'active'",
                 [org],
                 |r| r.get(0),
             )
-            .unwrap_or(0),
-        active_tokens: c
-            .query_row("SELECT COUNT(*) FROM agent_tokens WHERE org_id = ?1 AND status = 'active'", [org], |r| {
-                r.get(0)
-            })
             .unwrap_or(0),
         last_delivery,
         quick_check,
@@ -1389,9 +1392,99 @@ fn build_features_check() -> Value {
     }
 }
 
-fn embeddings_check(facts: &DbFacts) -> Value {
-    let gate = "cargo feature `embeddings`, UA_EMBED_MODEL";
+fn redact_url_origin(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(u) => {
+            let origin = u.origin().ascii_serialization();
+            if origin == "null" { format!("{}://<redacted>", u.scheme()) } else { origin }
+        }
+        Err(_) => "<invalid URL>".into(),
+    }
+}
+
+fn embeddings_check(cfg: &Config, facts: &DbFacts) -> Value {
+    let gate = "cargo feature `embeddings`, [memory].embedder, UA_EMBED_MODEL";
+    let mode = cfg.memory.embedder.as_str();
+    if mode == "off" {
+        return finding(
+            "semantic_search",
+            DORMANT,
+            "memory.embedder is off; memory search is lexical (FTS5) only",
+            gate,
+        );
+    }
+    let stale_note =
+        if facts.stale_embedded > 0 { format!(" ({} stale)", facts.stale_embedded) } else { String::new() };
+    if mode == "ollama" {
+        let origin = redact_url_origin(&cfg.memory.ollama_url);
+        if !facts.embedder_available {
+            return finding(
+                "semantic_search",
+                DEGRADED,
+                format!(
+                    "Ollama model {:?} at {origin} is unavailable for this organization \
+                     (allow_remote_embedder={}, endpoint unreachable, or model missing); search is lexical-only",
+                    cfg.memory.ollama_model, facts.allow_remote_embedder
+                ),
+                gate,
+            );
+        }
+        return finding(
+            "semantic_search",
+            LIVE,
+            format!(
+                "configured for Ollama model {:?} at {origin}; {} of {} notes embedded{stale_note}",
+                cfg.memory.ollama_model, facts.embedded, facts.notes
+            ),
+            gate,
+        );
+    }
+    if mode == "openai_compat" {
+        let Some(raw_url) = cfg.memory.openai_compat_url.as_deref() else {
+            return finding(
+                "semantic_search",
+                MISCONFIGURED,
+                "memory.embedder = \"openai_compat\" requires memory.openai_compat_url",
+                gate,
+            );
+        };
+        let origin = redact_url_origin(raw_url);
+        if !facts.embedder_available {
+            return finding(
+                "semantic_search",
+                DEGRADED,
+                format!(
+                    "openai_compat endpoint {origin} is unavailable for this organization \
+                     (allow_remote_embedder={}, https required when UA_EMBED_API_KEY is set, or host unresolvable); \
+                     search is lexical-only",
+                    facts.allow_remote_embedder
+                ),
+                gate,
+            );
+        }
+        return finding(
+            "semantic_search",
+            LIVE,
+            format!(
+                "configured for openai_compat endpoint {origin} (UA_EMBED_API_KEY set: {}); {} of {} notes embedded{stale_note}",
+                cfg.embed_api_key().is_some(),
+                facts.embedded,
+                facts.notes
+            ),
+            gate,
+        );
+    }
+    // `local` or `auto`: check local ONNX readiness without ever downloading.
     if !ua_memory::EMBEDDINGS_ENABLED {
+        if mode == "local" {
+            return finding(
+                "semantic_search",
+                DEGRADED,
+                "memory.embedder = \"local\" requested, but binary was built without the `embeddings` feature; \
+                 search is lexical-only",
+                gate,
+            );
+        }
         return finding(
             "semantic_search",
             DORMANT,
@@ -1399,23 +1492,66 @@ fn embeddings_check(facts: &DbFacts) -> Value {
             gate,
         );
     }
-    let missing = facts.notes - facts.embedded;
-    if facts.notes == 0 {
-        finding("semantic_search", DORMANT, "no memory notes to embed yet", gate)
-    } else if missing > 0 {
-        finding(
+    match ua_memory::models::check_local_model_presence(&cfg.home, &cfg.embed_model) {
+        ua_memory::models::LocalModelPresence::UnknownModel { requested } => finding(
             "semantic_search",
-            MISCONFIGURED,
-            format!("{missing} of {} notes have no embedding", facts.notes),
+            DEGRADED,
+            format!(
+                "local embedding model {requested:?} is not a pinned local model; search is lexical-only"
+            ),
             gate,
-        )
-    } else {
-        finding(
+        ),
+        ua_memory::models::LocalModelPresence::Missing { spec, missing_or_wrong_size, .. } => finding(
             "semantic_search",
-            UNKNOWN,
-            format!("all {} notes are embedded; model readiness in this process is unverified", facts.notes),
+            DEGRADED,
+            format!(
+                "local embedding model {}@{} is not fetched ({}); run `ua memory models fetch` (or `ua init`); \
+                 search is lexical-only",
+                spec.canonical_id,
+                &spec.revision[..12.min(spec.revision.len())],
+                missing_or_wrong_size.join(", ")
+            ),
             gate,
-        )
+        ),
+        ua_memory::models::LocalModelPresence::Present { spec, .. } => {
+            let missing = facts.notes - facts.embedded;
+            if facts.notes == 0 {
+                finding(
+                    "semantic_search",
+                    LIVE,
+                    format!(
+                        "local model {}@{} present; no memory notes yet",
+                        spec.canonical_id,
+                        &spec.revision[..12.min(spec.revision.len())]
+                    ),
+                    gate,
+                )
+            } else if missing > 0 {
+                finding(
+                    "semantic_search",
+                    DEGRADED,
+                    format!(
+                        "local model {}@{} present; {missing} of {} notes lack fresh embeddings{stale_note} (run recall_maintenance)",
+                        spec.canonical_id,
+                        &spec.revision[..12.min(spec.revision.len())],
+                        facts.notes
+                    ),
+                    gate,
+                )
+            } else {
+                finding(
+                    "semantic_search",
+                    LIVE,
+                    format!(
+                        "local model {}@{} present; all {} notes embedded",
+                        spec.canonical_id,
+                        &spec.revision[..12.min(spec.revision.len())],
+                        facts.notes
+                    ),
+                    gate,
+                )
+            }
+        }
     }
 }
 
@@ -2011,7 +2147,9 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let hub_reader = ctx.caller.org_id == ua_core::DEFAULT_ORG;
     let deep = a.refresh && hub_reader;
     let org = ctx.caller.org_id.clone();
-    let facts = ctx.hub.db().read_async(move |c| db_facts(c, &org, deep)).await?;
+    let active_embedder = ua_memory::embedder_for_org(ctx.hub.db(), ctx.hub.cfg(), &org).await;
+    let active_identity = active_embedder.available().then(|| active_embedder.identity());
+    let facts = ctx.hub.db().read_async(move |c| db_facts(c, &org, active_identity.as_deref(), deep)).await?;
     let ledger_row = match &facts.chain {
         Some(chain) => {
             ctx.hub.record_ledger_verify(chain.ok);
@@ -2054,7 +2192,7 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
         }),
         hub_resource_check(&ctx.caller, "search_provider", SEARCH_GATE, || search_check(reg)),
         build_features_check(),
-        embeddings_check(&facts),
+        embeddings_check(cfg, &facts),
         ledger_row,
         db_row,
         match &facts.schema_compat {
@@ -2390,7 +2528,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let missing_facts = hub.db().read(|c| db_facts(c, ua_core::DEFAULT_ORG, false)).unwrap();
+        let missing_facts = hub.db().read(|c| db_facts(c, ua_core::DEFAULT_ORG, None, false)).unwrap();
         assert!(matches!(missing_facts.org_counts, Some(Err(_))));
         assert_eq!(hub_auth_check(&cfg, &missing_facts)["status"], MISCONFIGURED);
         assert_eq!(bind_check(&cfg, &missing_facts)["status"], MISCONFIGURED);
@@ -2402,7 +2540,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let unreadable_facts = hub.db().read(|c| db_facts(c, ua_core::DEFAULT_ORG, false)).unwrap();
+        let unreadable_facts = hub.db().read(|c| db_facts(c, ua_core::DEFAULT_ORG, None, false)).unwrap();
         assert!(matches!(unreadable_facts.org_counts, Some(Err(_))));
         assert_eq!(hub_auth_check(&cfg, &unreadable_facts)["status"], MISCONFIGURED);
         assert_eq!(bind_check(&cfg, &unreadable_facts)["status"], MISCONFIGURED);

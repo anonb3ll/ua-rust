@@ -96,41 +96,47 @@ class.
 ### Relaxed policies
 
 A policy is relaxed when it uses `OperatorConfigured` or sets
-`accept_invalid_certs` (`Policy::is_relaxed`). There are three:
-`github.enterprise`, `notify.webhook` and `obsidian.local_rest`. By
-construction:
+`accept_invalid_certs` (`Policy::is_relaxed`). There are four:
+`github.enterprise`, `notify.webhook`, `obsidian.local_rest` and
+`memory.embedder_remote`. By construction:
 
 - **Not obtainable by name.** They are not in `policy::POLICIES` (the
   public list, every entry of which is strict); `policy::lookup` and
   `Outbound::named` refuse their names, however the name was built.
 - **No unpinned client.** `Outbound::new` refuses a relaxed policy. The
-  only constructor that accepts one is `Outbound::pinned(policy, origin)`,
-  and only for one of the three as `ua_ingress` defines them (or one of them
+  only constructors that accept one are `Outbound::pinned(policy, origin)`
+  and `Outbound::pinned_to_addrs(policy, origin, addrs)`,
+  and only for one of the four as `ua_ingress` defines them (or one of them
   under the loopback test hook); a hand-made policy with a relaxed class or
   the certificate flag is refused.
-- **Pinned to one origin.** A pinned client refuses every request whose
-  scheme, host or port differs from the origin it was built for, before
-  anything is sent: another port, another scheme, another name for the same
-  address, or an IP literal that is not the origin. Requests to the origin
-  are still checked against the policy, so a configured origin outside it
-  fails on first use.
+- **Pinned to one origin (and optionally checked addresses).** A pinned client
+  refuses every request whose scheme, host or port differs from the origin it
+  was built for, before anything is sent: another port, another scheme,
+  another name for the same address, or an IP literal that is not the origin.
+  `pinned_to_addrs` additionally validates every address in `addrs` upfront and
+  pins DNS resolution to that exact list, preventing DNS rebinding between a
+  caller's policy check (such as `allow_remote_embedder`) and the TCP connect.
+  Requests to the origin are still checked against the policy, so a configured
+  origin outside it fails on first use.
 
 What this guarantees is one origin per client. That the origin is the
 operator's own configured value (`github_api_url`, `notify_webhook_url`,
-`obsidian_api_url`) and never one a caller supplies is not enforced by the
-crate or the tests: it remains a review duty in the three consumer files
+`obsidian_api_url`, `memory.ollama_url` / `memory.openai_compat_url`) and
+never one a caller supplies is not enforced by the
+crate or the tests: it remains a review duty in the four consumer files
 (`ua-tools/src/families/github/client.rs`,
 `ua-tools/src/families/notify.rs`,
-`ua-tools/src/families/vault/obsidian.rs`).
+`ua-tools/src/families/vault/obsidian.rs`,
+`ua-tools/src/families/memory/remote.rs`).
 
 The ratchet test is a second line of defence
 (`relaxed_policies_stay_with_their_one_consumer`): outside `ua-ingress`,
 no file names `OperatorConfigured` or the certificate flag, and each
 relaxed policy's constant is named only by its one consumer file. Since a
 pinned client needs one of those constants, that check is what keeps
-relaxed clients in the three files. The test also refuses the text
-`Outbound::pinned(` elsewhere, as a convenience only: an alias or other
-spacing would get past it.
+relaxed clients in the four files. The test also refuses the text
+`Outbound::pinned(` and `Outbound::pinned_to_addrs(` elsewhere, as a
+convenience only: an alias or other spacing would get past it.
 
 A limit that predates this policy: the client cannot tell the plugin from
 any other local process. Whatever answers on the configured loopback port,

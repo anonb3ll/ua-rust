@@ -94,8 +94,14 @@ async fn doctor_reports_every_capability_without_secrets() {
     assert_eq!(status("search_provider"), "DORMANT");
     assert_eq!(status("http_bind"), "LIVE");
     assert!(["LIVE", "DORMANT"].contains(&status("ledger_chain")));
-    // No notes yet, or no embeddings feature: either way nothing to embed.
-    assert_eq!(status("semantic_search"), "DORMANT");
+    // Without the `embeddings` feature: DORMANT. With it and no fetched model
+    // yet: DEGRADED (never downloads inside system_doctor).
+    let expected_semantic = if cfg!(any(feature = "embeddings", feature = "embeddings-dynamic")) {
+        "DEGRADED"
+    } else {
+        "DORMANT"
+    };
+    assert_eq!(status("semantic_search"), expected_semantic);
     // Optional Cargo features: the row and build.features follow this build.
     let all_default = cfg!(feature = "code-intel")
         && cfg!(feature = "readability")
