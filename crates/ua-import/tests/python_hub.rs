@@ -1315,3 +1315,91 @@ async fn an_out_of_order_ulid_keeps_manifest_chain_ok() {
     assert_eq!(log["chain_ok"], json!(true), "{log}");
     assert_eq!(log["entry_hash_mismatches"], json!(0), "{log}");
 }
+
+/// Imported `memory_embeddings` and `memory_chunks` rows stay stale by
+/// construction and contribute nothing to `memory_search` until the
+/// maintenance backfill re-embeds them under the active vector identity.
+#[tokio::test]
+async fn imported_vectors_and_chunks_do_not_score_until_backfill_reembeds() {
+    use std::sync::Arc;
+    use ua_tools::families::memory::{EmbedError, Embedder, register_embedder, vector_identity};
+
+    struct ImportTestEmbedder;
+    impl Embedder for ImportTestEmbedder {
+        fn model(&self) -> &str {
+            "import-e2e-embedder"
+        }
+        fn backend(&self) -> &str {
+            "local"
+        }
+        fn revision(&self) -> &str {
+            "rev-import"
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let low = t.to_lowercase();
+                    if low.contains("wombat") || low.contains("marsupial") {
+                        vec![1.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0]
+                    }
+                })
+                .collect())
+        }
+    }
+
+    register_embedder(Arc::new(ImportTestEmbedder));
+    let f = fixture();
+    let db = target();
+    ua_import::import(&db, &f.path, &opts()).unwrap();
+
+    // Fixture imported `note-a` ("wombats have cube shaped droppings") with
+    // both `memory_embeddings` and `memory_chunks` holding vector [1.0, 2.0]
+    // (non-zero cosine with [1.0, 0.0]). They must NOT score as-is.
+    let mut cfg = Config::for_home(std::env::temp_dir());
+    cfg.embed_model = "import-e2e-embedder".into();
+    let hub = Hub::new(cfg, db.clone());
+    let caller = Caller {
+        label: "builder-1".into(),
+        kind: ActorKind::Agent,
+        profile: Profile::Developer,
+        enforce_profile: true,
+        session_key: Some("builder-1-key".into()),
+        transport: Transport::Mcp,
+        org_id: ua_core::DEFAULT_ORG.into(),
+    };
+    let reg = builtin_registry();
+
+    // Synonym query ("marsupial") has zero lexical overlap with "wombat";
+    // imported vectors must contribute nothing before backfill.
+    let before = reg.call(&hub, &caller, "memory_search", json!({ "query": "marsupial" })).await.unwrap();
+    assert_eq!(before["retrieval"]["mode"], "hybrid", "{before}");
+    assert_eq!(
+        before["retrieval"]["semantic"]["matched_count"], 0,
+        "imported vectors must not score before backfill: {before}"
+    );
+    assert_eq!(before["results"], json!([]), "{before}");
+
+    // Run maintenance backfill: re-embeds both imported notes under the active
+    // identity and removes stale imported chunks from short notes.
+    let maint = reg.call(&hub, &caller, "recall_maintenance", json!({})).await.unwrap();
+    assert_eq!(maint["embeddings"]["notes_embedded"], 2, "{maint}");
+    let want_id = vector_identity("local", "import-e2e-embedder", "rev-import");
+    assert_eq!(
+        n(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE model = '{want_id}' AND content_sha <> ''"
+            )
+        ),
+        2
+    );
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM memory_chunks"), 0);
+
+    // After backfill, semantic search finds `note-a` via "marsupial".
+    let after = reg.call(&hub, &caller, "memory_search", json!({ "query": "marsupial" })).await.unwrap();
+    assert_eq!(after["retrieval"]["semantic"]["matched_count"], 1, "{after}");
+    assert_eq!(after["results"][0]["id"], "note-a", "{after}");
+}

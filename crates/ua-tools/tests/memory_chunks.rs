@@ -484,3 +484,98 @@ async fn semantic_score_is_exact_max_of_single_and_best_chunk() {
     assert!((sim_a - 0.9).abs() < 1e-4, "expected 0.9, got {sim_a}");
     assert!((sim_b - 0.85).abs() < 1e-4, "expected 0.85, got {sim_b}");
 }
+
+/// Maintenance backfill runs strictly per organization: a backfill in one org
+/// never reads, embeds or writes vectors for another organization's notes.
+#[tokio::test]
+async fn backfill_is_strictly_per_org_and_never_touches_another_orgs_notes() {
+    let model = "chunks-per-org-backfill-model";
+    let (emb, fail_flag) = TruncatingEmbedder::new("local", model, "rev-1");
+    register_embedder(Arc::new(emb));
+    let t = T::new(hub_with_model(model));
+
+    t.hub
+        .db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
+                 VALUES ('org-b', 'org-b', 'Org B', '[\"developer\",\"operator\"]', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let a_caller = agent(DEFAULT_ORG);
+    let b_caller = Caller { org_id: "org-b".into(), ..agent("builder-b") };
+
+    // Create unembedded long notes in both orgs while embedder is failing.
+    fail_flag.store(true, Ordering::SeqCst);
+    let filler = "lorem ".repeat(650);
+    let note_a = t
+        .ok(
+            &a_caller,
+            "memory_save",
+            json!({ "title": "Org A note", "content": format!("{filler} car car car") }),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let note_b = t
+        .ok(
+            &b_caller,
+            "memory_save",
+            json!({ "title": "Org B note", "content": format!("{filler} quokka quokka quokka") }),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(t.count("SELECT COUNT(*) FROM memory_embeddings"), 0);
+    assert_eq!(t.count("SELECT COUNT(*) FROM memory_chunks"), 0);
+
+    // Backfill as default org: only Org A's note is embedded; Org B stays untouched.
+    fail_flag.store(false, Ordering::SeqCst);
+    let maint_a = t.ok(&a_caller, "recall_maintenance", json!({})).await;
+    assert_eq!(maint_a["embeddings"]["notes_embedded"], 1, "{maint_a}");
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM memory_embeddings WHERE note_id = '{note_a}' AND org_id = 'default'"
+        )),
+        1
+    );
+    assert!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM memory_chunks WHERE note_id = '{note_a}' AND org_id = 'default'"
+        )) >= 2
+    );
+    assert_eq!(
+        t.count(&format!("SELECT COUNT(*) FROM memory_embeddings WHERE note_id = '{note_b}'")),
+        0,
+        "org-a backfill must never embed org-b notes"
+    );
+    assert_eq!(
+        t.count(&format!("SELECT COUNT(*) FROM memory_chunks WHERE note_id = '{note_b}'")),
+        0,
+        "org-a backfill must never chunk org-b notes"
+    );
+
+    // Org B's own backfill embeds Org B's note without touching Org A.
+    let maint_b = t.ok(&b_caller, "recall_maintenance", json!({})).await;
+    assert_eq!(maint_b["embeddings"]["notes_embedded"], 1, "{maint_b}");
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM memory_embeddings WHERE note_id = '{note_b}' AND org_id = 'org-b'"
+        )),
+        1
+    );
+    assert!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM memory_chunks WHERE note_id = '{note_b}' AND org_id = 'org-b'"
+        )) >= 2
+    );
+    let hit_b = t.ok(&b_caller, "memory_search", json!({ "query": "marsupial" })).await;
+    assert_eq!(hit_b["results"][0]["id"], note_b, "{hit_b}");
+}
