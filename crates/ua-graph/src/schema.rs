@@ -219,8 +219,28 @@ END;
 pub const COUNTERS_TENANT_PART: Procedure =
     ua_store::org::tenant_part("organization.v1.graph_counters", &["graph_org_counts"]);
 
+/// `graph.v3.counters_no_delete`: additive immutability guard preventing
+/// `DELETE` on `graph_org_counts` (nodes and edges are never deleted, so
+/// deleting a counter row would reset quota accounting).
+pub const COUNTERS_NO_DELETE_SCHEMA: SchemaPart = SchemaPart {
+    name: "graph.v3.counters_no_delete",
+    sql: "
+CREATE TRIGGER IF NOT EXISTS graph_org_counts_no_delete
+BEFORE DELETE ON graph_org_counts
+BEGIN
+    SELECT RAISE(ABORT, 'graph organization counters cannot be deleted');
+END;
+",
+};
+
 /// Schema parts for the shared graph store, in application order. Requires
 /// `organization.v1.store` applied first.
 pub fn schema_parts() -> Vec<Part> {
-    vec![SCHEMA.into(), TENANT_PART.into(), COUNTERS_SCHEMA.into(), COUNTERS_TENANT_PART.into()]
+    vec![
+        SCHEMA.into(),
+        TENANT_PART.into(),
+        COUNTERS_SCHEMA.into(),
+        COUNTERS_TENANT_PART.into(),
+        COUNTERS_NO_DELETE_SCHEMA.into(),
+    ]
 }

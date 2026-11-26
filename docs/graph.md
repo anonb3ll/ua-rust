@@ -131,9 +131,12 @@ index over live rows (`WHERE valid_to IS NULL`). Acyclicity constraints
 enforced inside the write transaction before insert by a **hard-bounded
 reachability check** within `org_id` over live edges of the same kind:
 
-- **Hard write-time cycle-check bounds:** at most `CYCLE_CHECK_MAX_NODES = 1,000`
-  visited nodes, `CYCLE_CHECK_MAX_EDGES = 5,000` visited edges, and a
-  `CYCLE_CHECK_DEADLINE_MS = 50` ms wall-clock budget.
+- **Hard write-time cycle-check bounds (per-kind parameterized):**
+  `CycleCheckPolicy` parameterizes `(max_nodes, max_edges, deadline_ms)`
+  independently per acyclic edge kind (`depends_on`, `subtask_of`,
+  `goal_parent`, `delegates_to`, `escalates_to`); every kind defaults to
+  `CYCLE_CHECK_MAX_NODES = 1,000` visited nodes, `CYCLE_CHECK_MAX_EDGES = 5,000`
+  visited edges, and a `CYCLE_CHECK_DEADLINE_MS = 50` ms wall-clock budget.
 - **Distinct reason codes (fail-closed):**
   - If the check detects a real path from `dst_id` back to `src_id`, the write
     is refused with `invalid_argument` and reason code `cycle_detected`
@@ -431,6 +434,9 @@ to operate over `graph_edges`.
      `ua_store::org::tenant_part("organization.v1.graph_counters", &["graph_org_counts"])`)
      — installs `graph_org_counts_org_exists` and
      `graph_org_counts_org_immutable`.
+  5. `graph.v3.counters_no_delete` (`SchemaPart` in `ua-graph`) — installs
+     `graph_org_counts_no_delete` (`BEFORE DELETE ON graph_org_counts`) so
+     counter rows cannot be deleted to reset quota accounting.
 
 ### DDL (`graph.v1`)
 

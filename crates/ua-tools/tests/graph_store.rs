@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use ua_core::identity::Transport;
 use ua_core::{ActorKind, Caller, Config, DEFAULT_ORG, Profile};
 use ua_graph::{
-    AssertEdgeRequest, AssertedByKind, CycleCheckBounds, EdgeKind, EdgeState, EnsureNodeRequest, NodeKind,
+    AssertEdgeRequest, AssertedByKind, CycleCheckPolicy, EdgeKind, EdgeState, EnsureNodeRequest, NodeKind,
     OwnerType, PrincipalId, Provenance, SourceKind, Visibility, assert_edge, graph_node_ensure,
 };
 use ua_store::graph::VisibilityScope;
@@ -179,7 +179,7 @@ async fn generic_tools_refuse_evidence_mentions_and_other_domain_owned_edges() {
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
             let men = assert_edge(
@@ -205,7 +205,7 @@ async fn generic_tools_refuse_evidence_mentions_and_other_domain_owned_edges() {
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
             Ok((ev.id, men.id))
@@ -551,7 +551,7 @@ async fn retract_checks_asserted_by_kind_and_tool_layer_refusals_are_not_masked(
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
             Ok(e.id)
@@ -586,4 +586,23 @@ async fn retract_checks_asserted_by_kind_and_tool_layer_refusals_are_not_masked(
         .unwrap_err();
     assert_eq!(cap_err.code(), "denied");
     assert_eq!(cap_err.reason_code(), Some("node_edge_limit_exceeded"));
+
+    // 5. Verified caller whose label is the reserved `'system'` literal (any case)
+    //    is refused on both graph_edge_assert and graph_edge_retract.
+    for reserved in ["system", "SYSTEM"] {
+        let spoof = caller(reserved, ActorKind::Agent, Profile::Coordinator, DEFAULT_ORG);
+        let err = reg
+            .call(&hub, &spoof, "graph_edge_assert", json!({ "src_id": n3, "dst_id": n4, "kind": "extends" }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "invalid_argument", "{reserved}: {err:?}");
+        assert_eq!(err.reason_code(), Some("reserved_principal_id"), "{reserved}: {err:?}");
+
+        let retract_err = reg
+            .call(&hub, &spoof, "graph_edge_retract", json!({ "edge_id": "nonexistent" }))
+            .await
+            .unwrap_err();
+        assert_eq!(retract_err.code(), "invalid_argument", "{reserved}: {retract_err:?}");
+        assert_eq!(retract_err.reason_code(), Some("reserved_principal_id"), "{reserved}: {retract_err:?}");
+    }
 }

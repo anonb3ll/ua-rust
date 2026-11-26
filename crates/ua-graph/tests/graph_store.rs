@@ -5,10 +5,11 @@ use rusqlite::Connection;
 use serde_json::json;
 use ua_core::{DEFAULT_ORG, UaError};
 use ua_graph::{
-    AssertEdgeRequest, AssertedByKind, CycleCheckBounds, EdgeKind, EdgeState, EnsureNodeRequest, KHopRequest,
-    NeighborsRequest, NodeKind, OwnerType, PrincipalId, Provenance, RetractEdgeRequest, SeedExpandRequest,
-    SeedInput, ShortestPathRequest, SourceKind, Visibility, WalkDirection, assert_edge, check_acyclic,
-    graph_node_ensure, k_hop, neighbors, node_get, retract_edge, schema_parts, seed_expand, shortest_path,
+    AssertEdgeRequest, AssertedByKind, CycleCheckBounds, CycleCheckPolicy, EdgeKind, EdgeState,
+    EnsureNodeRequest, KHopRequest, NeighborsRequest, NodeKind, OwnerType, PrincipalId, Provenance,
+    RetractEdgeRequest, SeedExpandRequest, SeedInput, ShortestPathRequest, SourceKind, Visibility,
+    WalkDirection, assert_edge, check_acyclic, graph_node_ensure, k_hop, neighbors, node_get, retract_edge,
+    schema_parts, seed_expand, shortest_path,
 };
 use ua_store::graph::{
     EdgeDirection, GraphRead, GraphRepo, NewGraphEdge, NewGraphNode, SqliteGraph, VisibilityScope,
@@ -101,7 +102,7 @@ fn ddl_immutability_triggers_and_system_check_constraints() {
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -421,7 +422,7 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
         }
@@ -450,7 +451,7 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -480,7 +481,11 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds { max_nodes: 5, max_edges: 5_000, deadline_ms: 50 },
+                    cycle_bounds: CycleCheckPolicy::all(CycleCheckBounds {
+                        max_nodes: 5,
+                        max_edges: 5_000,
+                        deadline_ms: 50,
+                    }),
                 },
             )
         })
@@ -553,7 +558,7 @@ fn assert_never_creates_nodes_and_validates_endpoint_kinds() {
                     generic: true,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -578,7 +583,7 @@ fn assert_never_creates_nodes_and_validates_endpoint_kinds() {
                     generic: true,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -610,7 +615,7 @@ fn assert_never_creates_nodes_and_validates_endpoint_kinds() {
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -639,7 +644,7 @@ fn assert_never_creates_nodes_and_validates_endpoint_kinds() {
                     generic: true,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -676,7 +681,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
                     generic: true,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
             assert_edge(
@@ -697,7 +702,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
                     generic: true,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
             Ok(e1)
@@ -828,7 +833,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
                     generic: true,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
         }
@@ -868,7 +873,7 @@ fn same_org_visibility_before_after_invariant_and_as_of_reads() {
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -1021,7 +1026,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -1046,7 +1051,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
                 generic: false,
                 max_edges_per_org: 0,
                 max_live_edges_per_node: 0,
-                cycle_bounds: CycleCheckBounds::default(),
+                cycle_bounds: CycleCheckPolicy::default(),
             },
         )
     });
@@ -1083,7 +1088,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
                 generic: false,
                 max_edges_per_org: 0,
                 max_live_edges_per_node: 0,
-                cycle_bounds: CycleCheckBounds::default(),
+                cycle_bounds: CycleCheckPolicy::default(),
             },
         )
     })
@@ -1113,7 +1118,7 @@ fn node_ensure_idempotency_n_to_1_cardinality_and_traversal_bounds() {
                     generic: true,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
         }
@@ -1332,7 +1337,7 @@ fn org_quota_counters_are_trigger_maintained_transactional_and_enforced() {
                 generic: true,
                 max_edges_per_org: 2,
                 max_live_edges_per_node: 0,
-                cycle_bounds: CycleCheckBounds::default(),
+                cycle_bounds: CycleCheckPolicy::default(),
             },
         )
     })
@@ -1360,7 +1365,7 @@ fn org_quota_counters_are_trigger_maintained_transactional_and_enforced() {
                     generic: true,
                     max_edges_per_org: 1,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -1600,7 +1605,7 @@ fn generic_assertion_scope_refused_per_node_live_cap_and_source_kind_fallback() 
                     generic: true,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -1629,7 +1634,7 @@ fn generic_assertion_scope_refused_per_node_live_cap_and_source_kind_fallback() 
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -1658,7 +1663,7 @@ fn generic_assertion_scope_refused_per_node_live_cap_and_source_kind_fallback() 
                     generic: true,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 2,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
@@ -1686,7 +1691,7 @@ fn generic_assertion_scope_refused_per_node_live_cap_and_source_kind_fallback() 
                         generic: true,
                         max_edges_per_org: 0,
                         max_live_edges_per_node: 2,
-                        cycle_bounds: CycleCheckBounds::default(),
+                        cycle_bounds: CycleCheckPolicy::default(),
                     },
                 )
             })
@@ -1726,7 +1731,7 @@ fn generic_assertion_scope_refused_per_node_live_cap_and_source_kind_fallback() 
                 generic: true,
                 max_edges_per_org: 0,
                 max_live_edges_per_node: 2,
-                cycle_bounds: CycleCheckBounds::default(),
+                cycle_bounds: CycleCheckPolicy::default(),
             },
         )
     })
@@ -1770,7 +1775,7 @@ fn generic_assertion_scope_refused_per_node_live_cap_and_source_kind_fallback() 
                     generic: true,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
             Ok((node, edge))
@@ -1865,7 +1870,7 @@ fn sql_deadline_enforcement_exact_ppr_scan_cap_skip_hubs_clamp_and_endpoint_node
                 generic: true,
                 max_edges_per_org: 0,
                 max_live_edges_per_node: 0,
-                cycle_bounds: CycleCheckBounds::default(),
+                cycle_bounds: CycleCheckPolicy::default(),
             },
         )?;
         let mut priv_nodes = Vec::new();
@@ -1907,7 +1912,7 @@ fn sql_deadline_enforcement_exact_ppr_scan_cap_skip_hubs_clamp_and_endpoint_node
                     generic: true,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
         }
@@ -2000,7 +2005,7 @@ fn sql_deadline_enforcement_exact_ppr_scan_cap_skip_hubs_clamp_and_endpoint_node
                 generic: false,
                 max_edges_per_org: 0,
                 max_live_edges_per_node: 0,
-                cycle_bounds: CycleCheckBounds::default(),
+                cycle_bounds: CycleCheckPolicy::default(),
             },
         )
     })
@@ -2262,7 +2267,11 @@ fn writer_deadline_slot_is_disarmed_after_cycle_check() {
                 generic: false,
                 max_edges_per_org: 0,
                 max_live_edges_per_node: 0,
-                cycle_bounds: CycleCheckBounds { max_nodes: 1_000, max_edges: 5_000, deadline_ms: 5 },
+                cycle_bounds: CycleCheckPolicy::all(CycleCheckBounds {
+                    max_nodes: 1_000,
+                    max_edges: 5_000,
+                    deadline_ms: 5,
+                }),
             },
         )
     })
@@ -2288,7 +2297,11 @@ fn writer_deadline_slot_is_disarmed_after_cycle_check() {
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds { max_nodes: 1_000, max_edges: 5_000, deadline_ms: 5 },
+                    cycle_bounds: CycleCheckPolicy::all(CycleCheckBounds {
+                        max_nodes: 1_000,
+                        max_edges: 5_000,
+                        deadline_ms: 5,
+                    }),
                 },
             )
         })
@@ -2328,10 +2341,210 @@ fn writer_deadline_slot_is_disarmed_after_cycle_check() {
                     generic: false,
                     max_edges_per_org: 0,
                     max_live_edges_per_node: 0,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )
         })
         .expect("later ordinary write past previous cycle-check deadline must succeed");
     assert_eq!(later.dst_id, t3.id);
+}
+
+#[test]
+fn principal_id_reserves_system_case_insensitively_and_on_deserialize() {
+    for raw in ["system", "System", "SYSTEM", " system ", "\tsYsTeM\n"] {
+        let err = PrincipalId::new(raw).expect_err("reserved system id must be rejected");
+        assert_eq!(err.code(), "invalid_argument", "{raw:?}: {err:?}");
+        assert_eq!(err.reason_code(), Some("reserved_principal_id"), "{raw:?}: {err:?}");
+
+        let json_str = serde_json::to_string(raw).unwrap();
+        let deser_err = serde_json::from_str::<PrincipalId>(&json_str)
+            .expect_err("deserializing reserved system principal must fail");
+        assert!(deser_err.to_string().contains("reserved"), "{raw:?}: {deser_err}");
+    }
+
+    // Non-system IDs containing "system" as a substring remain valid.
+    let ok = PrincipalId::new("system-worker-1").expect("non-exact system prefix allowed");
+    assert!(!ok.is_system());
+    assert_eq!(ok.as_str(), "system-worker-1");
+
+    // Only PrincipalId::system() constructs the reserved system principal.
+    let sys = PrincipalId::system();
+    assert!(sys.is_system());
+    assert_eq!(sys.as_str(), "system");
+
+    // Provenance::validate still enforces the (system <-> System) pairing.
+    let bad_prov = Provenance {
+        asserted_by: PrincipalId::system(),
+        asserted_by_kind: AssertedByKind::Agent,
+        source_kind: SourceKind::Tool,
+        source_ref: "tool:x".into(),
+    };
+    assert_eq!(bad_prov.validate().unwrap_err().code(), "invalid_argument");
+
+    let good_prov = Provenance {
+        asserted_by: PrincipalId::system(),
+        asserted_by_kind: AssertedByKind::System,
+        source_kind: SourceKind::Mirror,
+        source_ref: "mirror:x".into(),
+    };
+    good_prov.validate().expect("system principal with System kind is valid");
+}
+
+#[test]
+fn per_kind_cycle_check_policy_enforces_independent_caps_per_edge_kind() {
+    // Policy coverage matches EdgeKind::is_acyclic() across every closed edge kind.
+    let default_policy = CycleCheckPolicy::default();
+    for kind in EdgeKind::ALL {
+        assert_eq!(
+            default_policy.bounds_for(kind).is_some(),
+            kind.is_acyclic(),
+            "CycleCheckPolicy::bounds_for({kind}) must match EdgeKind::is_acyclic()"
+        );
+    }
+
+    let db = open_graph_db();
+    // Build a 6-node chain (t0 -> t1 -> t2 -> t3 -> t4 -> t5) for both depends_on and subtask_of.
+    let tasks: Vec<_> =
+        (0..=5).map(|i| ensure_org_node(&db, DEFAULT_ORG, NodeKind::Task, &format!("pk-t{i}"))).collect();
+    let chain_src = ensure_org_node(&db, DEFAULT_ORG, NodeKind::Task, "pk-src");
+
+    for kind in [EdgeKind::DependsOn, EdgeKind::SubtaskOf] {
+        for i in 0..5 {
+            db.write(|tx| {
+                assert_edge(
+                    tx,
+                    AssertEdgeRequest {
+                        org_id: DEFAULT_ORG.into(),
+                        src_id: tasks[i].id.clone(),
+                        dst_id: tasks[i + 1].id.clone(),
+                        kind,
+                        assertion_scope: String::new(),
+                        state: EdgeState::Active,
+                        weight: 1.0,
+                        provenance: prov_agent("builder-1"),
+                        valid_from: None,
+                        valid_to: None,
+                        meta_json: None,
+                        scope: VisibilityScope::org_only(),
+                        generic: false,
+                        max_edges_per_org: 0,
+                        max_live_edges_per_node: 0,
+                        cycle_bounds: default_policy,
+                    },
+                )
+            })
+            .expect("seed chain edge");
+        }
+    }
+
+    // One policy: generous cap for `depends_on` (20 nodes), tight cap for `subtask_of` (3 nodes).
+    let policy = CycleCheckPolicy::default()
+        .with_kind(EdgeKind::DependsOn, CycleCheckBounds { max_nodes: 20, max_edges: 100, deadline_ms: 50 })
+        .with_kind(EdgeKind::SubtaskOf, CycleCheckBounds { max_nodes: 3, max_edges: 100, deadline_ms: 50 });
+
+    // `subtask_of` hits its 3-node cap on the 6-node chain -> cycle_check_bound_exceeded.
+    let sub_err = db
+        .write(|tx| {
+            assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: chain_src.id.clone(),
+                    dst_id: tasks[0].id.clone(),
+                    kind: EdgeKind::SubtaskOf,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_agent("builder-1"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: false,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: policy,
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(sub_err.code(), "invalid_argument");
+    assert_eq!(sub_err.reason_code(), Some("cycle_check_bound_exceeded"));
+
+    // Same policy: `depends_on` passes because its per-kind cap is 20 nodes.
+    let dep = db
+        .write(|tx| {
+            assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: chain_src.id.clone(),
+                    dst_id: tasks[0].id.clone(),
+                    kind: EdgeKind::DependsOn,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_agent("builder-1"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: false,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: policy,
+                },
+            )
+        })
+        .expect("depends_on must use its own higher per-kind cap");
+    assert_eq!(dep.kind, "depends_on");
+}
+
+#[test]
+fn graph_org_counts_no_delete_trigger_preserves_quota_accounting() {
+    let db = open_graph_db();
+    let n1 = ensure_org_node(&db, DEFAULT_ORG, NodeKind::Task, "nd-1");
+    let n2 = ensure_org_node(&db, DEFAULT_ORG, NodeKind::Task, "nd-2");
+    db.write(|tx| {
+        assert_edge(
+            tx,
+            AssertEdgeRequest {
+                org_id: DEFAULT_ORG.into(),
+                src_id: n1.id.clone(),
+                dst_id: n2.id.clone(),
+                kind: EdgeKind::DependsOn,
+                assertion_scope: String::new(),
+                state: EdgeState::Active,
+                weight: 1.0,
+                provenance: prov_agent("builder-1"),
+                valid_from: None,
+                valid_to: None,
+                meta_json: None,
+                scope: VisibilityScope::org_only(),
+                generic: false,
+                max_edges_per_org: 0,
+                max_live_edges_per_node: 0,
+                cycle_bounds: CycleCheckPolicy::default(),
+            },
+        )
+    })
+    .unwrap();
+
+    assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_nodes(DEFAULT_ORG)).unwrap(), 2);
+    assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_edges(DEFAULT_ORG)).unwrap(), 1);
+
+    let del_err = db
+        .write(|tx| {
+            tx.execute("DELETE FROM graph_org_counts WHERE org_id = ?1", [DEFAULT_ORG])?;
+            Ok(())
+        })
+        .expect_err("DELETE on graph_org_counts must abort");
+    assert!(
+        del_err.to_string().contains("graph organization counters cannot be deleted"),
+        "unexpected error: {del_err}"
+    );
+
+    // Counters remain intact after the aborted DELETE.
+    assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_nodes(DEFAULT_ORG)).unwrap(), 2);
+    assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_edges(DEFAULT_ORG)).unwrap(), 1);
 }
