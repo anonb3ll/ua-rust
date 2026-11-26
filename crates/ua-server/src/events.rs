@@ -766,11 +766,20 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        state.auth_policy.record_ok();
+        assert!(state.auth_policy.is_fresh());
         assert_eq!(auth.recheck(&state, &scope, false), Err("auth_required_multi_org"));
+        assert!(!state.auth_policy.is_fresh(), "failed recheck must invalidate AuthPolicyCache");
     }
 
     #[test]
-    fn auth_policy_revoke_reason_distinguishes_multi_org_from_unavailable_reader() {
+    fn auth_policy_cache_ttl_is_bounded_and_revoke_reason_distinguishes_unavailable_reader() {
+        assert!(
+            crate::auth::AUTH_POLICY_CACHE_TTL <= Duration::from_secs(1)
+                && !crate::auth::AUTH_POLICY_CACHE_TTL.is_zero(),
+            "per-event auth policy cache TTL must be > 0 and <= 1s, got {:?}",
+            crate::auth::AUTH_POLICY_CACHE_TTL
+        );
         assert_eq!(
             auth_policy_revoke_reason(&ua_core::UaError::denied("auth_required_multi_org", "two orgs")),
             "auth_required_multi_org"

@@ -654,11 +654,74 @@ async fn default_org_readiness_queries_use_integer_primary_key_lookup_for_prereq
     }
 }
 
+/// Split masked Rust source into `fn <name>(...) { ... }` function bodies
+/// (returning `(fn_name, body_start_offset, body_slice)`).
+fn extract_fn_bodies(masked: &str) -> Vec<(&str, usize, &str)> {
+    let b = masked.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b.get(i..i + 2) == Some(b"fn")
+            && (i == 0 || !is_ident(b[i - 1]))
+            && b.get(i + 2).is_some_and(|c| c.is_ascii_whitespace())
+        {
+            let mut k = i + 2;
+            while k < b.len() && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let name_start = k;
+            while k < b.len() && is_ident(b[k]) {
+                k += 1;
+            }
+            let name = &masked[name_start..k];
+            if !name.is_empty() {
+                let mut paren_depth = 0usize;
+                let mut angle_depth = 0usize;
+                while k < b.len() {
+                    match b[k] {
+                        b'(' => paren_depth += 1,
+                        b')' => paren_depth = paren_depth.saturating_sub(1),
+                        b'<' if paren_depth == 0 => angle_depth += 1,
+                        b'>' if paren_depth == 0 && b.get(k.saturating_sub(1)) != Some(&b'-') => {
+                            angle_depth = angle_depth.saturating_sub(1);
+                        }
+                        b';' if paren_depth == 0 && angle_depth == 0 => break,
+                        b'{' if paren_depth == 0 && angle_depth == 0 => {
+                            let body_start = k;
+                            let mut depth = 0usize;
+                            while k < b.len() {
+                                if b[k] == b'{' {
+                                    depth += 1;
+                                } else if b[k] == b'}' {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        out.push((name, body_start, &masked[body_start..=k]));
+                                        break;
+                                    }
+                                }
+                                k += 1;
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Check that every non-test graph `dependency_id` allocator (`next_dependency_id(`)
-/// has a matching `advance_dependency_sequence(` call in the same file, so
+/// lives in `crates/ua-tools/src/families/tasks/graph.rs` and has a matching
+/// `advance_dependency_sequence(` call in the **same function** after it, so
 /// `sqlite_sequence('task_dependencies')` never falls behind `graph_edges` and
 /// non-default organizations writing `task_dependencies` never collide on ids.
-fn dependency_sequence_guard_violations(files: &[(std::path::PathBuf, String)]) -> Vec<String> {
+/// Returns `(violations, total_allocators_found)`.
+fn dependency_sequence_guard_violations(files: &[(std::path::PathBuf, String)]) -> (Vec<String>, usize) {
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let call_positions = |masked: &str, name: &str| -> Vec<usize> {
         let needle = format!("{name}(");
@@ -674,46 +737,66 @@ fn dependency_sequence_guard_violations(files: &[(std::path::PathBuf, String)]) 
     };
 
     let mut violations = Vec::new();
+    let mut total_allocators = 0usize;
     for (path, src) in files {
         let path_str = path.display().to_string().replace('\\', "/");
         let masked = support::without_tests(src);
-        let allocs = call_positions(&masked, "next_dependency_id");
-        let advances = call_positions(&masked, "advance_dependency_sequence");
-        if allocs.is_empty() && advances.is_empty() {
+        let file_allocs = call_positions(&masked, "next_dependency_id");
+        let file_advances = call_positions(&masked, "advance_dependency_sequence");
+        if file_allocs.is_empty() && file_advances.is_empty() {
             continue;
         }
+        total_allocators += file_allocs.len();
         if !path_str.ends_with("crates/ua-tools/src/families/tasks/graph.rs") {
             violations.push(format!(
                 "{path_str}: unexpected dependency_id allocator outside crates/ua-tools/src/families/tasks/graph.rs"
             ));
             continue;
         }
-        if allocs.len() != advances.len() {
-            violations.push(format!(
-                "{path_str}: found {} `next_dependency_id(` call(s) but {} `advance_dependency_sequence(` call(s); \
-                 every graph dependency_id allocator must advance sqlite_sequence('task_dependencies')",
-                allocs.len(),
-                advances.len()
-            ));
-            continue;
-        }
-        for (alloc_at, adv_at) in allocs.iter().zip(advances.iter()) {
-            if adv_at <= alloc_at {
+        let mut matched_allocs = 0usize;
+        for (fn_name, body_start, body) in extract_fn_bodies(&masked) {
+            let allocs = call_positions(body, "next_dependency_id");
+            let advances = call_positions(body, "advance_dependency_sequence");
+            if allocs.is_empty() {
+                continue;
+            }
+            matched_allocs += allocs.len();
+            if allocs.len() != advances.len() {
                 violations.push(format!(
-                    "{path_str}:{}: `advance_dependency_sequence` must be called after `next_dependency_id`",
-                    support::line_of(&masked, *alloc_at)
+                    "{path_str}::{fn_name}: found {} `next_dependency_id(` call(s) but {} \
+                     `advance_dependency_sequence(` call(s) in the same function; every graph \
+                     dependency_id allocator must advance sqlite_sequence('task_dependencies')",
+                    allocs.len(),
+                    advances.len()
                 ));
+                continue;
+            }
+            for (alloc_at, adv_at) in allocs.iter().zip(advances.iter()) {
+                if adv_at <= alloc_at {
+                    violations.push(format!(
+                        "{path_str}:{}: in `{fn_name}`, `advance_dependency_sequence` must be called after `next_dependency_id`",
+                        support::line_of(&masked, body_start + *alloc_at)
+                    ));
+                }
             }
         }
+        if matched_allocs != file_allocs.len() {
+            violations
+                .push(format!("{path_str}: found `next_dependency_id(` outside an analyzed function body"));
+        }
     }
-    violations
+    (violations, total_allocators)
 }
 
 #[test]
 fn every_graph_dependency_id_allocator_calls_advance_dependency_sequence() {
     let files = support::sources();
     assert!(files.len() > 100, "found only {} workspace source files", files.len());
-    let violations = dependency_sequence_guard_violations(&files);
+    let (violations, total_allocators) = dependency_sequence_guard_violations(&files);
+    assert!(
+        total_allocators >= 1,
+        "expected at least 1 graph dependency_id allocator (`next_dependency_id(`); update this guard if renamed"
+    );
     assert!(violations.is_empty(), "dependency_id sequence guard violations:\n{}", violations.join("\n"));
 
     // Self-check: a missing `advance_dependency_sequence` call is caught.
@@ -729,9 +812,30 @@ fn every_graph_dependency_id_allocator_calls_advance_dependency_sequence() {
         "#
         .to_string(),
     )];
-    let caught = dependency_sequence_guard_violations(&bad);
+    let (caught, _) = dependency_sequence_guard_violations(&bad);
     assert_eq!(caught.len(), 1, "{caught:?}");
     assert!(caught[0].contains("advance_dependency_sequence"), "{caught:?}");
+
+    // Self-check: an `advance_dependency_sequence` call in a DIFFERENT function does not satisfy
+    // the allocator's function (paired per function, not just by file-level position).
+    let wrong_fn = vec![(
+        std::path::PathBuf::from("crates/ua-tools/src/families/tasks/graph.rs"),
+        r#"
+            fn next_dependency_id(c: &Connection) -> i64 { 1 }
+            fn advance_dependency_sequence(c: &Connection, id: i64) {}
+            fn dep_add(tx: &Connection) {
+                let id = next_dependency_id(tx);
+                let _ = id;
+            }
+            fn unrelated(tx: &Connection) {
+                advance_dependency_sequence(tx, 1);
+            }
+        "#
+        .to_string(),
+    )];
+    let (caught_wrong_fn, _) = dependency_sequence_guard_violations(&wrong_fn);
+    assert_eq!(caught_wrong_fn.len(), 1, "{caught_wrong_fn:?}");
+    assert!(caught_wrong_fn[0].contains("dep_add"), "{caught_wrong_fn:?}");
 
     // Self-check: an allocator added in another file is caught.
     let rogue = vec![(
@@ -739,6 +843,6 @@ fn every_graph_dependency_id_allocator_calls_advance_dependency_sequence() {
         "fn sneak(tx: &Connection) { let id = next_dependency_id(tx); advance_dependency_sequence(tx, id); }"
             .to_string(),
     )];
-    let caught_rogue = dependency_sequence_guard_violations(&rogue);
+    let (caught_rogue, _) = dependency_sequence_guard_violations(&rogue);
     assert_eq!(caught_rogue.len(), 1, "{caught_rogue:?}");
 }

@@ -237,6 +237,34 @@ async fn open_anonymous_stream_revokes_immediately_on_auth_channel_even_while_ca
     let after = append_event(&h.state.hub, "test.keep");
     let forbidden = format!("id: {after}\n");
     expect_auth_revoked(Response::new(api_body), "auth_required_multi_org", Some(&forbidden)).await;
+    assert!(!h.state.auth_policy.is_fresh());
+}
+
+#[tokio::test]
+async fn failed_http_auth_check_invalidates_stream_cache_immediately() {
+    let mut cfg = config();
+    cfg.enforce_auth = false;
+    let h = TestHub::new(cfg);
+
+    let api_resp = h.send(get("/api/events/stream?channel_prefix=test.keep", None, None)).await;
+    assert_eq!(api_resp.status(), StatusCode::OK);
+    let mut api_body = api_resp.into_body();
+
+    let before = append_event(&h.state.hub, "test.keep");
+    read_until_contains(&mut api_body, &format!("id: {before}\n")).await;
+    assert!(h.state.auth_policy.is_fresh());
+
+    // Insert org-b, then trigger a failed unauthenticated HTTP request without sleeping for TTL:
+    // the failed HTTP check must invalidate `AppState::auth_policy` so the open stream revokes
+    // on the very next event without waiting for the 1 s TTL.
+    insert_org(&h.state.hub, "org-b", "active");
+    let resp = h.send(get("/api/whoami", None, None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(!h.state.auth_policy.is_fresh(), "failed HTTP auth check must invalidate stream cache");
+
+    let after = append_event(&h.state.hub, "test.keep");
+    let forbidden = format!("id: {after}\n");
+    expect_auth_revoked(Response::new(api_body), "auth_required_multi_org", Some(&forbidden)).await;
 }
 
 #[tokio::test]

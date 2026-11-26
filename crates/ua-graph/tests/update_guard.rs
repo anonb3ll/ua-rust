@@ -682,10 +682,11 @@ fn direct_low_level_update_calls(path: &str, masked_non_test: &str) -> Vec<Strin
     findings
 }
 
-/// Return byte ranges of `pub use write::{ ... };` re-export lists in masked
-/// `crates/ua-graph/src/lib.rs` source. Only identifier lists (no `(`, `)`, or
-/// `;` inside the braces) qualify, so executable code or helper functions added
-/// to `lib.rs` are never exempted.
+/// Return byte ranges of plain `pub use write::{ ... };` re-export lists in
+/// masked `crates/ua-graph/src/lib.rs` source. Every comma-separated entry must
+/// be a single plain Rust identifier (no `as` aliases, globs, paths, or
+/// executable tokens like `(`, `)`, `;`, `{`, `}`), so neither helper functions
+/// nor aliased re-exports like `graph_node_update as patch_node` are exempted.
 fn pub_use_write_list_ranges(masked: &str) -> Vec<std::ops::Range<usize>> {
     let b = masked.as_bytes();
     let mut ranges = Vec::new();
@@ -712,9 +713,15 @@ fn pub_use_write_list_ranges(masked: &str) -> Vec<std::ops::Range<usize>> {
                                 let close = open + 1 + rel_close;
                                 let inner = &masked[open + 1..close];
                                 let after_close = skip_space(b, close + 1);
-                                if b.get(after_close) == Some(&b';')
-                                    && !inner.contains(['(', ')', ';', '{', '}'])
-                                {
+                                let is_plain_ident_list =
+                                    inner.split(',').map(str::trim).filter(|s| !s.is_empty()).all(|item| {
+                                        let bytes = item.as_bytes();
+                                        !bytes.is_empty()
+                                            && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+                                            && bytes.iter().all(|&c| is_ident_byte(c))
+                                            && item != "as"
+                                    });
+                                if b.get(after_close) == Some(&b';') && is_plain_ident_list {
                                     ranges.push(open..close + 1);
                                     i = after_close + 1;
                                     continue;
@@ -1133,6 +1140,34 @@ fn update_guard_catches_all_sql_variants_dynamic_slots_and_call_allowlist_bypass
         )
         .len(),
         2
+    );
+    // Aliased re-exports in `crates/ua-graph/src/lib.rs` (both plain and brace form) are caught
+    // so callers cannot smuggle `graph_node_update` under an unguarded alias.
+    let bad_lib_brace_alias = r#"
+        pub mod write;
+        pub use write::{assert_edge, graph_node_update as patch_node};
+    "#;
+    assert_eq!(
+        domain_update_call_violations(
+            "crates/ua-graph/src/lib.rs",
+            &support::without_tests(bad_lib_brace_alias),
+            DOMAIN_UPDATE_CALL_ALLOWLIST,
+        )
+        .len(),
+        1
+    );
+    let bad_lib_plain_alias = r#"
+        pub mod write;
+        pub use write::graph_node_update as patch_node;
+    "#;
+    assert_eq!(
+        domain_update_call_violations(
+            "crates/ua-graph/src/lib.rs",
+            &support::without_tests(bad_lib_plain_alias),
+            DOMAIN_UPDATE_CALL_ALLOWLIST,
+        )
+        .len(),
+        1
     );
 
     // MigrationGraph allowlist catches unauthorized usage and permits allowlisted modules.
