@@ -478,7 +478,11 @@ a held task's items, which stay queued until the hold is released.
 | `agent_forget` (`agent`, `reason`) | Lifecycle operators only | Refused unless the agent is retired. Deletes its agent row, lifecycle row and profile bindings so the label can be registered again; its sessions, notes and revoked tokens stay as history in its organization. |
 
 Every action works in the caller's organization; a label another
-organization holds is refused (`agent_label_taken`). `agent_retire` and
+organization holds is refused (`agent_label_taken`). That hub-wide refusal is
+the compatibility rule while existing data is migrated: the contract is a label
+local to one organization and resource type, behind an immutable agent id
+([organization.md](organization.md#3-names-are-local-to-one-organization-and-one-resource-type)).
+`agent_retire` and
 `agent_forget` take `any_org=true` for hub recovery by the default
 organization's lifecycle operators: the agent of whichever organization holds
 the label is retired or forgotten there, and the answer is only `{agent,

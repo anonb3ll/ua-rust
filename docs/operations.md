@@ -59,6 +59,13 @@ Checks performed:
 3. `permissions`: verifies `$UA_HOME`, active config file, and `ua.db` are owner-only (`mode & 0o077 == 0` on Unix; `0644` warns).
 4. `auth_lockout`: ensures `enforce_auth = true` has at least one static or active database token.
 5. `origin_security`: checks loopback bind (unless `--allow-non-loopback` with auth enforced), `insecure_origin_warning`, and refuses non-loopback binds with `enforce_auth = false`.
+
+   Enforced auth is a single-organization mode: the contract requires this
+   check, and the hub start, to fail with `enforce_auth = false` once any
+   organization other than `'default'` is active, because an unauthenticated
+   caller resolves to the default organization and reads every mailbox
+   ([organization.md](organization.md#7-fail-closed)). The tree does not do it
+   yet; `#2807` tracks the gap.
 6. `cargo_config`: runs `cargo_config_warning` across configured workspace roots.
 7. `policy_file`: validates the fail-closed YAML policy via `policy::load`.
 8. `database`: opens the DB strictly read-only (`query_only = ON`) and checks `PRAGMA quick_check`, `PRAGMA foreign_key_check`, `journal_mode=wal`, and WAL size (`> 64 MiB` warns).
