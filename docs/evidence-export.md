@@ -384,17 +384,22 @@ and the operator signs that digest offline.
     `hub` checkpoint (`seq <= checkpoint.seq`) still present in
     `evidence_checkpoint` — recomputing its digest, checking
     `event_log[prev_seq].entry_hash`, and verifying its Ed25519 signature when
-    the verifier supplied a key for that `key_id`. An earlier checkpoint signed
-    by a revoked key is no longer a continuity witness and is skipped with a
-    `warnings` entry on the `valid` verdict (rather than permanently preventing
-    newer checkpoints signed by a replacement key from verifying); an earlier
-    checkpoint signed by a rotated-out key not present in the verifier's trust
-    material is also noted in `warnings` without failing the target. This
-    catches both a careless ledger rewrite and a field-and-digest rewrite of an
-    earlier checkpoint row signed by a key the verifier supplied, but because an
-    attacker with SQLite write access could drop triggers to delete an earlier
-    row or clear its `signature`, the DB-side check alone is a consistency check
-    rather than full tamper-evidence.
+    the verifier supplied a key for that `key_id`. **Database state alone never
+    relaxes a check:** only the verifier's own revocation list
+    (`--revoked-key-id` or `--trust-file`'s `revoked_key_ids`) may exempt an
+    earlier checkpoint as a non-witness (recording a `warnings` entry on
+    `valid`, exit `0`). When an earlier checkpoint's signer is marked revoked
+    only in `evidence_key.revoked_at` (without being revoked in the verifier's
+    own trust) or is missing from `evidence_key`, `verify` still compares its
+    digest and `event_log[prev_seq].entry_hash` (and still verifies its
+    signature whenever the verifier supplied that key), returning
+    `ledger_mismatch` (exit `1`) on any tamper and `witness_skipped` (exit `2`)
+    otherwise. An earlier checkpoint signed by a non-revoked rotated-out key
+    not present in the verifier's trust material still has its digest and
+    `entry_hash` checked and adds a benign `warnings` entry on `valid` (exit
+    `0`). Because an attacker with SQLite write access could drop triggers to
+    delete an earlier row or clear its `signature`, the DB-side check alone is
+    a consistency check rather than full tamper-evidence.
   - *Out-of-band tamper-evidence:* `verify` accepts records held outside the
     hub database via repeatable `--prev-checkpoint <file>` flags (pointing at
     local copies of previously signed checkpoint files) and/or a
@@ -447,11 +452,14 @@ and the operator signs that digest offline.
   anchor (including the DB-side consistency check over earlier signed `hub`
   checkpoints and any out-of-band `--prev-checkpoint` / `signed_checkpoints`
   records) and verifies signatures against the pinned key or trust file.
-  `verify` exits `0` for `valid`, `1` for
-  refused (`digest_mismatch`, `ledger_mismatch`, `invalid_signature`,
-  `key_mismatch`), and `2` for cannot verify (`unsigned`, `unknown_key`,
-  `key_revoked`, `valid_in_store_only`, `org_class_not_verifiable`, or any
-  missing/invalid input, config, open/schema-fence, or database error).
+  `verify` exit codes:
+
+  | Exit code | Meaning | States / conditions |
+  |---|---|---|
+  | `0` | Verified | `valid` — including when `warnings` notes a non-revoked rotated-out earlier key not supplied in the verifier's trust (`signature not verified: no pinned key supplied`), or an earlier witness exempted by the verifier's own `--revoked-key-id` / `revoked_key_ids` |
+  | `1` | Refused | `digest_mismatch`, `ledger_mismatch`, `invalid_signature`, `key_mismatch` |
+  | `2` | Cannot verify | `unsigned`, `unknown_key`, `key_revoked`, `valid_in_store_only`, `witness_skipped` (an earlier witness whose key is DB-revoked without verifier revocation or missing from `evidence_key`), `org_class_not_verifiable`, or any missing/invalid input, config, open/schema-fence, or database error |
+
   `key-generate` and `sign` are offline: they do not open or create a hub
   database. Key and checkpoint changes are appended to `event_log`
   (`evidence.key.added`, `evidence.key.retired`, `evidence.key.revoked`,

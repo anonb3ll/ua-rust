@@ -1294,11 +1294,40 @@ fn anchor_mode_verify_succeeds_after_key_rotation_and_revocation_and_pinned_revo
     let v_both_json: Value = serde_json::from_slice(&v_both.stdout).unwrap();
     assert_eq!(v_both_json, serde_json::json!({ "state": "valid" }));
 
-    // 3. Revoke k1: anchor-mode verify of cp-2 with k2 STILL succeeds (exit 0) with a warning
-    //    that cp-1 was skipped because k1 is revoked.
+    // 3. Revoke k1 in DB only (without --revoked-key-id): anchor-mode verify of cp-2 with k2
+    //    exits 2 (`witness_skipped`) because DB state alone must never relax a check.
     assert!(ua(&home).args(["evidence", "key-revoke", "--key-id", "k1"]).output().unwrap().status.success());
-    let v_rev = ua(&home)
+    let v_db_rev_only = ua(&home)
         .args(["evidence", "verify", "--checkpoint", "cp-2", "--anchor-key", &pk2, "--anchor-key-id", "k2"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        v_db_rev_only.status.code(),
+        Some(2),
+        "stdout={} stderr={}",
+        text(&v_db_rev_only.stdout),
+        text(&v_db_rev_only.stderr)
+    );
+    let v_db_rev_json: Value = serde_json::from_slice(&v_db_rev_only.stdout).unwrap();
+    assert_eq!(v_db_rev_json["state"], "witness_skipped", "{v_db_rev_json}");
+    assert_eq!(v_db_rev_json["checkpoint_id"], "cp-1", "{v_db_rev_json}");
+    assert_eq!(v_db_rev_json["key_id"], "k1", "{v_db_rev_json}");
+
+    // 4. When the verifier explicitly revokes k1 (--revoked-key-id k1), anchor-mode verify of
+    //    cp-2 with k2 succeeds (exit 0) with a warning that cp-1 was skipped by verifier trust.
+    let v_rev = ua(&home)
+        .args([
+            "evidence",
+            "verify",
+            "--checkpoint",
+            "cp-2",
+            "--anchor-key",
+            &pk2,
+            "--anchor-key-id",
+            "k2",
+            "--revoked-key-id",
+            "k1",
+        ])
         .output()
         .unwrap();
     assert_eq!(v_rev.status.code(), Some(0), "stdout={} stderr={}", text(&v_rev.stdout), text(&v_rev.stderr));
@@ -1309,11 +1338,12 @@ fn anchor_mode_verify_succeeds_after_key_rotation_and_revocation_and_pinned_revo
             .as_array()
             .unwrap()
             .iter()
-            .any(|w| w.as_str().unwrap().contains("cp-1") && w.as_str().unwrap().contains("revoked")),
+            .any(|w| w.as_str().unwrap().contains("cp-1") && w.as_str().unwrap().contains("verifier")),
         "{v_rev_json}"
     );
 
-    // 4. Pinning cp-1 via `--prev-checkpoint` after k1 is revoked STILL fails hard (exit 2 key_revoked).
+    // 5. Pinning cp-1 via `--prev-checkpoint` after k1 is revoked STILL fails hard (exit 2 key_revoked),
+    //    even when `--revoked-key-id k1` is passed.
     let v_pinned_rev = ua(&home)
         .args([
             "evidence",
@@ -1322,6 +1352,8 @@ fn anchor_mode_verify_succeeds_after_key_rotation_and_revocation_and_pinned_revo
             "cp-2",
             "--trust-file",
             trust_both.to_str().unwrap(),
+            "--revoked-key-id",
+            "k1",
             "--prev-checkpoint",
             cp1_file.to_str().unwrap(),
         ])
@@ -1331,4 +1363,251 @@ fn anchor_mode_verify_succeeds_after_key_rotation_and_revocation_and_pinned_revo
     let v_pinned_rev_json: Value = serde_json::from_slice(&v_pinned_rev.stdout).unwrap();
     assert_eq!(v_pinned_rev_json["state"], "key_revoked", "{v_pinned_rev_json}");
     assert_eq!(v_pinned_rev_json["key_id"], "k1", "{v_pinned_rev_json}");
+}
+
+#[test]
+fn db_revoked_key_cannot_hide_careless_rewrite_or_variant_a_over_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let key1_path = root.path().join("op1.key");
+    let key2_path = root.path().join("op2.key");
+
+    let g1 =
+        ua(&home).args(["evidence", "key-generate", "--out", key1_path.to_str().unwrap()]).output().unwrap();
+    assert!(g1.status.success());
+    let pk1 =
+        serde_json::from_slice::<Value>(&g1.stdout).unwrap()["public_key"].as_str().unwrap().to_string();
+    let g2 =
+        ua(&home).args(["evidence", "key-generate", "--out", key2_path.to_str().unwrap()]).output().unwrap();
+    assert!(g2.status.success());
+    let pk2 =
+        serde_json::from_slice::<Value>(&g2.stdout).unwrap()["public_key"].as_str().unwrap().to_string();
+
+    assert!(ua(&home).args(["init"]).output().unwrap().status.success());
+    assert!(
+        ua(&home)
+            .args(["evidence", "key-add", "--key-id", "k1", "--public-key", &pk1])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let (seq1, hash1) = latest_ledger_head(&home);
+    let cp1_file = root.path().join("cp1.json");
+    assert!(
+        ua(&home)
+            .args([
+                "evidence",
+                "checkpoint",
+                "--id",
+                "cp-1",
+                "--key-id",
+                "k1",
+                "--seq",
+                &seq1.to_string(),
+                "--hash",
+                &hash1,
+                "--out",
+                cp1_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let sig1 = text(
+        &ua(&home)
+            .args([
+                "evidence",
+                "sign",
+                "--key-file",
+                key1_path.to_str().unwrap(),
+                "--checkpoint-file",
+                cp1_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        ua(&home)
+            .args(["evidence", "attach", "--checkpoint", "cp-1", "--signature", &sig1])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    assert!(ua(&home).args(["evidence", "key-retire", "--key-id", "k1"]).output().unwrap().status.success());
+    assert!(
+        ua(&home)
+            .args(["evidence", "key-add", "--key-id", "k2", "--public-key", &pk2])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // Rewrite event_log at seq1, sign cp-2 with k2, and mark k1 revoked in SQLite (no trigger drop needed for revoked_at).
+    {
+        struct EventRow {
+            seq: i64,
+            ulid: String,
+            channel: String,
+            payload: String,
+            originator: Option<String>,
+            episode_id: Option<String>,
+            causal_parent_id: Option<String>,
+            created_at: String,
+            dedupe_key: Option<String>,
+        }
+        let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+        conn.execute_batch("DROP TRIGGER event_log_no_update;").unwrap();
+        let rows: Vec<EventRow> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, \
+                            created_at, dedupe_key \
+                     FROM event_log ORDER BY seq ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok(EventRow {
+                    seq: r.get(0)?,
+                    ulid: r.get(1)?,
+                    channel: r.get(2)?,
+                    payload: r.get(3)?,
+                    originator: r.get(4)?,
+                    episode_id: r.get(5)?,
+                    causal_parent_id: r.get(6)?,
+                    created_at: r.get(7)?,
+                    dedupe_key: r.get(8)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        };
+        let mut prev: Option<String> = None;
+        for mut row in rows {
+            if row.seq == seq1 {
+                row.payload = r#"{"rewritten":true}"#.to_string();
+            }
+            let prev_val = prev.as_deref().unwrap_or(ua_store::ledger::GENESIS_HASH);
+            let entry_hash = ua_store::ledger::compute_entry_hash(
+                Some(prev_val),
+                &row.ulid,
+                &row.channel,
+                &row.payload,
+                row.originator.as_deref(),
+                row.episode_id.as_deref(),
+                row.causal_parent_id.as_deref(),
+                &row.created_at,
+                row.dedupe_key.as_deref(),
+            );
+            conn.execute(
+                "UPDATE event_log SET payload = ?1, prev_hash = ?2, entry_hash = ?3 WHERE seq = ?4",
+                rusqlite::params![row.payload, prev_val, entry_hash, row.seq],
+            )
+            .unwrap();
+            prev = Some(entry_hash);
+        }
+        conn.execute("UPDATE evidence_key SET revoked_at = '2026-01-01T00:00:00Z' WHERE key_id = 'k1'", [])
+            .unwrap();
+    }
+
+    let (seq2, hash2) = latest_ledger_head(&home);
+    let cp2_file = root.path().join("cp2.json");
+    assert!(
+        ua(&home)
+            .args([
+                "evidence",
+                "checkpoint",
+                "--id",
+                "cp-2",
+                "--key-id",
+                "k2",
+                "--seq",
+                &seq2.to_string(),
+                "--hash",
+                &hash2,
+                "--out",
+                cp2_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let sig2 = text(
+        &ua(&home)
+            .args([
+                "evidence",
+                "sign",
+                "--key-file",
+                key2_path.to_str().unwrap(),
+                "--checkpoint-file",
+                cp2_file.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(
+        ua(&home)
+            .args(["evidence", "attach", "--checkpoint", "cp-2", "--signature", &sig2])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let trust_both = root.path().join("trust-both.json");
+    std::fs::write(
+        &trust_both,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "keys": [
+                { "key_id": "k1", "public_key": pk1 },
+                { "key_id": "k2", "public_key": pk2 }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Careless rewrite with DB-revoked k1 MUST still exit 1 (`ledger_mismatch`).
+    let careless = ua(&home)
+        .args(["evidence", "verify", "--checkpoint", "cp-2", "--trust-file", trust_both.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(careless.status.code(), Some(1), "{}", text(&careless.stdout));
+    assert_eq!(serde_json::from_slice::<Value>(&careless.stdout).unwrap()["state"], "ledger_mismatch");
+
+    // Variant A with DB-revoked k1 MUST still exit 1 (`ledger_mismatch`) under trust {k1, k2}.
+    {
+        let conn = rusqlite::Connection::open(home.join("ua.db")).unwrap();
+        let rewritten_hash1: String =
+            conn.query_row("SELECT entry_hash FROM event_log WHERE seq = ?1", [seq1], |r| r.get(0)).unwrap();
+        let cp1_json: Value = serde_json::from_slice(&std::fs::read(&cp1_file).unwrap()).unwrap();
+        let mut cp1: ua_store::evidence::Checkpoint =
+            serde_json::from_value(cp1_json["checkpoint"].clone()).unwrap();
+        cp1.hash = Some(rewritten_hash1.clone());
+        let rewritten_digest1 = cp1.digest();
+        conn.execute_batch("DROP TRIGGER evidence_checkpoint_immutable;").unwrap();
+        conn.execute(
+            "UPDATE evidence_checkpoint SET hash = ?1, digest = ?2 WHERE checkpoint_id = 'cp-1'",
+            rusqlite::params![rewritten_hash1, rewritten_digest1],
+        )
+        .unwrap();
+    }
+    let var_a = ua(&home)
+        .args(["evidence", "verify", "--checkpoint", "cp-2", "--trust-file", trust_both.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(var_a.status.code(), Some(1), "{}", text(&var_a.stdout));
+    assert_eq!(serde_json::from_slice::<Value>(&var_a.stdout).unwrap()["state"], "ledger_mismatch");
 }
