@@ -54,12 +54,15 @@ Credentials, sessions, work items, ownership, approvals, ledger rows and audit
 exports bind to the immutable id. A rename changes only the name: it moves no
 grant, no history and no ownership.
 
-**Only a forget frees a name.** A rename carries the name to the same id, and a
-retirement keeps it: `agent_unretire` returns that principal to service under the
-same name (`policy.md`, lifecycle actions), so a retired name is still held and a
-create under it is refused exactly as for an active row. A forgotten name may be
-reused by a new principal, which inherits nothing from the old one: not grants,
-not token hashes, not session rows, not ledger history.
+**What frees a name.** A rename frees the *old* name — it moves to the same id
+under the new name — and a forget frees the name it held. A retirement frees
+nothing: `agent_unretire` returns that principal to service under the same name
+(`policy.md`, lifecycle actions), so a retired name is still held and a create
+under it is refused exactly as for an active row. A person's org-local name is
+freed when the membership carrying it is removed; the `users.id` and the person's
+memberships in other organizations are unaffected. A name reused after it is
+freed belongs to a new principal, which inherits nothing from the old one: not
+grants, not token hashes, not session rows, not ledger history.
 
 Resolution by name happens inside one verified organization and returns the id.
 After the migration, no code path keeps a name as a foreign key.
@@ -200,11 +203,15 @@ describes the authority the contract grants once that gate opens, not permission
 to exercise it today. `#2791` owns the membership and enrolment gates.
 
 **The gate does not block its own proof.** The §10 matrix runs on a rehearsal
-store — a copy of the database on the hub host, or a test home — where a hub owner
-creates the second organization with the gate lifted for that store only
-(`ua org rehearsal-create`, refused on a hub that is serving a second
-organization). `org_create` stays closed on a serving hub; the two-organization
-store that decides `#2800` is not enrolled tenant data and never holds real work.
+store — a copy of the database on the hub host, or a test home — never on a store
+`ua serve` serves. A rehearsal store carries a marker (`meta.rehearsal = 1`, set
+only by `ua org rehearsal-create`) and both ends enforce it: `ua org
+rehearsal-create` refuses to run against a store `ua serve` would serve (detected
+by the serve lock and the serving configuration, not by counting organizations),
+and `ua serve` refuses to start against a store carrying the marker. So the
+marker cannot be added to a live store, and a rehearsal store cannot be served by
+accident — which is the mechanism behind "never holds real work". `org_create`
+stays closed on a serving hub.
 
 The three levels are hub, organization and team (*Decision*). Inside an
 organization, a person's authority is their `org_memberships` role plus what a
@@ -261,8 +268,10 @@ a session.
     channel to notify members; an organization with no channel to reach members
     cannot use it.
   - **Out-of-band confirmation on the hub host.** `ua org recover-owner` runs on
-    the hub host (hub-host trust, §7) and takes effect immediately, which is the
-    fallback for an organization with no reachable members.
+    the hub host (hub-host trust, §7) and takes effect immediately. It is the
+    other alternative, not a second-class one: it is the route to take when the
+    organization has no reachable members to notify, and a sole owner with
+    reachable members may still choose it.
   Either way the resulting ledger event names the actor, the target id, the
   safeguard used, the delay if any, and the reason; the call requires explicit
   confirmation; and `ua doctor` reports the grant. If the organization has no
@@ -295,7 +304,8 @@ today (*Bootstrap and single-operator parity*, acceptance 1).
   labels, no row contents — and appends a ledger event naming the hub actor and
   the target id. **The authority is hub-owner authority, which is narrower than
   membership of the `'default'` `lifecycle_operators` set:** the actor must be a
-  row the bootstrap created and `human_identities` names (§6, *Hub owners*).
+  `users.id` the bootstrap created and `human_identities` names by id (§6, *Hub
+  owners*).
   `policy.md`'s "the default organization's lifecycle operators" and acceptance
   10's "a `'default'` agent or a hub owner" describe today's compatibility set;
   when `#2790` lands, a `'default'` lifecycle-operator label that is an agent or a
@@ -435,7 +445,7 @@ procedure:
 2. **Backfill.** Mint an id for every existing principal. **No existing row's
    `org_id` changes:** every row keeps the `org_id` it already carries, so rows
    that belong to a non-default organization stay there and the immutability
-   triggers (§10 row 6, acceptance 6) are never contradicted. Only a column
+   triggers (§10 row 23, acceptance 6) are never contradicted. Only a column
    newly added to a row that had none receives `'default'` as its initial
    value. Record each principal's name timeline in the projection
    `principal_names (org_id, kind, id, label, from_at, to_at)`, so a later rename
@@ -504,10 +514,11 @@ names both may choose.
 | 16 | Deliver a GitHub webhook to B's path signed with A's secret | `401`, identical to a bad signature; no B row is read |
 | 17 | Hub recovery targets B's `agent-1` by label with `any_org`, then by id | the label is refused as ambiguous; the id succeeds and the answer carries ids and changed flags only |
 | 18 | Rename `agent-1` to `agent-2` in A, then reuse `agent-1` for a new A principal | ledger rows before the rename resolve to the old id, rows after the reuse to the new one; none to the wrong principal |
-| 19 | Run MCP stdio or `ua` on the hub host while B is active | refused unless the caller authenticates; the local caller resolves to `'default'` only |
+| 19 | Run an MCP stdio tool call or a `ua` tool call on the hub host while B is active | refused unless the caller authenticates; the local caller resolves to `'default'` only. The hub-host recovery commands of §7 are not tool calls and are not refused |
 | 20 | Make the policy file unreadable, then run a governed call in B and in `'default'` | `policy_unavailable` in both |
 | 21 | Remove the hub's policy file (`policy_file` is one hub-wide setting), then run a governed call in B and in `'default'` | B refuses `policy_unavailable` (a tenant never runs on the shipped default); `'default'` behaves as today's single-tenant hub |
 | 22 | Rename the person `builder-1` in A, then reuse `builder-1` for a new membership in A | the rename changes no id, grant or ledger row; the reused name is a new user id; ledger rows resolve by the name timeline (§9) |
+| 23 | Update a row's `org_id` directly in SQL | refused by the immutability trigger; the row and its ledger chain are unchanged |
 
 ### 11. Security findings reconciled
 
@@ -2198,7 +2209,9 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS org_memberships (
     org_id   TEXT NOT NULL REFERENCES orgs(id),
     user_id  TEXT NOT NULL REFERENCES users(id),
-    name     TEXT,                 -- the person's name in this org (#2791): UNIQUE (org_id, name COLLATE NOCASE)
+    name     TEXT NOT NULL,        -- the person's name in this org (#2791): backfilled from users.label
+                                   --   UNIQUE (org_id, name COLLATE NOCASE); NOT NULL, because SQL UNIQUE
+                                   --   admits any number of NULLs and a nameless membership is not a person
     role     TEXT NOT NULL
              CHECK (role IN ('org_owner','org_admin','team_lead','member','auditor')),
     profile  TEXT,                 -- session profile in this org; NULL = 'reviewer'
@@ -2243,11 +2256,16 @@ or grant another tenant's person.
 
 ### Hub owners
 
-A **hub owner** is a label listed in `human_identities` **whose `users` row was
-created by the bootstrap** (`users.bootstrap = 1`). Only the bootstrap sets that
-flag. Binding hub authority to a bootstrap-created row, not to the label alone,
-means a row a tenant admin created — and every credential issued for it — can
-never become a hub owner by having its label added to the config later.
+A **hub owner** is a **`users.id`** that the bootstrap created (`users.bootstrap =
+1`) and that the configuration names in `human_identities` **by that id**.
+Authority hangs on the id, not on the label: once person names live on
+memberships (§3), renaming the default organization's membership changes what the
+person is called and cannot move or drop hub-owner authority. Only the bootstrap
+sets the flag, so a row a tenant admin created — and every credential issued for
+it — can never become a hub owner by having a label added to the config later.
+The configuration lists ids; a legacy label there resolves to a bootstrap row once
+at migration, and a label that resolves to more than one bootstrap row is
+`MISCONFIGURED`.
 
 ### Who is a human
 
