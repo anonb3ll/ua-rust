@@ -171,7 +171,10 @@ async fn semantic_ties_break_on_insertion_order() {
     cfg.embed_model = "constant-vector-order-test-model".into();
     let mut saved = Vec::new();
     for i in 0..55 {
-        saved.push(put(&db, &cfg, "Same title", &format!("Unrelated text number {i}."), None).await);
+        // Every other note is long enough to be chunked, so ties come from
+        // both the single-vector and the chunk scan (max of the two).
+        let filler = if i % 2 == 0 { "Filler sentence for chunking. ".repeat(100) } else { String::new() };
+        saved.push(put(&db, &cfg, "Same title", &format!("Unrelated text number {i}. {filler}"), None).await);
     }
     // No lexical match: only the semantic leg returns candidates.
     let hits = search::search(

@@ -77,8 +77,10 @@ Facts the first draft did not record:
   table directly, not through `Filter`. See the inventory in §3.
 - **The clock is injected.** Every memory operation reads `Config.clock`
   (`ua_core::time::Clock`): search, list and get, `similar_notes`,
-  `maintenance.rs` (`days_ago`), `save.rs` and `lifecycle.rs`. A hub uses the
-  wall clock; tests and the retrieval bench fix it. The
+  `maintenance.rs` (`days_ago` and the embedding backfill), `save.rs` and
+  `lifecycle.rs`. Writes read it inside the write transaction, so timestamps
+  follow commit order. A hub uses the wall clock; tests and the retrieval
+  bench fix it. The
   `memory_versions_capture` trigger still writes SQLite's wall clock into
   `recorded_at`; its schema part is checksum-locked, so the write path
   restamps the captured version from `Config.clock` in the same transaction.

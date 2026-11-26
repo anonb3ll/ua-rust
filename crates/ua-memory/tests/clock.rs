@@ -155,3 +155,54 @@ async fn maintenance_ages_notes_on_the_injected_clock() {
     assert_eq!(stale(at(T4)).await, json!(0));
     assert_eq!(stale(at("2026-06-10T00:00:00+00:00")).await, json!(1));
 }
+
+/// Hold the write lock for 1.5 s, then return the wall-clock second at which
+/// it is released. `started` fires once the lock is held.
+fn hold_writes(db: &Db) -> (tokio::sync::oneshot::Receiver<()>, tokio::task::JoinHandle<String>) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let db = db.clone();
+    let held = tokio::spawn(async move {
+        db.write_async(move |_| {
+            let _ = tx.send(());
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            Ok(ua_core::time::now())
+        })
+        .await
+        .unwrap()
+    });
+    (rx, held)
+}
+
+/// Save, delete and restore read the clock inside the write transaction,
+/// not when the call is queued: a write queued behind a held lock is
+/// stamped no earlier than the lock's release. Otherwise version k could be
+/// recorded after version k+1 under contention.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_read_the_clock_inside_the_transaction() {
+    let db = db();
+    let cfg = Config::for_home(std::env::temp_dir()); // the wall clock
+    let id = put(&db, &cfg, SaveRequest { content: "First text.".into(), ..Default::default() }).await;
+
+    let (started, held) = hold_writes(&db);
+    started.await.unwrap();
+    let req = SaveRequest { id: Some(id.clone()), content: "Second text.".into(), ..Default::default() };
+    put(&db, &cfg, req).await;
+    let released = held.await.unwrap();
+    let note = get(&db, &cfg, &id, None).await;
+    assert!(note["updated_at"].as_str().unwrap() >= released.as_str(), "save: {note} vs {released}");
+    assert!(note["versions"][0]["recorded_at"].as_str().unwrap() >= released.as_str(), "{note}");
+
+    let (started, held) = hold_writes(&db);
+    started.await.unwrap();
+    lifecycle::delete(&db, &cfg, &agent(), id.clone()).await.unwrap();
+    let released = held.await.unwrap();
+    let note = get(&db, &cfg, &id, None).await;
+    assert!(note["updated_at"].as_str().unwrap() >= released.as_str(), "delete: {note} vs {released}");
+
+    let (started, held) = hold_writes(&db);
+    started.await.unwrap();
+    lifecycle::restore(&db, &cfg, &agent(), id.clone()).await.unwrap();
+    let released = held.await.unwrap();
+    let note = get(&db, &cfg, &id, None).await;
+    assert!(note["updated_at"].as_str().unwrap() >= released.as_str(), "restore: {note} vs {released}");
+}

@@ -563,11 +563,6 @@ pub(crate) fn superseded_notes(conn: &Connection, org: &str, id: &str) -> UaResu
     Ok(stmt.query_map(params![id, org], |r| r.get(0))?.collect::<Result<_, _>>()?)
 }
 
-/// Refuse an organization `orgs` does not hold, or holds as suspended,
-/// before anything is written. The `org_exists` triggers fire only on
-/// insert and do not read the status, so a write with nothing to insert (an
-/// update, a soft delete) or a suspended organization's insert would
-/// otherwise pass.
 /// The newest version captured in `memory_versions` for note `id` (0 for none).
 pub(crate) fn last_version(conn: &Connection, org: &str, id: &str) -> UaResult<i64> {
     Ok(conn.query_row(
@@ -590,6 +585,11 @@ pub(crate) fn stamp_versions(conn: &Connection, org: &str, id: &str, since: i64,
     Ok(())
 }
 
+/// Refuse an organization `orgs` does not hold, or holds as suspended,
+/// before anything is written. The `org_exists` triggers fire only on
+/// insert and do not read the status, so a write with nothing to insert (an
+/// update, a soft delete) or a suspended organization's insert would
+/// otherwise pass.
 pub(crate) fn require_org(conn: &Connection, org: &str) -> UaResult<()> {
     let status: Option<String> =
         conn.query_row("SELECT status FROM orgs WHERE id = ?1", [org], |r| r.get(0)).optional()?;

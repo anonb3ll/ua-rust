@@ -24,7 +24,7 @@ pub async fn delete(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRes
         ));
     };
     let human = ua_org::authz::human(caller);
-    let (label, org, ts) = (caller.label.clone(), caller.org_id.clone(), cfg.clock.now());
+    let (label, org, clock) = (caller.label.clone(), caller.org_id.clone(), cfg.clock);
     db.write_async(move |tx| {
         note::require_org(tx, &org)?;
         let Some(n) = note::fetch(tx, &org, &id)? else { return Ok(json!({ "deleted": false })) };
@@ -42,6 +42,8 @@ pub async fn delete(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRes
                 ),
             ));
         }
+        // Read inside the write, so timestamps follow commit order.
+        let ts = clock.now();
         let tombstone =
             note::tombstone_block(n.author.as_deref(), n.title.as_deref(), &n.content, Some(&actor), &ts);
         let mut tags = n.tags.clone();
@@ -85,7 +87,7 @@ pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRe
     let caller = caller.clone();
     // Only what `Config::is_human` reads, not the whole config.
     let humans = cfg.human_identities.clone();
-    let ts = cfg.clock.now();
+    let clock = cfg.clock;
     db.write_async(move |tx| {
         let org = caller.org_id.clone();
         note::require_org(tx, &org)?;
@@ -157,6 +159,8 @@ pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRe
             tags.dedup();
             // A restored broadcast note is a broadcast again.
             assert_privileged(&caller, &tags, None)?;
+            // Read inside the write, so timestamps follow commit order.
+            let ts = clock.now();
             let since = note::last_version(tx, &org, &id)?;
             tx.execute(
                 "UPDATE memory SET content = ?1, tags = ?2, updated_at = ?3, updated_by = ?4 \
