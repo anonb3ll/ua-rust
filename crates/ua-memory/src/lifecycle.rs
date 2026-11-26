@@ -16,7 +16,7 @@ use super::note::{
 /// content becomes an attributed tombstone and it is tagged [`DELETED_TAG`].
 /// Returns `{deleted}`; `false` for a missing note, and for another
 /// organization's, alike.
-pub async fn delete(db: &Db, caller: &Caller, id: String) -> UaResult<Value> {
+pub async fn delete(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaResult<Value> {
     let Some(actor) = verified(caller).map(str::to_string) else {
         return Err(UaError::denied(
             "unverified",
@@ -24,7 +24,7 @@ pub async fn delete(db: &Db, caller: &Caller, id: String) -> UaResult<Value> {
         ));
     };
     let human = ua_org::authz::human(caller);
-    let (label, org) = (caller.label.clone(), caller.org_id.clone());
+    let (label, org, ts) = (caller.label.clone(), caller.org_id.clone(), cfg.clock.now());
     db.write_async(move |tx| {
         note::require_org(tx, &org)?;
         let Some(n) = note::fetch(tx, &org, &id)? else { return Ok(json!({ "deleted": false })) };
@@ -42,7 +42,6 @@ pub async fn delete(db: &Db, caller: &Caller, id: String) -> UaResult<Value> {
                 ),
             ));
         }
-        let ts = ua_core::time::now();
         let tombstone =
             note::tombstone_block(n.author.as_deref(), n.title.as_deref(), &n.content, Some(&actor), &ts);
         let mut tags = n.tags.clone();
@@ -84,6 +83,7 @@ pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRe
     let caller = caller.clone();
     // Only what `Config::is_human` reads, not the whole config.
     let humans = cfg.human_identities.clone();
+    let ts = cfg.clock.now();
     db.write_async(move |tx| {
         let org = caller.org_id.clone();
         note::require_org(tx, &org)?;
@@ -155,7 +155,6 @@ pub async fn restore(db: &Db, cfg: &Config, caller: &Caller, id: String) -> UaRe
             tags.dedup();
             // A restored broadcast note is a broadcast again.
             assert_privileged(&caller, &tags, None)?;
-            let ts = ua_core::time::now();
             tx.execute(
                 "UPDATE memory SET content = ?1, tags = ?2, updated_at = ?3, updated_by = ?4 \
                  WHERE id = ?5 AND org_id = ?6",
@@ -228,13 +227,13 @@ const SIGNALS: [(&str, &str); 4] = [
 /// Record `signal` (`helpful`, `not_helpful`, `stale` or `wrong`) on note
 /// `id` of the caller's organization. Returns the note's counters and its
 /// `confidence_posterior`.
-pub async fn feedback(db: &Db, caller: &Caller, id: String, signal: String) -> UaResult<Value> {
+pub async fn feedback(db: &Db, cfg: &Config, caller: &Caller, id: String, signal: String) -> UaResult<Value> {
     let signal = signal.trim().to_lowercase();
     let Some((_, column)) = SIGNALS.iter().find(|(s, _)| *s == signal) else {
         return Err(UaError::invalid("signal must be one of helpful, not_helpful, stale, wrong"));
     };
     let column = *column;
-    let (label, org) = (caller.label.clone(), caller.org_id.clone());
+    let (label, org, now) = (caller.label.clone(), caller.org_id.clone(), cfg.clock.now());
     db.write_async(move |tx| {
         note::require_org(tx, &org)?;
         note::require(tx, &org, &id)?;
@@ -247,7 +246,7 @@ pub async fn feedback(db: &Db, caller: &Caller, id: String, signal: String) -> U
         )?;
         emit(tx, &org, "agent.memory.feedback", json!({ "id": id, "signal": signal }), &label)?;
         let n = note::require(tx, &org, &id)?;
-        let open = note::open_contradictions(tx, &org, None)?.get(&id).copied().unwrap_or(0);
+        let open = note::open_contradictions(tx, &org, None, &now)?.get(&id).copied().unwrap_or(0);
         let mut res = json!({ "id": id, "signal": signal });
         if let (Some(obj), Value::Object(summary)) = (res.as_object_mut(), n.summary()) {
             obj.extend(summary);

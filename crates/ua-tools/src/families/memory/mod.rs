@@ -262,11 +262,11 @@ async fn search(ctx: ToolCtx, a: SearchArgs) -> UaResult<Value> {
 }
 
 async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
-    ua_memory::search::list(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
+    ua_memory::search::list(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller.org_id, a.into()).await
 }
 
 async fn get(ctx: ToolCtx, a: GetArgs) -> UaResult<Value> {
-    ua_memory::search::get(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
+    ua_memory::search::get(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller.org_id, a.into()).await
 }
 
 fn register_search(r: &mut Registry) {
@@ -337,7 +337,7 @@ pub struct FeedbackArgs {
 
 async fn delete(ctx: ToolCtx, a: IdArgs) -> UaResult<Value> {
     let IdArgs { id } = a;
-    ua_memory::lifecycle::delete(ctx.hub.db(), &ctx.caller, id).await
+    ua_memory::lifecycle::delete(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller, id).await
 }
 
 async fn restore(ctx: ToolCtx, a: IdArgs) -> UaResult<Value> {
@@ -347,7 +347,7 @@ async fn restore(ctx: ToolCtx, a: IdArgs) -> UaResult<Value> {
 
 async fn feedback(ctx: ToolCtx, a: FeedbackArgs) -> UaResult<Value> {
     let FeedbackArgs { id, signal } = a;
-    ua_memory::lifecycle::feedback(ctx.hub.db(), &ctx.caller, id, signal).await
+    ua_memory::lifecycle::feedback(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller, id, signal).await
 }
 
 fn register_lifecycle(r: &mut Registry) {
@@ -428,11 +428,12 @@ impl From<MaintenanceArgs> for MaintenanceRequest {
 }
 
 async fn prune_candidates(ctx: ToolCtx, a: PruneArgs) -> UaResult<Value> {
-    ua_memory::maintenance::prune_candidates(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
+    ua_memory::maintenance::prune_candidates(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller.org_id, a.into()).await
 }
 
 async fn recall_maintenance(ctx: ToolCtx, a: MaintenanceArgs) -> UaResult<Value> {
-    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
+    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller.org_id, a.into())
+        .await
 }
 
 fn register_maintenance(r: &mut Registry) {

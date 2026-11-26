@@ -256,6 +256,7 @@ pub(crate) fn store_vector(
     model: &str,
     v: &[f32],
     content_sha: &str,
+    ts: &str,
 ) -> UaResult<()> {
     conn.execute(
         "INSERT INTO memory_embeddings (org_id, note_id, model, dim, embedding, content_sha, updated_at) \
@@ -263,7 +264,7 @@ pub(crate) fn store_vector(
          ON CONFLICT(note_id) DO UPDATE SET model = excluded.model, dim = excluded.dim, \
            embedding = excluded.embedding, content_sha = excluded.content_sha, updated_at = excluded.updated_at \
          WHERE memory_embeddings.org_id = excluded.org_id",
-        params![org, note_id, model, v.len() as i64, to_blob(v), content_sha, ua_core::time::now()],
+        params![org, note_id, model, v.len() as i64, to_blob(v), content_sha, ts],
     )?;
     Ok(())
 }

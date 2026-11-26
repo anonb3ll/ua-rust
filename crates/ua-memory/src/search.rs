@@ -79,7 +79,7 @@ fn lexical_leg(
         "SELECT m.id, bm25(memory_fts, {w_title}, {w_content}, {w_tags}) AS score, \
          snippet(memory_fts, 1, '[', ']', ' … ', 20) \
          FROM memory_fts JOIN memory m ON m.seq = memory_fts.rowid \
-         WHERE memory_fts MATCH ? AND {} ORDER BY score, m.id LIMIT ?",
+         WHERE memory_fts MATCH ? AND {} ORDER BY score, m.seq LIMIT ?",
         filter.sql
     );
     let run = |query: &str, and_mode: bool| -> UaResult<Vec<(String, LexHit)>> {
@@ -154,7 +154,7 @@ fn gather(
         }
         None => HashMap::new(),
     };
-    let contradictions = note::open_contradictions(conn, &elig.org, elig.as_of.as_deref())?;
+    let contradictions = note::open_contradictions(conn, &elig.org, elig.as_of.as_deref(), &elig.now)?;
     Ok(Gathered { lexical, semantic, sims, notes, contradictions })
 }
 
@@ -200,7 +200,7 @@ pub async fn search(db: &Db, cfg: &Config, org: &str, a: SearchRequest) -> UaRes
     }
     let as_of = a.as_of.as_deref().map(|v| note::parse_instant(v, "as_of", false)).transpose()?;
     let limit = a.limit.unwrap_or(10).clamp(1, 50) as usize;
-    let now = ua_core::time::now();
+    let now = cfg.clock.now();
     let elig = Eligibility {
         org: org.to_string(),
         tags: a
@@ -242,7 +242,7 @@ pub async fn search(db: &Db, cfg: &Config, org: &str, a: SearchRequest) -> UaRes
     let lex: HashMap<&str, &LexHit> = g.lexical.iter().map(|(id, h)| (id.as_str(), h)).collect();
     let sem: HashMap<&str, f32> = g.semantic.iter().map(|(id, s)| (id.as_str(), *s)).collect();
     let at = as_of.clone().unwrap_or_else(|| now.clone());
-    let at_ms = note::ts_ms(&at).unwrap_or_else(ua_core::time::now_ms);
+    let at_ms = note::ts_ms(&at).unwrap_or_else(|| cfg.clock.now_ms());
 
     let mut cands: Vec<Candidate> = Vec::new();
     for n in g.notes {
@@ -346,13 +346,15 @@ pub async fn search(db: &Db, cfg: &Config, org: &str, a: SearchRequest) -> UaRes
         sb.partial_cmp(&sa)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.note.title.as_deref().unwrap_or("").cmp(b.note.title.as_deref().unwrap_or("")))
-            .then_with(|| a.note.id.cmp(&b.note.id))
+            // Insertion order, not the random note id, so a tie (two notes
+            // with the same score and title) orders the same on every run.
+            .then_with(|| a.note.seq.cmp(&b.note.seq))
     });
     cands.truncate(limit);
 
     // Side write: access and recall counters. Best effort; never fails the search.
     let hit_ids: Vec<String> = cands.iter().map(|c| c.note.id.clone()).collect();
-    let ts = ua_core::time::now();
+    let ts = cfg.clock.now();
     if !hit_ids.is_empty() {
         let (ids, ts2, org) = (json_text(&hit_ids), ts.clone(), org.to_string());
         let res = db
@@ -440,7 +442,8 @@ pub struct ListRequest {
 }
 
 /// Organization `org`'s live notes newest first: returns `{items}`.
-pub async fn list(db: &Db, org: &str, a: ListRequest) -> UaResult<Value> {
+/// `cfg.clock` decides expiry.
+pub async fn list(db: &Db, cfg: &Config, org: &str, a: ListRequest) -> UaResult<Value> {
     let limit = a.limit.unwrap_or(50).clamp(1, 200);
     let mut wanted: Vec<String> = a.tags.unwrap_or_default();
     if let Some(t) = a.tag {
@@ -453,7 +456,7 @@ pub async fn list(db: &Db, org: &str, a: ListRequest) -> UaResult<Value> {
         tags: wanted,
         author: a.author,
         include_expired: a.include_expired,
-        now: ua_core::time::now(),
+        now: cfg.clock.now(),
         ..Default::default()
     };
     db.read_async(move |c| {
@@ -535,6 +538,7 @@ fn compose(
     id: &str,
     as_of: Option<&str>,
     include_versions: bool,
+    now: &str,
 ) -> UaResult<Value> {
     let n = note::require(conn, org, id)?;
     if let Some(at) = as_of
@@ -566,7 +570,7 @@ fn compose(
         res["supersedes"] = json!(replaced);
     }
     res["links"] = note::note_links(conn, org, &n)?;
-    let open = note::open_contradictions(conn, org, as_of)?.get(id).copied().unwrap_or(0);
+    let open = note::open_contradictions(conn, org, as_of, now)?.get(id).copied().unwrap_or(0);
     res["confidence_posterior"] = n.confidence_block(open);
     if include_versions {
         let (v, total) = versions(conn, org, id, as_of)?;
@@ -579,16 +583,17 @@ fn compose(
 /// One note of organization `org` with its content, revision, links and
 /// confidence posterior, including a superseded or deleted one. Another
 /// organization's note answers `not_found`, exactly like a missing one.
-pub async fn get(db: &Db, org: &str, a: GetRequest) -> UaResult<Value> {
+pub async fn get(db: &Db, cfg: &Config, org: &str, a: GetRequest) -> UaResult<Value> {
     let as_of = a.as_of.as_deref().map(|v| note::parse_instant(v, "as_of", false)).transpose()?;
     let (id, include_versions) = (a.id, a.include_versions);
-    let (read_id, read_org) = (id.clone(), org.to_string());
-    let mut res =
-        db.read_async(move |c| compose(c, &read_org, &read_id, as_of.as_deref(), include_versions)).await?;
+    let (read_id, read_org, now) = (id.clone(), org.to_string(), cfg.clock.now());
+    let mut res = db
+        .read_async(move |c| compose(c, &read_org, &read_id, as_of.as_deref(), include_versions, &now))
+        .await?;
     if a.count_access {
         // Access telemetry, best effort (see the module docs): it never
         // fails the read.
-        let ts = ua_core::time::now();
+        let ts = cfg.clock.now();
         let (ts2, org) = (ts.clone(), org.to_string());
         let counted = db
             .write_async(move |tx| {

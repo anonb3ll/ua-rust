@@ -2,7 +2,7 @@
 //! neither deletes or rewrites a note.
 
 use serde_json::{Value, json};
-use ua_core::{UaError, UaResult};
+use ua_core::{Config, UaError, UaResult};
 use ua_store::Db;
 
 use super::note::{DELETED_TAG, NOTE_COLS, Note, days_ago};
@@ -34,14 +34,15 @@ fn live_notes(conn: &rusqlite::Connection, org: &str, extra: &str) -> UaResult<V
 
 /// Organization `org`'s live notes that look superseded, low-salience, or
 /// old and never accessed, most reasons first.
-pub async fn prune_candidates(db: &Db, org: &str, a: PruneRequest) -> UaResult<Value> {
+/// `cfg.clock` dates the age cutoff.
+pub async fn prune_candidates(db: &Db, cfg: &Config, org: &str, a: PruneRequest) -> UaResult<Value> {
     let threshold = a.salience_threshold.unwrap_or(0.3);
     let max_age = a.max_age_days.unwrap_or(30.0);
     if !threshold.is_finite() || !max_age.is_finite() {
         return Err(UaError::invalid("salience_threshold and max_age_days must be finite numbers"));
     }
     let limit = a.limit.unwrap_or(50).max(0) as usize;
-    let cutoff = days_ago(max_age);
+    let cutoff = days_ago(&cfg.clock, max_age);
     let org = org.to_string();
     db.read_async(move |c| {
         let mut candidates: Vec<(usize, f64, Value)> = Vec::new();
@@ -122,7 +123,8 @@ fn candidate(n: &Note, reason: &str) -> Value {
 
 /// Organization `org`'s stale (old, never recalled, salience <= 0.5) and
 /// low-confidence notes. Refuses `dry_run = false`: it never deletes.
-pub async fn recall_maintenance(db: &Db, org: &str, a: MaintenanceRequest) -> UaResult<Value> {
+/// `cfg.clock` dates the staleness cutoff.
+pub async fn recall_maintenance(db: &Db, cfg: &Config, org: &str, a: MaintenanceRequest) -> UaResult<Value> {
     if !a.dry_run {
         return Err(UaError::invalid(
             "recall_maintenance never deletes; it is a report. Review the candidates, then remove specific \
@@ -135,7 +137,7 @@ pub async fn recall_maintenance(db: &Db, org: &str, a: MaintenanceRequest) -> Ua
         return Err(UaError::invalid("stale_days and confidence_floor must be finite numbers"));
     }
     let limit = a.limit.unwrap_or(100).max(0) as usize;
-    let cutoff = days_ago(stale_days);
+    let cutoff = days_ago(&cfg.clock, stale_days);
     let org = org.to_string();
     db.read_async(move |c| {
         let mut notes = live_notes(c, &org, "AND m.superseded_by IS NULL")?;

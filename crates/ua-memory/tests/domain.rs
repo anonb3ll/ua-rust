@@ -72,17 +72,17 @@ async fn save_search_get_delete_restore_without_a_registry() {
     assert_eq!(hits["results"][0]["id"], json!(id));
     assert_eq!(hits["results"][0]["trust"]["level"], json!("untrusted"));
 
-    let note = search::get(&db, ua_core::DEFAULT_ORG, get_req(&id)).await.unwrap();
+    let note = search::get(&db, &cfg, ua_core::DEFAULT_ORG, get_req(&id)).await.unwrap();
     assert_eq!(note["author"], json!("builder-1"));
     assert_eq!(note["access_count"], json!(1), "the search counted one access");
 
     // Another agent may not delete it; the owner may, and may restore it.
-    let err = lifecycle::delete(&db, &agent("builder-2"), id.clone()).await.unwrap_err();
+    let err = lifecycle::delete(&db, &cfg, &agent("builder-2"), id.clone()).await.unwrap_err();
     assert!(
         matches!(&err, ua_core::UaError::Denied { reason_code, .. } if reason_code == "not_owner"),
         "{err:?}"
     );
-    let deleted = lifecycle::delete(&db, &a, id.clone()).await.unwrap();
+    let deleted = lifecycle::delete(&db, &cfg, &a, id.clone()).await.unwrap();
     assert_eq!(deleted, json!({ "deleted": true }));
     let gone = search::search(
         &db,
@@ -150,7 +150,7 @@ async fn a_legacy_human_delete_is_restored_only_by_a_human() {
     let restored = lifecycle::restore(&db, &cfg, &owner, id.clone()).await.unwrap();
     assert_eq!(restored["restored"], json!(true));
     assert_eq!(
-        search::get(&db, ua_core::DEFAULT_ORG, get_req(&id)).await.unwrap()["content"],
+        search::get(&db, &cfg, ua_core::DEFAULT_ORG, get_req(&id)).await.unwrap()["content"],
         json!("Legacy note.")
     );
 }

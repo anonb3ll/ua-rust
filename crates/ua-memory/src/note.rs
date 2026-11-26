@@ -33,7 +33,7 @@ pub(crate) const NOTE_COLS: &str = "m.id, m.title, m.content, m.tags, m.author, 
      m.updated_at, m.salience, m.confidence, m.last_accessed, m.access_count, m.source_host, \
      m.superseded_by, m.expires_at, m.feedback_helpful, m.feedback_not_helpful, m.feedback_stale, \
      m.feedback_wrong, m.recalled_count, m.upvoted_count, m.epistemic, m.evidence, m.valid_from, \
-     m.valid_to, m.contradicts";
+     m.valid_to, m.contradicts, m.seq";
 
 /// One stored note.
 #[derive(Debug, Clone)]
@@ -62,6 +62,8 @@ pub(crate) struct Note {
     pub valid_from: Option<String>,
     pub valid_to: Option<String>,
     pub contradicts: Vec<String>,
+    /// Insertion order (the `memory` rowid). Search breaks score ties on it.
+    pub seq: i64,
 }
 
 pub(crate) fn json_list(raw: Option<String>) -> Vec<String> {
@@ -112,6 +114,7 @@ impl Note {
             valid_from: r.get(23)?,
             valid_to: r.get(24)?,
             contradicts: json_list(r.get(25)?),
+            seq: r.get(26)?,
         })
     }
 
@@ -287,12 +290,10 @@ pub(crate) fn ts_ms(s: &str) -> Option<i64> {
     ua_core::time::parse_ts(s).map(|t| t.as_millisecond())
 }
 
-/// Storage form of now minus `days`.
-pub(crate) fn days_ago(days: f64) -> String {
-    let ms = ua_core::time::now_ms() - (days * 86_400_000.0) as i64;
-    jiff::Timestamp::from_millisecond(ms)
-        .map(ua_core::time::format_ts)
-        .unwrap_or_else(|_| ua_core::time::now())
+/// Storage form of `clock`'s now minus `days`.
+pub(crate) fn days_ago(clock: &ua_core::time::Clock, days: f64) -> String {
+    let ms = clock.now_ms() - (days * 86_400_000.0) as i64;
+    jiff::Timestamp::from_millisecond(ms).map(ua_core::time::format_ts).unwrap_or_else(|_| clock.now())
 }
 
 /// Storage form of `s` plus `secs` seconds.
@@ -450,16 +451,18 @@ impl Eligibility {
 
 /// Open `contradicts` links against each note: the disputing note is live
 /// (not deleted, not superseded or valid at `as_of`, not expired). Capped
-/// per note at [`rank::MAX_COUNTED_CONTRADICTIONS`].
+/// per note at [`rank::MAX_COUNTED_CONTRADICTIONS`]. `now` (storage form)
+/// decides expiry.
 pub(crate) fn open_contradictions(
     conn: &Connection,
     org: &str,
     as_of: Option<&str>,
+    now: &str,
 ) -> UaResult<HashMap<String, i64>> {
     let elig = Eligibility {
         org: org.to_string(),
         as_of: as_of.map(str::to_string),
-        now: ua_core::time::now(),
+        now: now.to_string(),
         ..Default::default()
     };
     let f = elig.filter();
