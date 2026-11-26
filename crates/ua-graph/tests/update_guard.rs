@@ -61,6 +61,14 @@ const GUARDED_TABLES: &[&str] = &["graph_nodes", "graph_edges", "graph_org_count
 /// and `crates/ua-server/` must NEVER be added here.
 const DOMAIN_UPDATE_CALL_ALLOWLIST: &[&str] = &[];
 
+/// Non-test workspace source files (suffixes, forward-slash normalized)
+/// permitted to reference `MigrationGraph` outside its definition
+/// (`crates/ua-store/src/graph.rs`). `MigrationGraph::record_event` returns
+/// `Ok(None)` so schema migrations and bulk importers do not write to the
+/// hash-chained ledger; runtime handlers and `ua-server` must NEVER be added
+/// here.
+const MIGRATION_GRAPH_ALLOWLIST: &[&str] = &["crates/ua-tools/src/families/tasks/graph.rs"];
+
 /// Crates where dynamic `format!` table-slot DML (`UPDATE {}`, `REPLACE INTO {}`,
 /// `INSERT OR REPLACE INTO {}`) is forbidden.
 const DYNAMIC_SQL_GUARDED_CRATES: &[&str] = &[
@@ -692,14 +700,36 @@ fn domain_update_call_violations(path: &str, masked_non_test: &str, allowlist: &
     findings
 }
 
+fn migration_graph_call_violations(path: &str, masked_non_test: &str, allowlist: &[&str]) -> Vec<String> {
+    if path.ends_with("crates/ua-store/src/graph.rs") || allowlist.iter().any(|a| path.ends_with(a)) {
+        return Vec::new();
+    }
+    let mut findings = Vec::new();
+    for at in find_ident_refs(masked_non_test, "MigrationGraph") {
+        let line = support::line_of(masked_non_test, at);
+        findings.push(format!(
+            "{path}:{line}: unauthorized reference to `MigrationGraph` (which skips ledger writes); \
+             only allowlisted migration/import modules may construct it"
+        ));
+    }
+    findings
+}
+
 #[test]
 fn graph_table_updates_only_exist_in_sanctioned_primitives() {
-    // Structural invariant on the allowlist itself: generic graph tools and
-    // ua-server must never be allowlisted to call domain-only node/edge updates.
+    // Structural invariant on the allowlists themselves: generic graph tools and
+    // ua-server must never be allowlisted to call domain-only node/edge updates
+    // or ledger-skipping MigrationGraph writes.
     for entry in DOMAIN_UPDATE_CALL_ALLOWLIST {
         assert!(
             !entry.contains("families/graph_store.rs") && !entry.contains("crates/ua-server/"),
             "forbidden path in DOMAIN_UPDATE_CALL_ALLOWLIST: {entry}"
+        );
+    }
+    for entry in MIGRATION_GRAPH_ALLOWLIST {
+        assert!(
+            !entry.contains("families/graph_store.rs") && !entry.contains("crates/ua-server/"),
+            "forbidden path in MIGRATION_GRAPH_ALLOWLIST: {entry}"
         );
     }
 
@@ -759,6 +789,11 @@ fn graph_table_updates_only_exist_in_sanctioned_primitives() {
             &path_str,
             &masked_non_test,
             DOMAIN_UPDATE_CALL_ALLOWLIST,
+        ));
+        violations.extend(migration_graph_call_violations(
+            &path_str,
+            &masked_non_test,
+            MIGRATION_GRAPH_ALLOWLIST,
         ));
     }
 
@@ -1003,6 +1038,32 @@ fn update_guard_catches_all_sql_variants_dynamic_slots_and_call_allowlist_bypass
             "crates/ua-graph/src/write.rs",
             &masked_dom,
             DOMAIN_UPDATE_CALL_ALLOWLIST,
+        )
+        .is_empty()
+    );
+
+    // MigrationGraph allowlist catches unauthorized usage and permits allowlisted modules.
+    let bad_mig_use = r#"
+        use ua_store::graph::MigrationGraph;
+        fn bypass(conn: &Connection) {
+            let _repo = MigrationGraph::new(conn);
+        }
+    "#;
+    let masked_mig = support::without_tests(bad_mig_use);
+    assert_eq!(
+        migration_graph_call_violations(
+            "crates/ua-tools/src/families/graph_store.rs",
+            &masked_mig,
+            MIGRATION_GRAPH_ALLOWLIST,
+        )
+        .len(),
+        2
+    );
+    assert!(
+        migration_graph_call_violations(
+            "crates/ua-tools/src/families/tasks/graph.rs",
+            &masked_mig,
+            MIGRATION_GRAPH_ALLOWLIST,
         )
         .is_empty()
     );

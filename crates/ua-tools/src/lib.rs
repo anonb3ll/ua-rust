@@ -242,6 +242,9 @@ pub fn schema_parts() -> Vec<Part> {
     // Per-class column invariants and org-existence trigger on
     // `evidence_checkpoint` (additive; `evidence_key_store.v1` is frozen).
     parts.push(ua_store::evidence::CHECKPOINT_CHECKS_PART.into());
+    // C2a: migrate default-org `task_dependencies` into `graph_edges(kind='depends_on')`
+    // and freeze `task_dependencies` read-only.
+    parts.push(families::tasks::DEPENDS_ON_GRAPH_PART.into());
     parts
 }
 

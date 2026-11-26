@@ -1012,6 +1012,10 @@ struct DbFacts {
     /// left no ledger event, so the doctor reports them. Default-organization
     /// readers only.
     harness_approvals_expired_at_upgrade: Option<i64>,
+    /// Migration counts recorded by `tasks.v3.depends_on_graph`
+    /// (`families::tasks::depends_on_migration_summary`): copied and skipped
+    /// `task_dependencies` rows. Default-organization readers only.
+    depends_on_migration: Option<Value>,
 }
 
 /// Database facts for `system_doctor`. The memory counts and the fleet are
@@ -1073,6 +1077,9 @@ fn db_facts(c: &Connection, org: &str, deep: bool) -> UaResult<DbFacts> {
             .flatten(),
         harness_approvals_expired_at_upgrade: (org == ua_core::DEFAULT_ORG)
             .then(|| crate::families::harness_config::upgrade_expired_approvals(c).ok())
+            .flatten(),
+        depends_on_migration: (org == ua_core::DEFAULT_ORG)
+            .then(|| crate::families::tasks::depends_on_migration_summary(c))
             .flatten(),
     })
 }
@@ -1417,6 +1424,15 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
              no ledger event)"
         ));
     }
+    if let Some(ref summary) = facts.depends_on_migration
+        && let Some(skipped) = summary.get("skipped_total").and_then(Value::as_u64).filter(|n| *n > 0)
+    {
+        let copied = summary.get("copied").and_then(Value::as_u64).unwrap_or(0);
+        detail.push_str(&format!(
+            "; tasks.v3.depends_on_graph migrated {copied} dependency edge(s) and skipped {skipped} row(s) \
+             (kept in task_dependencies)"
+        ));
+    }
     let stats = json!({
         "file_bytes": main,
         "wal_bytes": wal,
@@ -1427,6 +1443,7 @@ fn database_check(facts: &DbFacts, path: Option<&Path>) -> (Value, Value) {
         "quick_check": facts.quick_check,
         "idempotency_keys_unplaced": facts.idempotency_unplaced,
         "harness_config_approvals_expired_at_upgrade": facts.harness_approvals_expired_at_upgrade,
+        "depends_on_migration": facts.depends_on_migration,
     });
     (finding("database", status, detail, "UA_DB_PATH"), stats)
 }
