@@ -50,7 +50,9 @@ the same entry points that operators and agents use.
    access in the same organization cannot discover restricted memory, work, or
    evidence through direct reads, retrieval results and explanations, handoffs,
    streams, or exports. Compare what they see before and after adding the
-   hidden records.
+   hidden records. The boundary being checked is the one stated in the
+   [organization contract](organization.md#contract), including its
+   [two-organization acceptance matrix](organization.md#10-two-organization-acceptance).
 5. **Verify independently.** An authorized auditor on another machine can
    trace the artifact to the task, handoff, approval, applicable policy, run
    attempt, and checks at the reviewed revision. The verifier checks integrity,

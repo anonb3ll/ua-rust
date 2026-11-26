@@ -31,6 +31,13 @@ A caller with no verified identity (a stdio process, or an HTTP request when
 where every process that can reach it is trusted: `ua doctor` fails a
 non-loopback bind without enforced auth.
 
+Because that caller resolves to the default organization and reads every
+mailbox, enforced auth is a single-organization mode. The contract requires a
+hub with `enforce_auth` off to refuse to serve once any other organization is
+active, so no tenant is reachable by an unauthenticated caller; the tree does
+not enforce that yet (`#2807`;
+[organization.md](organization.md#7-fail-closed)).
+
 There is no identity to scope a read by, so mailboxes and conversations are
 a **message board**:
 
