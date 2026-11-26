@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use ua_core::DEFAULT_ORG;
 use ua_graph::{
-    AssertEdgeRequest, AssertedByKind, CycleCheckBounds, EdgeKind, EdgeState, EnsureNodeRequest, KHopRequest,
+    AssertEdgeRequest, AssertedByKind, CycleCheckPolicy, EdgeKind, EdgeState, EnsureNodeRequest, KHopRequest,
     NodeKind, PrincipalId, Provenance, SeedExpandRequest, SeedInput, ShortestPathRequest, SourceKind,
     Visibility, WalkDirection, assert_edge, graph_node_ensure, k_hop, schema_parts, seed_expand,
     shortest_path,
@@ -575,7 +575,7 @@ fn main() {
                     generic: false,
                     max_edges_per_org: 2_000_000,
                     max_live_edges_per_node: 5_000,
-                    cycle_bounds: CycleCheckBounds::default(),
+                    cycle_bounds: CycleCheckPolicy::default(),
                 },
             )?;
             Ok(())
@@ -622,7 +622,7 @@ fn main() {
                         generic: false,
                         max_edges_per_org: 2_000_000,
                         max_live_edges_per_node: 5_000,
-                        cycle_bounds: CycleCheckBounds::default(),
+                        cycle_bounds: CycleCheckPolicy::default(),
                     },
                 )
             })
