@@ -466,7 +466,7 @@ pub async fn backfill_embeddings_capped(
     if let Some(identity) = active_auth_backoff(db_id, org, &backoff_target, cfg.clock.now_ms()) {
         return Ok(BackfillReport {
             identity,
-            available: true,
+            available: false,
             stopped_unavailable: true,
             stopped_auth_refused: true,
             ..Default::default()
