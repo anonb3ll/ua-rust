@@ -5,6 +5,544 @@ review gate for the `organization.*` schema parts and the `ua-org` crate. Its
 companion is `docs/memory.md` (PR #40), which relies on the decisions recorded
 here for memory columns, owners and defaults.
 
+## Contract
+
+This section is the normative summary. Everything after it records the design,
+the schema and what is in the tree; where the two disagree, this section wins
+and the design is the defect. `#2790` (identity) and `#2791` (membership)
+implement it. `#2773`/`#129` are compatibility only.
+
+### 1. The organization is the security boundary
+
+`org_id` is `NOT NULL` on every tenant-scoped table, with one seeded default
+organization, so a single-organization hub behaves as a single-tenant hub and a
+second organization needs no further migration. Every read, write, approval,
+ledger row and audit export is scoped to exactly one organization. A row never
+moves between organizations; "moving" is a copy plus a reference. Organizations
+are suspended, never deleted.
+
+The boundary is enforced in the query, not in the deployment. Organizations
+share one hub, one process and one database ("Hard data-plane separation was
+considered and not chosen", *What this is not*); what makes that safe is that
+every statement names the organization of the row it touches, and every caller
+carries exactly one.
+
+A caller's organization comes from the verified credential and from nothing
+else: not a tool argument, not a header, not a label, not a name. `Caller`
+carries `org_id` and an optional `user_id`, both set by the adapter
+(*Resolution*).
+
+### 2. Identifiers are immutable; a name is not an identity
+
+| Thing | Identity (immutable) | Name (mutable) |
+|---|---|---|
+| Agent | `agent_id` | `label` |
+| Node | `node_id` | node name |
+| Person | `users.id` | person name (unique per organization, §3) |
+| Office, team | `id` | `slug` |
+
+**The id.** `agent_id`, `node_id` and `user_id` are lowercase hyphenated UUIDv7
+text (36 characters), minted by the hub inside the transaction that inserts the
+row, never supplied by a client and never derived from a name. An id is issued
+once, is never rewritten, and is never reused: a retired or forgotten row may be
+deleted, but its id stays spent and a later row gets a new one. UUIDv7 is
+time-ordered, so an id sorts usefully and cannot collide across a restore, an
+import or a hub move. An id is opaque to clients (§8): they store it and never
+parse it for an organization, a type or a timestamp.
+
+Credentials, sessions, work items, ownership, approvals, ledger rows and audit
+exports bind to the immutable id. A rename changes only the name: it moves no
+grant, no history and no ownership.
+
+**What frees a name.** A rename frees the *old* name — it moves to the same id
+under the new name — and a forget frees the name it held. A retirement frees
+nothing: `agent_unretire` returns that principal to service under the same name
+(`policy.md`, lifecycle actions), so a retired name is still held and a create
+under it is refused exactly as for an active row. A person's org-local name is
+freed when the membership carrying it is removed; the `users.id` and the person's
+memberships in other organizations are unaffected. A name reused after it is
+freed belongs to a new principal, which inherits nothing from the old one: not
+grants, not token hashes, not session rows, not ledger history.
+
+Resolution by name happens inside one verified organization and returns the id.
+After the migration, no code path keeps a name as a foreign key.
+
+**Today: this paragraph is a requirement, not current behavior.** Two of its
+three promises are false against the tree, and the third does not exist:
+
+- `agents.label` is the primary key, `nodes.node` is the key, and `users.label`
+  is `UNIQUE NOCASE` hub-wide (*People*, *Global keys and table rebuilds*).
+- Nine further surfaces still key on a label rather than an id:
+  `agent_lifecycle.agent`, `session_profiles (identity, session_key)`,
+  `org_role_grants (org_id, label)`, `org_seats (org_id, label)`,
+  `org_service_identities (org_id, label)`, `agent_tokens.agent_label`,
+  `delegations.from_agent`/`to_agent`, `approvals.requested_by`/`resolved_by`,
+  and `zulip_fetch_cursors (agent_label, channel, topic)`, which carries no
+  `org_id` at all, so two organizations share one cursor.
+- `agent_forget` deletes only `agents`, `agent_lifecycle` and `session_profiles`
+  (`ua-tools/src/families/governance/lifecycle.rs:1053`). Grants, seats,
+  service identities, tokens, delegations, approvals and cursors survive it.
+  **So a forget followed by re-registering the same label in the same
+  organization inherits the old grants and seats today.** §10 row 8 tests that
+  case, not a cross-organization one that is trivially true.
+- There is no rename operation at all.
+
+`#2790` closes this by delivering, in one migration: an id column on every
+principal, every table above keyed by `(org_id, id)`, a rename that updates one
+name column and nothing else, and a forget that **stops resolving** the
+label-keyed rows of the forgotten id — its managed tokens, OAuth sign-ins and
+session credentials are revoked, and its grants, seats, service identities,
+delegations and approvals are retained as history that no longer resolves to any
+principal. They are never deleted: they are audit records, and deleting them to
+free a name is the same defect as re-attributing them (§9).
+
+
+### 3. Names are local to one organization and one resource type
+
+An agent label, a node name, a workspace name, a secret name, a skill name, a
+team slug, an office slug and a project name are unique **within one
+organization and one resource type**, compared case-insensitively, and are
+opaque outside it.
+
+- The same agent label may exist in A and B: two independent principals, two
+  ids, two grant sets.
+- The same node name may be registered in A and B. Each node serves only its
+  own organization's work.
+- The same secret, skill, project, team slug and office slug may exist in A and
+  B. This is already true for the rebuilt keys (*Global keys and table
+  rebuilds*) and is the rule for every future one.
+- A refusal never states whether another organization holds the name. Under
+  org-local names there is no such state to reveal: B's create succeeds.
+- A name resolves only inside the caller's verified organization. There is no
+  hub-wide lookup, and no "did someone else take it" answer.
+
+**Charset and comparison.** A label is ASCII: `[A-Za-z]` followed by up to 63
+of `[A-Za-z0-9_-]`, compared case-insensitively and stored `COLLATE NOCASE`,
+which is the rule `clean_label` already enforces (`ua-org/src/registry.rs:521`,
+`LABEL_MAX = 64`). A slug is up to 64 characters of lowercase `[a-z0-9]` groups
+joined by single `-`. Non-ASCII input is refused `invalid_label` rather than
+folded: SQLite's `NOCASE` folds ASCII only, so accepting Unicode would create two
+names that compare equal in one code path and unequal in another. No Unicode
+normalization is part of the contract because no non-ASCII name is accepted.
+
+**What is org-local.** Every tenant-scoped name is unique within
+`(org_id, resource type)`. That covers an agent label, a node name, a workspace
+name, a secret name, a skill name and a skill target, a team slug, an office
+slug, a project name, a deliverable identity, a graph board id and a graph
+`(kind, external_id)`, a harness config per node, a seat and a service identity,
+and the idempotency and launch keys, which are already keyed `(org_id, …)`
+(*Global keys and table rebuilds*). A person's name is unique per
+`(org_id, name)` under the same rule; it is not an exception, below.
+
+**Hub-wide by declaration, never by accident.** Four names stay hub-scoped
+because they are hub configuration or the tenant's own key, and the contract says
+so out loud instead of leaving them implicit: the profile catalog
+(`profiles.json`), `provider_accounts.label`, `mcp_servers.name`, and
+`orgs.slug` (with `orgs.id` as the tenant's immutable key). A fifth,
+`dispatch_meta.key`, is hub salt and hub-owner only.
+
+**People are org-local names on a hub-level identity.** A person is a hub-level
+identity — `users.id` exists once for one human, who may belong to several
+organizations — but the *name* is per organization: person names are unique per
+`(org_id, name)`, exactly like an agent label, and a person name never collides
+with an agent label because the resource type differs. Organization B creating the
+person `builder-1` therefore blocks neither A's agent `builder-1` nor A's own
+person `builder-1`; those are three names in three scopes. **Login is by
+credential, never by name:** a session resolves its `user_id` from the credential
+it presented (*Resolution*), so nothing depends on a name being unique across the
+hub. The name belongs to the membership, not to the global row: `org_memberships`
+carries the org-local person name and its `UNIQUE (org_id, name)` key, while
+`users` keeps the id and display metadata (*People*, *Global keys and table
+rebuilds*). Today the name is still `users.label`, `UNIQUE NOCASE` hub-wide, and a
+person label collides with an agent label; both are compatibility, below, and
+`#2791` moves the name onto the membership (`#2790` supplies the id keys; §10 rows
+13 and 22).
+
+
+**Compatibility, not the contract.** Until `#2790`, agent labels, node names and
+`users.label` are one hub-wide, case-insensitive namespace (`#129`), and a
+foreign holder is refused (`agent_label_taken`, or the node equivalent). That
+behavior is kept for existing data and the default organization during the
+migration, and it carries two known costs, both closed by `#2790`:
+
+- **Squatting.** One organization can hold a name another needs, including a
+  name it never uses (`#2790` acceptance input), and today one can also hold a
+  *person* name another's agent needs.
+- **Existence.** A refusal reveals that a name exists somewhere in the hub,
+  which is a cross-organization probe.
+
+The compatibility scope is bounded twice: it applies only to existing data and
+the default organization, and **no second organization is enrolled under it**
+(`#2800` keeps customer-admin enrolment and token issuance off until the §10
+proofs pass). It is not a promise to a second organization.
+
+### 4. One verified active organization per request
+
+- Every caller carries exactly one `org_id`, and for a person at most one
+  `user_id`. Both come from the credential (*Resolution*).
+- A person with several memberships chooses one at login. The session carries
+  the choice, switching organizations rotates the session id and the CSRF token,
+  and a token, grant or session credential that names a second organization is
+  refused.
+- No request, job or tool call spans organizations. Background work iterates the
+  active organizations and acts through `system_for(org_id)`. There is no
+  organization-free caller.
+- A suspended organization keeps its owners and auditors read-only and refuses
+  everything else (`org_suspended`); its nodes receive no work.
+- Below hub-owner scope there is no combined view. A hub owner's fleet or doctor
+  row reports other organizations as counts and status classes only: no rows,
+  no names, no ids.
+
+### 5. Authority is membership plus an explicit grant
+
+**Enrolment is closed until `#2800`.** Until the §10 matrix passes on a real
+two-organization store, no second organization is enrolled: `org_create` is
+hub-owner only and refuses while enrolment is closed, and no agent token, node or
+customer admin is issued to a non-default organization. The role table below
+describes the authority the contract grants once that gate opens, not permission
+to exercise it today. `#2791` owns the membership and enrolment gates.
+
+**The gate does not block its own proof.** The §10 matrix runs on a rehearsal
+store — a copy of the database on the hub host, or a test home — never on a store
+`ua serve` serves. A rehearsal store carries a marker (`meta.rehearsal = 1`, set
+only by `ua org rehearsal-create`) and both ends enforce it: `ua org
+rehearsal-create` refuses to run against a store `ua serve` would serve (detected
+by the serve lock and the serving configuration, not by counting organizations),
+and `ua serve` refuses to start against a store carrying the marker. So the
+marker cannot be added to a live store, and a rehearsal store cannot be served by
+accident — which is the mechanism behind "never holds real work". `org_create`
+stays closed on a serving hub.
+
+The three levels are hub, organization and team (*Decision*). Inside an
+organization, a person's authority is their `org_memberships` role plus what a
+team or a spec grants, evaluated at the moment of the action and never cached in
+a session.
+
+| Role | May | May not |
+|---|---|---|
+| `org_owner` | everything `org_admin` can do, plus owner grants and owner-only settings | be removed or demoted as the last owner |
+| `org_admin` | memberships below owner, teams, offices, specs, budgets, settings, secrets, agent tokens, nodes; `org_admin` and `team_lead` approvals | grant `org_owner` alone; act across the boundary |
+| `team_lead` | approve `team_lead` approvals routed to a team they lead; narrow that team's spec | approve `org_admin` or `hub_owner` work, or another team's |
+| `member` | belong to teams, hold seats, request approvals | approve anything |
+| `auditor` | read the ledger, approvals and audit exports | write, approve, deny, revoke or resolve |
+
+- **A profile never confers authority.** A profile decides which tools a session
+  sees, bounded by the organization's `allowed_profiles` (*What this is not*).
+  An `operator` profile is not operator authority; `ua-org::authz` decides that
+  from identity.
+- **An agent acts as itself.** An agent's authority is its own explicit grants
+  in its organization. It never inherits a human's role, and `owner_user_id`
+  confers no authority except where a rule names it (agent credential issuance,
+  *Agent owners*).
+- **Approval authority is computed, not chosen.** Every parked approval records
+  `required_authority`, `team_id` and `two_person` when it is created and never
+  lowers them (*Approvals routed by team*).
+- **The floor.** `member` and `auditor` never approve. The requester never
+  approves. A two-person approval needs a second eligible human who is not the
+  subject. The last owner cannot be removed or demoted. A grant of an approving
+  role and a credential for another human are two-person.
+- **The first owner.** `org_create` is hub-owner only and **names an existing
+  user** as the organization's first `org_owner`: the caller supplies that
+  person's `user_id`, which must already be a hub user, and the organization and
+  that `org_owner` membership are inserted in one transaction, so an organization
+  never exists without an owner. The creator gets no membership for creating one:
+  a hub owner acting inside a tenant is the boundary violation §6 forbids, so
+  creating an organization is not a way into it. `'default'` gets its owners from
+  the bootstrap (§6).
+- **The last owner.** The last owner cannot be removed, demoted, or removed from
+  the organization: the operation is refused `last_owner` rather than silently
+  leaving the tenant unowned.
+- **No standing break-glass.** No configured label, static token or profile
+  carries owner authority inside a tenant, and none can be added to one.
+- **Recovering an organization whose owners are all unreachable.** One narrow,
+  audited path: a hub owner may grant `org_owner` to an **existing membership
+  named by id** (`org_id` + `user_id`) — never by label, and never by creating a
+  member. It is two-person when a second hub owner exists. **A sole hub owner
+  needs one of two safeguards, and neither can be waived:**
+  - **Cooling off with notice.** The grant is *proposed*: the ledger records the
+    proposal and its reason, every remaining member of that organization is
+    notified, and the grant takes effect only when the delay expires
+    (`hub_owner_recovery_cooloff`, default 24 hours). Any other hub owner, a new
+    hub owner appearing, or the organization's own surviving owner cancels it. A
+    sole owner cannot shorten it. This is the default whenever the hub has a
+    channel to notify members; an organization with no channel to reach members
+    cannot use it.
+  - **Out-of-band confirmation on the hub host.** `ua org recover-owner` runs on
+    the hub host (hub-host trust, §7) and takes effect immediately. It is the
+    other alternative, not a second-class one: it is the route to take when the
+    organization has no reachable members to notify, and a sole owner with
+    reachable members may still choose it.
+  Either way the resulting ledger event names the actor, the target id, the
+  safeguard used, the delay if any, and the reason; the call requires explicit
+  confirmation; and `ua doctor` reports the grant. If the organization has no
+  human membership left, nothing is granted: recovery is a suspend plus restore
+  from backup (§6). This is **one of the two** writes a hub owner performs inside
+  a tenant (§6), and both are named there.
+
+### 6. Default compatibility and platform recovery
+
+The default organization is the compatibility surface: a hub with one configured
+human and no other organization behaves exactly as a single-tenant hub does
+today (*Bootstrap and single-operator parity*, acceptance 1).
+
+- The bootstrap creates each `human_identities` label once, as a `bootstrap = 1`
+  user with an `org_owner` membership in `'default'`, and records a tombstone.
+  An explicit later removal survives a restart.
+- A hub owner is a configured label **whose row the bootstrap created**. A row an
+  organization created can never become a hub owner by having its label added to
+  the configuration. `system_doctor` reports it, and `ua org adopt-owner`
+  resolves it on the hub host after revoking that row's credentials.
+- Reserved labels (configured `human_identities`, `lifecycle_operators`, static
+  tokens, `[profiles]`) exist only in `'default'`. A conflict is
+  `MISCONFIGURED`: the hub keeps starting, the label gets none of its configured
+  authority, and the operator resolves it.
+- **Hub recovery acts by id, never by name, and only as a hub owner.** A hub
+  owner may retire and forget an agent or a node another organization holds
+  through `any_org`. After §2 that operation takes `(org_id, id)`: once names are
+  org-local, "which organization's `agent-1`" has no answer, so a label is not
+  accepted as the target. The answer carries only ids and changed flags — no
+  labels, no row contents — and appends a ledger event naming the hub actor and
+  the target id. **The authority is hub-owner authority, which is narrower than
+  membership of the `'default'` `lifecycle_operators` set:** the actor must be a
+  `users.id` the bootstrap created and `human_identities` names by id (§6, *Hub
+  owners*).
+  `policy.md`'s "the default organization's lifecycle operators" and acceptance
+  10's "a `'default'` agent or a hub owner" describe today's compatibility set;
+  when `#2790` lands, a `'default'` lifecycle-operator label that is an agent or a
+  tenant-created user loses `any_org`, because neither is a hub owner.
+- **Hub operator and organization operator are different authorities.** A hub
+  owner may suspend an organization, restore a backup, and perform exactly the two
+  recovery writes above (retire/forget by id; the owner grant in §5). It cannot
+  read tenant rows, approve tenant work, or grant any other role. An
+  organization's own owner or admin has no `any_org` power at all.
+- A lost or suspended organization is recovered by a hub owner suspending it,
+  its owners reading read-only, and data being restored from backup. Rows are
+  never moved between organizations to effect a recovery.
+
+### 7. Fail closed
+
+The contract prefers a refusal to a guess at every boundary.
+
+- **Auth off is a single-organization mode.** With `enforce_auth` off, an
+  unauthenticated HTTP request resolves to `'default'` (*Resolution*) and reads
+  every mailbox ([auth.md](auth.md), "With auth enforcement off"). That is
+  acceptable only while no other organization is served by the process: once
+  `orgs` holds any organization other than `'default'` (active or suspended) or
+  is unreadable, `ua serve` refuses to start, `ua doctor` fails `auth_lockout`
+  and `origin_security` even on loopback, unauthenticated non-public HTTP
+  requests fail `401`, and open anonymous event streams are revoked (`#2807`,
+  landed). Loopback is not a boundary when a second tenant is served by the same
+  process.
+- **An unavailable policy is not the default policy, in any organization.** The
+  three readings of an unreadable policy collapse into one rule: if a configured
+  policy file exists but cannot be read, is not valid YAML, or fails validation,
+  **every governed call is refused `policy_unavailable`**, including in
+  `'default'` — this is what `policy.md` already says, and anything narrower would
+  make the default organization the one tenant whose gate can fail open.
+  `ua doctor` reports it.
+  - **A missing file for a tenant organization is refused**, exactly like an
+    unreadable one: a non-default organization never runs on the shipped default,
+    which its owner did not choose and cannot see.
+  - **A missing file for `'default'` is the single documented exception**: it is
+    the shipped default, i.e. a single-tenant hub with no policy file behaves as
+    it does today (`policy.md`, "Fail-closed behaviour"). That is parity, not a
+    fallback on error.
+  - `enabled: false` is an explicit operator choice and keeps its documented
+    meaning (rules ignored); it is never inferred from a read failure.
+- **A caller with no organization is refused.** `Caller` deserializes
+  `org_id` with `#[serde(default = "default_org")]`
+  (`ua-core/src/identity.rs:57`), so a payload that omits the field silently
+  becomes `'default'`. After `#2790` a `Caller` without an `org_id` is refused
+  `caller_without_org`; the serde default is a compatibility shim and its removal
+  is part of the migration, not a later cleanup.
+- **Every ingress names its organization, and only these do.** The organization
+  comes from the verified credential, except for the three documented surfaces:
+  the GitHub webhook path (§8), the Slack/Zulip workspace mapping, and the
+  hub-host stdio/CLI caller. Each of the three is default-safe: an unmapped
+  workspace, an unknown webhook organization and a second-org hub all refuse.
+- **Slack and Zulip ingress map workspace to organization, never text to
+  organization.** The mapping is hub configuration; an incoming delivery whose
+  workspace has no mapping is refused, and no message content can select an
+  organization. A Zulip cursor is keyed `(org_id, agent_label, channel, topic)`
+  once §2 delivers the id keying, so two organizations cannot share one.
+- **A node's organization is its registering agent's.** A node registers with a
+  credential that resolves to an agent in one organization; the node row carries
+  that `org_id`, a node claim must match it, and a name or id that resolves to
+  another organization is refused. There is no hub-wide node pool.
+- **MCP stdio and the CLI local caller are default-only hub-host callers.**
+  `Caller::local` resolves to `'default'` on the hub host with
+  `enforce_profile = false`; that is hub-host trust, stated here rather than
+  hidden, and it is refused once a second organization is active unless the caller
+  authenticates. A local caller can never name another organization.
+  **The hub-host recovery commands are exempt, because they are that same
+  hub-host trust:** `ua doctor`, `ua org adopt-owner`, `ua org recover-owner`,
+  `ua backup` and a restore run on the host, as hub-owner work, and stay
+  available with a second organization active. They are not exposed over MCP or
+  HTTP, so nothing a remote caller can reach is exempted.
+- **`ua-import --drop-org-scope` is hub-owner only and closed by default.** It is
+  refused once a second organization is active or enrolled, because its whole
+  purpose is to fold a foreign hub's rows into `'default'`.
+- **Refuse, do not fall back.** An unknown organization, a suspended
+  organization, a missing or revoked membership, a stale session, or a
+  credential whose organization disagrees with its subject is refused. A caller
+  that presented another organization's credential is never silently served as
+  `'default'`.
+- **Foreign and absent are indistinguishable.** Every read by id returns the
+  same `not_found` for another organization's row as for a missing id, and a
+  create that would collide with a foreign row answers as if it would not. Once
+  §3 lands no key spans two organizations, so the second half is structural
+  rather than a check. Today the hub-wide label namespace is the one exception —
+  which is exactly why `agent_label_taken` is compatibility (§3), and why
+  `#2790` removes it.
+- **Filesystem and process effects happen after the check.** A family that
+  touches the workspace, the skill store, the audit files or a cycle refuses a
+  caller outside its organization **before** any filesystem access.
+
+### 8. Clients and the API surface
+
+- No tool, route, SDK call or CLI command takes an organization from its
+  arguments. `goal_manage` refusing `params.org_id` is the pattern (*Never from
+  tool arguments*).
+- **One route is the exception, and it is not a tool.** `POST
+  /api/github/webhook/{org}` takes the organization from its path, and the bare
+  `POST /api/github/webhook` means `'default'`
+  (`ua-server/src/github_api.rs:1`). That is delivery routing for a caller that
+  has no credential, not caller identity: the request still has to verify the
+  body under that organization's own webhook secret, an unknown organization and
+  a bad signature get the same `401`, and the route reaches no tool the
+  organization's own authorization would not also allow. Every other route and
+  every tool take the organization from the credential.
+- **GitHub runs on each organization's own credential.** Each organization
+  configures its own GitHub App installation and webhook secret, and a delivery
+  is verified only against the secret of the organization in its path. There is no
+  hub-level fallback credential: a request that would have to borrow another
+  organization's secret is refused.
+- **A delegation target is a registered agent in the delegator's own
+  organization.** An unregistered target and a target registered in another
+  organization both answer `not_found`, identically, so a delegation cannot probe
+  the other tenant's roster (§7).
+- **Ids are opaque.** A client stores what it is given and never parses an id for
+  an organization, a type or a timestamp.
+- **Ownership, membership and every reference are same-organization:** a team
+  member, a team office, a spec, a task `team_id`, an approval `team_id`, a
+  delegation target and a node reference from another organization are refused.
+- **A client that needs two organizations holds two credentials and two
+  sessions.** There is no combined view below hub-owner scope and no export that
+  merges two tenants. `ua backup` and the migration manifest stay hub-wide and
+  hub-owner only (*Scoping per subsystem*).
+- **Local clients are default-only.** MCP stdio and the CLI on the hub host
+  resolve to `'default'` and are refused once a second organization is active
+  unless they authenticate; `ua-import --drop-org-scope` is hub-owner only and
+  closed by default (§7).
+
+### 9. Staged migration and rollback
+
+Every step is additive, and each lands as its own schema part or standalone
+procedure:
+
+1. **Expand.** Add the immutable id columns and the org-local unique indexes
+   beside the existing keys; dual-write both. Nothing reads them yet.
+2. **Backfill.** Mint an id for every existing principal. **No existing row's
+   `org_id` changes:** every row keeps the `org_id` it already carries, so rows
+   that belong to a non-default organization stay there and the immutability
+   triggers (§10 row 23, acceptance 6) are never contradicted. Only a column
+   newly added to a row that had none receives `'default'` as its initial
+   value. Record each principal's name timeline in the projection
+   `principal_names (org_id, kind, id, label, from_at, to_at)`, so a later rename
+   appends an interval instead of rewriting history. `from_at` is the row's own
+   `created_at` where one is recorded, else the migration instant; nothing
+   earlier is invented. A forget-and-reuse cycle that happened **before** the
+   migration cannot be reconstructed, so a pre-migration label whose holder at
+   the event's time is ambiguous is recorded with `from_at = NULL` and resolves
+   to `unknown` (§ below) rather than to whichever holder exists now. Refuse to
+   proceed while a case-collision exists, and name it: the collision is the row
+   pair, not the surviving string.
+3. **Switch reads.** Resolve by id inside the caller's organization. Keep the
+   name as an accepted lookup key.
+4. **Contract.** Drop the hub-wide unique keys and the name-shaped foreign
+   references, one family per PR, after the switch has run on populated data.
+
+- **Rollback.** The unknown-part fence and the newer-ledger-hash fence refuse a
+  build older than the database, and `--allow-newer-schema` never lifts them for
+  `ua serve` (`docs/operations.md`). There is no down-migration: recovery is a
+  restore from the pre-phase backup plus a forward fix. A phase that has not
+  been rehearsed on a populated copy of a real store does not land.
+- **No data moves between organizations.** The migration preserves every id,
+  grant and ledger row.
+- **The ledger keeps its meaning across rename and reuse.** An event records its
+  actor as `org_id` + `kind` + `id`. Rows written before the migration recorded a
+  label, and each is resolved through `principal_names` **at the event's own
+  `at`**: the principal that held that name at that instant, never the one that
+  holds it now. A rename appends `(old_label → new_label, at)`; a forget closes
+  the interval, because the name is no longer held; a retirement does not close
+  it, because the name is still held and `agent_unretire` returns the same id
+  under it. So a ledger reads correctly after a rename and after a
+  same-organization reuse, and the same label recorded at two times resolves to
+  two different ids by time. Where no interval covers an event — an imported row
+  for a label no row ever held — the projection records `unknown` and the event
+  reads as unattributed rather than being credited to the current holder.
+  `docs/graph.md`'s provisional `asserted_by` backfill consumes this same
+  projection; it does not re-derive attribution from the current roster.
+- **Rehearsal is the gate.** `#2790` is complete only with a rehearsal on
+  populated legacy data, the rollback fence proven, and the negative tests under
+  [§10](#10-two-organization-acceptance) passing.
+
+### 10. Two-organization acceptance
+
+The contract is met when a two-organization store passes this matrix, in
+addition to the single-organization parity and isolation checks under
+[Acceptance](#acceptance). A and B are organizations; `agent-1` and `node-1` are
+names both may choose.
+
+| # | Check | Expected |
+|---|---|---|
+| 1 | Register agent `agent-1` in A, then in B | both succeed: two principals, two ids |
+| 2 | Register node `node-1` in A, then in B | both succeed; each serves only its own organization's work |
+| 3 | Heartbeat or `session_start` as `agent-1` from B | touches B only; A's row, sessions and grants unchanged |
+| 4 | List agents, nodes, tasks and memory as A | no B row, and no B count below hub scope |
+| 5 | Read an id belonging to B as A | `not_found`, identical to a missing id |
+| 6 | Create a secret, skill, project, team or office with B's name in A | succeeds; neither error reveals the other organization |
+| 7 | Approve A's request from B, as one human holding both memberships | refused; A's pass never satisfies B's identical call |
+| 8 | Forget `agent-1` in A (it is retired first), then register `agent-1` again in A | succeeds as a new principal: none of the old grants, seats, tokens, delegations or approvals carry over, and they stay on the ledger as history. Retiring alone frees nothing: `agent_unretire` returns the same id under the same label (§2) |
+| 9 | Start with `enforce_auth` off while B is active | the hub refuses to serve and `ua doctor` fails |
+| 10 | Suspend B, then act as B and as A | B gets `org_suspended` except owner and auditor reads; A is unaffected |
+| 11 | Rename `agent-1` in A | the id, grants, ownership, ledger rows and B are unchanged |
+| 12 | Restore the pre-migration backup | the hub starts, the ledger verifies, both organizations are intact |
+| 13 | Register a person `builder-1` in B, then an agent `builder-1` and a person `builder-1` in A | all three succeed: person names are unique per `(org_id, name)` and a person is a different resource type from an agent, so neither a hub-wide person key nor the cross-type refusal acceptance 17 describes exists (§3) |
+| 14 | Delegate from A's agent to `agent-1` while that label is registered only in B | `not_found`, identical to a label that exists nowhere; B's rosters unchanged |
+| 15 | Present A's agent token to act as `agent-1` in B | refused; B's row, sessions and grants untouched |
+| 16 | Deliver a GitHub webhook to B's path signed with A's secret | `401`, identical to a bad signature; no B row is read |
+| 17 | Hub recovery targets B's `agent-1` by label with `any_org`, then by id | the label is refused as ambiguous; the id succeeds and the answer carries ids and changed flags only |
+| 18 | Rename `agent-1` to `agent-2` in A, then reuse `agent-1` for a new A principal | ledger rows before the rename resolve to the old id, rows after the reuse to the new one; none to the wrong principal |
+| 19 | Run an MCP stdio tool call or a `ua` tool call on the hub host while B is active | refused unless the caller authenticates; the local caller resolves to `'default'` only. The hub-host recovery commands of §7 are not tool calls and are not refused |
+| 20 | Make the policy file unreadable, then run a governed call in B and in `'default'` | `policy_unavailable` in both |
+| 21 | Remove the hub's policy file (`policy_file` is one hub-wide setting), then run a governed call in B and in `'default'` | B refuses `policy_unavailable` (a tenant never runs on the shipped default); `'default'` behaves as today's single-tenant hub |
+| 22 | Rename the person `builder-1` in A, then reuse `builder-1` for a new membership in A | the rename changes no id, grant or ledger row; the reused name is a new user id; ledger rows resolve by the name timeline (§9) |
+| 23 | Update a row's `org_id` directly in SQL | refused by the immutability trigger; the row and its ledger chain are unchanged |
+
+### 11. Security findings reconciled
+
+These are the organization-boundary findings the contract has to answer. Each is
+carried by a delivered fix or an open card, and the migration may not waive any
+of them.
+
+| Finding | Source | Resolution |
+|---|---|---|
+| A foreign name could block, or reveal, another organization's row | `#129` second review round; `#2790` acceptance input | Org-local names (§3): no foreign-holder refusal, no existence answer |
+| A person's label shared the agents' namespace, so one organization's user could block another's agent | This review (blocker 1) | Person names are unique per `(org_id, name)` and a person is a different resource type from an agent: no hub-wide person key, no cross-type collision, and the refusal acceptance 17 describes is removed (§3, `#2791`) |
+| An unreadable policy fell back to the permissive default | `#129` second review round | Every governed call is refused `policy_unavailable` in every organization; a missing file refuses a tenant and is the shipped default only for `'default'` (§7) |
+| The workspace, skill store, audit files and cycles reached the filesystem before the organization check | `#129` second review round | The check comes before any filesystem access (§7) |
+| `agent_forget` could orphan an agent's nodes | `#129` second review round | Refused while the agent owns nodes (`agent_owns_nodes`, `ua-tools/src/families/governance/lifecycle.rs:964`); §6 covers the hub-recovery path |
+| A delegation target matched case-insensitively against a label absent from the organization | `#129` second review round | The target must be a registered agent in the delegator's own organization; unregistered and other-organization targets answer the same `not_found` (§8) |
+| A forget left grants, seats and tokens keyed to the label, so a same-organization reuse inherited them | This review (blocker 2) | Forget revokes the id's credentials and stops resolving its label-keyed rows, which are kept as history and never re-attributed; §10 row 8 tests it (§2) |
+| Ledger rows recorded a label, so a rename or a reuse silently re-attributed old events | This review (blocker 3) | Attribution resolves through the name timeline at the event's own time, and reads `unknown` rather than guessing (§9) |
+| An unauthenticated caller reached tenant data while auth was off | [auth.md](auth.md), "With auth enforcement off" | Refused once a second organization is active (§7) |
+| A sole hub owner could grant itself `org_owner` in a tenant with no witness | Owner decision, 2026-11-26 | A sole hub owner's recovery grant needs a cooling-off delay with notice to the remaining members, or out-of-band confirmation on the hub host; a second hub owner makes it two-person (§5, §6) |
+
+`#2716` owns the audit implementation for the boundary, `#2791` owns the
+membership and enrollment gates, and `#2800` keeps customer-admin enrollment and
+token issuance off until these proofs pass.
+
 `organization.v1` lands in several PRs rather than one. What is in the tree:
 
 - The `Procedure` part kind with `version` refusal and the `standalone` flag
@@ -1015,7 +1553,8 @@ here for memory columns, owners and defaults.
   the row's detail) and `other_org_unsent_command_notices`, and a provider
   account's recent runs list only the default organization's and add
   `other_org_runs`.
-  **Hub recovery.** Node names are one hub namespace, so a name another
+  **Hub recovery (compatibility namespace).** Node names are one hub namespace
+  today, so a name another
   organization registered (by mistake, or to squat it) would otherwise be
   stuck: its lifecycle operators are not admitted yet, and every operator
   action is scoped to the caller's organization. A default-organization
@@ -1232,14 +1771,16 @@ here for memory columns, owners and defaults.
   token or grant it authenticates with ("the grant carries the
   organization"); existing agents go to `default`. Its sessions, profile
   bindings, session credentials, handoff notes and wake rows belong to that
-  organization too. **Agent labels stay one hub-wide namespace**, as node
+  organization too. **Agent labels stay one hub-wide namespace** (compatibility;
+  the contract is org-local names, §3), as node
   names do, compared without regard to case: a label is held by the
   organization of its agent row, else of a lifecycle row for it, else of an
   active managed token for it, and any other organization registering it
   (a heartbeat, `session_start`, a profile binding, a token issue) is
   refused `agent_label_taken`, which reveals only that the label is taken.
-  - **Hub recovery.** A default-organization lifecycle operator (`Authz`
-    over `default`, which no other organization's caller holds) passes
+  - **Hub recovery.** A **hub owner** — a bootstrap-created row named by
+    `human_identities`, not merely a member of the `'default'`
+    `lifecycle_operators` set (§6) — passes
     `any_org=true` to `agent_retire` and the new `agent_forget`: the agent
     of whichever organization's **row** holds the label (the rows, not the
     configuration reservation, so a stale row another organization keeps
@@ -1620,9 +2161,10 @@ orgs ─────────────────────┼── of
   (`agents.owner_user_id`). Memory uses it to decide which agent may summarize
   that human's private notes; nothing else derives authority from it.
 
-**One label namespace.** Agent labels and user labels share one hub-wide
+**One label namespace (compatibility).** Agent labels and user labels share one hub-wide
 namespace, compared **case-insensitively** (as `agent_lifecycle.agent` already
-is). Today `agents.label` is a case-sensitive primary key, so `Builder-1` in B
+is). In the contract a person name is per `(org_id, name)` (§3), so this shared
+namespace is compatibility and `#2791` ends it. Today `agents.label` is a case-sensitive primary key, so `Builder-1` in B
 could coexist with `builder-1` in A and then overwrite A's NOCASE
 `agent_lifecycle` row. `organization.v1` therefore adds a unique index on
 `agents(label COLLATE NOCASE)`, after a pre-check that refuses to apply the
@@ -1659,7 +2201,7 @@ operator resolves it — the same treatment as Bootstrap's unadopted row. Rows i
 ```sql
 CREATE TABLE IF NOT EXISTS users (
     id           TEXT PRIMARY KEY,
-    label        TEXT NOT NULL UNIQUE COLLATE NOCASE,  -- the label credentials carry
+    label        TEXT NOT NULL UNIQUE COLLATE NOCASE,  -- compatibility (hub-wide, §3); #2791 moves the name
     display_name TEXT NOT NULL,
     status       TEXT NOT NULL DEFAULT 'active'
                  CHECK (status IN ('active','suspended')),
@@ -1670,6 +2212,9 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS org_memberships (
     org_id   TEXT NOT NULL REFERENCES orgs(id),
     user_id  TEXT NOT NULL REFERENCES users(id),
+    name     TEXT NOT NULL,        -- the person's name in this org (#2791): backfilled from users.label
+                                   --   UNIQUE (org_id, name COLLATE NOCASE); NOT NULL, because SQL UNIQUE
+                                   --   admits any number of NULLs and a nameless membership is not a person
     role     TEXT NOT NULL
              CHECK (role IN ('org_owner','org_admin','team_lead','member','auditor')),
     profile  TEXT,                 -- session profile in this org; NULL = 'reviewer'
@@ -1690,6 +2235,20 @@ CREATE TABLE IF NOT EXISTS org_bootstrap (
 grant. A role decides **which rows and which approvals** a person has authority
 over.
 
+**Where the person's name lives.** A person's *identity* is `users.id`, global
+because one human may belong to several organizations. A person's *name* is
+org-local: it is the `name` on `org_memberships`, unique per
+`(org_id, name)` and compared case-insensitively, exactly like an agent label,
+and it never collides with an agent label because the resource type differs
+(§3). **Login goes by credential, never by name:** a session resolves its
+`user_id` from the credential it presented, so no lookup depends on a name being
+unique across the hub. Until `#2791`, `users.label` carries the name hub-wide
+(`UNIQUE NOCASE`) and acceptance 17's cross-type refusal still fires; that is
+compatibility, and `#2791` moves the constraint onto the membership. Adding an
+existing user to a second organization stays two-person with `hub_owner`
+authority (*Credentials for people*), because that is the step that could expose
+or grant another tenant's person.
+
 | Role | Authority inside the organization |
 |---|---|
 | `org_owner` | Everything `org_admin` can do, plus granting and removing `org_owner` and changing owner-only settings. The last owner cannot be removed or demoted. |
@@ -1700,11 +2259,16 @@ over.
 
 ### Hub owners
 
-A **hub owner** is a label listed in `human_identities` **whose `users` row was
-created by the bootstrap** (`users.bootstrap = 1`). Only the bootstrap sets that
-flag. Binding hub authority to a bootstrap-created row, not to the label alone,
-means a row a tenant admin created — and every credential issued for it — can
-never become a hub owner by having its label added to the config later.
+A **hub owner** is a **`users.id`** that the bootstrap created (`users.bootstrap =
+1`) and that the configuration names in `human_identities` **by that id**.
+Authority hangs on the id, not on the label: once person names live on
+memberships (§3), renaming the default organization's membership changes what the
+person is called and cannot move or drop hub-owner authority. Only the bootstrap
+sets the flag, so a row a tenant admin created — and every credential issued for
+it — can never become a hub owner by having a label added to the config later.
+The configuration lists ids; a legacy label there resolves to a bootstrap row once
+at migration, and a label that resolves to more than one bootstrap row is
+`MISCONFIGURED`.
 
 ### Who is a human
 
@@ -2077,9 +2641,10 @@ global key in the tree is classified:
 
 | Table and key | Class | Reason / action |
 |---|---|---|
-| `agents.label`, `users.label` | Hub namespace | One case-insensitive label namespace (above). An agent belongs to one organization (`organization.v1.tools.agents`); a label another organization holds is refused `agent_label_taken`, and hub recovery frees one (`agent_retire`, `agent_forget` with `any_org`). `agent_lifecycle.agent` and `session_profiles (identity, session_key)` follow the label. |
+| `agents.label` | Compatibility namespace | One case-insensitive label namespace with users today, kept for existing data (§3). The contract replaces it with org-local agent names and immutable ids (§2–§3, `#2790`). An agent belongs to one organization (`organization.v1.tools.agents`); a label another organization holds is refused `agent_label_taken`, and hub recovery frees one (`agent_retire`, `agent_forget` with `any_org`, by id after `#2790`). `agent_lifecycle.agent` and `session_profiles (identity, session_key)` follow the label. |
+| `users.label` | Compatibility key | The person's *name* is org-local: unique per `(org_id, name)` on the membership, with `users.id` as the hub-level identity (§3, *People*). A person name never collides with an agent label because the resource type differs. Today the name is `users.label`, `UNIQUE NOCASE` hub-wide and cross-type-refused with `agents.label`; `#2791` moves it onto `org_memberships` and removes both. |
 | `agent_sessions.id`, `agent_tokens.token_hash`, `session_credentials.credential_id` and `.token_sha256`, `session_handoff_notes.id`, `session_wake.session_id`, `session_wake_offers.offer_id` | Global, safe | Hub-generated ULIDs, digests of random secrets, random ids, AUTOINCREMENT ids or a session id; no rebuild (`organization.v1.tools.agents`, `agents.v2.org_scope`). The `*_org_parent` triggers keep every reference in one organization. |
-| `nodes.node` | Hub namespace | Node names are registered hub-wide; a node belongs to the one organization that registered it (`organization.v1.tools.nodes`). `node_claim_ops (node, op_id)` is led by it. |
+| `nodes.node` | Compatibility namespace | Node names are registered hub-wide today; the contract is a name local to `(org_id)`, with an immutable `node_id` (§2–§3, #2790). A node belongs to the one organization that registered it (`organization.v1.tools.nodes`). `node_claim_ops (node, op_id)` is led by it. |
 | `provider_accounts.label`, `mcp_servers.name`, `dispatch_meta.key` | Hub table | Hub-scoped configuration and hub salts, managed by hub owners. |
 | `managed_secrets.name` | **Rebuild** | Key becomes `(org_id, name)`, rebuilt in the standalone procedure `managed_secrets.v2.tenant_keys`, which also adds `aad_v` so new rows bind the organization into their associated data. |
 | `skill_versions UNIQUE(name, version)` | **Rebuild** | Becomes `UNIQUE(org_id, name, version)`, rebuilt in the standalone procedure `skill_registry.v2.tenant_keys`. |
@@ -3071,9 +3636,11 @@ People and authority
     `ua-core` primitive definitions and `ua-core`'s own unit tests; for each row
     of the authority table, a `member` and an `auditor` are refused, and a
     caller in B is refused on A's target (for example minting a token for A's
-    agent); a lifecycle operator whose label is a `'default'` agent or a hub
-    owner may retire a node in any organization, and a same-named label
-    resolving to anything else may not.
+    agent); a hub owner may retire or forget a node or an agent in any
+    organization by `(org_id, id)` (§6), while a `'default'`
+    `lifecycle_operators` label that is not a hub owner may not use `any_org` —
+    that narrowing is `#2790`'s change to `policy.md`'s lifecycle-operator
+    wording.
 11. **Hub scope.** A hub-scoped tool is refused to an agent and to a human
     outside `'default'`; its approval is refused to an `org_admin` and accepted
     from a hub owner; `org_create` (with its first owner) and `org_suspend` are
@@ -3100,10 +3667,17 @@ People and authority
     credential also needs a hub owner; a user B created and credentialed, once
     added to A with that approval, is not reachable by B's credentials in A
     without A's own membership; `agent_token_issue` refuses a human label.
-17. **Label namespace.** Creating a user with an agent's label, or the reverse,
-    in any letter case, is refused; creating agent `Builder-1` in B while
+17. **Label namespace (compatibility).** Creating a user with an agent's label, or the reverse,
+    in any letter case, is refused today; creating agent `Builder-1` in B while
     `builder-1` exists in A is refused, including through `touch_agent`'s
-    auto-create, so B cannot overwrite A's `agent_lifecycle` row.
+    auto-create, so B cannot overwrite A's `agent_lifecycle` row. All of this is
+    compatibility until `#2790`/`#2791`: the contract keeps only the *same-type,
+    same-organization* uniqueness of §3 — a person's name unique per
+    `(org_id, name)` on the membership, with `users.id` the hub-level identity —
+    and removes both the hub-wide person key and the cross-type refusal (§10 rows
+    13 and 22). The contract-level checks are
+    [§10](#10-two-organization-acceptance) rows 1, 3, 6, 8, 11, 13, 14, 15, 16,
+    17, 18, 19 and 22.
 17a. **Reserved labels.** A tenant admin, an unverified named caller, and
     `touch_agent` acting for another label cannot create an agent or user whose
     label is in `human_identities`, `lifecycle_operators`, a static token or

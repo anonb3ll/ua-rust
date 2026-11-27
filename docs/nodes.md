@@ -23,6 +23,11 @@ Lifecycle operators retire, un-retire, reassign and forget nodes through
 `coordination_manage`. None of these is allowed while the node has queued or
 claimed work.
 
+A node name is hub-wide only as a compatibility rule while existing data is
+migrated. The contract is a node name that is local to one organization and
+resource type, with an immutable node id behind it
+([organization.md](organization.md#3-names-are-local-to-one-organization-and-one-resource-type)).
+
 ## The work queue
 
 An item is one piece of work for one node: a backend (`codex`, `claude`,

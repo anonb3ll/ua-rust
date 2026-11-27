@@ -860,6 +860,15 @@ from its commit history.
 
 ### Changed
 
+- `docs/organization.md` publishes the organization contract: the organization
+  as the security boundary, immutable identifiers, names local to one
+  organization and resource type, one verified active organization per request,
+  membership plus explicit grants as the only authority, default-organization
+  compatibility and recovery, fail-closed rules (including `enforce_auth` off
+  being a single-organization mode), client and API constraints, a staged
+  migration with a rollback fence, and a two-organization acceptance matrix.
+  The existing hub-wide agent and node names are recorded as compatibility
+  until the identity migration lands.
 - The default organization's task→goal links are `serves_goal` edges in the
   shared graph store (`docs/graph.md`, C2 slice b). `goal_manage` `link`,
   `unlink` and `ancestry`, and `task_update`'s project check, keep their
