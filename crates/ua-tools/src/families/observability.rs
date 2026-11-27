@@ -996,7 +996,7 @@ struct DbFacts {
     notes: i64,
     embedded: i64,
     stale_embedded: i64,
-    embedder_availability: super::memory::remote::DoctorEmbedderAvailability,
+    embedder_availability: super::memory::doctor::DoctorEmbedderAvailability,
     allow_remote_embedder: bool,
     active_tokens: i64,
     /// The default organization's only.
@@ -1062,7 +1062,7 @@ fn db_facts(c: &Connection, cfg: &Config, org: &str, deep: bool) -> UaResult<DbF
     let quick_check =
         if deep { Some(c.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))?) } else { None };
     let allow_remote_embedder = ua_memory::org_allows_remote_embedder(c, org);
-    let embedder_state = super::memory::remote::inspect_embedder_for_doctor(cfg, allow_remote_embedder);
+    let embedder_state = super::memory::doctor::inspect_embedder_for_doctor(cfg, allow_remote_embedder);
     let mem_counts = ua_memory::embedding_freshness_counts(c, org, embedder_state.active_identity.as_deref())
         .unwrap_or_default();
     Ok(DbFacts {
@@ -1420,7 +1420,7 @@ fn embeddings_check(cfg: &Config, facts: &DbFacts) -> Value {
     if mode == "ollama" {
         let origin = redact_url_origin(&cfg.memory.ollama_url);
         return match facts.embedder_availability {
-            super::memory::remote::DoctorEmbedderAvailability::Unavailable => finding(
+            super::memory::doctor::DoctorEmbedderAvailability::Unavailable => finding(
                 "semantic_search",
                 DEGRADED,
                 format!(
@@ -1430,7 +1430,7 @@ fn embeddings_check(cfg: &Config, facts: &DbFacts) -> Value {
                 ),
                 gate,
             ),
-            super::memory::remote::DoctorEmbedderAvailability::Unprobed => finding(
+            super::memory::doctor::DoctorEmbedderAvailability::Unprobed => finding(
                 "semantic_search",
                 DEGRADED,
                 format!(
@@ -1440,7 +1440,7 @@ fn embeddings_check(cfg: &Config, facts: &DbFacts) -> Value {
                 ),
                 gate,
             ),
-            super::memory::remote::DoctorEmbedderAvailability::Available => finding(
+            super::memory::doctor::DoctorEmbedderAvailability::Available => finding(
                 "semantic_search",
                 LIVE,
                 format!(
@@ -1461,7 +1461,7 @@ fn embeddings_check(cfg: &Config, facts: &DbFacts) -> Value {
             );
         };
         let origin = redact_url_origin(raw_url);
-        if facts.embedder_availability != super::memory::remote::DoctorEmbedderAvailability::Available {
+        if facts.embedder_availability != super::memory::doctor::DoctorEmbedderAvailability::Available {
             return finding(
                 "semantic_search",
                 DEGRADED,

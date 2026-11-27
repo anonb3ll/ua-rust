@@ -157,3 +157,105 @@ async fn another_organizations_agent_never_leaks_into_the_default_read() {
     let report = reg.call(&hub, &who, "system_doctor", json!({})).await.unwrap();
     assert_eq!(status(&report, "org_registry"), "LIVE");
 }
+
+#[tokio::test]
+async fn org_settings_update_requires_human_operator_approval_and_records_ledger_event() {
+    let hub = hub();
+    let reg = builtin_registry();
+    let who = human("operator");
+
+    // 1. Agent caller is refused even if its always-gated request is approved.
+    let agent_who = agent("builder-1");
+    let agent_parked = reg
+        .call(&hub, &agent_who, "org_settings_update", json!({ "allow_remote_embedder": true }))
+        .await
+        .unwrap_err();
+    let UaError::ApprovalRequired { approval_id: agent_approval_id, .. } = agent_parked else {
+        panic!("expected ApprovalRequired for always-gated org_settings_update, got {agent_parked:?}");
+    };
+    reg.call(
+        &hub,
+        &human("lead"),
+        "approval_resolve",
+        json!({ "id": agent_approval_id, "decision": "approve" }),
+    )
+    .await
+    .unwrap();
+    let agent_err = reg
+        .call(&hub, &agent_who, "org_settings_update", json!({ "allow_remote_embedder": true }))
+        .await
+        .unwrap_err();
+    assert_eq!(agent_err.code(), "denied");
+    assert_eq!(agent_err.reason_code(), Some("authority_required"), "{agent_err:?}");
+
+    // 2. Caller cannot target another organization via `org_id` (deny_unknown_fields).
+    let unknown_args = json!({ "allow_remote_embedder": true, "org_id": "other" });
+    let unknown_parked = reg.call(&hub, &who, "org_settings_update", unknown_args.clone()).await.unwrap_err();
+    let UaError::ApprovalRequired { approval_id: unknown_id, .. } = unknown_parked else {
+        panic!("expected ApprovalRequired, got {unknown_parked:?}");
+    };
+    reg.call(&hub, &human("lead"), "approval_resolve", json!({ "id": unknown_id, "decision": "approve" }))
+        .await
+        .unwrap();
+    let unknown_err = reg.call(&hub, &who, "org_settings_update", unknown_args).await.unwrap_err();
+    assert_eq!(unknown_err.code(), "invalid_argument");
+
+    // 3. Verified human operator call is always gated: parks until a second human approves.
+    let parked = reg
+        .call(&hub, &who, "org_settings_update", json!({ "allow_remote_embedder": true }))
+        .await
+        .unwrap_err();
+    let UaError::ApprovalRequired { approval_id, .. } = parked else {
+        panic!("expected ApprovalRequired for org_settings_update, got {parked:?}");
+    };
+    reg.call(&hub, &human("lead"), "approval_resolve", json!({ "id": approval_id, "decision": "approve" }))
+        .await
+        .unwrap();
+
+    let enabled =
+        reg.call(&hub, &who, "org_settings_update", json!({ "allow_remote_embedder": true })).await.unwrap();
+    assert_eq!(enabled["changed"], true);
+    assert_eq!(enabled["settings"]["allow_remote_embedder"], true);
+
+    let (flag, events): (i64, Vec<String>) = hub
+        .db()
+        .read(|c| {
+            let flag: i64 =
+                c.query_row("SELECT allow_remote_embedder FROM orgs WHERE id = 'default'", [], |r| r.get(0))?;
+            let mut stmt =
+                c.prepare("SELECT payload FROM event_log WHERE channel = 'agent.org.settings' ORDER BY seq")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok((flag, rows.collect::<Result<Vec<_>, _>>()?))
+        })
+        .unwrap();
+    assert_eq!(flag, 1);
+    assert_eq!(events.len(), 1);
+    let ev: Value = serde_json::from_str(&events[0]).unwrap();
+    assert_eq!(ev["org_id"], "default");
+    assert_eq!(ev["allow_remote_embedder"]["old"], false);
+    assert_eq!(ev["allow_remote_embedder"]["new"], true);
+
+    // 4. Re-applying the same value (after approval) is idempotent and appends no duplicate event.
+    let parked_same = reg
+        .call(&hub, &who, "org_settings_update", json!({ "allow_remote_embedder": true }))
+        .await
+        .unwrap_err();
+    let UaError::ApprovalRequired { approval_id: id2, .. } = parked_same else {
+        panic!("expected ApprovalRequired, got {parked_same:?}");
+    };
+    reg.call(&hub, &human("lead"), "approval_resolve", json!({ "id": id2, "decision": "approve" }))
+        .await
+        .unwrap();
+    let same =
+        reg.call(&hub, &who, "org_settings_update", json!({ "allow_remote_embedder": true })).await.unwrap();
+    assert_eq!(same["changed"], false);
+    let event_count: i64 = hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM event_log WHERE channel = 'agent.org.settings'", [], |r| {
+                r.get(0)
+            })?)
+        })
+        .unwrap();
+    assert_eq!(event_count, 1);
+}

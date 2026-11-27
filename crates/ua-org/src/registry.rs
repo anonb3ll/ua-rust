@@ -14,6 +14,9 @@ use ua_store::org::{NewSeat, OfficeRow, OrgRead, OrgWrite, RoleRow};
 /// Ledger channel for a registry change. The payload's `kind` says which.
 pub const CHANNEL: &str = "agent.org.registry";
 
+/// Ledger channel for an organization settings change (`docs/organization.md`).
+pub const SETTINGS_CHANNEL: &str = "agent.org.settings";
+
 /// The organization id of the default organization, the only one that exists
 /// until tenancy lands. It is [`ua_core::DEFAULT_ORG`] under a registry-local
 /// name; a caller's registry row belongs to the caller's organization, never
@@ -458,6 +461,43 @@ pub fn register_service(
         &ledger_originator(org_id, actor),
     )?;
     Ok(Outcome { changed: true, value: label })
+}
+
+/// Organization settings returned by [`update_settings`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OrgSettings {
+    pub allow_remote_embedder: bool,
+}
+
+/// Input for [`update_settings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateOrgSettings {
+    pub allow_remote_embedder: bool,
+}
+
+/// Update organization settings on `orgs` and append an `agent.org.settings`
+/// ledger event with old and new values in the same write transaction.
+pub fn update_settings(
+    repo: &mut impl OrgWrite,
+    org_id: &str,
+    input: UpdateOrgSettings,
+    actor: &str,
+) -> UaResult<Outcome<OrgSettings>> {
+    let old = repo.allow_remote_embedder(org_id)?;
+    let new = input.allow_remote_embedder;
+    if old == new {
+        return Ok(Outcome { changed: false, value: OrgSettings { allow_remote_embedder: old } });
+    }
+    repo.set_allow_remote_embedder(org_id, new)?;
+    repo.record(
+        SETTINGS_CHANNEL,
+        json!({
+            "org_id": org_id,
+            "allow_remote_embedder": { "old": old, "new": new },
+        }),
+        &ledger_originator(org_id, actor),
+    )?;
+    Ok(Outcome { changed: true, value: OrgSettings { allow_remote_embedder: new } })
 }
 
 fn refuse_service(repo: &mut impl OrgRead, org_id: &str, label: &str) -> UaResult<()> {
