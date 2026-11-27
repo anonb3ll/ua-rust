@@ -2,6 +2,10 @@
 //! DNS-rebinding / redirect / proxy defenses, offline model fetch verification,
 //! and `system_doctor` readiness (docs/memory.md §2, acceptance items 6 & 7).
 
+#[path = "../../ua-core/tests/support/mod.rs"]
+mod support;
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1205,7 +1209,10 @@ async fn auth_refused_backfill_uses_exponential_backoff_on_injected_clock() {
     // t=30s and t=59.999s: skipped without any network request.
     let r1 = ua_tools::families::memory::backfill_all_orgs_step(hub.db(), &cfg_at(30_000), 8).await.unwrap();
     assert_eq!(hits.load(Ordering::SeqCst), 1);
-    assert!(r1[0].1.stopped_auth_refused, "{r1:?}");
+    assert!(
+        !r1[0].1.available && r1[0].1.stopped_unavailable && r1[0].1.stopped_auth_refused,
+        "backoff-skipped org must report available=false: {r1:?}"
+    );
     let _ = ua_tools::families::memory::backfill_all_orgs_step(hub.db(), &cfg_at(59_999), 8).await.unwrap();
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
@@ -1230,8 +1237,8 @@ async fn auth_refused_backfill_uses_exponential_backoff_on_injected_clock() {
         .await
         .unwrap();
     assert!(
-        manual_rep.stopped_auth_refused,
-        "manual recall_maintenance must respect backoff: {manual_rep:?}"
+        !manual_rep.available && manual_rep.stopped_unavailable && manual_rep.stopped_auth_refused,
+        "manual recall_maintenance must respect backoff and report available=false: {manual_rep:?}"
     );
     assert_eq!(hits.load(Ordering::SeqCst), 3, "manual recall_maintenance must not bypass auth backoff");
 
@@ -1263,7 +1270,7 @@ async fn auth_refused_backfill_uses_exponential_backoff_on_injected_clock() {
     revoked.store(false, Ordering::SeqCst);
     let r_ok = ua_tools::families::memory::backfill_all_orgs_step(hub.db(), &cfg_at(t_ms), 8).await.unwrap();
     assert_eq!(r_ok[0].1.notes_embedded, 4, "3600s cap must retry and embed on recovery: {r_ok:?}");
-    assert!(!r_ok[0].1.stopped_auth_refused, "{r_ok:?}");
+    assert!(r_ok[0].1.available && !r_ok[0].1.stopped_auth_refused, "{r_ok:?}");
 
     // Clear-on-success check: add a new unembedded note and flip back to 401.
     // Backoff must reset to the 60s base (NOT stay at 3600s).
@@ -1658,4 +1665,244 @@ async fn ollama_flaky_api_tags_keeps_cached_digest_and_supports_registry_port_ta
             .expect("auto keeps cached digest when /api/show succeeds and /api/tags flakes");
         assert_eq!(e_auto.revision(), "sha256:abc123", "auto flipped on iter {i}");
     }
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Extract every `fn <name>(...) { ... }` definition from comment/string/test-masked
+/// Rust source, returning the text from the start of the `fn` line through the
+/// matching closing brace.
+fn extract_fn_items(masked: &str) -> HashMap<String, Vec<String>> {
+    let b = masked.as_bytes();
+    let mut fns: HashMap<String, Vec<String>> = HashMap::new();
+    let mut i = 0;
+    while i + 3 < b.len() {
+        let found = masked[i..].find("fn ").map(|n| i + n);
+        let Some(pos) = found else { break };
+        i = pos + 3;
+        if pos > 0 && is_ident_byte(b[pos - 1]) {
+            continue;
+        }
+        // Skip whitespace after `fn` and read the identifier name.
+        let mut p = pos + 3;
+        while p < b.len() && b[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        let name_start = p;
+        while p < b.len() && is_ident_byte(b[p]) {
+            p += 1;
+        }
+        if p == name_start {
+            continue;
+        }
+        let name = &masked[name_start..p];
+        // Advance past optional generics / parameter list to the body's `{`
+        // (skipping trait/extern signatures that end with `;` before `{`).
+        let mut paren_depth = 0usize;
+        let mut angle_depth = 0usize;
+        let mut body_open = None;
+        let mut j = p;
+        while j < b.len() {
+            match b[j] {
+                b'(' => paren_depth += 1,
+                b')' => paren_depth = paren_depth.saturating_sub(1),
+                b'<' if paren_depth == 0 => angle_depth += 1,
+                b'>' if paren_depth == 0 && b.get(j.wrapping_sub(1)) != Some(&b'-') => {
+                    angle_depth = angle_depth.saturating_sub(1);
+                }
+                b';' if paren_depth == 0 && angle_depth == 0 => break,
+                b'{' if paren_depth == 0 && angle_depth == 0 => {
+                    body_open = Some(j);
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let Some(open) = body_open else { continue };
+        let close = support::close_brace(masked, open);
+        let line_start = masked[..pos].rfind('\n').map_or(0, |n| n + 1);
+        fns.entry(name.to_string()).or_default().push(masked[line_start..close].to_string());
+    }
+    fns
+}
+
+/// True when `src` invokes `callee` as a whole identifier followed by `(` or `::<`.
+fn body_calls_fn(src: &str, callee: &str) -> bool {
+    let b = src.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(callee) {
+        let start = from + rel;
+        let end = start + callee.len();
+        from = end;
+        let left_ok = start == 0 || !is_ident_byte(b[start - 1]);
+        let right_ok = end == b.len() || !is_ident_byte(b[end]);
+        if !left_ok || !right_ok {
+            continue;
+        }
+        let rest = src[end..].trim_start();
+        if rest.starts_with('(') || rest.starts_with("::<") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Walk every function in `fns` transitively reachable from `roots` and return
+/// `(visited_functions, violations)` for any forbidden substring in `forbidden`.
+fn scan_reachable_fns(
+    fns: &HashMap<String, Vec<String>>,
+    roots: &[&str],
+    forbidden: &[&str],
+) -> (HashSet<String>, Vec<String>) {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for &root in roots {
+        assert!(fns.contains_key(root), "expected doctor entry function `{root}` to exist");
+        if visited.insert(root.to_string()) {
+            queue.push_back(root.to_string());
+        }
+    }
+    let mut violations = Vec::new();
+    while let Some(name) = queue.pop_front() {
+        let Some(bodies) = fns.get(&name) else { continue };
+        for body in bodies {
+            for &needle in forbidden {
+                if body.contains(needle) {
+                    violations.push(format!("{name}: forbidden token `{needle}`"));
+                }
+            }
+            for other in fns.keys() {
+                if !visited.contains(other) && body_calls_fn(body, other) {
+                    visited.insert(other.clone());
+                    queue.push_back(other.clone());
+                }
+            }
+        }
+    }
+    (visited, violations)
+}
+
+/// Hub #2819: `host_lookup_attempted` only observes `build_guarded_client`; a raw
+/// `ToSocketAddrs`, `tokio::net::lookup_host`, `ua_ingress::resolve_endpoint`, or
+/// socket/HTTP call added directly to the `system_doctor` inspection path would
+/// bypass it. Guard the full transitive call graph of `inspect_embedder_for_doctor`,
+/// `db_facts`, `embeddings_check`, `system_doctor`, and `ua-memory/src` statically.
+#[test]
+fn system_doctor_source_has_no_dns_or_network_calls() {
+    const FORBIDDEN_NET_AND_DNS: &[&str] = &[
+        "to_socket_addrs",
+        "ToSocketAddrs",
+        "lookup_host",
+        "getaddrinfo",
+        "dns_lookup",
+        "resolve_endpoint",
+        "Outbound",
+        "reqwest::Client",
+        "reqwest::get",
+        "reqwest::blocking",
+        "Client::builder",
+        "Client::new",
+        "ClientBuilder",
+        "TcpStream",
+        "TcpSocket",
+        "UdpSocket",
+        "build_guarded_client",
+        "build_ollama_embedder",
+        "build_openai_compat_embedder",
+        "probe_ollama",
+        "fetch_ollama_tags_digest",
+        "embedder_for_org",
+        "embedder_for(",
+        "embedder_for_with_remote_flag",
+        "resolve_http_embedder",
+        "block_on",
+        "Runtime::",
+    ];
+    const FORBIDDEN_SYNC_ONLY: &[&str] = &["async fn", ".await"];
+
+    // Self-check: a direct raw lookup or one hidden behind a helper must fail the scanner.
+    let synthetic = support::without_tests(
+        "fn inspect_embedder_for_doctor() { helper(); }\n\
+         fn helper() { let _ = (\"example.invalid\", 443).to_socket_addrs(); }\n",
+    );
+    let (_, synthetic_hits) = scan_reachable_fns(
+        &extract_fn_items(&synthetic),
+        &["inspect_embedder_for_doctor"],
+        FORBIDDEN_NET_AND_DNS,
+    );
+    assert!(
+        synthetic_hits.iter().any(|v| v.contains("helper") && v.contains("to_socket_addrs")),
+        "scanner must catch transitive raw DNS lookups: {synthetic_hits:?}"
+    );
+
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = crate_dir.parent().unwrap().parent().unwrap();
+
+    // 1. `remote.rs`: `inspect_embedder_for_doctor` and every helper it calls must be
+    //    purely synchronous and perform zero DNS or network calls.
+    let remote_src = std::fs::read_to_string(crate_dir.join("src/families/memory/remote.rs")).unwrap();
+    let remote_fns = extract_fn_items(&support::without_tests(&remote_src));
+    let mut remote_forbidden = FORBIDDEN_NET_AND_DNS.to_vec();
+    remote_forbidden.extend_from_slice(FORBIDDEN_SYNC_ONLY);
+    let (remote_visited, remote_violations) =
+        scan_reachable_fns(&remote_fns, &["inspect_embedder_for_doctor"], &remote_forbidden);
+    assert!(
+        remote_visited.contains("classify_url_host_without_dns")
+            && remote_visited.contains("classify_literal_ip"),
+        "expected doctor call graph in remote.rs to include host classifiers; saw {remote_visited:?}"
+    );
+    assert!(
+        remote_violations.is_empty(),
+        "remote.rs doctor inspection path must perform zero DNS/network/async calls: {remote_violations:#?}"
+    );
+
+    // 2. `observability.rs`: `db_facts` and `embeddings_check` (sync) plus `system_doctor`
+    //    (and every helper they call) must perform zero DNS or network calls.
+    let obs_src = std::fs::read_to_string(crate_dir.join("src/families/observability.rs")).unwrap();
+    let obs_fns = extract_fn_items(&support::without_tests(&obs_src));
+    let (_, obs_sync_violations) =
+        scan_reachable_fns(&obs_fns, &["db_facts", "embeddings_check"], &remote_forbidden);
+    assert!(
+        obs_sync_violations.is_empty(),
+        "observability.rs sync doctor helpers must perform zero DNS/network/async calls: {obs_sync_violations:#?}"
+    );
+    let (_, obs_doctor_violations) = scan_reachable_fns(&obs_fns, &["system_doctor"], FORBIDDEN_NET_AND_DNS);
+    assert!(
+        obs_doctor_violations.is_empty(),
+        "observability.rs system_doctor must perform zero DNS or network calls: {obs_doctor_violations:#?}"
+    );
+
+    // 3. `ua-memory/src`: called by `inspect_embedder_for_doctor` and `db_facts`;
+    //    must contain no raw DNS lookups or sockets anywhere in non-test source.
+    const FORBIDDEN_RAW_NET: &[&str] = &[
+        "to_socket_addrs",
+        "ToSocketAddrs",
+        "lookup_host",
+        "getaddrinfo",
+        "dns_lookup",
+        "resolve_endpoint",
+        "TcpStream",
+        "TcpSocket",
+        "UdpSocket",
+        "reqwest::Client",
+    ];
+    let mut mem_files = Vec::new();
+    support::rust_files(&workspace_root.join("crates/ua-memory/src"), &mut mem_files);
+    assert!(!mem_files.is_empty(), "expected ua-memory/src Rust files");
+    let mut mem_violations = Vec::new();
+    for path in mem_files {
+        let masked = support::without_tests(&std::fs::read_to_string(&path).unwrap());
+        for &needle in FORBIDDEN_RAW_NET {
+            if masked.contains(needle) {
+                mem_violations.push(format!("{}: forbidden token `{needle}`", path.display()));
+            }
+        }
+    }
+    assert!(
+        mem_violations.is_empty(),
+        "ua-memory/src must not perform raw DNS or socket calls: {mem_violations:#?}"
+    );
 }

@@ -271,6 +271,11 @@ embedder = "auto"        # auto | local | ollama | openai_compat | off
   (`cfg.home.join("models")`). The revision is pinned.
 - `ollama`: an Ollama server's embedding endpoint, with its own
   `ollama_model` key, since Ollama names do not match Hugging Face ids.
+  The endpoint must expose a content-addressed `digest` via `/api/show` or
+  `/api/tags` (used to form `ollama:<model>@<digest>`). A server or proxy
+  that returns neither stays lexical-only rather than falling back to
+  non-digest metadata such as `quantization_level`; once a digest has been
+  read, a transient `/api/tags` failure retains the cached digest.
 - `openai_compat`: any OpenAI-compatible `/v1/embeddings` endpoint. The key
   comes only from the environment, never the config file.
 - `auto` picks `local` when it is compiled in and its model is present, else a
