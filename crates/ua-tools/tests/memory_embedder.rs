@@ -5,7 +5,6 @@
 #[path = "../../ua-core/tests/support/mod.rs"]
 mod support;
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1308,7 +1307,7 @@ async fn auth_refused_backfill_uses_exponential_backoff_on_injected_clock() {
 /// hostnames), reading only cached revisions and local policy.
 #[tokio::test]
 async fn system_doctor_makes_zero_network_or_dns_calls_for_ollama_and_unflagged_orgs() {
-    use ua_tools::families::memory::remote::{DoctorEmbedderAvailability, inspect_embedder_for_doctor};
+    use ua_tools::families::memory::doctor::{DoctorEmbedderAvailability, inspect_embedder_for_doctor};
 
     let show_hits = Arc::new(AtomicUsize::new(0));
     let show_hits_cl = show_hits.clone();
@@ -1671,130 +1670,359 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Extract every `fn <name>(...) { ... }` definition from comment/string/test-masked
-/// Rust source, returning the text from the start of the `fn` line through the
-/// matching closing brace.
-fn extract_fn_items(masked: &str) -> HashMap<String, Vec<String>> {
-    let b = masked.as_bytes();
-    let mut fns: HashMap<String, Vec<String>> = HashMap::new();
-    let mut i = 0;
-    while i + 3 < b.len() {
-        let found = masked[i..].find("fn ").map(|n| i + n);
-        let Some(pos) = found else { break };
-        i = pos + 3;
-        if pos > 0 && is_ident_byte(b[pos - 1]) {
-            continue;
-        }
-        // Skip whitespace after `fn` and read the identifier name.
-        let mut p = pos + 3;
-        while p < b.len() && b[p].is_ascii_whitespace() {
-            p += 1;
-        }
-        let name_start = p;
-        while p < b.len() && is_ident_byte(b[p]) {
-            p += 1;
-        }
-        if p == name_start {
-            continue;
-        }
-        let name = &masked[name_start..p];
-        // Advance past optional generics / parameter list to the body's `{`
-        // (skipping trait/extern signatures that end with `;` before `{`).
-        let mut paren_depth = 0usize;
-        let mut angle_depth = 0usize;
-        let mut body_open = None;
-        let mut j = p;
-        while j < b.len() {
-            match b[j] {
-                b'(' => paren_depth += 1,
-                b')' => paren_depth = paren_depth.saturating_sub(1),
-                b'<' if paren_depth == 0 => angle_depth += 1,
-                b'>' if paren_depth == 0 && b.get(j.wrapping_sub(1)) != Some(&b'-') => {
-                    angle_depth = angle_depth.saturating_sub(1);
-                }
-                b';' if paren_depth == 0 && angle_depth == 0 => break,
-                b'{' if paren_depth == 0 && angle_depth == 0 => {
-                    body_open = Some(j);
-                    break;
-                }
-                _ => {}
-            }
-            j += 1;
-        }
-        let Some(open) = body_open else { continue };
-        let close = support::close_brace(masked, open);
-        let line_start = masked[..pos].rfind('\n').map_or(0, |n| n + 1);
-        fns.entry(name.to_string()).or_default().push(masked[line_start..close].to_string());
-    }
-    fns
-}
-
-/// True when `src` invokes `callee` as a whole identifier followed by `(` or `::<`.
-fn body_calls_fn(src: &str, callee: &str) -> bool {
+fn contains_word(src: &str, word: &str) -> bool {
     let b = src.as_bytes();
     let mut from = 0;
-    while let Some(rel) = src[from..].find(callee) {
+    while let Some(rel) = src[from..].find(word) {
         let start = from + rel;
-        let end = start + callee.len();
+        let end = start + word.len();
         from = end;
         let left_ok = start == 0 || !is_ident_byte(b[start - 1]);
         let right_ok = end == b.len() || !is_ident_byte(b[end]);
-        if !left_ok || !right_ok {
-            continue;
-        }
-        let rest = src[end..].trim_start();
-        if rest.starts_with('(') || rest.starts_with("::<") {
+        if left_ok && right_ok {
             return true;
         }
     }
     false
 }
 
-/// Walk every function in `fns` transitively reachable from `roots` and return
-/// `(visited_functions, violations)` for any forbidden substring in `forbidden`.
-fn scan_reachable_fns(
-    fns: &HashMap<String, Vec<String>>,
-    roots: &[&str],
-    forbidden: &[&str],
-) -> (HashSet<String>, Vec<String>) {
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<String> = VecDeque::new();
-    for &root in roots {
-        assert!(fns.contains_key(root), "expected doctor entry function `{root}` to exist");
-        if visited.insert(root.to_string()) {
-            queue.push_back(root.to_string());
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
         }
     }
-    let mut violations = Vec::new();
-    while let Some(name) = queue.pop_front() {
-        let Some(bodies) = fns.get(&name) else { continue };
-        for body in bodies {
-            for &needle in forbidden {
-                if body.contains(needle) {
-                    violations.push(format!("{name}: forbidden token `{needle}`"));
-                }
-            }
-            for other in fns.keys() {
-                if !visited.contains(other) && body_calls_fn(body, other) {
-                    visited.insert(other.clone());
-                    queue.push_back(other.clone());
-                }
-            }
-        }
-    }
-    (visited, violations)
+    out.push(&s[start..]);
+    out
 }
 
-/// Hub #2819: `host_lookup_attempted` only observes `build_guarded_client`; a raw
-/// `ToSocketAddrs`, `tokio::net::lookup_host`, `ua_ingress::resolve_endpoint`, or
-/// socket/HTTP call added directly to the `system_doctor` inspection path would
-/// bypass it. Guard the full transitive call graph of `inspect_embedder_for_doctor`,
-/// `db_facts`, `embeddings_check`, `system_doctor`, and `ua-memory/src` statically.
+fn expand_use_tree(prefix: &str, tree: &str, leaves: &mut Vec<String>, violations: &mut Vec<String>) {
+    let t = tree.trim();
+    if t.is_empty() {
+        return;
+    }
+    if t.contains('*') {
+        violations.push(format!("glob import forbidden in doctor.rs: `{t}`"));
+        return;
+    }
+    if contains_word(t, "as") {
+        violations.push(format!("aliased import forbidden in doctor.rs: `{t}`"));
+        return;
+    }
+    if let Some(open) = t.find('{') {
+        let close = t.rfind('}').unwrap_or(t.len());
+        let head = t[..open].trim().trim_end_matches("::");
+        let next_prefix = match (prefix.is_empty(), head.is_empty()) {
+            (true, _) => head.to_string(),
+            (false, true) => prefix.to_string(),
+            (false, false) => format!("{prefix}::{head}"),
+        };
+        for item in split_top_level_commas(&t[open + 1..close]) {
+            expand_use_tree(&next_prefix, item, leaves, violations);
+        }
+    } else {
+        let clean: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+        let full = if clean == "self" {
+            prefix.to_string()
+        } else if prefix.is_empty() {
+            clean
+        } else {
+            format!("{prefix}::{clean}")
+        };
+        leaves.push(full);
+    }
+}
+
+/// Audit a comment/string/`#[cfg(test)]`-masked doctor module against strict
+/// import, inline-path-root, and keyword allowlists.
+fn audit_doctor_module(masked: &str, allowed_imports: &[&str], allowed_path_roots: &[&str]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut non_use = masked.to_string();
+    let b = masked.as_bytes();
+    let mut i = 0;
+    let mut use_spans = Vec::new();
+    while i + 4 <= b.len() {
+        let Some(rel) = masked[i..].find("use") else { break };
+        let start = i + rel;
+        let after = start + 3;
+        i = after;
+        let left_ok = start == 0 || !is_ident_byte(b[start - 1]);
+        let right_ok = after < b.len() && b[after].is_ascii_whitespace();
+        if !left_ok || !right_ok {
+            continue;
+        }
+        let Some(semi_rel) = masked[after..].find(';') else {
+            violations.push("unterminated `use` statement".into());
+            break;
+        };
+        let semi = after + semi_rel;
+        let tree = &masked[after..semi];
+        let mut leaves = Vec::new();
+        expand_use_tree("", tree, &mut leaves, &mut violations);
+        for leaf in leaves {
+            if !allowed_imports.contains(&leaf.as_str()) {
+                violations.push(format!("import not in allowlist: `{leaf}`"));
+            }
+        }
+        use_spans.push((start, semi + 1));
+        i = semi + 1;
+    }
+    for (from, to) in use_spans {
+        let blank: String = non_use[from..to].chars().map(|c| if c == '\n' { '\n' } else { ' ' }).collect();
+        non_use.replace_range(from..to, &blank);
+    }
+
+    // Check every `::` path outside `use` statements so unimported paths
+    // (`std::net::...`, `super::...`, `crate::...`, `tokio::...`, `::std::...`)
+    // cannot bypass the import allowlist.
+    let nb = non_use.as_bytes();
+    let mut pos = 0;
+    while let Some(rel) = non_use[pos..].find("::") {
+        let at = pos + rel;
+        pos = at + 2;
+        if non_use[at + 2..].trim_start().starts_with('<') {
+            continue;
+        }
+        // Walk backwards across the whole `a::b::c` chain to find the root segment.
+        let mut cursor = at;
+        while cursor > 0 && nb[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == 0 || !is_ident_byte(nb[cursor - 1]) {
+            violations.push("leading `::` path is forbidden in doctor.rs".into());
+            continue;
+        }
+        let (root_start, root_end) = loop {
+            let seg_end = cursor;
+            while cursor > 0 && is_ident_byte(nb[cursor - 1]) {
+                cursor -= 1;
+            }
+            let seg_start = cursor;
+            let mut prev = cursor;
+            while prev > 0 && nb[prev - 1].is_ascii_whitespace() {
+                prev -= 1;
+            }
+            if prev >= 2 && &nb[prev - 2..prev] == b"::" {
+                cursor = prev - 2;
+                while cursor > 0 && nb[cursor - 1].is_ascii_whitespace() {
+                    cursor -= 1;
+                }
+                if cursor == 0 || !is_ident_byte(nb[cursor - 1]) {
+                    violations.push("leading `::` path is forbidden in doctor.rs".into());
+                    break (seg_start, seg_end);
+                }
+            } else {
+                break (seg_start, seg_end);
+            }
+        };
+        let root = &non_use[root_start..root_end];
+        if !allowed_path_roots.contains(&root) {
+            violations.push(format!("path root `{root}::` is not in allowlist"));
+        }
+    }
+
+    for word in [
+        "async",
+        "extern",
+        "mod",
+        "TcpStream",
+        "TcpSocket",
+        "UdpSocket",
+        "ToSocketAddrs",
+        "lookup_host",
+        "getaddrinfo",
+        "Outbound",
+        "resolve_endpoint",
+        "socket_addrs",
+        "to_socket_addrs",
+    ] {
+        if contains_word(&non_use, word) {
+            violations.push(format!("forbidden identifier `{word}` in doctor.rs"));
+        }
+    }
+    for macro_name in ["include", "include_str", "include_bytes"] {
+        if contains_macro_call(&non_use, macro_name) {
+            violations.push(format!("forbidden macro `{macro_name}!` in doctor.rs"));
+        }
+    }
+    for method in ["embed", "embed_batch", "embed_one", "embed_note"] {
+        if contains_method_call(&non_use, method) {
+            violations.push(format!("forbidden method `.{method}(` in doctor.rs"));
+        }
+    }
+    if non_use.contains(".await") {
+        violations.push("forbidden token `.await` in doctor.rs".into());
+    }
+    violations
+}
+
+fn contains_macro_call(src: &str, name: &str) -> bool {
+    let b = src.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(name) {
+        let start = from + rel;
+        let end = start + name.len();
+        from = end;
+        let left_ok = start == 0 || !is_ident_byte(b[start - 1]);
+        let right_ok = end == b.len() || !is_ident_byte(b[end]);
+        if left_ok && right_ok && src[end..].trim_start().starts_with('!') {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_method_call(src: &str, method: &str) -> bool {
+    let b = src.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(method) {
+        let start = from + rel;
+        let end = start + method.len();
+        from = end;
+        let left_ok = start == 0 || !is_ident_byte(b[start - 1]);
+        let right_ok = end == b.len() || !is_ident_byte(b[end]);
+        if !left_ok || !right_ok {
+            continue;
+        }
+        let preceded_by_dot = src[..start].trim_end().ends_with('.');
+        let rest = src[end..].trim_start();
+        if preceded_by_dot && (rest.starts_with('(') || rest.starts_with("::<")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Hub #2821: `system_doctor` embedder inspection is isolated in
+/// `families/memory/doctor.rs` under a strict import and path-root allowlist
+/// (replacing the partial call-graph walker from #161). This rejects cross-file
+/// helpers (`super::`/`crate::`), aliased imports (`TcpStream as Ts`),
+/// function-pointer indirection (`.map(helper)`), module re-export bypasses
+/// (`addr::TcpStream`), spaced `include ! (...)`, `.embed(...)` on `dyn Embedder`,
+/// inline `std::net::` / `tokio::` / `ua_ingress::resolve_endpoint` paths, and
+/// `extern`/`async`.
 #[test]
-fn system_doctor_source_has_no_dns_or_network_calls() {
-    const FORBIDDEN_NET_AND_DNS: &[&str] = &[
+fn memory_doctor_module_import_allowlist_and_zero_network_guard() {
+    const ALLOWED_IMPORTS: &[&str] = &[
+        "std::collections::HashMap",
+        "std::net::IpAddr",
+        "std::sync::Mutex",
+        "std::sync::OnceLock",
+        "ua_core::Config",
+        "ua_ingress::Url",
+        "ua_ingress::addr::is_cloud_metadata",
+        "ua_ingress::addr::is_loopback",
+        "ua_ingress::addr::is_private_network",
+        "ua_ingress::addr::is_public",
+        "ua_memory::local_embedder",
+        "ua_memory::openai_compat_revision",
+        "ua_memory::registered_embedder",
+        "ua_memory::vector_identity",
+        "url::Host",
+    ];
+    const ALLOWED_PATH_ROOTS: &[&str] = &[
+        "DoctorEmbedderAvailability",
+        "HashMap",
+        "Host",
+        "IpAddr",
+        "LocalHostClass",
+        "Mutex",
+        "OnceLock",
+        "Option",
+        "Result",
+        "String",
+        "Url",
+    ];
+
+    // Self-checks covering every bypass class:
+    // 1. Cross-file helper in `memory/mod.rs` or `remote.rs` (direct or via `.map(helper)`).
+    let cross_file = support::without_tests(
+        "use super::helper;\nfn inspect(h: Option<&str>) { let _ = h.map(helper); }\n",
+    );
+    assert!(
+        !audit_doctor_module(&cross_file, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject cross-file `super::` import"
+    );
+    let inline_map =
+        support::without_tests("fn inspect(h: Option<&str>) { let _ = h.map(super::helper); }\n");
+    assert!(
+        !audit_doctor_module(&inline_map, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject inline `super::helper` passed by name"
+    );
+    // 2. Aliased import (`use std::net::TcpStream as Ts`).
+    let aliased = support::without_tests(
+        "use std::net::TcpStream as Ts;\nfn inspect() { let _ = Ts::connect(\"127.0.0.1:1\"); }\n",
+    );
+    assert!(
+        !audit_doctor_module(&aliased, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject aliased network import"
+    );
+    // 3. Inline fully-qualified raw DNS lookup.
+    let inline_dns = support::without_tests(
+        "fn inspect() { let _ = std::net::ToSocketAddrs::to_socket_addrs(&(\"example.invalid\", 443)); }\n",
+    );
+    assert!(
+        !audit_doctor_module(&inline_dns, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject inline std::net::ToSocketAddrs"
+    );
+    // 4. Module re-export bypass (`use ua_ingress::addr; addr::TcpStream::connect(...)`).
+    let reexport = support::without_tests(
+        "use ua_ingress::addr;\nfn inspect() { let _ = addr::TcpStream::connect(\"127.0.0.1:1\"); }\n",
+    );
+    assert!(
+        !audit_doctor_module(&reexport, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject addr module import / re-export bypass"
+    );
+    // 5. Spaced `include ! ("x.rs")`.
+    let spaced_include = support::without_tests("fn inspect() { include ! (\"x.rs\"); }\n");
+    assert!(
+        !audit_doctor_module(&spaced_include, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject spaced include ! (...) macro"
+    );
+    // 6. Calling `.embed(...)` on a `dyn Embedder` trait object.
+    let trait_embed = support::without_tests("fn inspect(e: &dyn Embedder) { let _ = e.embed(&[]); }\n");
+    assert!(
+        !audit_doctor_module(&trait_embed, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject .embed(...) on dyn Embedder"
+    );
+    // 7. Calling `Url::socket_addrs` through the allowed `Url` type.
+    let url_dns = support::without_tests("fn inspect(u: &Url) { let _ = u.socket_addrs(|| Some(80)); }\n");
+    assert!(
+        !audit_doctor_module(&url_dns, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject Url::socket_addrs DNS lookup"
+    );
+
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = crate_dir.parent().unwrap().parent().unwrap();
+
+    // 1. Audit isolated `families/memory/doctor.rs`.
+    let doctor_src = std::fs::read_to_string(crate_dir.join("src/families/memory/doctor.rs")).unwrap();
+    let doctor_masked = support::without_tests(&doctor_src);
+    assert!(
+        doctor_masked.contains("fn inspect_embedder_for_doctor"),
+        "expected inspect_embedder_for_doctor in families/memory/doctor.rs"
+    );
+    let doctor_violations = audit_doctor_module(&doctor_masked, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS);
+    assert!(
+        doctor_violations.is_empty(),
+        "families/memory/doctor.rs violated zero-network allowlist: {doctor_violations:#?}"
+    );
+
+    // 2. `observability.rs` must call `super::memory::doctor::inspect_embedder_for_doctor`,
+    //    never reach `memory::remote`, and never perform raw DNS/socket/HTTP client calls.
+    const FORBIDDEN_RAW_NET: &[&str] = &[
         "to_socket_addrs",
         "ToSocketAddrs",
+        "socket_addrs",
         "lookup_host",
         "getaddrinfo",
         "dns_lookup",
@@ -1803,106 +2031,129 @@ fn system_doctor_source_has_no_dns_or_network_calls() {
         "reqwest::Client",
         "reqwest::get",
         "reqwest::blocking",
-        "Client::builder",
-        "Client::new",
-        "ClientBuilder",
         "TcpStream",
         "TcpSocket",
         "UdpSocket",
-        "build_guarded_client",
-        "build_ollama_embedder",
-        "build_openai_compat_embedder",
-        "probe_ollama",
-        "fetch_ollama_tags_digest",
-        "embedder_for_org",
-        "embedder_for(",
-        "embedder_for_with_remote_flag",
-        "resolve_http_embedder",
-        "block_on",
-        "Runtime::",
     ];
-    const FORBIDDEN_SYNC_ONLY: &[&str] = &["async fn", ".await"];
-
-    // Self-check: a direct raw lookup or one hidden behind a helper must fail the scanner.
-    let synthetic = support::without_tests(
-        "fn inspect_embedder_for_doctor() { helper(); }\n\
-         fn helper() { let _ = (\"example.invalid\", 443).to_socket_addrs(); }\n",
-    );
-    let (_, synthetic_hits) = scan_reachable_fns(
-        &extract_fn_items(&synthetic),
-        &["inspect_embedder_for_doctor"],
-        FORBIDDEN_NET_AND_DNS,
-    );
-    assert!(
-        synthetic_hits.iter().any(|v| v.contains("helper") && v.contains("to_socket_addrs")),
-        "scanner must catch transitive raw DNS lookups: {synthetic_hits:?}"
-    );
-
-    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = crate_dir.parent().unwrap().parent().unwrap();
-
-    // 1. `remote.rs`: `inspect_embedder_for_doctor` and every helper it calls must be
-    //    purely synchronous and perform zero DNS or network calls.
-    let remote_src = std::fs::read_to_string(crate_dir.join("src/families/memory/remote.rs")).unwrap();
-    let remote_fns = extract_fn_items(&support::without_tests(&remote_src));
-    let mut remote_forbidden = FORBIDDEN_NET_AND_DNS.to_vec();
-    remote_forbidden.extend_from_slice(FORBIDDEN_SYNC_ONLY);
-    let (remote_visited, remote_violations) =
-        scan_reachable_fns(&remote_fns, &["inspect_embedder_for_doctor"], &remote_forbidden);
-    assert!(
-        remote_visited.contains("classify_url_host_without_dns")
-            && remote_visited.contains("classify_literal_ip"),
-        "expected doctor call graph in remote.rs to include host classifiers; saw {remote_visited:?}"
-    );
-    assert!(
-        remote_violations.is_empty(),
-        "remote.rs doctor inspection path must perform zero DNS/network/async calls: {remote_violations:#?}"
-    );
-
-    // 2. `observability.rs`: `db_facts` and `embeddings_check` (sync) plus `system_doctor`
-    //    (and every helper they call) must perform zero DNS or network calls.
+    const FORBIDDEN_OBS_EMBEDDER: &[&str] =
+        &["embedder_for_org", "embedder_for(", "embedder_for_with_remote_flag"];
     let obs_src = std::fs::read_to_string(crate_dir.join("src/families/observability.rs")).unwrap();
-    let obs_fns = extract_fn_items(&support::without_tests(&obs_src));
-    let (_, obs_sync_violations) =
-        scan_reachable_fns(&obs_fns, &["db_facts", "embeddings_check"], &remote_forbidden);
+    let obs_masked = support::without_tests(&obs_src);
     assert!(
-        obs_sync_violations.is_empty(),
-        "observability.rs sync doctor helpers must perform zero DNS/network/async calls: {obs_sync_violations:#?}"
+        obs_masked.contains("super::memory::doctor::inspect_embedder_for_doctor"),
+        "observability.rs must call super::memory::doctor::inspect_embedder_for_doctor"
     );
-    let (_, obs_doctor_violations) = scan_reachable_fns(&obs_fns, &["system_doctor"], FORBIDDEN_NET_AND_DNS);
     assert!(
-        obs_doctor_violations.is_empty(),
-        "observability.rs system_doctor must perform zero DNS or network calls: {obs_doctor_violations:#?}"
+        !obs_masked.contains("memory::remote"),
+        "observability.rs must not reference memory::remote directly"
     );
+    for &needle in FORBIDDEN_RAW_NET.iter().chain(FORBIDDEN_OBS_EMBEDDER) {
+        assert!(!obs_masked.contains(needle), "observability.rs must not contain `{needle}`");
+    }
 
-    // 3. `ua-memory/src`: called by `inspect_embedder_for_doctor` and `db_facts`;
-    //    must contain no raw DNS lookups or sockets anywhere in non-test source.
-    const FORBIDDEN_RAW_NET: &[&str] = &[
-        "to_socket_addrs",
-        "ToSocketAddrs",
-        "lookup_host",
-        "getaddrinfo",
-        "dns_lookup",
-        "resolve_endpoint",
-        "TcpStream",
-        "TcpSocket",
-        "UdpSocket",
-        "reqwest::Client",
-    ];
+    // 3. `ua-memory/src` (called by `doctor.rs` and `db_facts`) must contain no raw DNS/sockets.
     let mut mem_files = Vec::new();
     support::rust_files(&workspace_root.join("crates/ua-memory/src"), &mut mem_files);
     assert!(!mem_files.is_empty(), "expected ua-memory/src Rust files");
-    let mut mem_violations = Vec::new();
     for path in mem_files {
         let masked = support::without_tests(&std::fs::read_to_string(&path).unwrap());
         for &needle in FORBIDDEN_RAW_NET {
-            if masked.contains(needle) {
-                mem_violations.push(format!("{}: forbidden token `{needle}`", path.display()));
-            }
+            assert!(!masked.contains(needle), "{} must not contain `{needle}`", path.display());
         }
     }
-    assert!(
-        mem_violations.is_empty(),
-        "ua-memory/src must not perform raw DNS or socket calls: {mem_violations:#?}"
+}
+
+/// Hub #2821 review: toggling `allow_remote_embedder` via `org_settings_update`
+/// from `false -> true -> false` immediately admits and then refuses the remote
+/// endpoint in `embedder_for_org` (the flag is not cached).
+#[tokio::test]
+async fn org_settings_update_toggles_remote_embedder_on_and_back_off() {
+    use ua_core::UaError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path());
+    cfg.human_identities = vec!["operator".into(), "lead".into()];
+    cfg.memory.embedder = "openai_compat".into();
+    cfg.memory.openai_compat_url = Some("https://10.20.30.40:8443".into());
+    cfg.memory.openai_compat_model = Some("remote-toggle-v1".into());
+    let hub = Hub::in_memory(cfg.clone()).unwrap();
+    let reg = builtin_registry();
+    let human = |label: &str| Caller {
+        label: label.into(),
+        kind: ActorKind::Human,
+        profile: Profile::Coordinator,
+        enforce_profile: true,
+        session_key: Some(format!("{label}-s")),
+        transport: Transport::Mcp,
+        org_id: DEFAULT_ORG.into(),
+    };
+    let op = human("operator");
+    let approver = human("lead");
+
+    // 1. Default (`allow_remote_embedder = 0`): remote endpoint is refused.
+    let before = ua_tools::families::memory::embedder_for_org(hub.db(), &cfg, DEFAULT_ORG).await;
+    assert!(!before.available(), "remote endpoint must be refused initially");
+    assert_eq!(before.backend(), "noop");
+
+    // 2. Flip to `true` via governed `org_settings_update`: remote endpoint is admitted.
+    let parked_on = reg
+        .call(&hub, &op, "org_settings_update", json!({ "allow_remote_embedder": true }))
+        .await
+        .unwrap_err();
+    let UaError::ApprovalRequired { approval_id: on_id, .. } = parked_on else {
+        panic!("expected ApprovalRequired, got {parked_on:?}");
+    };
+    reg.call(&hub, &approver, "approval_resolve", json!({ "id": on_id, "decision": "approve" }))
+        .await
+        .unwrap();
+    let res_on =
+        reg.call(&hub, &op, "org_settings_update", json!({ "allow_remote_embedder": true })).await.unwrap();
+    assert_eq!(res_on["changed"], true);
+    assert_eq!(res_on["settings"]["allow_remote_embedder"], true);
+
+    let enabled = ua_tools::families::memory::embedder_for_org(hub.db(), &cfg, DEFAULT_ORG).await;
+    assert!(enabled.available(), "remote endpoint must be admitted after org_settings_update(true)");
+    assert_eq!(enabled.backend(), "openai_compat");
+
+    // 3. Flip back to `false` via governed `org_settings_update`: remote endpoint is immediately refused.
+    let parked_off = reg
+        .call(&hub, &op, "org_settings_update", json!({ "allow_remote_embedder": false }))
+        .await
+        .unwrap_err();
+    let UaError::ApprovalRequired { approval_id: off_id, .. } = parked_off else {
+        panic!("expected ApprovalRequired, got {parked_off:?}");
+    };
+    reg.call(&hub, &approver, "approval_resolve", json!({ "id": off_id, "decision": "approve" }))
+        .await
+        .unwrap();
+    let res_off =
+        reg.call(&hub, &op, "org_settings_update", json!({ "allow_remote_embedder": false })).await.unwrap();
+    assert_eq!(res_off["changed"], true);
+    assert_eq!(res_off["settings"]["allow_remote_embedder"], false);
+
+    let disabled = ua_tools::families::memory::embedder_for_org(hub.db(), &cfg, DEFAULT_ORG).await;
+    assert!(!disabled.available(), "remote endpoint must be refused again after org_settings_update(false)");
+    assert_eq!(disabled.backend(), "noop");
+
+    // 4. Both transitions (`false -> true`, `true -> false`) are recorded in `agent.org.settings`.
+    let payloads: Vec<String> = hub
+        .db()
+        .read(|c| {
+            let mut stmt =
+                c.prepare("SELECT payload FROM event_log WHERE channel = 'agent.org.settings' ORDER BY seq")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(payloads.len(), 2);
+    let ev1: Value = serde_json::from_str(&payloads[0]).unwrap();
+    let ev2: Value = serde_json::from_str(&payloads[1]).unwrap();
+    assert_eq!(
+        (ev1["allow_remote_embedder"]["old"].as_bool(), ev1["allow_remote_embedder"]["new"].as_bool()),
+        (Some(false), Some(true))
+    );
+    assert_eq!(
+        (ev2["allow_remote_embedder"]["old"].as_bool(), ev2["allow_remote_embedder"]["new"].as_bool()),
+        (Some(true), Some(false))
     );
 }

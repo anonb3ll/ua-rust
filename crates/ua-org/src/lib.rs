@@ -30,9 +30,9 @@ pub mod schema;
 
 pub use registry::{
     CHANNEL, DEFAULT_ORG_ID, Finding, Health, ISSUE_ACTIVE_WITHOUT_OFFICE, ISSUE_MEMBER_NOT_IN_ROSTER,
-    ISSUE_SERVICE_IN_OFFICE, ISSUE_SERVICE_NOT_IN_ROSTER, NEUTRAL_ORIGINATOR, Office, Outcome,
-    RegisterOffice, RegisterRole, RegisterSeat, RegisterService, Registry, RoleGrant, Seat, find_office,
-    health, load, office_for_identity, offices_for_identity, register_office, register_role, register_seat,
-    register_service,
+    ISSUE_SERVICE_IN_OFFICE, ISSUE_SERVICE_NOT_IN_ROSTER, NEUTRAL_ORIGINATOR, Office, OrgSettings, Outcome,
+    RegisterOffice, RegisterRole, RegisterSeat, RegisterService, Registry, RoleGrant, SETTINGS_CHANNEL, Seat,
+    UpdateOrgSettings, find_office, health, load, office_for_identity, offices_for_identity, register_office,
+    register_role, register_seat, register_service, update_settings,
 };
 pub use schema::{SCHEMA, schema_parts};

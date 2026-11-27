@@ -27,7 +27,9 @@ pub enum Authority {
     /// `lifecycle_operators` is never an operator either.
     ///
     /// Replaced by `OrgRole { min: OrgAdmin }` (and `HubOwner` for hub-scoped
-    /// rows) once users and memberships exist (`organization.v2`).
+    /// rows) once users and memberships exist (`organization.v2`). Exception:
+    /// `org_settings_update` (`allow_remote_embedder`) must map to
+    /// `OrgRole { min: OrgOwner }`, not `OrgAdmin` (`docs/organization.md`).
     Operator,
     /// A configured lifecycle operator, verified. A separate, explicitly
     /// named grant. It holds for a human whose label is in

@@ -1,15 +1,16 @@
-//! Organization registry tools. Argument structs and the call into `ua-org`.
+//! Organization registry and settings tools. Argument structs and the call into `ua-org`.
 //!
 //! Tools: `org_registry_read`, `org_office_register`, `org_role_register`,
-//! `org_seat_register`, `org_service_register`.
+//! `org_seat_register`, `org_service_register`, `org_settings_update`.
 //!
 //! The organization is the caller's, never a tool argument: a request that
 //! names `org_id` is refused with the other unknown fields. Every read and
 //! write is scoped to `ctx.caller.org_id`, and `require_same_org` refuses a
 //! caller whose organization differs from the row's before a row is read or
-//! written. The four write tools require a verified human operator in that
-//! organization (`Authz::require`); `org_role_register` is always gated, so a
-//! role grant needs a one-time human approval. Registering grants no profile
+//! written. The write tools require a verified human operator in that
+//! organization (`Authz::require`); `org_role_register` and
+//! `org_settings_update` are always gated, so changing roles or remote-embedder
+//! egress policy needs a one-time human approval. Registering grants no profile
 //! and no approval.
 
 use rusqlite::Connection;
@@ -18,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::UaResult;
 use ua_org::authz::{Authority, Authz, require_same_org};
-use ua_org::{RegisterOffice, RegisterRole, RegisterSeat, RegisterService};
+use ua_org::{RegisterOffice, RegisterRole, RegisterSeat, RegisterService, UpdateOrgSettings};
 use ua_store::SchemaPart;
 use ua_store::org::SqliteOrg;
 
@@ -84,6 +85,14 @@ struct SeatArgs {
 struct ServiceArgs {
     /// Label that sends as a service. It holds no office, seat or role.
     label: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SettingsUpdateArgs {
+    /// Whether this organization permits sending memory notes and queries to a
+    /// non-loopback embedding endpoint. Defaults to false.
+    allow_remote_embedder: bool,
 }
 
 fn agent_labels(c: &Connection, org: &str) -> UaResult<Vec<String>> {
@@ -167,6 +176,21 @@ async fn service(ctx: ToolCtx, args: ServiceArgs) -> UaResult<Value> {
     Ok(json!({ "changed": outcome.changed, "service_identity": outcome.value }))
 }
 
+async fn settings_update(ctx: ToolCtx, args: SettingsUpdateArgs) -> UaResult<Value> {
+    let org = ctx.caller.org_id.clone();
+    // `docs/organization.md` designates `allow_remote_embedder` as an `org_owner`
+    // decision. Until `organization.v2` lands users and memberships, `ua_org::authz`
+    // only has `Authority::Operator` (which otherwise maps to `OrgAdmin` per
+    // `ua-org/src/authz.rs`). When memberships land, this tool must map to
+    // `OrgRole { min: OrgOwner }`, not `OrgAdmin`.
+    require_operator(&ctx, &org)?;
+    let actor = ctx.caller.label.clone();
+    let input = UpdateOrgSettings { allow_remote_embedder: args.allow_remote_embedder };
+    let outcome =
+        ctx.hub.db().write_async(move |tx| ua_org::update_settings(tx, &org, input, &actor)).await?;
+    Ok(json!({ "changed": outcome.changed, "settings": outcome.value }))
+}
+
 pub fn register(r: &mut Registry) {
     r.add(
         tool(
@@ -220,5 +244,17 @@ pub fn register(r: &mut Registry) {
             service,
         )
         .family("org"),
+    );
+    r.add(
+        tool(
+            "org_settings_update",
+            "Update organization settings for the caller's organization (currently \
+             allow_remote_embedder) and append an agent.org.settings ledger event with old and new \
+             values. Requires a verified human operator and always needs a one-time human approval. \
+             The organization is the caller's, never an argument. Returns {changed, settings}.",
+            settings_update,
+        )
+        .family("org")
+        .always_gated(),
     );
 }

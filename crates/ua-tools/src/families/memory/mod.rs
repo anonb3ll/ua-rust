@@ -12,6 +12,7 @@
 //! who may change a note live in `ua_memory`. Every tool reads and writes
 //! only the caller's organization's notes (`ctx.caller.org_id`).
 
+pub mod doctor;
 pub mod models_fetch;
 pub mod remote;
 

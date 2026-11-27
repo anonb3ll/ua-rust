@@ -271,11 +271,14 @@ embedder = "auto"        # auto | local | ollama | openai_compat | off
   (`cfg.home.join("models")`). The revision is pinned.
 - `ollama`: an Ollama server's embedding endpoint, with its own
   `ollama_model` key, since Ollama names do not match Hugging Face ids.
-  The endpoint must expose a content-addressed `digest` via `/api/show` or
-  `/api/tags` (used to form `ollama:<model>@<digest>`). A server or proxy
-  that returns neither stays lexical-only rather than falling back to
-  non-digest metadata such as `quantization_level`; once a digest has been
-  read, a transient `/api/tags` failure retains the cached digest.
+  The endpoint must expose a content-addressed `digest` via `/api/show`
+  (checked first) or `/api/tags` (used to form `ollama:<model>@<digest>`).
+  Real Ollama servers omit `digest` from `/api/show`, so `/api/tags` is the
+  practical source. A server or proxy that returns neither stays lexical-only
+  rather than falling back to non-digest metadata such as
+  `quantization_level`. Once a digest has been read, a transient `/api/tags`
+  failure retains the cached digest; the cache lives in process memory, so
+  after a hub restart search stays lexical-only until a digest read succeeds.
 - `openai_compat`: any OpenAI-compatible `/v1/embeddings` endpoint. The key
   comes only from the environment, never the config file.
 - `auto` picks `local` when it is compiled in and its model is present, else a
@@ -289,8 +292,9 @@ addresses it checked (`ClientBuilder::resolve`), follows no redirects
 rebinding, a redirect or an `HTTP(S)_PROXY` cannot move the request elsewhere.
 A remote endpoint is used only for the notes and queries of organizations whose
 `allow_remote_embedder` setting is on (an `org_owner` decision, see the
-organization doc; `orgs.allow_remote_embedder` defaults to `0` and currently
-requires a direct operator database update until an admin setter tool is added);
+organization doc; `orgs.allow_remote_embedder` defaults to `0` and is toggled
+via the always-gated `org_settings_update` tool, which requires a verified human
+operator and appends an `agent.org.settings` ledger event);
 every other organization gets `local` or lexical-only, and
 their vectors carry a different identity. An explicit `ollama` with a remote
 URL is remote like any other.

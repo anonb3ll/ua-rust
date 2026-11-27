@@ -264,6 +264,7 @@ pub struct NewSeat {
 /// write transaction.
 pub trait OrgRead {
     fn allowed_profiles(&mut self, org_id: &str) -> UaResult<Vec<String>>;
+    fn allow_remote_embedder(&mut self, org_id: &str) -> UaResult<bool>;
     fn offices(&mut self, org_id: &str) -> UaResult<Vec<OfficeRow>>;
     fn roles(&mut self, org_id: &str) -> UaResult<Vec<RoleRow>>;
     fn seats(&mut self, org_id: &str) -> UaResult<Vec<SeatRow>>;
@@ -278,6 +279,7 @@ pub trait OrgWrite: OrgRead {
     fn insert_seat(&mut self, row: &NewSeat) -> UaResult<()>;
     fn update_seat(&mut self, row: &NewSeat) -> UaResult<()>;
     fn insert_service(&mut self, org_id: &str, label: &str) -> UaResult<()>;
+    fn set_allow_remote_embedder(&mut self, org_id: &str, allow: bool) -> UaResult<()>;
     fn record(&mut self, channel: &str, payload: Value, originator: &str) -> UaResult<()>;
 }
 
@@ -304,6 +306,16 @@ fn allowed_profiles_sql(c: &Connection, org_id: &str) -> UaResult<Vec<String>> {
         return Err(UaError::not_found(format!("unknown organization {org_id}")));
     };
     decode_profiles(&raw)
+}
+
+fn allow_remote_embedder_sql(c: &Connection, org_id: &str) -> UaResult<bool> {
+    let raw: Option<i64> = c
+        .query_row("SELECT allow_remote_embedder FROM orgs WHERE id = ?1", [org_id], |r| r.get(0))
+        .optional()?;
+    let Some(raw) = raw else {
+        return Err(UaError::not_found(format!("unknown organization {org_id}")));
+    };
+    Ok(raw != 0)
 }
 
 fn offices_sql(c: &Connection, org_id: &str) -> UaResult<Vec<OfficeRow>> {
@@ -380,6 +392,9 @@ impl OrgRead for SqliteOrg<'_> {
     fn allowed_profiles(&mut self, org_id: &str) -> UaResult<Vec<String>> {
         allowed_profiles_sql(self.conn, org_id)
     }
+    fn allow_remote_embedder(&mut self, org_id: &str) -> UaResult<bool> {
+        allow_remote_embedder_sql(self.conn, org_id)
+    }
     fn offices(&mut self, org_id: &str) -> UaResult<Vec<OfficeRow>> {
         offices_sql(self.conn, org_id)
     }
@@ -397,6 +412,9 @@ impl OrgRead for SqliteOrg<'_> {
 impl OrgRead for WriteTx<'_> {
     fn allowed_profiles(&mut self, org_id: &str) -> UaResult<Vec<String>> {
         allowed_profiles_sql(self, org_id)
+    }
+    fn allow_remote_embedder(&mut self, org_id: &str) -> UaResult<bool> {
+        allow_remote_embedder_sql(self, org_id)
     }
     fn offices(&mut self, org_id: &str) -> UaResult<Vec<OfficeRow>> {
         offices_sql(self, org_id)
@@ -470,6 +488,17 @@ impl OrgWrite for WriteTx<'_> {
             "INSERT INTO org_service_identities (org_id, label) VALUES (?1, ?2)",
             params![org_id, label],
         )?;
+        Ok(())
+    }
+
+    fn set_allow_remote_embedder(&mut self, org_id: &str, allow: bool) -> UaResult<()> {
+        let n = self.execute(
+            "UPDATE orgs SET allow_remote_embedder = ?1 WHERE id = ?2",
+            params![i64::from(allow), org_id],
+        )?;
+        if n == 0 {
+            return Err(UaError::not_found(format!("unknown organization {org_id}")));
+        }
         Ok(())
     }
 
