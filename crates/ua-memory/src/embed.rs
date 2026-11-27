@@ -32,7 +32,7 @@ pub fn vector_identity(backend: &str, model: &str, revision: &str) -> String {
 /// Why an embedding could not be produced.
 #[derive(Debug, Clone)]
 pub struct EmbedError {
-    /// `disabled`, `model_acquisition` or `runtime`.
+    /// `disabled`, `model_acquisition`, `auth_refused` or `runtime`.
     pub category: &'static str,
     pub message: String,
 }
@@ -40,6 +40,10 @@ pub struct EmbedError {
 impl EmbedError {
     pub fn disabled() -> Self {
         Self { category: "disabled", message: "embeddings are not enabled in this build".into() }
+    }
+
+    pub fn auth_refused(message: impl Into<String>) -> Self {
+        Self { category: "auth_refused", message: message.into() }
     }
 
     pub fn runtime(message: impl Into<String>) -> Self {
@@ -228,19 +232,34 @@ pub fn local_embedder(cfg: &Config) -> Option<Arc<dyn Embedder>> {
     }
 }
 
-/// Resolve the embedder for `cfg` with an explicit `allow_remote` gate.
-/// Explicitly registered process embedders ([`register_embedder`]) take
-/// precedence for tests and custom integrations. Never downloads a model.
-pub fn embedder_for_with_remote_flag(cfg: &Config, allow_remote: bool) -> Arc<dyn Embedder> {
+/// Return an explicitly registered in-process embedder (`register_embedder` or
+/// `register_remote_embedder` gated by `allow_remote`), without consulting the
+/// HTTP factory or performing any network I/O (used by zero-network
+/// `system_doctor` checks).
+pub fn registered_embedder(cfg: &Config, allow_remote: bool) -> Option<Arc<dyn Embedder>> {
     if let Ok(reg) = registry().lock()
         && let Some(e) = reg.get(&cfg.embed_model)
     {
-        return e.clone();
+        return Some(e.clone());
     }
     if let Ok(reg) = remote_registry().lock()
         && let Some(e) = reg.get(&cfg.embed_model)
     {
-        return if allow_remote { e.clone() } else { Arc::new(NoopEmbedder::new(cfg.embed_model.clone())) };
+        return Some(if allow_remote {
+            e.clone()
+        } else {
+            Arc::new(NoopEmbedder::new(cfg.embed_model.clone()))
+        });
+    }
+    None
+}
+
+/// Resolve the embedder for `cfg` with an explicit `allow_remote` gate.
+/// Explicitly registered process embedders ([`register_embedder`]) take
+/// precedence for tests and custom integrations. Never downloads a model.
+pub fn embedder_for_with_remote_flag(cfg: &Config, allow_remote: bool) -> Arc<dyn Embedder> {
+    if let Some(e) = registered_embedder(cfg, allow_remote) {
+        return e;
     }
     match cfg.memory.embedder.trim().to_ascii_lowercase().as_str() {
         "off" => Arc::new(NoopEmbedder::new(cfg.embed_model.clone())),

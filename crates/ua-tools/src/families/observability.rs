@@ -996,7 +996,7 @@ struct DbFacts {
     notes: i64,
     embedded: i64,
     stale_embedded: i64,
-    embedder_available: bool,
+    embedder_availability: super::memory::remote::DoctorEmbedderAvailability,
     allow_remote_embedder: bool,
     active_tokens: i64,
     /// The default organization's only.
@@ -1036,7 +1036,7 @@ struct DbFacts {
 /// nothing of the hub's other notes or nodes. The hub-wide facts (schema,
 /// the full ledger verify, the webhook's last delivery) are read for the
 /// default organization only.
-fn db_facts(c: &Connection, org: &str, active_identity: Option<&str>, deep: bool) -> UaResult<DbFacts> {
+fn db_facts(c: &Connection, cfg: &Config, org: &str, deep: bool) -> UaResult<DbFacts> {
     let hub_reader = org == ua_core::DEFAULT_ORG;
     let schema_compat = hub_reader.then(|| {
         ua_store::backup::check_schema_compatibility(
@@ -1061,8 +1061,10 @@ fn db_facts(c: &Connection, org: &str, active_identity: Option<&str>, deep: bool
     };
     let quick_check =
         if deep { Some(c.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))?) } else { None };
-    let mem_counts = ua_memory::embedding_freshness_counts(c, org, active_identity).unwrap_or_default();
     let allow_remote_embedder = ua_memory::org_allows_remote_embedder(c, org);
+    let embedder_state = super::memory::remote::inspect_embedder_for_doctor(cfg, allow_remote_embedder);
+    let mem_counts = ua_memory::embedding_freshness_counts(c, org, embedder_state.active_identity.as_deref())
+        .unwrap_or_default();
     Ok(DbFacts {
         journal_mode: c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?,
         page_count: pragma_i64(c, "page_count")?,
@@ -1073,7 +1075,7 @@ fn db_facts(c: &Connection, org: &str, active_identity: Option<&str>, deep: bool
         notes: mem_counts.live_notes,
         embedded: mem_counts.fresh_embedded,
         stale_embedded: mem_counts.stale_embedded,
-        embedder_available: active_identity.is_some(),
+        embedder_availability: embedder_state.availability,
         allow_remote_embedder,
         active_tokens: c
             .query_row(
@@ -1417,27 +1419,37 @@ fn embeddings_check(cfg: &Config, facts: &DbFacts) -> Value {
         if facts.stale_embedded > 0 { format!(" ({} stale)", facts.stale_embedded) } else { String::new() };
     if mode == "ollama" {
         let origin = redact_url_origin(&cfg.memory.ollama_url);
-        if !facts.embedder_available {
-            return finding(
+        return match facts.embedder_availability {
+            super::memory::remote::DoctorEmbedderAvailability::Unavailable => finding(
                 "semantic_search",
                 DEGRADED,
                 format!(
                     "Ollama model {:?} at {origin} is unavailable for this organization \
-                     (allow_remote_embedder={}, endpoint unreachable, or model missing); search is lexical-only",
+                     (allow_remote_embedder={}, endpoint blocked, or invalid URL); search is lexical-only",
                     cfg.memory.ollama_model, facts.allow_remote_embedder
                 ),
                 gate,
-            );
-        }
-        return finding(
-            "semantic_search",
-            LIVE,
-            format!(
-                "configured for Ollama model {:?} at {origin}; {} of {} notes embedded{stale_note}",
-                cfg.memory.ollama_model, facts.embedded, facts.notes
             ),
-            gate,
-        );
+            super::memory::remote::DoctorEmbedderAvailability::Unprobed => finding(
+                "semantic_search",
+                DEGRADED,
+                format!(
+                    "configured for Ollama model {:?} at {origin} (not yet probed; \
+                     system_doctor makes no network calls); {} of {} notes embedded{stale_note}",
+                    cfg.memory.ollama_model, facts.embedded, facts.notes
+                ),
+                gate,
+            ),
+            super::memory::remote::DoctorEmbedderAvailability::Available => finding(
+                "semantic_search",
+                LIVE,
+                format!(
+                    "configured for Ollama model {:?} at {origin}; {} of {} notes embedded{stale_note}",
+                    cfg.memory.ollama_model, facts.embedded, facts.notes
+                ),
+                gate,
+            ),
+        };
     }
     if mode == "openai_compat" {
         let Some(raw_url) = cfg.memory.openai_compat_url.as_deref() else {
@@ -1449,14 +1461,14 @@ fn embeddings_check(cfg: &Config, facts: &DbFacts) -> Value {
             );
         };
         let origin = redact_url_origin(raw_url);
-        if !facts.embedder_available {
+        if facts.embedder_availability != super::memory::remote::DoctorEmbedderAvailability::Available {
             return finding(
                 "semantic_search",
                 DEGRADED,
                 format!(
                     "openai_compat endpoint {origin} is unavailable for this organization \
-                     (allow_remote_embedder={}, https required when UA_EMBED_API_KEY is set, or host unresolvable); \
-                     search is lexical-only",
+                     (allow_remote_embedder={}, https required when UA_EMBED_API_KEY is set, \
+                     or host not yet verified as loopback); search is lexical-only",
                     facts.allow_remote_embedder
                 ),
                 gate,
@@ -2147,9 +2159,8 @@ async fn system_doctor(ctx: ToolCtx, a: DoctorArgs) -> UaResult<Value> {
     let hub_reader = ctx.caller.org_id == ua_core::DEFAULT_ORG;
     let deep = a.refresh && hub_reader;
     let org = ctx.caller.org_id.clone();
-    let active_embedder = ua_memory::embedder_for_org(ctx.hub.db(), ctx.hub.cfg(), &org).await;
-    let active_identity = active_embedder.available().then(|| active_embedder.identity());
-    let facts = ctx.hub.db().read_async(move |c| db_facts(c, &org, active_identity.as_deref(), deep)).await?;
+    let cfg_for_facts = ctx.hub.cfg().clone();
+    let facts = ctx.hub.db().read_async(move |c| db_facts(c, &cfg_for_facts, &org, deep)).await?;
     let ledger_row = match &facts.chain {
         Some(chain) => {
             ctx.hub.record_ledger_verify(chain.ok);
@@ -2528,7 +2539,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let missing_facts = hub.db().read(|c| db_facts(c, ua_core::DEFAULT_ORG, None, false)).unwrap();
+        let missing_facts = hub.db().read(|c| db_facts(c, hub.cfg(), ua_core::DEFAULT_ORG, false)).unwrap();
         assert!(matches!(missing_facts.org_counts, Some(Err(_))));
         assert_eq!(hub_auth_check(&cfg, &missing_facts)["status"], MISCONFIGURED);
         assert_eq!(bind_check(&cfg, &missing_facts)["status"], MISCONFIGURED);
@@ -2540,7 +2551,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let unreadable_facts = hub.db().read(|c| db_facts(c, ua_core::DEFAULT_ORG, None, false)).unwrap();
+        let unreadable_facts =
+            hub.db().read(|c| db_facts(c, hub.cfg(), ua_core::DEFAULT_ORG, false)).unwrap();
         assert!(matches!(unreadable_facts.org_counts, Some(Err(_))));
         assert_eq!(hub_auth_check(&cfg, &unreadable_facts)["status"], MISCONFIGURED);
         assert_eq!(bind_check(&cfg, &unreadable_facts)["status"], MISCONFIGURED);
