@@ -592,7 +592,7 @@ fn bench_config_with_embed(scratch_home: &Path, embed: Option<&EmbedOptions>) ->
     Ok(cfg)
 }
 
-fn embed_report_meta(cfg: &Config, embed: Option<&EmbedOptions>) -> Option<Value> {
+fn embed_report_meta(cfg: &Config, embed: Option<&EmbedOptions>, chunks_scored: usize) -> Option<Value> {
     let opt = embed?;
     let e = crate::embed::embedder_for(cfg);
     Some(json!({
@@ -600,7 +600,14 @@ fn embed_report_meta(cfg: &Config, embed: Option<&EmbedOptions>) -> Option<Value
         "revision": e.revision(),
         "identity": e.identity(),
         "no_chunks": opt.no_chunks,
+        "chunks_scored": chunks_scored,
     }))
+}
+
+async fn count_memory_chunks(db: &Db) -> UaResult<usize> {
+    let n: i64 =
+        db.read_async(|c| Ok(c.query_row("SELECT COUNT(*) FROM memory_chunks", [], |r| r.get(0))?)).await?;
+    Ok(n.max(0) as usize)
 }
 
 fn caller(label: &str) -> Caller {
@@ -799,6 +806,17 @@ async fn run_fixture_with_embed(
     scratch: &Scratch,
     embed: Option<&EmbedOptions>,
 ) -> UaResult<Value> {
+    let cfg = bench_config_with_embed(&scratch.dir, embed)?;
+    run_fixture_with_cfg(corpus_raw, floor_raw, scratch, &cfg, embed).await
+}
+
+async fn run_fixture_with_cfg(
+    corpus_raw: &str,
+    floor_raw: &str,
+    scratch: &Scratch,
+    cfg: &Config,
+    embed: Option<&EmbedOptions>,
+) -> UaResult<Value> {
     let corpus = parse_corpus(corpus_raw)?;
     let floor = parse_floor(floor_raw)?;
     if floor.k != RECALL_K {
@@ -818,12 +836,11 @@ async fn run_fixture_with_embed(
         }
     }
 
-    let cfg = bench_config_with_embed(&scratch.dir, embed)?;
     let no_chunks = embed.is_some_and(|e| e.no_chunks);
     let base = scratch.sub("corpus")?.join("corpus.db");
-    let ids = {
+    let (ids, chunks_scored) = {
         let db = open_db(&base)?;
-        let ids = load_fixture(&db, &cfg, &corpus.notes).await?;
+        let ids = load_fixture(&db, cfg, &corpus.notes).await?;
         if no_chunks {
             db.write_async(|tx| {
                 tx.execute("DELETE FROM memory_chunks", [])?;
@@ -831,11 +848,12 @@ async fn run_fixture_with_embed(
             })
             .await?;
         }
+        let chunks_scored = count_memory_chunks(&db).await?;
         let (busy, _, _) = db.checkpoint_truncate()?;
         if busy {
             return Err(UaError::internal("bench checkpoint was busy; the fixture copy would be partial"));
         }
-        ids
+        (ids, chunks_scored)
     };
 
     let mut query_rows = Vec::new();
@@ -849,7 +867,7 @@ async fn run_fixture_with_embed(
         let path = dir.join("q.db");
         std::fs::copy(&base, &path).map_err(|e| UaError::internal(format!("copy fixture database: {e}")))?;
         let db = open_db(&path)?;
-        let searched = search_keys(&db, &cfg, &ids, &q.query, q.as_of.clone()).await;
+        let searched = search_keys(&db, cfg, &ids, &q.query, q.as_of.clone()).await;
         drop(db);
         Scratch::release(&dir);
         let (ranked, qmode) = searched?;
@@ -931,7 +949,7 @@ async fn run_fixture_with_embed(
     let recalls: Vec<f64> = query_rows.iter().map(|r| r["recall_at_5"].as_f64().unwrap_or(0.0)).collect();
     let mrrs: Vec<f64> = query_rows.iter().map(|r| r["mrr"].as_f64().unwrap_or(0.0)).collect();
     let mut retrieval = json!({"mode": mode});
-    if let Some(meta) = embed_report_meta(&cfg, embed) {
+    if let Some(meta) = embed_report_meta(cfg, embed, chunks_scored) {
         retrieval["embed"] = meta;
     }
     Ok(json!({
@@ -1016,6 +1034,7 @@ struct QuestionRun {
     as_of: Option<f64>,
     older: usize,
     older_seen: usize,
+    chunks_scored: usize,
 }
 
 /// Score one question on its own database in its own scratch subdirectory,
@@ -1079,6 +1098,7 @@ async fn score_question_in(
         })
         .await?;
     }
+    let chunks_scored = count_memory_chunks(&db).await?;
 
     let started = std::time::Instant::now();
     let hits = search::search(
@@ -1090,7 +1110,7 @@ async fn score_question_in(
     .await
     .map_err(|e| UaError::invalid(format!("question {}: search: {e}", q.question_id)))?;
     let search_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let mode = hits["retrieval"]["mode"].as_str().unwrap_or("").to_string();
+    let mut mode = hits["retrieval"]["mode"].as_str().unwrap_or("").to_string();
     let ranked = rank_sessions(&hits, &session_of);
     let score = score_sessions(&ranked, &q.answer_session_ids)
         .map_err(|e| UaError::invalid(format!("question {}: {e}", q.question_id)))?;
@@ -1112,6 +1132,10 @@ async fn score_question_in(
         )
         .await
         .map_err(|e| UaError::invalid(format!("question {}: as_of search: {e}", q.question_id)))?;
+        let as_of_mode = again["retrieval"]["mode"].as_str().unwrap_or("");
+        if as_of_mode != mode {
+            mode = "mixed".into();
+        }
         let ranked_as_of = rank_sessions(&again, &session_of);
         let again_score = score_sessions(&ranked_as_of, &q.answer_session_ids)?;
         Some(again_score.recall_all_5)
@@ -1136,6 +1160,7 @@ async fn score_question_in(
         as_of: as_of_hit,
         older,
         older_seen,
+        chunks_scored,
     })
 }
 
@@ -1233,28 +1258,43 @@ async fn run_longmemeval(
     let raw: Value = serde_json::from_reader(std::io::BufReader::new(file))
         .map_err(|e| UaError::invalid(format!("{} is not JSON: {e}", path.display())))?;
     let questions = parse_questions(&raw)?;
+    let scratch = Scratch::new("longmemeval")?;
+    let cfg = bench_config_with_embed(&scratch.dir, embed)?;
+    run_longmemeval_with_cfg(&pin, &path.display().to_string(), &questions, limit, ids, &scratch, &cfg, embed)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_longmemeval_with_cfg(
+    pin: &Pin,
+    path_display: &str,
+    questions: &[LmeQuestion],
+    limit: Option<usize>,
+    ids: Option<&[String]>,
+    scratch: &Scratch,
+    cfg: &Config,
+    embed: Option<&EmbedOptions>,
+) -> UaResult<Value> {
     let total = questions.len();
     let answerable = questions.iter().filter(|q| !q.question_id.ends_with("_abs")).count();
-    let (chosen, selection) = select(&questions, limit, ids)?;
+    let (chosen, selection) = select(questions, limit, ids)?;
     if chosen.is_empty() {
         return Err(UaError::invalid(format!(
-            "{} has no answerable questions. {}",
-            path.display(),
-            dataset_help(&pin)
+            "{path_display} has no answerable questions. {}",
+            dataset_help(pin)
         )));
     }
 
-    let scratch = Scratch::new("longmemeval")?;
-    let cfg = bench_config_with_embed(&scratch.dir, embed)?;
     let no_chunks = embed.is_some_and(|e| e.no_chunks);
     let mut rows = Vec::new();
     let mut times = Vec::new();
     let mut as_of_hits = Vec::new();
     let mut older = 0usize;
     let mut older_seen = 0usize;
+    let mut chunks_scored = 0usize;
     let mut mode = String::new();
     for (i, q) in chosen.iter().enumerate() {
-        let run = score_question(q, &scratch, &cfg, no_chunks).await?;
+        let run = score_question(q, scratch, cfg, no_chunks).await?;
         if embed.is_some() && run.mode != "hybrid" {
             return Err(UaError::internal(format!(
                 "--embed requested hybrid retrieval, but question {} fell back to {:?} \
@@ -1281,6 +1321,7 @@ async fn run_longmemeval(
         }
         older += run.older;
         older_seen += run.older_seen;
+        chunks_scored += run.chunks_scored;
         rows.push(run.row);
     }
 
@@ -1302,7 +1343,7 @@ async fn run_longmemeval(
         })
         .collect();
     let mut retrieval = json!({"mode": mode, "search_limit": SEARCH_LIMIT, "granularity": "session"});
-    if let Some(meta) = embed_report_meta(&cfg, embed) {
+    if let Some(meta) = embed_report_meta(cfg, embed, chunks_scored) {
         retrieval["embed"] = meta;
     }
     Ok(json!({
@@ -1315,7 +1356,7 @@ async fn run_longmemeval(
             "revision": pin.revision,
             "file": pin.file,
             "sha256": pin.sha256,
-            "url": dataset_url(&pin),
+            "url": dataset_url(pin),
             "questions": total,
             "answerable": answerable,
             "scored": n,
@@ -1636,11 +1677,60 @@ mod tests {
         assert!(!body.contains("answer_"));
     }
 
+    struct BenchTestEmbedder {
+        model: &'static str,
+        revision: &'static str,
+        fail: bool,
+    }
+
+    impl crate::embed::Embedder for BenchTestEmbedder {
+        fn model(&self) -> &str {
+            self.model
+        }
+
+        fn backend(&self) -> &str {
+            "local"
+        }
+
+        fn revision(&self) -> &str {
+            self.revision
+        }
+
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, crate::embed::EmbedError> {
+            if self.fail {
+                return Err(crate::embed::EmbedError::runtime("simulated corrupt local model"));
+            }
+            // Inspect only the first 2,048 chars of each input, matching the
+            // ~512-token single-vector window where long tails are truncated
+            // while chunking surfaces tail chunks inside the window.
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let head: String = t.chars().take(2048).collect();
+                    if head.contains("tail-beacon-marker") || head.contains("celestial lighthouse") {
+                        vec![1.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0]
+                    }
+                })
+                .collect())
+        }
+    }
+
+    fn hybrid_test_config(home: &Path, model: &'static str, revision: &'static str, fail: bool) -> Config {
+        crate::embed::register_embedder(std::sync::Arc::new(BenchTestEmbedder { model, revision, fail }));
+        let mut cfg = Config::for_home(home);
+        cfg.memory.embedder = "local".into();
+        cfg.embed_model = model.into();
+        cfg.clock = ua_core::time::Clock::fixed(BENCH_NOW).expect("BENCH_NOW is a valid instant");
+        cfg
+    }
+
     #[test]
-    fn embed_report_meta_distinguishes_chunked_and_single_vector_runs() {
+    fn embed_report_meta_uses_hybrid_config_and_records_chunks_scored() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = bench_config(dir.path());
-        assert!(embed_report_meta(&cfg, None).is_none());
+        let cfg = hybrid_test_config(dir.path(), "bench-meta-test-model", "ea104dacec62c0de", false);
+        assert!(embed_report_meta(&cfg, None, 0).is_none());
         let chunked = embed_report_meta(
             &cfg,
             Some(&EmbedOptions {
@@ -1648,6 +1738,7 @@ mod tests {
                 model: cfg.embed_model.clone(),
                 no_chunks: false,
             }),
+            4,
         )
         .unwrap();
         let single = embed_report_meta(
@@ -1657,13 +1748,165 @@ mod tests {
                 model: cfg.embed_model.clone(),
                 no_chunks: true,
             }),
+            0,
         )
         .unwrap();
-        assert_eq!(chunked["model"], cfg.embed_model);
-        assert!(chunked["revision"].is_string());
-        assert!(chunked["identity"].is_string());
+        assert_eq!(chunked["model"], "bench-meta-test-model");
+        assert_eq!(chunked["revision"], "ea104dacec62c0de");
+        assert_eq!(chunked["identity"], "local:bench-meta-test-model@ea104dacec62c0de");
         assert_eq!(chunked["no_chunks"], json!(false));
+        assert_eq!(chunked["chunks_scored"], json!(4));
         assert_eq!(single["no_chunks"], json!(true));
+        assert_eq!(single["chunks_scored"], json!(0));
         assert_ne!(chunked, single);
+    }
+
+    #[tokio::test]
+    async fn no_chunks_drops_memory_chunks_and_changes_retrieval_in_fixture_and_longmemeval() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = hybrid_test_config(dir.path(), "bench-no-chunks-effect", "rev-no-chunks-1", false);
+        let padding = "filler prose about ordinary weather and routine schedules. ".repeat(60);
+        let long_body = format!("{padding}\n\nConclusion: tail-beacon-marker.");
+        assert!(long_body.len() > 3000);
+
+        // 1. Fixture path: chunked finds the tail-only semantic match and records chunks_scored > 0;
+        //    --no-chunks deletes memory_chunks (chunks_scored == 0) and misses the tail-only match.
+        let mini_corpus = json!({
+            "notes": [{
+                "key": "long-tail-note",
+                "title": "Long log",
+                "content": long_body,
+                "tags": []
+            }],
+            "queries": [{
+                "id": "tail-semantic",
+                "class": "long-document",
+                "query": "celestial lighthouse",
+                "must": ["long-tail-note"]
+            }]
+        })
+        .to_string();
+        let mini_floor = json!({
+            "k": 5,
+            "classes": [{ "class": "long-document", "n": 1, "recall_at_5": 1.0, "mrr": 1.0 }]
+        })
+        .to_string();
+
+        let scratch_chunked = Scratch::new("fix-chunked").unwrap();
+        let opt_chunked =
+            EmbedOptions { home: dir.path().to_path_buf(), model: cfg.embed_model.clone(), no_chunks: false };
+        let rep_chunked =
+            run_fixture_with_cfg(&mini_corpus, &mini_floor, &scratch_chunked, &cfg, Some(&opt_chunked))
+                .await
+                .unwrap();
+        assert_eq!(rep_chunked["retrieval"]["mode"], "hybrid");
+        assert_eq!(
+            rep_chunked["retrieval"]["embed"]["identity"],
+            "local:bench-no-chunks-effect@rev-no-chunks-1"
+        );
+        assert_eq!(rep_chunked["retrieval"]["embed"]["no_chunks"], json!(false));
+        assert!(
+            rep_chunked["retrieval"]["embed"]["chunks_scored"].as_u64().unwrap_or(0) > 0,
+            "chunked fixture run must score >0 chunks: {rep_chunked}"
+        );
+        assert_eq!(rep_chunked["overall"]["recall_at_5"], json!(1.0), "{rep_chunked}");
+
+        let scratch_single = Scratch::new("fix-single").unwrap();
+        let opt_single =
+            EmbedOptions { home: dir.path().to_path_buf(), model: cfg.embed_model.clone(), no_chunks: true };
+        let rep_single =
+            run_fixture_with_cfg(&mini_corpus, &mini_floor, &scratch_single, &cfg, Some(&opt_single))
+                .await
+                .unwrap();
+        assert_eq!(rep_single["retrieval"]["mode"], "hybrid");
+        assert_eq!(rep_single["retrieval"]["embed"]["no_chunks"], json!(true));
+        assert_eq!(
+            rep_single["retrieval"]["embed"]["chunks_scored"],
+            json!(0),
+            "--no-chunks fixture run must drop memory_chunks: {rep_single}"
+        );
+        assert_eq!(
+            rep_single["overall"]["recall_at_5"],
+            json!(0.0),
+            "--no-chunks must remove tail chunk retrieval effect: {rep_single}"
+        );
+
+        // 2. LongMemEval path: same --no-chunks effect on chunks_scored and strict recall@5.
+        let lme_q = LmeQuestion {
+            question_id: "lme-no-chunks-1".into(),
+            question_type: "single-session-user".into(),
+            question: "celestial lighthouse".into(),
+            question_date: None,
+            answer_session_ids: vec!["s0".into()],
+            haystack_session_ids: vec!["s0".into()],
+            haystack_dates: vec!["2023/05/20 (Sat) 02:21".into()],
+            haystack_sessions: vec![vec![LmeTurn { role: "user".into(), content: long_body }]],
+        };
+        let pin = pin().unwrap();
+        let lme_scratch_chunked = Scratch::new("lme-chunked").unwrap();
+        let lme_chunked = run_longmemeval_with_cfg(
+            &pin,
+            "in-memory",
+            std::slice::from_ref(&lme_q),
+            None,
+            None,
+            &lme_scratch_chunked,
+            &cfg,
+            Some(&opt_chunked),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lme_chunked["retrieval"]["mode"], "hybrid");
+        assert_eq!(lme_chunked["retrieval"]["embed"]["no_chunks"], json!(false));
+        assert!(
+            lme_chunked["retrieval"]["embed"]["chunks_scored"].as_u64().unwrap_or(0) > 0,
+            "chunked LongMemEval run must score >0 chunks: {lme_chunked}"
+        );
+        assert_eq!(lme_chunked["strict_recall_at_5"]["hits"], json!(1), "{lme_chunked}");
+
+        let lme_scratch_single = Scratch::new("lme-single").unwrap();
+        let lme_single = run_longmemeval_with_cfg(
+            &pin,
+            "in-memory",
+            &[lme_q],
+            None,
+            None,
+            &lme_scratch_single,
+            &cfg,
+            Some(&opt_single),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lme_single["retrieval"]["mode"], "hybrid");
+        assert_eq!(lme_single["retrieval"]["embed"]["no_chunks"], json!(true));
+        assert_eq!(
+            lme_single["retrieval"]["embed"]["chunks_scored"],
+            json!(0),
+            "--no-chunks LongMemEval run must drop memory_chunks: {lme_single}"
+        );
+        assert_eq!(
+            lme_single["strict_recall_at_5"]["hits"],
+            json!(0),
+            "--no-chunks must remove tail chunk retrieval effect in LongMemEval: {lme_single}"
+        );
+    }
+
+    #[tokio::test]
+    async fn longmemeval_embed_fails_instead_of_silently_falling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = hybrid_test_config(dir.path(), "bench-lme-fallback-guard", "rev-fail-1", true);
+        let pin = pin().unwrap();
+        let scratch = Scratch::new("lme-fallback").unwrap();
+        let qs = vec![question("lme-fb-1", 2)];
+        let opt =
+            EmbedOptions { home: dir.path().to_path_buf(), model: cfg.embed_model.clone(), no_chunks: false };
+        let err = run_longmemeval_with_cfg(&pin, "in-memory", &qs, None, None, &scratch, &cfg, Some(&opt))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--embed requested hybrid retrieval") && msg.contains("lexical_fallback"),
+            "LongMemEval --embed must fail fast on lexical fallback, got: {msg}"
+        );
     }
 }
