@@ -97,6 +97,10 @@ fn read_ids(path: &str) -> Result<Vec<String>, String> {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(raw_args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut args = Args {
         longmemeval: false,
         data: None,
@@ -108,7 +112,7 @@ fn parse_args() -> Result<Args, String> {
         model: None,
         no_chunks: false,
     };
-    let mut rest = std::env::args().skip(1);
+    let mut rest = raw_args.into_iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--longmemeval" => args.longmemeval = true,
@@ -158,4 +162,40 @@ fn parse_args() -> Result<Args, String> {
 
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
     args.next().filter(|v| !v.starts_with("--")).ok_or_else(|| format!("{flag} needs a value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(xs: &[&str]) -> Result<Args, String> {
+        parse_args_from(xs.iter().map(|s| (*s).to_string()))
+    }
+
+    #[test]
+    fn embed_flag_is_opt_in_and_off_by_default() {
+        let def = parse(&[]).unwrap();
+        assert!(!def.embed, "--embed must stay off by default so CI remains lexical");
+        assert!(!def.longmemeval);
+        assert!(!def.no_chunks);
+        assert!(def.models_home.is_none());
+        assert!(def.model.is_none());
+
+        let lme = parse(&["--longmemeval"]).unwrap();
+        assert!(lme.longmemeval);
+        assert!(!lme.embed, "--longmemeval alone must not enable --embed");
+    }
+
+    #[test]
+    fn embed_subflags_require_embed_and_parse_when_enabled() {
+        assert!(parse(&["--no-chunks"]).is_err());
+        assert!(parse(&["--models-home", "/tmp/ua"]).is_err());
+        assert!(parse(&["--model", "BAAI/bge-small-en-v1.5"]).is_err());
+
+        let ok = parse(&["--embed", "--no-chunks", "--models-home", "/tmp/ua", "--model", "m"]).unwrap();
+        assert!(ok.embed);
+        assert!(ok.no_chunks);
+        assert_eq!(ok.models_home, Some(PathBuf::from("/tmp/ua")));
+        assert_eq!(ok.model.as_deref(), Some("m"));
+    }
 }

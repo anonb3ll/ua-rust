@@ -574,6 +574,9 @@ fn bench_config_with_embed(scratch_home: &Path, embed: Option<&EmbedOptions>) ->
         ));
     }
     let mut cfg = Config::for_home(&opt.home);
+    // `opt.home` is used strictly read-only for `local_embedder` model lookup
+    // (`$UA_HOME/models`, never writing or downloading); all benchmark SQLite
+    // databases live under `scratch_home`.
     cfg.memory.embedder = "local".into();
     cfg.embed_model = opt.model.clone();
     cfg.clock = ua_core::time::Clock::fixed(BENCH_NOW).expect("BENCH_NOW is a valid instant");
@@ -587,6 +590,17 @@ fn bench_config_with_embed(scratch_home: &Path, embed: Option<&EmbedOptions>) ->
         )));
     }
     Ok(cfg)
+}
+
+fn embed_report_meta(cfg: &Config, embed: Option<&EmbedOptions>) -> Option<Value> {
+    let opt = embed?;
+    let e = crate::embed::embedder_for(cfg);
+    Some(json!({
+        "model": e.model(),
+        "revision": e.revision(),
+        "identity": e.identity(),
+        "no_chunks": opt.no_chunks,
+    }))
 }
 
 fn caller(label: &str) -> Caller {
@@ -839,6 +853,13 @@ async fn run_fixture_with_embed(
         drop(db);
         Scratch::release(&dir);
         let (ranked, qmode) = searched?;
+        if embed.is_some() && qmode != "hybrid" {
+            return Err(UaError::internal(format!(
+                "--embed requested hybrid retrieval, but query {} fell back to {qmode:?} \
+                 (verify model files with `ua memory models status --verify`)",
+                q.id
+            )));
+        }
         if mode.is_empty() {
             mode = qmode.clone();
         } else if mode != qmode {
@@ -909,10 +930,14 @@ async fn run_fixture_with_embed(
     let share = |hits: usize| if shown == 0 { 0.0 } else { round4(hits as f64 / shown as f64) };
     let recalls: Vec<f64> = query_rows.iter().map(|r| r["recall_at_5"].as_f64().unwrap_or(0.0)).collect();
     let mrrs: Vec<f64> = query_rows.iter().map(|r| r["mrr"].as_f64().unwrap_or(0.0)).collect();
+    let mut retrieval = json!({"mode": mode});
+    if let Some(meta) = embed_report_meta(&cfg, embed) {
+        retrieval["embed"] = meta;
+    }
     Ok(json!({
         "bench": "fixture",
         "build": {"embeddings": crate::EMBEDDINGS_ENABLED},
-        "retrieval": {"mode": mode},
+        "retrieval": retrieval,
         "clock": BENCH_NOW,
         "k": RECALL_K,
         "stale_share": {
@@ -1230,6 +1255,13 @@ async fn run_longmemeval(
     let mut mode = String::new();
     for (i, q) in chosen.iter().enumerate() {
         let run = score_question(q, &scratch, &cfg, no_chunks).await?;
+        if embed.is_some() && run.mode != "hybrid" {
+            return Err(UaError::internal(format!(
+                "--embed requested hybrid retrieval, but question {} fell back to {:?} \
+                 (verify model files with `ua memory models status --verify`)",
+                run.row.id, run.mode
+            )));
+        }
         if mode.is_empty() {
             mode = run.mode.clone();
         } else if mode != run.mode {
@@ -1269,10 +1301,14 @@ async fn run_longmemeval(
             })
         })
         .collect();
+    let mut retrieval = json!({"mode": mode, "search_limit": SEARCH_LIMIT, "granularity": "session"});
+    if let Some(meta) = embed_report_meta(&cfg, embed) {
+        retrieval["embed"] = meta;
+    }
     Ok(json!({
         "bench": "longmemeval-s",
         "build": {"embeddings": crate::EMBEDDINGS_ENABLED},
-        "retrieval": {"mode": mode, "search_limit": SEARCH_LIMIT, "granularity": "session"},
+        "retrieval": retrieval,
         "clock": BENCH_NOW,
         "dataset": {
             "repo": pin.repo,
@@ -1598,5 +1634,36 @@ mod tests {
         assert_eq!(title, "Conversation on 2023/05/20 (Sat) 02:21");
         assert_eq!(body, "Conversation date: 2023/05/20 (Sat) 02:21\n\nuser: hi");
         assert!(!body.contains("answer_"));
+    }
+
+    #[test]
+    fn embed_report_meta_distinguishes_chunked_and_single_vector_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = bench_config(dir.path());
+        assert!(embed_report_meta(&cfg, None).is_none());
+        let chunked = embed_report_meta(
+            &cfg,
+            Some(&EmbedOptions {
+                home: dir.path().to_path_buf(),
+                model: cfg.embed_model.clone(),
+                no_chunks: false,
+            }),
+        )
+        .unwrap();
+        let single = embed_report_meta(
+            &cfg,
+            Some(&EmbedOptions {
+                home: dir.path().to_path_buf(),
+                model: cfg.embed_model.clone(),
+                no_chunks: true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(chunked["model"], cfg.embed_model);
+        assert!(chunked["revision"].is_string());
+        assert!(chunked["identity"].is_string());
+        assert_eq!(chunked["no_chunks"], json!(false));
+        assert_eq!(single["no_chunks"], json!(true));
+        assert_ne!(chunked, single);
     }
 }

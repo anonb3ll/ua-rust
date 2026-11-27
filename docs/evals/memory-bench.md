@@ -225,19 +225,23 @@ bench / injected `Config.clock`, and PR #157 local ONNX embedder and
 1. **Hybrid mode regresses the fixture corpus from `0.8000` to `0.6000`
    recall@5 (`0.8000` to `0.7500` MRR), failing `bench/floor.json` on
    `exact-term` (`1.0000` -> `0.0000`, `must_not_share` `0.0769`).** Both
-   single-vector and chunked hybrid modes score identically on the fixture.
+   single-vector and chunked hybrid modes score identically on the fixture, and
+   the fixture's `long-document` class stays `1.0000` in all three modes via
+   FTS5.
 2. **On LongMemEval-S (120-question stratified sample, 20 per type, seed 2145),
    hybrid embeddings lift strict recall@5 from `0.8833` to `0.9000` and MRR@10
    from `0.8302` to `0.8890` (single-vector) / `0.9111` (chunked), while search
-   p95 latency increases from `16.7 ms` (lexical) to `57.5 ms` (single-vector)
-   and `87.8 ms` (chunked).** At `n = 120`, one question is `≈ 0.83` percentage
-   points (`0.0083`), so the overall strict recall@5 delta (`0.8833` -> `0.9000`)
-   is `+2` net questions (`+3` wins / `-1` loss; within each 20-question class,
+   p95 latency increases from `16.7 ms` (lexical, single-process) to `57.5 ms`
+   (single-vector) and `87.8 ms` (chunked, under 2-shard contention; see note
+   below).** At `n = 120`, one question is `≈ 0.83` percentage points
+   (`0.0083`), so the overall strict recall@5 delta (`0.8833` -> `0.9000`) is
+   `+2` net questions (`+3` wins / `-1` loss; within each 20-question class,
    one question is `5.0` percentage points).
-3. **Chunking on top of single-vector hybrid moves strict recall@5 by `0`
-   (`0.9000` -> `0.9000`, `0` wins / `0` losses across all 6 classes) and leaves
-   `long-document` unchanged at `1.0000` (already passed via FTS5), while adding
-   `+0.0221` MRR@10 (`0.8890` -> `0.9111`) and `+30.3 ms` p95 search latency.**
+3. **On LongMemEval-S, chunking on top of single-vector hybrid moves strict
+   recall@5 by `0` (`0.9000` -> `0.9000`, `0` wins / `0` losses across all 6
+   LongMemEval types), adds `+0.0221` MRR@10 (`0.8890` -> `0.9111`, within
+   sample noise at `n = 120`), and increases p95 search latency (`57.5 ms` ->
+   `87.8 ms`).**
 4. **`as_of` accuracy is flat at `0.5000` (`10/20`) across all three modes**
    (lexical, hybrid single-vector, and hybrid chunked).
 
@@ -338,26 +342,35 @@ predecessor's 20/type `random.Random(2145)` protocol).
 | temporal-reasoning | 20 | 0.7500 (15) / 0.9000 | 0.8000 (16) / 0.9250 | 0.8000 (16) / 0.9167 | +0.0500 (+1) / +0.0167 | +0.0000 (0) / -0.0083 |
 | `as_of` accuracy | 20 | 0.5000 (10/20) | 0.5000 (10/20) | 0.5000 (10/20) | +0.0000 | +0.0000 |
 | `older_non_evidence_share` | 100 | 0.3800 (38/100) | 0.3800 (38/100) | 0.3800 (38/100) | +0.0000 | +0.0000 |
-| search latency p50 / p95 | 120 | — / 16.7 ms | 38.3 ms / 57.5 ms | 55.9 ms / 87.8 ms | +71.1 ms p95 | +30.3 ms p95 |
+| search latency p95* | 120 | 16.7 ms | 57.5 ms | 87.8 ms | +71.1 ms* | +30.3 ms* |
 
-*(Latency note: hybrid single-vector and chunked were scored on the same
-embedded database per question across two concurrent shards on a 4-core CPU;
-for the 29 questions resumed alone on an otherwise quiet box, chunked p50/p95
-was 69.8/100.9 ms and single-vector p50/p95 was 47.4/57.9 ms.)*
+*\*Latency qualification:* the hybrid p95 figures above were collected with a
+temporary dual-scoring measurement build running two concurrent shards on a
+4-core CPU (scoring chunked, then dropping `memory_chunks` and scoring
+single-vector on the same embedded database, with 29 questions resumed after a
+host reboot where chunked p95 was `100.9 ms` and single-vector p95 was
+`57.9 ms`), whereas lexical (`16.7 ms`) ran alone in a single process. Because
+the hybrid runs experienced 2-shard CPU contention, those p95 values are not
+directly comparable to an uncontended single-process run. The committed
+`memory-bench` binary runs one mode per invocation and reports `p95` only.
 
 ##### Diagnosis
 
-1. **Chunking did not materially move strict recall@5 on LongMemEval-S or
-   `long-document`.** All four recall@5 flips from lexical to hybrid
-   (`+c4a1ceb8` multi-session, `+eac54adc` temporal-reasoning, `+06f04340`
-   single-session-preference, `-195a1a1b` single-session-preference; net `+2`)
-   occurred identically in single-vector hybrid and chunked hybrid (`0` net
-   recall@5 change from adding chunks).
-2. **Chunking did improve top-of-list ranking precision (MRR@10):** hybrid
-   single-vector raised MRR@10 by `+0.0588` over lexical (`0.8302` ->
-   `0.8890`), and chunking added another `+0.0221` (`0.8890` -> `0.9111`),
-   bringing `multi-session` and `knowledge-update` MRR@10 to `1.0000` and
-   `single-session-preference` MRR@10 from `0.5855` -> `0.6296` -> `0.6955`.
+1. **Chunking did not materially move strict recall@5 on LongMemEval-S or the
+   fixture `long-document` class.** All four recall@5 flips from lexical to
+   hybrid (`+c4a1ceb8` multi-session, `+eac54adc` temporal-reasoning,
+   `+06f04340` single-session-preference, `-195a1a1b`
+   single-session-preference; net `+2`) occurred identically in single-vector
+   hybrid and chunked hybrid (`0` net recall@5 change from adding chunks).
+2. **Most of the MRR@10 gain came from embeddings rather than chunking:**
+   hybrid single-vector accounted for `+0.0588` of the `+0.0809` total MRR@10
+   gain over lexical (`0.8302` -> `0.8890`). Adding chunks shifted overall
+   MRR@10 by `+0.0221` (`0.8890` -> `0.9111`), which is within sample noise at
+   `n = 120` and moved classes in both directions: up on
+   `single-session-preference` (`+0.0659`), `knowledge-update` (`+0.0500`),
+   `single-session-user` (`+0.0250`), and `multi-session` (`+0.0250`), but
+   down on `single-session-assistant` (`1.0000` -> `0.9750`) and
+   `temporal-reasoning` (`0.9250` -> `0.9167`).
 3. **Why remaining LongMemEval-S misses survive chunking:** 9 of the 12
    remaining misses (4 `multi-session`, 4 `temporal-reasoning`, 1
    `knowledge-update`) already achieve `recall_frac@5` between `0.50` and
@@ -373,32 +386,39 @@ was 69.8/100.9 ms and single-vector p50/p95 was 47.4/57.9 ms.)*
 5. **Why `long-tail` and `para-gap` did not gain semantic hits:** the hard
    `SEMANTIC_MIN_SIMILARITY = 0.65` floor drops genuine rank-1 semantic hits
    just below `0.65` (`long-tail` tail chunk `0.6469`, `para-gap` `0.5965`).
-6. **Latency overhead:** hybrid search adds ~41 ms p95 for query embedding +
-   single-vector scan (`16.7 -> 57.5 ms`), and chunking adds another ~30 ms p95
-   (`57.5 -> 87.8 ms`) scanning ~640 chunk rows per question (note
-   `BruteForceIndex::nearest` also recomputes `text_sha` per scanned note).
-   On ingest, batching a full >2,048-char note (512 tokens) together with its
-   ~800-char chunks (~170 tokens) pads all chunks to 512 tokens inside ONNX;
-   separating the full-note call from the chunk batch cut pilot ingest wall
-   time ~1.6x with identical rankings.
+6. **Latency overhead:** hybrid search adds query embedding + vector-scan time
+   (`16.7 ms` lexical single-process vs `57.5 ms` single-vector / `87.8 ms`
+   chunked under 2-shard contention; note `BruteForceIndex::nearest` also
+   recomputes `text_sha` per scanned note). On ingest, batching a full
+   >2,048-char note (512 tokens) together with its ~800-char chunks (~170
+   tokens) pads all chunks to 512 tokens inside ONNX; a separate unmerged trial
+   change that split the full-note call from the chunk batch (not included in
+   this PR) cut 2-question pilot ingest wall time ~1.6x with identical
+   rankings.
 
 ##### Candidate tuning levers (options only — no ranking changes in this PR)
 
 Ranking weights, thresholds and `RRF_K` are intentionally untouched here so
 tuning is a separate decision. The measurements above point to four concrete
-options:
+options (none measured or recommended here):
 
 | Option | Mechanism | Evidence from this run | Trade-off / risk |
 |---|---|---|---|
-| **A. Asymmetric `LEG_WEIGHTS` or lexical tie-break** | Give `lexical` slightly higher weight than `semantic` (currently `1.0` / `1.0`), or break exact RRF ties on lexical rank before alphabetical title. | Directly fixes `exact-title` (`signing key`), where `exact-key` (`lex #1, sem #2`) tied `exact-near` (`lex #2, sem #1`) and lost purely on `"Checklist..." < "Harbor..."`. | Small change; needs re-check on LongMemEval-S MRR@10 to confirm paraphrase wins are kept. |
-| **B. Lexical exact/phrase guard for token queries** | For single-token / hyphenated identifier queries where FTS5 phrase matching finds exact hits, attenuate or gate semantic-only candidates. | Directly fixes `exact-token` (`quartz-falcon-17`), where `exact-noise` (`quartz-falcon-71`, cosine `0.7910`) bypassed FTS5 phrase matching via the semantic leg. | Must avoid suppressing legitimate single-word paraphrases (`sedan` -> `automobile`), where FTS5 has zero hits. |
+| **A. Asymmetric `LEG_WEIGHTS` or lexical tie-break** | Give `lexical` slightly higher weight than `semantic` (currently `1.0` / `1.0`), or break exact RRF ties on lexical rank before alphabetical title. | Would address `exact-title` (`signing key`), where `exact-key` (`lex #1, sem #2`) tied `exact-near` (`lex #2, sem #1`) and lost purely on `"Checklist..." < "Harbor..."`. | Needs re-check on LongMemEval-S MRR@10 to confirm paraphrase wins are kept. |
+| **B. Lexical exact/phrase guard for token queries** | For single-token / hyphenated identifier queries where FTS5 phrase matching finds exact hits, attenuate or gate semantic-only candidates. | Would address `exact-token` (`quartz-falcon-17`), where `exact-noise` (`quartz-falcon-71`, cosine `0.7910`) bypassed FTS5 phrase matching via the semantic leg. | Must avoid suppressing legitimate single-word paraphrases (`sedan` -> `automobile`), where FTS5 has zero hits. |
 | **C. Recalibrate `SEMANTIC_MIN_SIMILARITY` or query-relative gating** | Lower the fixed `0.65` floor (e.g. `0.55–0.60`) or combine a lower floor with a margin/top-k cap when lexical hits are absent. | `para-gap` (`0.5965` vs `0.5239` runner-up) and `long-tail` tail chunk (`0.6469` vs `0.5954` `long-noise`) both rank #1 semantically yet are dropped by `0.65`. | Lowering `0.65` alone admits more `exact-noise` / `temporal-old` false positives unless paired with A/B. |
 | **D. BGE query instruction prefix** | Prepend BGE's asymmetric query prefix (`"Represent this sentence for searching relevant passages: "`) for `BAAI/bge-*` queries in `search.rs`. | `BAAI/bge-small-en-v1.5` was trained asymmetrically with a query prefix; raw-query cosines compressed `para-gap` (`0.5965`) and `long-tail` (`0.6469`) under `0.65`. | Model-family-specific; requires re-measuring cosine separation across both fixture and LongMemEval-S before changing floors. |
 
 ##### Reproducing the `--features embeddings` run
 
 `--embed` is opt-in and off by default so `cargo test -p ua-memory` and CI
-stay lexical and never depend on local model files.
+stay lexical and never depend on local model files. When `--embed` is set,
+`Config.home` points at `--models-home` (defaulting to `$UA_HOME` or
+`~/.ua-rust`) for read-only model lookup (`local_embedder` never downloads or
+writes there), while all benchmark SQLite databases remain isolated in the
+temporary scratch directory. Each `--embed` report records
+`retrieval.embed` (`model`, `revision`, `identity`, `no_chunks`) and fails
+fast if any query falls back from `hybrid`.
 
 ```sh
 # 1. Fetch and verify the pinned local model into $UA_HOME/models (~/.ua-rust/models)
