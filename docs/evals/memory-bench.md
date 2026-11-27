@@ -231,17 +231,19 @@ bench / injected `Config.clock`, and PR #157 local ONNX embedder and
 2. **On LongMemEval-S (120-question stratified sample, 20 per type, seed 2145),
    hybrid embeddings lift strict recall@5 from `0.8833` to `0.9000` and MRR@10
    from `0.8302` to `0.8890` (single-vector) / `0.9111` (chunked), while search
-   p95 latency increases from `16.7 ms` (lexical, single-process) to `57.5 ms`
-   (single-vector) and `87.8 ms` (chunked, under 2-shard contention; see note
-   below).** At `n = 120`, one question is `≈ 0.83` percentage points
-   (`0.0083`), so the overall strict recall@5 delta (`0.8833` -> `0.9000`) is
-   `+2` net questions (`+3` wins / `-1` loss; within each 20-question class,
-   one question is `5.0` percentage points).
+   p95 latency was `16.7 ms` (lexical, single-process) vs `57.5 ms`
+   (single-vector) and `87.8 ms` (chunked) — both hybrid runs mostly under
+   2-shard contention (`91/120` questions; the `29` resumed questions ran
+   uncontended; see note below).** At `n = 120`, one question is
+   `≈ 0.83` percentage points (`0.0083`), so the overall strict recall@5 delta
+   (`0.8833` -> `0.9000`) is `+2` net questions (`+3` wins / `-1` loss; within
+   each 20-question class, one question is `5.0` percentage points).
 3. **On LongMemEval-S, chunking on top of single-vector hybrid moves strict
    recall@5 by `0` (`0.9000` -> `0.9000`, `0` wins / `0` losses across all 6
    LongMemEval types), adds `+0.0221` MRR@10 (`0.8890` -> `0.9111`, within
    sample noise at `n = 120`), and increases p95 search latency (`57.5 ms` ->
-   `87.8 ms`).**
+   `87.8 ms`, both hybrid runs mostly under 2-shard contention; see note
+   below).**
 4. **`as_of` accuracy is flat at `0.5000` (`10/20`) across all three modes**
    (lexical, hybrid single-vector, and hybrid chunked).
 
@@ -345,14 +347,16 @@ predecessor's 20/type `random.Random(2145)` protocol).
 | search latency p95* | 120 | 16.7 ms | 57.5 ms | 87.8 ms | +71.1 ms* | +30.3 ms* |
 
 *\*Latency qualification:* the hybrid p95 figures above were collected with a
-temporary dual-scoring measurement build running two concurrent shards on a
-4-core CPU (scoring chunked, then dropping `memory_chunks` and scoring
-single-vector on the same embedded database, with 29 questions resumed after a
-host reboot where chunked p95 was `100.9 ms` and single-vector p95 was
-`57.9 ms`), whereas lexical (`16.7 ms`) ran alone in a single process. Because
-the hybrid runs experienced 2-shard CPU contention, those p95 values are not
-directly comparable to an uncontended single-process run. The committed
-`memory-bench` binary runs one mode per invocation and reports `p95` only.
+temporary dual-scoring measurement build scoring chunked, then dropping
+`memory_chunks` and scoring single-vector on the same embedded database:
+mostly under 2-shard contention on a 4-core CPU (`91/120` questions), with the
+remaining `29` questions resumed uncontended after a host reboot (where
+chunked p95 was `100.9 ms` and single-vector p95 was `57.9 ms`), whereas
+lexical (`16.7 ms`) ran alone in a single process. Because most hybrid
+questions ran under 2-shard CPU contention on a non-committed dual-scoring
+build, those p95 values are not directly comparable to an uncontended
+single-process run. The committed `memory-bench` binary runs one mode per
+invocation and reports `p95` only.
 
 ##### Diagnosis
 
@@ -387,9 +391,10 @@ directly comparable to an uncontended single-process run. The committed
    `SEMANTIC_MIN_SIMILARITY = 0.65` floor drops genuine rank-1 semantic hits
    just below `0.65` (`long-tail` tail chunk `0.6469`, `para-gap` `0.5965`).
 6. **Latency overhead:** hybrid search adds query embedding + vector-scan time
-   (`16.7 ms` lexical single-process vs `57.5 ms` single-vector / `87.8 ms`
-   chunked under 2-shard contention; note `BruteForceIndex::nearest` also
-   recomputes `text_sha` per scanned note). On ingest, batching a full
+   (`16.7 ms` lexical single-process vs `57.5 ms` single-vector and `87.8 ms`
+   chunked, both hybrid runs mostly under 2-shard contention with `29/120`
+   resumed uncontended; note `BruteForceIndex::nearest` also recomputes
+   `text_sha` per scanned note). On ingest, batching a full
    >2,048-char note (512 tokens) together with its ~800-char chunks (~170
    tokens) pads all chunks to 512 tokens inside ONNX; a separate unmerged trial
    change that split the full-note call from the chunk batch (not included in
@@ -417,8 +422,8 @@ stay lexical and never depend on local model files. When `--embed` is set,
 `~/.ua-rust`) for read-only model lookup (`local_embedder` never downloads or
 writes there), while all benchmark SQLite databases remain isolated in the
 temporary scratch directory. Each `--embed` report records
-`retrieval.embed` (`model`, `revision`, `identity`, `no_chunks`) and fails
-fast if any query falls back from `hybrid`.
+`retrieval.embed` (`model`, `revision`, `identity`, `no_chunks`,
+`chunks_scored`) and fails fast if any query falls back from `hybrid`.
 
 ```sh
 # 1. Fetch and verify the pinned local model into $UA_HOME/models (~/.ua-rust/models)
