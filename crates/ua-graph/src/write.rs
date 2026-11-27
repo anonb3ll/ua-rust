@@ -30,12 +30,17 @@ pub const EVENT_EDGE_UPDATED: &str = "agent.graph.edge_updated";
 /// Ledger channel for edge retraction.
 pub const EVENT_EDGE_RETRACTED: &str = "agent.graph.edge_retracted";
 
-/// Maximum nodes visited during one write-time acyclicity check.
+/// Maximum nodes visited during one write-time acyclicity check (primary
+/// deterministic work bound).
 pub const CYCLE_CHECK_MAX_NODES: usize = 1_000;
-/// Maximum edges visited during one write-time acyclicity check.
+/// Maximum edges visited during one write-time acyclicity check (primary
+/// deterministic work bound).
 pub const CYCLE_CHECK_MAX_EDGES: usize = 5_000;
-/// Wall-clock deadline (ms) for one write-time acyclicity check.
-pub const CYCLE_CHECK_DEADLINE_MS: u64 = 50;
+/// Generous wall-clock backstop (ms) for one write-time acyclicity check.
+/// Deterministic node and edge caps are the primary limit; the wall-clock
+/// backstop interrupts a pathological query via SQLite's progress handler
+/// without falsely rejecting small writes under parallel CPU contention.
+pub const CYCLE_CHECK_DEADLINE_MS: u64 = 2_000;
 /// Sentinel `deadline_ms` value that disables the wall-clock deadline while
 /// keeping deterministic node and edge caps (used by schema migrations and
 /// bulk imports so slow disks never non-deterministically skip legacy rows).
@@ -292,17 +297,15 @@ pub fn check_acyclic<R: GraphRead>(
         bounds.max_edges,
         deadline_at,
     )?;
-    if !no_deadline && Instant::now() >= deadline_at {
-        return Err(UaError::invalid_code(
-            "cycle_check_bound_exceeded",
-            format!("acyclicity check for {kind} exceeded deadline of {} ms", bounds.deadline_ms),
-        ));
-    }
     match outcome {
         AcyclicReachOutcome::Acyclic => Ok(()),
         AcyclicReachOutcome::CycleDetected => Err(UaError::invalid_code(
             "cycle_detected",
             format!("asserting {kind} ({src_id} -> {dst_id}) would create a cycle"),
+        )),
+        AcyclicReachOutcome::BoundExceeded("deadline") => Err(UaError::invalid_code(
+            "cycle_check_bound_exceeded",
+            format!("acyclicity check for {kind} exceeded deadline of {} ms", bounds.deadline_ms),
         )),
         AcyclicReachOutcome::BoundExceeded(which) => Err(UaError::invalid_code(
             "cycle_check_bound_exceeded",

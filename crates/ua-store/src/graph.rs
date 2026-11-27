@@ -1999,12 +1999,7 @@ impl GraphRead for MigrationGraph<'_> {
         if Instant::now() >= deadline {
             return Ok(AcyclicReachOutcome::BoundExceeded("deadline"));
         }
-        let out =
-            bounded_acyclic_reach_sql_inner(self.conn, org_id, src_id, dst_id, kind, max_nodes, max_edges)?;
-        if Instant::now() >= deadline {
-            return Ok(AcyclicReachOutcome::BoundExceeded("deadline"));
-        }
-        Ok(out)
+        bounded_acyclic_reach_sql_inner(self.conn, org_id, src_id, dst_id, kind, max_nodes, max_edges)
     }
     fn eligible_degree(
         &mut self,

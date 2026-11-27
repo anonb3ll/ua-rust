@@ -486,7 +486,7 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
                     cycle_bounds: CycleCheckPolicy::all(CycleCheckBounds {
                         max_nodes: 5,
                         max_edges: 5_000,
-                        deadline_ms: 50,
+                        deadline_ms: ua_graph::CYCLE_CHECK_DEADLINE_MS,
                     }),
                 },
             )
@@ -505,7 +505,11 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
                 &n_new.id,
                 &nodes[0].id,
                 EdgeKind::DependsOn,
-                CycleCheckBounds { max_nodes: 1_000, max_edges: 4, deadline_ms: 50 },
+                CycleCheckBounds {
+                    max_nodes: 1_000,
+                    max_edges: 4,
+                    deadline_ms: ua_graph::CYCLE_CHECK_DEADLINE_MS,
+                },
             )
         })
         .unwrap_err();
@@ -528,6 +532,198 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
         .unwrap_err();
     assert_eq!(deadline_err.code(), "invalid_argument");
     assert_eq!(deadline_err.reason_code(), Some("cycle_check_bound_exceeded"));
+    assert!(deadline_err.to_string().contains("deadline"), "{deadline_err}");
+
+    // 5. Default wall-clock backstop is generous (>= 1,000 ms, work bounds are primary)
+    //    and a completed bounded answer is never discarded due to post-query scheduling delay,
+    //    while an in-flight SQL deadline interrupt maps to cycle_check_bound_exceeded.
+    const {
+        assert!(ua_graph::CYCLE_CHECK_DEADLINE_MS >= 1_000);
+    }
+    struct PreemptedRead {
+        outcome: ua_store::graph::AcyclicReachOutcome,
+        sleep_ms: u64,
+    }
+    impl ua_store::graph::GraphRead for PreemptedRead {
+        fn require_org_exists(&mut self, _: &str) -> ua_core::UaResult<()> {
+            unreachable!()
+        }
+        fn get_node_by_id(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &VisibilityScope,
+        ) -> ua_core::UaResult<Option<ua_store::graph::GraphNodeRow>> {
+            unreachable!()
+        }
+        fn get_node_by_external(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &VisibilityScope,
+        ) -> ua_core::UaResult<Option<ua_store::graph::GraphNodeRow>> {
+            unreachable!()
+        }
+        fn get_nodes_by_ids(
+            &mut self,
+            _: &str,
+            _: &[String],
+            _: &VisibilityScope,
+        ) -> ua_core::UaResult<Vec<ua_store::graph::GraphNodeRow>> {
+            unreachable!()
+        }
+        fn get_edge_by_id(
+            &mut self,
+            _: &str,
+            _: &str,
+        ) -> ua_core::UaResult<Option<ua_store::graph::GraphEdgeRow>> {
+            unreachable!()
+        }
+        fn get_edges_by_ids(
+            &mut self,
+            _: &str,
+            _: &[String],
+        ) -> ua_core::UaResult<Vec<ua_store::graph::GraphEdgeRow>> {
+            unreachable!()
+        }
+        fn get_edges_by_rowids(
+            &mut self,
+            _: &str,
+            _: &[i64],
+        ) -> ua_core::UaResult<Vec<(i64, ua_store::graph::GraphEdgeRow)>> {
+            unreachable!()
+        }
+        fn count_org_nodes(&mut self, _: &str) -> ua_core::UaResult<u64> {
+            unreachable!()
+        }
+        fn count_org_edges(&mut self, _: &str) -> ua_core::UaResult<u64> {
+            unreachable!()
+        }
+        fn count_node_live_edges_capped(&mut self, _: &str, _: &str, _: usize) -> ua_core::UaResult<usize> {
+            unreachable!()
+        }
+        fn with_deadline<F, T>(&mut self, _: std::time::Instant, f: F) -> ua_core::UaResult<T>
+        where
+            F: FnOnce(&mut Self) -> ua_core::UaResult<T>,
+        {
+            f(self)
+        }
+        fn adjacent_edges(
+            &mut self,
+            _: &ua_store::graph::AdjacencyQuery,
+        ) -> ua_core::UaResult<Vec<ua_store::graph::AdjacencyEntry>> {
+            unreachable!()
+        }
+        fn compact_adjacent(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: EdgeDirection,
+            _: &ua_store::graph::EdgeFilter,
+            _: &VisibilityScope,
+            _: usize,
+        ) -> ua_core::UaResult<Vec<ua_store::graph::CompactAdjEdge>> {
+            unreachable!()
+        }
+        fn with_compact_adjacent<F, T>(
+            &mut self,
+            _: &str,
+            _: EdgeDirection,
+            _: &ua_store::graph::EdgeFilter,
+            _: &VisibilityScope,
+            _: F,
+        ) -> ua_core::UaResult<T>
+        where
+            F: FnOnce(
+                &mut dyn FnMut(
+                    &str,
+                    EdgeDirection,
+                    usize,
+                    &mut Vec<ua_store::graph::CompactAdjEdge>,
+                ) -> ua_core::UaResult<()>,
+            ) -> ua_core::UaResult<T>,
+        {
+            unreachable!()
+        }
+        fn bounded_acyclic_reach(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: usize,
+            _: usize,
+            _: std::time::Instant,
+        ) -> ua_core::UaResult<ua_store::graph::AcyclicReachOutcome> {
+            if self.sleep_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.sleep_ms));
+            }
+            Ok(self.outcome.clone())
+        }
+        fn eligible_degree(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: EdgeDirection,
+            _: &ua_store::graph::EdgeFilter,
+            _: &VisibilityScope,
+            _: usize,
+        ) -> ua_core::UaResult<usize> {
+            unreachable!()
+        }
+        fn outgoing_live_targets_of_kind_into(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: usize,
+            _: &mut Vec<String>,
+        ) -> ua_core::UaResult<()> {
+            unreachable!()
+        }
+        fn exact_ppr_slice(
+            &mut self,
+            _: &str,
+            _: &ua_store::graph::EdgeFilter,
+            _: &VisibilityScope,
+            _: usize,
+            _: usize,
+        ) -> ua_core::UaResult<Option<ua_store::graph::ExactPprSlice>> {
+            unreachable!()
+        }
+    }
+
+    // Completed bounded proof is preserved even if thread was delayed past deadline_ms.
+    let mut completed =
+        PreemptedRead { outcome: ua_store::graph::AcyclicReachOutcome::Acyclic, sleep_ms: 15 };
+    check_acyclic(
+        &mut completed,
+        DEFAULT_ORG,
+        "a",
+        "b",
+        EdgeKind::DependsOn,
+        CycleCheckBounds { max_nodes: 1_000, max_edges: 5_000, deadline_ms: 5 },
+    )
+    .expect("already-completed bounded acyclic proof must not be discarded");
+
+    // In-flight SQL progress-handler deadline interrupt still fails closed with cycle_check_bound_exceeded.
+    let mut interrupted = PreemptedRead {
+        outcome: ua_store::graph::AcyclicReachOutcome::BoundExceeded("deadline"),
+        sleep_ms: 0,
+    };
+    let int_err = check_acyclic(
+        &mut interrupted,
+        DEFAULT_ORG,
+        "a",
+        "b",
+        EdgeKind::DependsOn,
+        CycleCheckBounds { max_nodes: 1_000, max_edges: 5_000, deadline_ms: 2_000 },
+    )
+    .unwrap_err();
+    assert_eq!(int_err.code(), "invalid_argument");
+    assert_eq!(int_err.reason_code(), Some("cycle_check_bound_exceeded"));
+    assert!(int_err.to_string().contains("exceeded deadline of 2000 ms"), "{int_err}");
 }
 
 #[test]
