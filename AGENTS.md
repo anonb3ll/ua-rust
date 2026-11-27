@@ -57,7 +57,13 @@ touched; CI runs the whole workspace (`cargo nextest run --workspace`).
 
 This repository is public. No personal names, e-mail addresses, home
 directory paths, host names, private-network addresses or real tokens in
-code, tests, docs or commits, and no team- or organization-specific roles or
-vocabulary. Use placeholders such as `builder-1`, `operator`, `~/projects`,
-`example.com`. `scripts/vocab-check.sh` runs in CI; an intended exception
-goes in `scripts/vocab-allowlist.txt` with a reason.
+tracked files (code, tests, docs), and no team- or organization-specific
+roles or vocabulary. Use placeholders such as `builder-1`, `operator`,
+`~/projects`, `example.com`. `scripts/vocab-check.sh` runs in CI; an intended
+exception goes in `scripts/vocab-allowlist.txt` with a reason.
+
+Commit *metadata* is a separate matter: a merge commit GitHub authors carries
+the merging account's identity, and the operator has accepted that his own
+address may appear in pull requests and merge commits (2026-11-27). Do not
+rewrite such a commit to scrub it and do not report it as a privacy finding —
+this rule is about tracked content, which is what `vocab-check.sh` reads.
