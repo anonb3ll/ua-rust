@@ -49,8 +49,8 @@ const WEBHOOK_SECRET: &str = "tenant-webhook-secret";
 
 /// Parts registered after this family's, which need its `org_id` columns
 /// (the continuity, holds, delegation, goal, proposal, policy
-/// authorization, dispatch and node queue families').
-const LATER: [&str; 14] = [
+/// authorization, dispatch, node queue and C2a depends_on migration parts).
+const LATER: [&str; 15] = [
     "organization.v1.tools.continuity",
     "continuity.v2.org_scope",
     "organization.v1.tools.holds",
@@ -65,6 +65,7 @@ const LATER: [&str; 14] = [
     "github.v3.policy_authorizations_org_scope",
     "dispatch.v4.org_scope",
     "node_queue.v2.org_scope",
+    "tasks.v3.depends_on_graph",
 ];
 
 fn old_parts() -> Vec<ua_store::Part> {
@@ -391,8 +392,9 @@ fn the_triggers_refuse_every_cross_organization_task_reference() {
     refused(
         "INSERT INTO deliverables (org_id, task_id, kind, title, repo, created_by, created_at) VALUES ('org-b', 10, 'file', 't', NULL, 'b', 'x')",
     );
-    // The same rows inside one organization are accepted.
-    h.sql("INSERT INTO task_dependencies (org_id, task_id, depends_on_task_id, created_by, created_at) VALUES ('default', 10, 10, 'a', 'x')").ok();
+    // The same rows inside one organization are accepted (for `task_dependencies`,
+    // default-org rows are frozen under C2a while non-default orgs stay on it).
+    h.sql("INSERT INTO task_dependencies (org_id, task_id, depends_on_task_id, created_by, created_at) VALUES ('org-b', 20, 20, 'b', 'x')").ok();
     h.sql("INSERT INTO deliverables (org_id, task_id, kind, title, repo, created_by, created_at) VALUES ('org-b', 20, 'file', 't', NULL, 'b', 'x')").unwrap();
 }
 

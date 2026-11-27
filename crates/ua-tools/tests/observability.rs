@@ -94,8 +94,14 @@ async fn doctor_reports_every_capability_without_secrets() {
     assert_eq!(status("search_provider"), "DORMANT");
     assert_eq!(status("http_bind"), "LIVE");
     assert!(["LIVE", "DORMANT"].contains(&status("ledger_chain")));
-    // No notes yet, or no embeddings feature: either way nothing to embed.
-    assert_eq!(status("semantic_search"), "DORMANT");
+    // Without the `embeddings` feature: DORMANT. With it and no fetched model
+    // yet: DEGRADED (never downloads inside system_doctor).
+    let expected_semantic = if cfg!(any(feature = "embeddings", feature = "embeddings-dynamic")) {
+        "DEGRADED"
+    } else {
+        "DORMANT"
+    };
+    assert_eq!(status("semantic_search"), expected_semantic);
     // Optional Cargo features: the row and build.features follow this build.
     let all_default = cfg!(feature = "code-intel")
         && cfg!(feature = "readability")
@@ -836,4 +842,25 @@ async fn another_organizations_ledger_line_is_neutral_and_reuses_the_last_full_v
             assert!(!text.contains(hidden), "{hidden} in {text}");
         }
     }
+}
+
+#[tokio::test]
+async fn doctor_marks_hub_auth_and_bind_misconfigured_when_auth_off_and_second_org_exists() {
+    let mut cfg = Config::for_home(std::env::temp_dir());
+    cfg.enforce_auth = false;
+    cfg.bind = "127.0.0.1:8788".parse().unwrap();
+    let hub = Hub::in_memory(cfg).unwrap();
+    let reg = builtin_registry();
+    let who = agent("builder-1", Profile::Developer);
+
+    // 1. Single-organization loopback parity: not MISCONFIGURED.
+    let single = call(&reg, &hub, &who, "system_doctor", json!({})).await;
+    assert_eq!(check(&single, "hub_auth")["status"], "DORMANT", "{single}");
+    assert_eq!(check(&single, "http_bind")["status"], "LIVE", "{single}");
+
+    // 2. Adding a second organization flips both to MISCONFIGURED for default-org readers.
+    add_org_b(&hub);
+    let multi = call(&reg, &hub, &who, "system_doctor", json!({})).await;
+    assert_eq!(check(&multi, "hub_auth")["status"], "MISCONFIGURED", "{multi}");
+    assert_eq!(check(&multi, "http_bind")["status"], "MISCONFIGURED", "{multi}");
 }

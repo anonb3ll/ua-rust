@@ -326,13 +326,13 @@ The contract prefers a refusal to a guess at every boundary.
 - **Auth off is a single-organization mode.** With `enforce_auth` off, an
   unauthenticated HTTP request resolves to `'default'` (*Resolution*) and reads
   every mailbox ([auth.md](auth.md), "With auth enforcement off"). That is
-  acceptable only while `'default'` is the only active organization on a
-  loopback hub. Once any other organization is active, a hub with
-  `enforce_auth` off must refuse to serve, and `ua doctor` must fail: loopback is
-  not a boundary when a second tenant is served by the same process. `#2807`
-  tracks the gap in the tree today, where the final `else` in
-  `ua-server/src/auth.rs` accepts the anonymous caller and `ua doctor` only
-  warns.
+  acceptable only while no other organization is served by the process: once
+  `orgs` holds any organization other than `'default'` (active or suspended) or
+  is unreadable, `ua serve` refuses to start, `ua doctor` fails `auth_lockout`
+  and `origin_security` even on loopback, unauthenticated non-public HTTP
+  requests fail `401`, and open anonymous event streams are revoked (`#2807`,
+  landed). Loopback is not a boundary when a second tenant is served by the same
+  process.
 - **An unavailable policy is not the default policy, in any organization.** The
   three readings of an unreadable policy collapse into one rule: if a configured
   policy file exists but cannot be read, is not valid YAML, or fails validation,
@@ -1213,7 +1213,10 @@ token issuance off until these proofs pass.
   Every later part that drops or rewrites rows records them in the same
   transaction (item 11 of [Converting a table family](#converting-a-table-family)).
   The importer writes legacy goals, links, proposals and items
-  to `default` and never copies a source `org_id`.
+  to `default` and never copies a source `org_id`. Since C2 slice b the
+  default organization's links are `serves_goal` graph edges, not
+  `task_goal_links` rows ([graph.md](graph.md#c2-slice-b-task_goal_links--serves_goal));
+  other organizations keep the table until #2790.
   `crates/ua-tools/tests/goals_tenant.rs` holds the upgrade and the
   isolation tests.
 - The managed-secret store and per-organization GitHub credentials: the

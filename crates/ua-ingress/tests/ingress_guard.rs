@@ -525,6 +525,7 @@ const EXCEPTION_POLICIES: &[(&str, &str)] = &[
     ("GITHUB_ENTERPRISE", "ua-tools/src/families/github/client.rs"),
     ("OBSIDIAN_LOCAL", "ua-tools/src/families/vault/obsidian.rs"),
     ("NOTIFY_WEBHOOK", "ua-tools/src/families/notify.rs"),
+    ("EMBEDDER_REMOTE", "ua-tools/src/families/memory/remote.rs"),
 ];
 
 /// Relaxations that only `ua-ingress` itself may write.
@@ -550,7 +551,7 @@ fn relaxed_policies_stay_with_their_one_consumer() {
         // A convenience, not the guard: an alias or other spacing gets past
         // this text match. The real guard is the constant check above, since
         // `Outbound::pinned` accepts only one of those relaxed policies.
-        if code.contains("Outbound::pinned(") {
+        if code.contains("Outbound::pinned(") || code.contains("Outbound::pinned_to_addrs(") {
             assert!(homes.iter().any(|h| shown.ends_with(h)), "{shown} builds a pinned client");
         }
     }

@@ -150,6 +150,18 @@ pub struct StreamAuth {
     transport: Transport,
 }
 
+/// Map a [`crate::auth::check_auth_policy`] error to a short stream revocation
+/// reason code. Policy denials (`auth_required_multi_org`) stay distinct from
+/// store or reader-pool unavailability (`auth_policy_unavailable`).
+fn auth_policy_revoke_reason(err: &ua_core::UaError) -> &'static str {
+    match err {
+        ua_core::UaError::Denied { reason_code, .. } if reason_code == "auth_required_multi_org" => {
+            "auth_required_multi_org"
+        }
+        _ => "auth_policy_unavailable",
+    }
+}
+
 impl StreamAuth {
     /// Capture the credential of the request that `caller` was built from.
     /// A bearer takes precedence over a session cookie, as in
@@ -194,7 +206,18 @@ impl StreamAuth {
         admitted_gated: bool,
     ) -> Result<(), &'static str> {
         let id = match &self.credential {
-            Credential::Unverified => AuthIdentity::in_default(self.label.clone(), self.kind, false),
+            Credential::Unverified => {
+                match crate::auth::check_auth_policy(&state.hub) {
+                    Ok(()) => state.auth_policy.record_ok(),
+                    Err(e) => {
+                        state.auth_policy.invalidate();
+                        let reason = auth_policy_revoke_reason(&e);
+                        tracing::warn!(error = %e, reason, "revoking unauthenticated event stream");
+                        return Err(reason);
+                    }
+                }
+                AuthIdentity::in_default(self.label.clone(), self.kind, false)
+            }
             Credential::Bearer(t) => {
                 resolve_bearer_blocking(state, t.expose_secret(), self.path).ok_or("credential_invalid")?
             }
@@ -492,6 +515,29 @@ impl Cursor {
                 _ = self.recheck.tick() => self.run_recheck().await,
                 recv = self.rx.recv() => match recv {
                     Ok(ev) => {
+                        if matches!(self.auth.credential, Credential::Unverified)
+                            && !self.state.hub.cfg().enforce_auth
+                            && !self.state.auth_policy.is_fresh()
+                        {
+                            let hub = self.state.hub.clone();
+                            let allowed = tokio::task::spawn_blocking(move || {
+                                crate::auth::check_auth_policy(&hub)
+                            })
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(ua_core::UaError::internal(format!("blocking task failed: {e}")))
+                            });
+                            match allowed {
+                                Ok(()) => self.state.auth_policy.record_ok(),
+                                Err(e) => {
+                                    self.state.auth_policy.invalidate();
+                                    let reason = auth_policy_revoke_reason(&e);
+                                    tracing::warn!(error = %e, reason, "revoking unauthenticated event stream");
+                                    self.revoke(reason);
+                                    continue;
+                                }
+                            }
+                        }
                         if AUTH_CHANNELS.contains(&ev.channel.as_str()) {
                             self.schedule_recheck();
                         }
@@ -697,6 +743,115 @@ mod tests {
         assert!(matches!(item, StreamItem::Revoked { reason: "credential_invalid" }), "{item:?}");
         let after = tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled");
         assert!(after.is_none(), "items after the revocation");
+    }
+
+    #[tokio::test]
+    async fn unverified_recheck_refuses_when_second_org_exists() {
+        let mut cfg = Config::for_home(std::env::temp_dir());
+        cfg.enforce_auth = false;
+        let state = AppState::new(Hub::in_memory(cfg).unwrap(), Arc::new(builtin_registry()));
+        let auth = local_auth();
+        let scope = EventScope::default();
+        assert_eq!(auth.recheck(&state, &scope, false), Ok(()));
+
+        state
+            .hub
+            .db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, status, allowed_profiles, created_at) \
+                     VALUES ('org-b', 'org-b', 'Org B', 'active', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        state.auth_policy.record_ok();
+        assert!(state.auth_policy.is_fresh());
+        assert_eq!(auth.recheck(&state, &scope, false), Err("auth_required_multi_org"));
+        assert!(!state.auth_policy.is_fresh(), "failed recheck must invalidate AuthPolicyCache");
+    }
+
+    #[test]
+    fn auth_policy_cache_ttl_is_bounded_and_revoke_reason_distinguishes_unavailable_reader() {
+        assert!(
+            crate::auth::AUTH_POLICY_CACHE_TTL <= Duration::from_secs(1)
+                && !crate::auth::AUTH_POLICY_CACHE_TTL.is_zero(),
+            "per-event auth policy cache TTL must be > 0 and <= 1s, got {:?}",
+            crate::auth::AUTH_POLICY_CACHE_TTL
+        );
+        assert_eq!(
+            auth_policy_revoke_reason(&ua_core::UaError::denied("auth_required_multi_org", "two orgs")),
+            "auth_required_multi_org"
+        );
+        assert_eq!(
+            auth_policy_revoke_reason(&ua_core::UaError::internal("no reader became free within 5s")),
+            "auth_policy_unavailable"
+        );
+        assert_eq!(
+            auth_policy_revoke_reason(&ua_core::UaError::denied("other_reason", "other")),
+            "auth_policy_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_stream_caches_auth_policy_briefly_and_reports_unavailable_distinctly() {
+        let mut cfg = Config::for_home(std::env::temp_dir());
+        cfg.enforce_auth = false;
+        let hub = Hub::in_memory(cfg).unwrap();
+        let mut state = AppState::new(hub, Arc::new(builtin_registry()));
+        state.auth_policy = Arc::new(crate::auth::AuthPolicyCache::with_ttl(Duration::from_millis(80)));
+
+        let c = cursor(&state, 0);
+        // First event populates the cache (single org -> Ok).
+        let first = append(&state, "test.keep");
+        let (item, c) =
+            tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled").unwrap();
+        assert!(matches!(item, StreamItem::Event(e) if e.seq == first));
+        assert!(state.auth_policy.is_fresh());
+
+        // Insert a second org while the cache is fresh: within TTL, the per-event cache avoids
+        // taking a pooled reader on every broadcast.
+        state
+            .hub
+            .db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, status, allowed_profiles, created_at) \
+                     VALUES ('org-b', 'org-b', 'Org B', 'active', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let cached = append(&state, "test.keep");
+        let (item, c) =
+            tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled").unwrap();
+        assert!(matches!(item, StreamItem::Event(e) if e.seq == cached));
+
+        // Buffer one more event before breaking `orgs`, then wait past TTL so the per-event
+        // check re-reads the store and hits a DB error rather than a multi-org denial.
+        append(&state, "test.keep");
+        state
+            .hub
+            .db()
+            .write(|tx| {
+                tx.execute_batch(
+                    "PRAGMA foreign_keys = OFF; \
+                     DROP TRIGGER IF EXISTS event_log_org_exists; \
+                     DROP TABLE orgs; \
+                     CREATE TABLE orgs (broken INTEGER);",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (item, c) =
+            tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled").unwrap();
+        assert!(matches!(item, StreamItem::Revoked { reason: "auth_policy_unavailable" }), "{item:?}");
+        assert!(!state.auth_policy.is_fresh());
+        let after = tokio::time::timeout(Duration::from_secs(5), c.next()).await.expect("stream stalled");
+        assert!(after.is_none(), "items after revocation");
     }
 
     /// A state whose policy file is `dir/policy.yaml`, holding `text`.

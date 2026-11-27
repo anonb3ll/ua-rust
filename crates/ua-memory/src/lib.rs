@@ -30,9 +30,11 @@
 //! off and search is lexical only.
 
 pub mod bench;
+pub mod chunks;
 pub mod embed;
 pub mod lifecycle;
 pub mod maintenance;
+pub mod models;
 pub(crate) mod note;
 pub mod rank;
 pub mod save;
@@ -40,7 +42,14 @@ pub mod schema;
 pub mod search;
 
 pub use embed::{
-    BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
+    BruteForceIndex, EmbedError, Embedder, HttpEmbedderFactory, HttpEmbedderRequest, NoopEmbedder,
+    VectorIndex, embed_batch, embedder_for, embedder_for_org, embedder_for_with_remote_flag, local_embedder,
+    openai_compat_revision, org_allows_remote_embedder, register_embedder, register_http_embedder_factory,
+    register_remote_embedder, vector_identity,
+};
+pub use maintenance::{
+    BackfillReport, EmbeddingCounts, MAX_BACKFILL_BATCHES_PER_PASS, backfill_all_orgs_step,
+    backfill_embeddings, backfill_embeddings_capped, embedding_freshness_counts,
 };
 pub use note::{Filter, mark_untrusted};
 /// The ORG-EVENT-DEFAULT rule for memory events, exposed so `ua-tools` can
@@ -48,14 +57,15 @@ pub use note::{Filter, mark_untrusted};
 #[doc(hidden)]
 pub use note::{ledger_label, ledger_originator, ledger_text};
 pub use schema::{
-    EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA, org_parts, schema_parts,
+    CHUNKS_SCHEMA, CHUNKS_TENANT_PART, EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA,
+    org_parts, schema_parts,
 };
 
 use ua_core::{UaError, UaResult};
 
-/// True when this build has the `embeddings` feature (fastembed). Without it
-/// every model resolves to [`NoopEmbedder`] and search is lexical only.
-pub const EMBEDDINGS_ENABLED: bool = cfg!(feature = "embeddings");
+/// True when this build has local ONNX embeddings (`embeddings` or
+/// `embeddings-dynamic` cargo feature).
+pub const EMBEDDINGS_ENABLED: bool = cfg!(any(feature = "embeddings", feature = "embeddings-dynamic"));
 
 /// Run blocking work (an embedding model) off the async runtime.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> UaResult<T> + Send + 'static) -> UaResult<T> {

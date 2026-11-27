@@ -31,12 +31,23 @@ A caller with no verified identity (a stdio process, or an HTTP request when
 where every process that can reach it is trusted: `ua doctor` fails a
 non-loopback bind without enforced auth.
 
-Because that caller resolves to the default organization and reads every
-mailbox, enforced auth is a single-organization mode. The contract requires a
-hub with `enforce_auth` off to refuse to serve once any other organization is
-active, so no tenant is reachable by an unauthenticated caller; the tree does
-not enforce that yet (`#2807`;
-[organization.md](organization.md#7-fail-closed)).
+**Single-organization only.** Unauthenticated HTTP mode (`enforce_auth = false`)
+is strictly single-organization. As soon as `orgs` contains any organization
+other than `default` (active or suspended), `ua serve` refuses to start,
+`ua doctor` fails `auth_lockout` and `origin_security` (even on loopback),
+`system_doctor` reports `MISCONFIGURED`, unauthenticated non-public HTTP
+requests fail closed immediately with `401`, and already-open anonymous event
+streams (`/api/events/stream`, `/ui/activity/stream`) are revoked with
+`auth_revoked` (the per-event stream check caches a passing single-organization
+result on `AppState` for up to 1 second to avoid taking a pooled reader on
+every broadcast, while HTTP requests and auth-channel re-checks bypass the
+cache and any failed check invalidates it immediately). A missing or unreadable
+`orgs` table fails closed the same way.
+
+**Local stdio (`ua mcp`).** `ua mcp` over stdio is a local hub-host caller
+(`Caller::local`) with direct access to the hub database; it does not run the
+HTTP `enforce_auth` / multi-organization check and stays an unverified local
+caller regardless of `enforce_auth` or organization count.
 
 There is no identity to scope a read by, so mailboxes and conversations are
 a **message board**:

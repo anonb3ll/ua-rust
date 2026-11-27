@@ -3,10 +3,11 @@
 
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
+use ua_core::time::Clock;
 use ua_core::{Caller, Config, UaError, UaResult};
 use ua_store::{Db, WriteTx};
 
-use super::embed::{self, BruteForceIndex, VectorIndex, embedder_for};
+use super::embed::{self, BruteForceIndex, VectorIndex, embedder_for_org};
 use super::note::{
     self, Eligibility, Note, assert_privileged, embed_text, emit, json_opt, json_text, ledger_label,
     ledger_text, linked_note, text_sha, write_author,
@@ -218,28 +219,43 @@ struct Outcome {
 /// are read, updated, superseded, contradicted or reported as similar.
 ///
 /// With an available embedder, a new note is embedded before the write so
-/// its vector commits with it; an updated note is re-embedded after the
-/// commit, and the vector is stored only if the note still holds that text.
+/// its single vector and (for long notes) chunk vectors commit with it; an
+/// updated note is re-embedded after the commit, and its vectors are stored
+/// only if the note still holds that text. If a re-embed fails, stale rows
+/// are left untouched and are never scored until backfilled.
 pub async fn save(db: &Db, cfg: &Config, caller: &Caller, req: SaveRequest) -> UaResult<Value> {
     let p = Prepared::new(caller, req)?;
-    let embedder = embedder_for(cfg);
-    let model = embedder.model().to_string();
+    let embedder = embedder_for_org(db, cfg, &caller.org_id).await;
+    let identity = embedder.identity();
 
-    // Create: embed first, so the vector commits with the note and the
-    // similar-note check can run. Failure only drops the semantic part.
-    let mut create_vec: Option<Vec<f32>> = None;
+    // Create: embed first, so the single vector and chunks commit with the
+    // note and the similar-note check can run. Failure only drops the semantic part.
+    let mut create_vecs: Option<(Vec<f32>, Vec<Vec<f32>>)> = None;
     let mut similar: Vec<Value> = Vec::new();
     if p.id.is_none() && embedder.available() {
-        let (e, text) = (embedder.clone(), embed_text(p.title.as_deref(), &p.content));
-        match blocking(move || Ok(embed::embed_one(&*e, text))).await? {
-            Ok(v) => create_vec = Some(v),
-            Err(err) => {
-                tracing::debug!(category = err.category, error = %err.message, "memory_save: no embedding")
+        let e = embedder.clone();
+        if p.check_only {
+            let text = embed_text(p.title.as_deref(), &p.content);
+            match blocking(move || Ok(embed::embed_one(&*e, text))).await? {
+                Ok(v) => create_vecs = Some((v, Vec::new())),
+                Err(err) => {
+                    tracing::debug!(category = err.category, error = %err.message, "memory_save: no embedding")
+                }
+            }
+        } else {
+            let (title, content) = (p.title.clone(), p.content.clone());
+            match blocking(move || Ok(embed::embed_note(&*e, title.as_deref(), &content))).await? {
+                Ok(vecs) => create_vecs = Some(vecs),
+                Err(err) => {
+                    tracing::debug!(category = err.category, error = %err.message, "memory_save: no embedding")
+                }
             }
         }
-        if let Some(v) = create_vec.clone() {
-            let (m, content, org) = (model.clone(), p.content.clone(), caller.org_id.clone());
-            similar = db.read_async(move |c| similar_notes(c, &org, &m, &v, &content)).await?;
+        if let Some((v, _)) = create_vecs.as_ref() {
+            let (v, m, content, org) =
+                (v.clone(), identity.clone(), p.content.clone(), caller.org_id.clone());
+            let now = cfg.clock.now();
+            similar = db.read_async(move |c| similar_notes(c, &org, &m, &v, &content, &now)).await?;
         }
     }
     if p.check_only {
@@ -248,30 +264,35 @@ pub async fn save(db: &Db, cfg: &Config, caller: &Caller, req: SaveRequest) -> U
 
     let org = caller.org_id.clone();
     let caller = caller.clone();
-    let m = model.clone();
+    let m = identity.clone();
     let creating = p.id.is_none();
-    let outcome = db.write_async(move |tx| write(tx, &caller, p, create_vec.map(|v| (m, v)))).await?;
+    let clock = cfg.clock;
+    let outcome = db
+        .write_async(move |tx| write(tx, &caller, p, create_vecs.map(|(v, chunks)| (m, v, chunks)), clock))
+        .await?;
     let mut result = outcome.result;
     if creating && result.get("similar").is_some() {
         result["similar"] = json!(similar);
     }
 
-    // Update: embed the committed text, and store the vector only if the
-    // note still holds that text.
+    // Update: embed the committed text (single vector plus chunks for long
+    // notes), and store the vectors only if the note still holds that text.
     if let Some((id, title, content)) = outcome.embed_after
         && embedder.available()
     {
         let text = embed_text(title.as_deref(), &content);
         let sha = text_sha(&text);
         let e = embedder.clone();
-        match blocking(move || Ok(embed::embed_one(&*e, text))).await? {
-            Ok(v) => {
+        match blocking(move || Ok(embed::embed_note(&*e, title.as_deref(), &content))).await? {
+            Ok((v, chunks)) => {
+                let clock = cfg.clock;
                 let res = db
                     .write_async(move |tx| {
                         if let Some(n) = note::fetch(tx, &org, &id)?
                             && text_sha(&embed_text(n.title.as_deref(), &n.content)) == sha
                         {
-                            embed::store_vector(tx, &org, &id, &model, &v, &sha)?;
+                            embed::store_vector(tx, &org, &id, &identity, &v, &sha, &clock.now())?;
+                            embed::store_chunks(tx, &org, &id, &identity, &chunks, &sha)?;
                         }
                         Ok(())
                     })
@@ -296,11 +317,12 @@ fn similar_notes(
     model: &str,
     v: &[f32],
     content: &str,
+    now: &str,
 ) -> UaResult<Vec<Value>> {
     let elig = Eligibility {
         org: org.to_string(),
         include_expired: true,
-        now: ua_core::time::now(),
+        now: now.to_string(),
         ..Default::default()
     };
     let hits = BruteForceIndex.nearest(conn, model, v, &elig.filter(), rank::DEDUP_THRESHOLD, 10)?;
@@ -424,30 +446,41 @@ fn idempotent_replay(tx: &WriteTx<'_>, caller: &Caller, p: &Prepared) -> UaResul
     Ok(Some(cached))
 }
 
-fn record_idempotency(tx: &WriteTx<'_>, caller: &Caller, p: &Prepared, result: &Value) -> UaResult<()> {
+fn record_idempotency(
+    tx: &WriteTx<'_>,
+    caller: &Caller,
+    p: &Prepared,
+    result: &Value,
+    ts: &str,
+) -> UaResult<()> {
     if let Some(key) = &p.idempotency_key {
         tx.execute(
             "INSERT INTO idempotency_keys (org_id, key, tool, result_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![caller.org_id, scoped_key(caller, key), SAVE_TOOL, result.to_string(), ua_core::time::now()],
+            params![caller.org_id, scoped_key(caller, key), SAVE_TOOL, result.to_string(), ts],
         )?;
     }
     Ok(())
 }
 
+type CreateVectors = (String, Vec<f32>, Vec<Vec<f32>>);
+
 fn write(
     tx: &mut WriteTx<'_>,
     caller: &Caller,
     p: Prepared,
-    vector: Option<(String, Vec<f32>)>,
+    vectors: Option<CreateVectors>,
+    clock: Clock,
 ) -> UaResult<Outcome> {
     note::require_org(tx, &caller.org_id)?;
     if let Some(cached) = idempotent_replay(tx, caller, &p)? {
         return Ok(Outcome { result: cached, embed_after: None });
     }
-    let ts = ua_core::time::now();
+    // Read inside the write transaction, so timestamps (and version
+    // history) follow commit order under contention.
+    let ts = clock.now();
     match p.id.clone() {
         Some(id) => update(tx, caller, p, &id, &ts),
-        None => create(tx, caller, p, vector, &ts),
+        None => create(tx, caller, p, vectors, &ts),
     }
 }
 
@@ -558,6 +591,7 @@ fn update(tx: &mut WriteTx<'_>, caller: &Caller, p: Prepared, id: &str, ts: &str
     let final_expires =
         if p.clear_expires_at { None } else { p.expires_at.clone().or_else(|| old.expires_at.clone()) };
 
+    let since = note::last_version(tx, org, id)?;
     tx.execute(
         "UPDATE memory SET content = ?1, title = ?2, tags = ?3, updated_at = ?4, updated_by = ?5, salience = ?6, \
          confidence = ?7, expires_at = ?8, epistemic = ?9, evidence = ?10, valid_from = ?11, contradicts = ?12 \
@@ -579,6 +613,7 @@ fn update(tx: &mut WriteTx<'_>, caller: &Caller, p: Prepared, id: &str, ts: &str
             org
         ],
     )?;
+    note::stamp_versions(tx, org, id, since, ts)?;
     let saved = note::require(tx, org, id)?;
     let revision = saved.revision();
     emit(
@@ -597,7 +632,7 @@ fn update(tx: &mut WriteTx<'_>, caller: &Caller, p: Prepared, id: &str, ts: &str
         &caller.label,
     )?;
     let result = json!({ "id": id, "created": false, "revision": revision });
-    record_idempotency(tx, caller, &p, &result)?;
+    record_idempotency(tx, caller, &p, &result, ts)?;
     let changed =
         (old.title.as_deref(), old.content.as_str()) != (saved.title.as_deref(), saved.content.as_str());
     let embed_after = changed.then(|| (id.to_string(), saved.title.clone(), saved.content.clone()));
@@ -644,7 +679,7 @@ fn create(
     tx: &mut WriteTx<'_>,
     caller: &Caller,
     p: Prepared,
-    vector: Option<(String, Vec<f32>)>,
+    vectors: Option<CreateVectors>,
     ts: &str,
 ) -> UaResult<Outcome> {
     let org = caller.org_id.as_str();
@@ -745,9 +780,10 @@ fn create(
         )?;
     }
 
-    if let Some((model, v)) = vector {
+    if let Some((model, v, chunks)) = vectors {
         let sha = text_sha(&embed_text(p.title.as_deref(), &p.content));
-        embed::store_vector(tx, org, &id, &model, &v, &sha)?;
+        embed::store_vector(tx, org, &id, &model, &v, &sha, ts)?;
+        embed::store_chunks(tx, org, &id, &model, &chunks, &sha)?;
     }
 
     let saved = note::require(tx, org, &id)?;
@@ -772,6 +808,6 @@ fn create(
     if let Some(sid) = &p.supersedes {
         result["supersedes"] = json!(sid);
     }
-    record_idempotency(tx, caller, &p, &result)?;
+    record_idempotency(tx, caller, &p, &result, ts)?;
     Ok(Outcome { result, embed_after: None })
 }

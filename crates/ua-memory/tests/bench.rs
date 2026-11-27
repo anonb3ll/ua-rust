@@ -1,5 +1,6 @@
-//! The fixture bench is the CI gate: same report twice, and no class under
-//! `bench/floor.json`. LongMemEval-S is not required here.
+//! The fixture bench is the CI gate: the same bytes twice, and no class under
+//! `bench/floor.json`. LongMemEval-S is not required here, and nothing here
+//! touches the network.
 
 use ua_memory::bench::{Kind, Options};
 
@@ -7,7 +8,12 @@ use ua_memory::bench::{Kind, Options};
 async fn fixture_bench_is_deterministic_and_meets_its_floor() {
     let a = ua_memory::bench::run(Options::fixture()).await.unwrap();
     let b = ua_memory::bench::run(Options::fixture()).await.unwrap();
-    assert_eq!(a, b, "fixture report changed between runs");
+    // Byte-identical output, as the binary prints it, not only equal values.
+    let (ja, jb) = (serde_json::to_string_pretty(&a).unwrap(), serde_json::to_string_pretty(&b).unwrap());
+    assert_eq!(ja, jb, "fixture report changed between runs");
+    assert_eq!(ua_memory::bench::table(&a), ua_memory::bench::table(&b));
+    // The run reads the injected clock, not the wall clock.
+    assert_eq!(a["clock"], ua_memory::bench::BENCH_NOW);
     // The recorded floor is the default build: lexical only, no embedder.
     #[cfg(not(feature = "embeddings"))]
     {
@@ -23,6 +29,7 @@ async fn longmemeval_absent_file_names_the_pin_and_the_command() {
         kind: Kind::LongMemEval,
         data: Some("missing-longmemeval.json".into()),
         limit: None,
+        ids: None,
     })
     .await
     .unwrap_err();

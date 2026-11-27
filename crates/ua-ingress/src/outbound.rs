@@ -228,8 +228,67 @@ fn send_error(e: reqwest::Error) -> OutboundError {
 // The resolver: the connect-time address check
 // ---------------------------------------------------------------------------
 
+/// Result of resolving an outbound URL's host once and classifying whether
+/// any resolved address is non-loopback (`is_remote`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEndpoint {
+    pub host: String,
+    pub addrs: Vec<SocketAddr>,
+    /// True if any resolved address is outside loopback (`!ua_ingress::addr::is_loopback`).
+    pub is_remote: bool,
+}
+
+/// Resolve `url`'s host once using system DNS (or parse an IP literal without
+/// DNS) and classify whether any resolved address is non-loopback.
+pub async fn resolve_endpoint(
+    url: &Url,
+    timeout: std::time::Duration,
+) -> Result<ResolvedEndpoint, OutboundError> {
+    resolve_endpoint_with_lookup(url, timeout, system_lookup()).await
+}
+
+/// Resolve `url`'s host once through `lookup` (for deterministic DNS-rebinding tests).
+pub async fn resolve_endpoint_with_lookup(
+    url: &Url,
+    timeout: std::time::Duration,
+    lookup: Lookup,
+) -> Result<ResolvedEndpoint, OutboundError> {
+    let port = url
+        .port_or_known_default()
+        .ok_or(OutboundError::UrlRefused { policy: "resolve", why: "URL has no known port" })?;
+    let host_str =
+        url.host_str().ok_or(OutboundError::UrlRefused { policy: "resolve", why: "URL has no host" })?;
+    let addrs: Vec<SocketAddr> = match url.host() {
+        Some(url::Host::Ipv4(ip)) => vec![SocketAddr::new(IpAddr::V4(ip), port)],
+        Some(url::Host::Ipv6(ip)) => vec![SocketAddr::new(IpAddr::V6(ip), port)],
+        Some(url::Host::Domain(domain)) => {
+            let pending = (lookup)(domain);
+            let raw = match tokio::time::timeout(timeout, pending).await {
+                Ok(Ok(addrs)) => addrs,
+                Ok(Err(e)) => {
+                    return Err(OutboundError::Lookup { host: domain.to_string(), why: e.to_string() });
+                }
+                Err(_) => {
+                    return Err(OutboundError::Lookup { host: domain.to_string(), why: "timed out".into() });
+                }
+            };
+            if raw.is_empty() {
+                return Err(OutboundError::Lookup { host: domain.to_string(), why: "no address".into() });
+            }
+            raw.into_iter().map(|a| SocketAddr::new(a.ip(), port)).collect()
+        }
+        None => {
+            return Err(OutboundError::UrlRefused { policy: "resolve", why: "URL has no host" });
+        }
+    };
+    let is_remote = addrs.iter().any(|a| !crate::addr::is_loopback(a.ip()));
+    Ok(ResolvedEndpoint { host: host_str.to_string(), addrs, is_remote })
+}
+
+/// A custom async lookup closure type for [`resolve_endpoint_with_lookup`].
+pub type Lookup = Arc<dyn Fn(&str) -> LookupFuture + Send + Sync>;
+
 type LookupFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
-type Lookup = Arc<dyn Fn(&str) -> LookupFuture + Send + Sync>;
 
 fn system_lookup() -> Lookup {
     Arc::new(|host: &str| {
@@ -420,6 +479,47 @@ impl Outbound {
     pub fn pinned(policy: Policy, origin: &Url) -> Result<Self, OutboundError> {
         policy.validate_pinned()?;
         let mut out = Self::build(policy, system_lookup(), policy.addresses, reqwest::Response::remote_addr)?;
+        out.pin = Some(origin.origin());
+        Ok(out)
+    }
+
+    /// A client for `policy` pinned to BOTH the origin of `origin` AND a
+    /// pre-resolved list of socket addresses `addrs` from a single earlier
+    /// lookup ([`resolve_endpoint`]). No second DNS lookup is ever performed,
+    /// so a hostname that re-resolves after the check cannot move the request
+    /// off the checked addresses. Every address in `addrs` is checked against
+    /// `policy.addresses` up front and re-checked against the peer address
+    /// after the response head arrives.
+    pub fn pinned_to_addrs(
+        policy: Policy,
+        origin: &Url,
+        addrs: Vec<SocketAddr>,
+    ) -> Result<Self, OutboundError> {
+        policy.validate_pinned()?;
+        if addrs.is_empty() {
+            return Err(OutboundError::Lookup {
+                host: origin.host_str().unwrap_or_default().to_string(),
+                why: "no address".into(),
+            });
+        }
+        let host = origin.host_str().unwrap_or_default().to_ascii_lowercase();
+        for a in &addrs {
+            if let Err(reason) = policy.addresses.check(a.ip()) {
+                return Err(OutboundError::AddressRefused { host, ip: a.ip(), reason });
+            }
+        }
+        let pinned_host = host.clone();
+        let pinned_addrs = Arc::new(addrs);
+        let lookup: Lookup = Arc::new(move |req_host: &str| {
+            let matches = req_host.eq_ignore_ascii_case(&pinned_host);
+            let out = if matches {
+                Ok((*pinned_addrs).clone())
+            } else {
+                Err(io::Error::other(format!("host {req_host:?} does not match pinned host")))
+            };
+            Box::pin(async move { out })
+        });
+        let mut out = Self::build(policy, lookup, policy.addresses, reqwest::Response::remote_addr)?;
         out.pin = Some(origin.origin());
         Ok(out)
     }
@@ -663,6 +763,35 @@ impl Response {
     pub async fn bytes_within(mut self, limit: usize) -> Result<Vec<u8>, OutboundError> {
         self.cap = self.cap.min(limit);
         Ok(self.read(true).await?.bytes)
+    }
+
+    /// Stream the response body directly into `writer`, enforcing the policy's
+    /// body cap and call deadline without buffering the full body in memory.
+    pub async fn stream_to_writer<W: io::Write>(mut self, writer: &mut W) -> Result<usize, OutboundError> {
+        let cap = self.cap;
+        let declared = self
+            .inner
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        if declared.is_some_and(|n| n > cap as u64) {
+            return Err(OutboundError::TooLarge { limit: cap });
+        }
+        let mut written = 0usize;
+        loop {
+            let chunk = match tokio::time::timeout_at(self.deadline, self.inner.chunk()).await {
+                Err(_) => return Err(OutboundError::Timeout),
+                Ok(Err(e)) => return Err(send_error(e)),
+                Ok(Ok(None)) => return Ok(written),
+                Ok(Ok(Some(chunk))) => chunk,
+            };
+            if chunk.len() > cap - written {
+                return Err(OutboundError::TooLarge { limit: cap });
+            }
+            writer.write_all(&chunk).map_err(|e| OutboundError::Body(e.to_string()))?;
+            written += chunk.len();
+        }
     }
 
     /// The whole body as JSON, or [`OutboundError::TooLarge`] past the cap.

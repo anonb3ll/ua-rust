@@ -582,14 +582,16 @@ async fn update(ctx: ToolCtx, a: UpdateArgs) -> UaResult<Value> {
             if let Some(p) = &project
                 && p != &old_project
             {
-                let goal_project: Option<String> = tx
-                    .query_row(
-                        "SELECT g.project FROM task_goal_links l JOIN goals g ON g.id = l.goal_id AND g.org_id = l.org_id \
-                         WHERE l.org_id = ?2 AND l.task_id = ?1",
-                        params![id, org],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
+                let goal_project: Option<String> = match super::goal_links::served_goal_tx(tx, &org, id)? {
+                    Some(goal) => tx
+                        .query_row(
+                            "SELECT project FROM goals WHERE org_id = ?1 AND id = ?2",
+                            params![org, goal],
+                            |r| r.get(0),
+                        )
+                        .optional()?,
+                    None => None,
+                };
                 if let Some(gp) = goal_project
                     && &gp != p
                 {
@@ -801,6 +803,10 @@ async fn delete(ctx: ToolCtx, a: DeleteArgs) -> UaResult<Value> {
             if org != ua_core::DEFAULT_ORG {
                 drop_orphaned_task_rows(tx, &org, &subtree)?;
             }
+            graph::retract_task_dependencies_for_subtree(tx, &org, &subtree)?;
+            // A deleted task stops serving its goal: its live `serves_goal`
+            // edge is closed (the old table's rows go by cascade).
+            super::goal_links::close_for_deleted_tasks(tx, &org, &subtree)?;
             let n = tx.execute("DELETE FROM tasks WHERE org_id = ?1 AND id = ?2", params![org, a.id])?;
             let children = subtree.len() - 1;
             emit(tx, &org, "agent.task.deleted", json!({ "task_id": a.id, "subtree": subtree }), &by)?;

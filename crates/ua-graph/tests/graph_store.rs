@@ -5,14 +5,16 @@ use rusqlite::Connection;
 use serde_json::json;
 use ua_core::{DEFAULT_ORG, UaError};
 use ua_graph::{
-    AssertEdgeRequest, AssertedByKind, CycleCheckBounds, CycleCheckPolicy, EdgeKind, EdgeState,
-    EnsureNodeRequest, KHopRequest, NeighborsRequest, NodeKind, OwnerType, PrincipalId, Provenance,
-    RetractEdgeRequest, SeedExpandRequest, SeedInput, ShortestPathRequest, SourceKind, Visibility,
-    WalkDirection, assert_edge, check_acyclic, graph_node_ensure, k_hop, neighbors, node_get, retract_edge,
-    schema_parts, seed_expand, shortest_path,
+    AssertEdgeRequest, AssertedByKind, CycleCheckBounds, CycleCheckPolicy, EVENT_EDGE_UPDATED,
+    EVENT_NODE_UPDATED, EdgeKind, EdgeState, EnsureNodeRequest, FieldPatch, KHopRequest, NeighborsRequest,
+    NodeKind, OwnerType, PrincipalId, Provenance, RetractEdgeRequest, SeedExpandRequest, SeedInput,
+    ShortestPathRequest, SourceKind, UpdateEdgeWeightRequest, UpdateNodeRequest, Visibility, WalkDirection,
+    assert_edge, check_acyclic, graph_edge_update_weight, graph_node_ensure, graph_node_update, k_hop,
+    neighbors, node_get, retract_edge, schema_parts, seed_expand, shortest_path,
 };
 use ua_store::graph::{
-    EdgeDirection, GraphRead, GraphRepo, NewGraphEdge, NewGraphNode, SqliteGraph, VisibilityScope,
+    EdgeDirection, GraphNodePatch, GraphRead, GraphRepo, NewGraphEdge, NewGraphNode, SqliteGraph,
+    VisibilityScope,
 };
 use ua_store::{Db, Part, ledger, org};
 
@@ -1535,6 +1537,13 @@ impl GraphRead for NoLedgerRepo<'_, '_> {
 }
 
 impl GraphRepo for NoLedgerRepo<'_, '_> {
+    fn find_node_by_id_internal(
+        &mut self,
+        org_id: &str,
+        id: &str,
+    ) -> ua_core::UaResult<Option<ua_store::graph::GraphNodeRow>> {
+        self.0.find_node_by_id_internal(org_id, id)
+    }
     fn find_node_by_external_internal(
         &mut self,
         org_id: &str,
@@ -1549,8 +1558,24 @@ impl GraphRepo for NoLedgerRepo<'_, '_> {
     ) -> ua_core::UaResult<(ua_store::graph::GraphNodeRow, bool)> {
         self.0.ensure_node(node)
     }
+    fn update_node_mutable(
+        &mut self,
+        org_id: &str,
+        id: &str,
+        patch: &GraphNodePatch,
+    ) -> ua_core::UaResult<Option<ua_store::graph::GraphNodeRow>> {
+        self.0.update_node_mutable(org_id, id, patch)
+    }
     fn insert_edge(&mut self, edge: &NewGraphEdge) -> ua_core::UaResult<ua_store::graph::GraphEdgeRow> {
         self.0.insert_edge(edge)
+    }
+    fn update_edge_weight(
+        &mut self,
+        org_id: &str,
+        edge_id: &str,
+        weight: f64,
+    ) -> ua_core::UaResult<Option<ua_store::graph::GraphEdgeRow>> {
+        self.0.update_edge_weight(org_id, edge_id, weight)
     }
     fn insert_nodes_batch(&mut self, nodes: &[NewGraphNode]) -> ua_core::UaResult<usize> {
         self.0.insert_nodes_batch(nodes)
@@ -2547,4 +2572,818 @@ fn graph_org_counts_no_delete_trigger_preserves_quota_accounting() {
     // Counters remain intact after the aborted DELETE.
     assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_nodes(DEFAULT_ORG)).unwrap(), 2);
     assert_eq!(db.read_mut(|c| SqliteGraph::new(c).count_org_edges(DEFAULT_ORG)).unwrap(), 1);
+}
+
+#[test]
+fn graph_node_update_records_same_tx_event_rolls_back_atomically_and_keeps_identity_immutable() {
+    let db = open_graph_db();
+    let orig = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "upd-1");
+
+    // 1. No-op update writes neither row change nor ledger event.
+    let (same, changed) = db
+        .write(|tx| {
+            graph_node_update(
+                tx,
+                UpdateNodeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    node_id: orig.id.clone(),
+                    actor: PrincipalId::new("builder-1").unwrap(),
+                    actor_kind: AssertedByKind::Agent,
+                    visibility: None,
+                    team_id: FieldPatch::Unchanged,
+                    owner_type: FieldPatch::Unchanged,
+                    owner_id: FieldPatch::Unchanged,
+                    display_label: FieldPatch::Unchanged,
+                    meta_json: None,
+                    archived_at: FieldPatch::Unchanged,
+                },
+            )
+        })
+        .unwrap();
+    assert!(!changed);
+    assert_eq!(same, orig);
+    let ev_count: i64 = db
+        .read(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM event_log WHERE channel = ?1", [EVENT_NODE_UPDATED], |r| {
+                r.get(0)
+            })?)
+        })
+        .unwrap();
+    assert_eq!(ev_count, 0);
+
+    // 2. Rolled-back transaction reverts BOTH the graph_nodes update AND event_log row.
+    let rb: Result<(), UaError> = db.write(|tx| {
+        let (_, ch) = graph_node_update(
+            tx,
+            UpdateNodeRequest {
+                org_id: DEFAULT_ORG.into(),
+                node_id: orig.id.clone(),
+                actor: PrincipalId::new("builder-1").unwrap(),
+                actor_kind: AssertedByKind::Agent,
+                visibility: Some(Visibility::Private),
+                team_id: FieldPatch::Unchanged,
+                owner_type: FieldPatch::Set(OwnerType::Agent),
+                owner_id: FieldPatch::Set("builder-1".into()),
+                display_label: FieldPatch::Set("rolled-back-label".into()),
+                meta_json: Some(json!({"rb": true})),
+                archived_at: FieldPatch::Unchanged,
+            },
+        )?;
+        assert!(ch);
+        Err(UaError::invalid("force rollback"))
+    });
+    assert!(rb.is_err());
+    let after_rb = db
+        .read_mut(|c| SqliteGraph::new(c).get_node_by_id(DEFAULT_ORG, &orig.id, &VisibilityScope::org_only()))
+        .unwrap()
+        .expect("node still org-visible after rollback");
+    assert_eq!(after_rb.visibility, "org");
+    assert_eq!(after_rb.display_label, orig.display_label);
+    let ev_count_after_rb: i64 = db
+        .read(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM event_log WHERE channel = ?1", [EVENT_NODE_UPDATED], |r| {
+                r.get(0)
+            })?)
+        })
+        .unwrap();
+    assert_eq!(ev_count_after_rb, 0, "rolled-back node update must not leave a ledger event");
+
+    // 3. Committed update updates mutable fields, records attributed event with
+    //    changed_fields + safe old/new values (omitting display_label / meta_json
+    //    content from event payload), and leaves identity/provenance untouched.
+    let archive_ts = ua_core::time::now();
+    let (updated, changed) = db
+        .write(|tx| {
+            graph_node_update(
+                tx,
+                UpdateNodeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    node_id: orig.id.clone(),
+                    actor: PrincipalId::new("operator-1").unwrap(),
+                    actor_kind: AssertedByKind::Person,
+                    visibility: Some(Visibility::Private),
+                    team_id: FieldPatch::Clear,
+                    owner_type: FieldPatch::Set(OwnerType::Human),
+                    owner_id: FieldPatch::Set("operator-1".into()),
+                    display_label: FieldPatch::Set("sensitive-title-text".into()),
+                    meta_json: Some(json!({"secret_note": "do-not-log-in-event"})),
+                    archived_at: FieldPatch::Set(archive_ts.clone()),
+                },
+            )
+        })
+        .unwrap();
+    assert!(changed);
+    assert_eq!(updated.visibility, "private");
+    assert_eq!(updated.owner_type.as_deref(), Some("human"));
+    assert_eq!(updated.owner_id.as_deref(), Some("operator-1"));
+    assert_eq!(updated.display_label.as_deref(), Some("sensitive-title-text"));
+    assert_eq!(updated.meta_json, r#"{"secret_note":"do-not-log-in-event"}"#);
+    assert_eq!(updated.archived_at.as_deref(), Some(archive_ts.as_str()));
+    // Identity & provenance columns remain identical.
+    assert_eq!(updated.id, orig.id);
+    assert_eq!(updated.org_id, orig.org_id);
+    assert_eq!(updated.kind, orig.kind);
+    assert_eq!(updated.external_id, orig.external_id);
+    assert_eq!(updated.asserted_by, orig.asserted_by);
+    assert_eq!(updated.asserted_by_kind, orig.asserted_by_kind);
+    assert_eq!(updated.source_kind, orig.source_kind);
+    assert_eq!(updated.source_ref, orig.source_ref);
+    assert_eq!(updated.created_at, orig.created_at);
+
+    let (originator, payload_str): (String, String) = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT originator, payload FROM event_log WHERE channel = ?1 ORDER BY seq DESC LIMIT 1",
+                [EVENT_NODE_UPDATED],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(originator, "operator-1");
+    assert!(
+        !payload_str.contains("sensitive-title-text"),
+        "event must not leak display_label: {payload_str}"
+    );
+    assert!(!payload_str.contains("do-not-log-in-event"), "event must not leak meta_json: {payload_str}");
+    let ev: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
+    assert_eq!(ev["org_id"], DEFAULT_ORG);
+    assert_eq!(ev["node_id"], orig.id);
+    assert_eq!(ev["kind"], "memory_note");
+    assert_eq!(ev["updated_by"], "operator-1");
+    assert_eq!(ev["updated_by_kind"], "person");
+    assert_eq!(ev["old_visibility"], "org");
+    assert_eq!(ev["new_visibility"], "private");
+    assert_eq!(ev["old_archived_at"], serde_json::Value::Null);
+    assert_eq!(ev["new_archived_at"], archive_ts);
+    let fields: Vec<&str> =
+        ev["changed_fields"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+    for expected in ["visibility", "owner_type", "owner_id", "display_label", "meta_json", "archived_at"] {
+        assert!(fields.contains(&expected), "missing {expected} in {fields:?}");
+    }
+
+    // 4. Schema immutability triggers still refuse modifying identity/provenance columns.
+    for sql in [
+        "UPDATE graph_nodes SET kind = 'task' WHERE id = ?1",
+        "UPDATE graph_nodes SET external_id = 'mutated' WHERE id = ?1",
+        "UPDATE graph_nodes SET asserted_by = 'someone-else' WHERE id = ?1",
+        "UPDATE graph_nodes SET created_at = '2020-01-01T00:00:00+00:00' WHERE id = ?1",
+    ] {
+        assert!(
+            db.write(|tx| {
+                tx.execute(sql, [&orig.id])?;
+                Ok(())
+            })
+            .is_err(),
+            "immutability trigger must still reject {sql}"
+        );
+    }
+
+    // 5. Validation guards: team without team_id, private without owner, future archived_at.
+    let bad_team = db
+        .write(|tx| {
+            graph_node_update(
+                tx,
+                UpdateNodeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    node_id: orig.id.clone(),
+                    actor: PrincipalId::new("operator-1").unwrap(),
+                    actor_kind: AssertedByKind::Person,
+                    visibility: Some(Visibility::Team),
+                    team_id: FieldPatch::Clear,
+                    owner_type: FieldPatch::Unchanged,
+                    owner_id: FieldPatch::Unchanged,
+                    display_label: FieldPatch::Unchanged,
+                    meta_json: None,
+                    archived_at: FieldPatch::Unchanged,
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(bad_team.code(), "invalid_argument");
+
+    let future_arch = db
+        .write(|tx| {
+            graph_node_update(
+                tx,
+                UpdateNodeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    node_id: orig.id.clone(),
+                    actor: PrincipalId::new("operator-1").unwrap(),
+                    actor_kind: AssertedByKind::Person,
+                    visibility: None,
+                    team_id: FieldPatch::Unchanged,
+                    owner_type: FieldPatch::Unchanged,
+                    owner_id: FieldPatch::Unchanged,
+                    display_label: FieldPatch::Unchanged,
+                    meta_json: None,
+                    archived_at: FieldPatch::Set("2099-01-01T00:00:00+00:00".into()),
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(future_arch.code(), "invalid_argument");
+    assert_eq!(future_arch.reason_code(), Some("future_archived_at"));
+
+    // 6. Length and control-character limits on team_id and owner_id (both update and ensure).
+    let long_id = "x".repeat(129);
+    for (bad_team, bad_owner) in [
+        (FieldPatch::Set(long_id.clone()), FieldPatch::Unchanged),
+        (FieldPatch::Set("bad\nteam".into()), FieldPatch::Unchanged),
+        (FieldPatch::Set("bad\x00team".into()), FieldPatch::Unchanged),
+        (FieldPatch::Unchanged, FieldPatch::Set(long_id.clone())),
+        (FieldPatch::Unchanged, FieldPatch::Set("bad\x1bowner".into())),
+    ] {
+        let err = db
+            .write(|tx| {
+                graph_node_update(
+                    tx,
+                    UpdateNodeRequest {
+                        org_id: DEFAULT_ORG.into(),
+                        node_id: orig.id.clone(),
+                        actor: PrincipalId::new("operator-1").unwrap(),
+                        actor_kind: AssertedByKind::Person,
+                        visibility: None,
+                        team_id: bad_team,
+                        owner_type: FieldPatch::Unchanged,
+                        owner_id: bad_owner,
+                        display_label: FieldPatch::Unchanged,
+                        meta_json: None,
+                        archived_at: FieldPatch::Unchanged,
+                    },
+                )
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "invalid_argument");
+    }
+    let bad_ensure_team = db
+        .write(|tx| {
+            graph_node_ensure(
+                tx,
+                EnsureNodeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    kind: NodeKind::MemoryNote,
+                    external_id: "bad-tid-ensure".into(),
+                    display_label: None,
+                    visibility: Visibility::Team,
+                    team_id: Some(long_id),
+                    owner_type: None,
+                    owner_id: None,
+                    provenance: prov_agent("builder-1"),
+                    meta_json: None,
+                    max_nodes_per_org: 0,
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(bad_ensure_team.code(), "invalid_argument");
+}
+
+#[test]
+fn graph_node_update_non_default_org_redacts_ledger_and_enforces_system_actor_and_isolation() {
+    let db = open_graph_db();
+    let default_node = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "def-iso");
+    let org_b_node = ensure_org_node(&db, "org-b", NodeKind::MemoryNote, "orgb-secret-ext");
+
+    // 1. Cross-org isolation: updating default_node as org-b returns not_found.
+    let cross_err = db
+        .write(|tx| {
+            graph_node_update(
+                tx,
+                UpdateNodeRequest {
+                    org_id: "org-b".into(),
+                    node_id: default_node.id.clone(),
+                    actor: PrincipalId::system(),
+                    actor_kind: AssertedByKind::System,
+                    visibility: None,
+                    team_id: FieldPatch::Unchanged,
+                    owner_type: FieldPatch::Unchanged,
+                    owner_id: FieldPatch::Unchanged,
+                    display_label: FieldPatch::Set("nope".into()),
+                    meta_json: None,
+                    archived_at: FieldPatch::Unchanged,
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(cross_err.code(), "not_found");
+
+    // 2. Pre-#2790 fence: non-system actor in non-default org is refused.
+    let non_sys_err = db
+        .write(|tx| {
+            graph_node_update(
+                tx,
+                UpdateNodeRequest {
+                    org_id: "org-b".into(),
+                    node_id: org_b_node.id.clone(),
+                    actor: PrincipalId::new("builder-b").unwrap(),
+                    actor_kind: AssertedByKind::Agent,
+                    visibility: None,
+                    team_id: FieldPatch::Unchanged,
+                    owner_type: FieldPatch::Unchanged,
+                    owner_id: FieldPatch::Unchanged,
+                    display_label: FieldPatch::Set("nope".into()),
+                    meta_json: None,
+                    archived_at: FieldPatch::Unchanged,
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(non_sys_err.code(), "denied");
+    assert_eq!(non_sys_err.reason_code(), Some("principal_id_required"));
+
+    // 3. System update in org-b succeeds and redacts ORG-EVENT-DEFAULT fields.
+    let ts = ua_core::time::now();
+    let (_, changed) = db
+        .write(|tx| {
+            graph_node_update(
+                tx,
+                UpdateNodeRequest {
+                    org_id: "org-b".into(),
+                    node_id: org_b_node.id.clone(),
+                    actor: PrincipalId::system(),
+                    actor_kind: AssertedByKind::System,
+                    visibility: Some(Visibility::Team),
+                    team_id: FieldPatch::Set("secret-team-99".into()),
+                    owner_type: FieldPatch::Set(OwnerType::Agent),
+                    owner_id: FieldPatch::Set("secret-owner-99".into()),
+                    display_label: FieldPatch::Set("secret-orgb-label".into()),
+                    meta_json: Some(json!({"confidential": "secret-meta-99"})),
+                    archived_at: FieldPatch::Set(ts),
+                },
+            )
+        })
+        .unwrap();
+    assert!(changed);
+
+    let (originator, payload_str): (String, String) = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT originator, payload FROM event_log WHERE channel = ?1 ORDER BY seq DESC LIMIT 1",
+                [EVENT_NODE_UPDATED],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(originator, "system");
+    for secret in
+        ["secret-orgb-label", "secret-meta-99", "secret-team-99", "secret-owner-99", "orgb-secret-ext"]
+    {
+        assert!(!payload_str.contains(secret), "non-default event leaked {secret}: {payload_str}");
+    }
+    let ev: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
+    assert_eq!(ev["org_id"], "org-b");
+    assert_eq!(ev["node_id"], org_b_node.id);
+    assert_eq!(ev["kind"], "memory_note");
+    assert_eq!(ev["old_visibility"], "org");
+    assert_eq!(ev["new_visibility"], "team");
+    assert_eq!(ev["old_archived"], false);
+    assert_eq!(ev["new_archived"], true);
+    assert!(ev.get("updated_by").is_none());
+    assert!(ev.get("display_label").is_none());
+    assert!(ev.get("meta_json").is_none());
+}
+
+#[test]
+fn graph_node_update_visibility_and_archive_changes_reflect_in_traversals() {
+    let db = open_graph_db();
+    let seed = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "vis-seed");
+    let target = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "vis-target");
+
+    db.write(|tx| {
+        assert_edge(
+            tx,
+            AssertEdgeRequest {
+                org_id: DEFAULT_ORG.into(),
+                src_id: seed.id.clone(),
+                dst_id: target.id.clone(),
+                kind: EdgeKind::Extends,
+                assertion_scope: String::new(),
+                state: EdgeState::Active,
+                weight: 1.0,
+                provenance: prov_agent("builder-1"),
+                valid_from: None,
+                valid_to: None,
+                meta_json: None,
+                scope: VisibilityScope::org_only(),
+                generic: true,
+                max_edges_per_org: 0,
+                max_live_edges_per_node: 0,
+                cycle_bounds: CycleCheckPolicy::default(),
+            },
+        )
+    })
+    .unwrap();
+
+    let outsider = VisibilityScope::for_principal("agent", "outsider", vec![]);
+    let owner = VisibilityScope::for_principal("agent", "owner-1", vec![]);
+    let teammate = VisibilityScope::for_principal("agent", "teammate-1", vec!["team-alpha".into()]);
+
+    let can_traverse = |scope: &VisibilityScope| -> bool {
+        let got_node = db
+            .read_mut(|c| {
+                node_get(&mut SqliteGraph::new(c), DEFAULT_ORG, Some(&target.id), None, None, scope)
+            })
+            .is_ok();
+        let nbrs = db
+            .read_mut(|c| {
+                neighbors(
+                    &mut SqliteGraph::new(c),
+                    NeighborsRequest {
+                        org_id: DEFAULT_ORG.into(),
+                        node_id: Some(seed.id.clone()),
+                        kind: None,
+                        external_id: None,
+                        direction: EdgeDirection::Out,
+                        edge_kinds: vec![],
+                        node_kinds: vec![],
+                        as_of: None,
+                        include_proposed: false,
+                        limit: Some(10),
+                        cursor: None,
+                        deadline_ms: None,
+                        scope: scope.clone(),
+                    },
+                )
+            })
+            .unwrap();
+        let kh = db
+            .read_mut(|c| {
+                k_hop(
+                    &mut SqliteGraph::new(c),
+                    KHopRequest {
+                        org_id: DEFAULT_ORG.into(),
+                        seed_ids: vec![seed.id.clone()],
+                        max_hops: Some(1),
+                        direction: EdgeDirection::Out,
+                        edge_kinds: vec![],
+                        node_kinds: vec![],
+                        as_of: None,
+                        include_proposed: false,
+                        max_nodes: None,
+                        max_edges: None,
+                        max_degree_per_node: None,
+                        max_visited_edges: None,
+                        skip_hubs_over: None,
+                        deadline_ms: None,
+                        scope: scope.clone(),
+                    },
+                )
+            })
+            .unwrap();
+        let has_nbr = nbrs.neighbors.iter().any(|n| n.node.id == target.id);
+        let has_kh = kh.nodes.iter().any(|n| n.id == target.id);
+        assert_eq!(got_node, has_nbr, "node_get and neighbors must agree");
+        assert_eq!(got_node, has_kh, "node_get and k_hop must agree");
+        got_node
+    };
+
+    // Initially `org`: visible to everyone.
+    assert!(can_traverse(&outsider));
+    assert!(can_traverse(&owner));
+
+    // Flip `org` -> `private` (owned by `owner-1`): outsider loses visibility; owner retains it.
+    db.write(|tx| {
+        graph_node_update(
+            tx,
+            UpdateNodeRequest {
+                org_id: DEFAULT_ORG.into(),
+                node_id: target.id.clone(),
+                actor: PrincipalId::new("owner-1").unwrap(),
+                actor_kind: AssertedByKind::Agent,
+                visibility: Some(Visibility::Private),
+                team_id: FieldPatch::Clear,
+                owner_type: FieldPatch::Set(OwnerType::Agent),
+                owner_id: FieldPatch::Set("owner-1".into()),
+                display_label: FieldPatch::Unchanged,
+                meta_json: None,
+                archived_at: FieldPatch::Unchanged,
+            },
+        )
+    })
+    .unwrap();
+    assert!(!can_traverse(&outsider), "outsider must not see private node");
+    assert!(can_traverse(&owner), "owner must still see private node");
+
+    // Flip `private` -> `team` (`team-alpha`): teammate sees it; outsider & non-member owner do not.
+    db.write(|tx| {
+        graph_node_update(
+            tx,
+            UpdateNodeRequest {
+                org_id: DEFAULT_ORG.into(),
+                node_id: target.id.clone(),
+                actor: PrincipalId::new("owner-1").unwrap(),
+                actor_kind: AssertedByKind::Agent,
+                visibility: Some(Visibility::Team),
+                team_id: FieldPatch::Set("team-alpha".into()),
+                owner_type: FieldPatch::Clear,
+                owner_id: FieldPatch::Clear,
+                display_label: FieldPatch::Unchanged,
+                meta_json: None,
+                archived_at: FieldPatch::Unchanged,
+            },
+        )
+    })
+    .unwrap();
+    assert!(!can_traverse(&outsider));
+    assert!(!can_traverse(&owner));
+    assert!(can_traverse(&teammate));
+
+    // Archive node: hidden from everyone including teammate.
+    db.write(|tx| {
+        graph_node_update(
+            tx,
+            UpdateNodeRequest {
+                org_id: DEFAULT_ORG.into(),
+                node_id: target.id.clone(),
+                actor: PrincipalId::new("owner-1").unwrap(),
+                actor_kind: AssertedByKind::Agent,
+                visibility: None,
+                team_id: FieldPatch::Unchanged,
+                owner_type: FieldPatch::Unchanged,
+                owner_id: FieldPatch::Unchanged,
+                display_label: FieldPatch::Unchanged,
+                meta_json: None,
+                archived_at: FieldPatch::Set(ua_core::time::now()),
+            },
+        )
+    })
+    .unwrap();
+    assert!(!can_traverse(&teammate), "archived node must be excluded from traversals");
+
+    // Unarchive + flip back to `org`: visible to everyone again.
+    db.write(|tx| {
+        graph_node_update(
+            tx,
+            UpdateNodeRequest {
+                org_id: DEFAULT_ORG.into(),
+                node_id: target.id.clone(),
+                actor: PrincipalId::new("owner-1").unwrap(),
+                actor_kind: AssertedByKind::Agent,
+                visibility: Some(Visibility::Org),
+                team_id: FieldPatch::Clear,
+                owner_type: FieldPatch::Clear,
+                owner_id: FieldPatch::Clear,
+                display_label: FieldPatch::Unchanged,
+                meta_json: None,
+                archived_at: FieldPatch::Clear,
+            },
+        )
+    })
+    .unwrap();
+    assert!(can_traverse(&outsider));
+}
+
+#[test]
+fn graph_edge_update_weight_records_same_tx_event_rolls_back_redacts_and_updates_traversal_ranking() {
+    let db = open_graph_db();
+    let seed = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "ew-seed");
+    let a = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "ew-a");
+    let b = ensure_org_node(&db, DEFAULT_ORG, NodeKind::MemoryNote, "ew-b");
+
+    let (ea, eb) = db
+        .write(|tx| {
+            let ea = assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: seed.id.clone(),
+                    dst_id: a.id.clone(),
+                    kind: EdgeKind::Extends,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 2.0,
+                    provenance: prov_agent("builder-1"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: true,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: CycleCheckPolicy::default(),
+                },
+            )?;
+            let eb = assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    src_id: seed.id.clone(),
+                    dst_id: b.id.clone(),
+                    kind: EdgeKind::Extends,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_agent("builder-1"),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: true,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: CycleCheckPolicy::default(),
+                },
+            )?;
+            Ok((ea, eb))
+        })
+        .unwrap();
+
+    // Invalid weights refused.
+    for bad_w in [0.0, -1.0, 1000.1, f64::NAN, f64::INFINITY] {
+        let err = db
+            .write(|tx| {
+                graph_edge_update_weight(
+                    tx,
+                    UpdateEdgeWeightRequest {
+                        org_id: DEFAULT_ORG.into(),
+                        edge_id: eb.id.clone(),
+                        actor: PrincipalId::new("builder-1").unwrap(),
+                        actor_kind: AssertedByKind::Agent,
+                        weight: bad_w,
+                    },
+                )
+            })
+            .unwrap_err();
+        assert_eq!(err.code(), "invalid_argument", "weight={bad_w}");
+    }
+
+    // Rolled-back update reverts weight and event_log.
+    let rb: Result<(), UaError> = db.write(|tx| {
+        graph_edge_update_weight(
+            tx,
+            UpdateEdgeWeightRequest {
+                org_id: DEFAULT_ORG.into(),
+                edge_id: eb.id.clone(),
+                actor: PrincipalId::new("builder-1").unwrap(),
+                actor_kind: AssertedByKind::Agent,
+                weight: 10.0,
+            },
+        )?;
+        Err(UaError::invalid("force rollback"))
+    });
+    assert!(rb.is_err());
+    assert_eq!(
+        db.read_mut(|c| SqliteGraph::new(c).get_edge_by_id(DEFAULT_ORG, &eb.id)).unwrap().unwrap().weight,
+        1.0
+    );
+    let ev_rb: i64 = db
+        .read(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM event_log WHERE channel = ?1", [EVENT_EDGE_UPDATED], |r| {
+                r.get(0)
+            })?)
+        })
+        .unwrap();
+    assert_eq!(ev_rb, 0);
+
+    // Raise `eb` weight from 1.0 -> 5.0: `neighbors` ordering flips so `b` comes before `a`.
+    let (updated, changed) = db
+        .write(|tx| {
+            graph_edge_update_weight(
+                tx,
+                UpdateEdgeWeightRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    edge_id: eb.id.clone(),
+                    actor: PrincipalId::new("builder-1").unwrap(),
+                    actor_kind: AssertedByKind::Agent,
+                    weight: 5.0,
+                },
+            )
+        })
+        .unwrap();
+    assert!(changed);
+    assert_eq!(updated.weight, 5.0);
+
+    let nbrs = db
+        .read_mut(|c| {
+            neighbors(
+                &mut SqliteGraph::new(c),
+                NeighborsRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    node_id: Some(seed.id.clone()),
+                    kind: None,
+                    external_id: None,
+                    direction: EdgeDirection::Out,
+                    edge_kinds: vec![],
+                    node_kinds: vec![],
+                    as_of: None,
+                    include_proposed: false,
+                    limit: Some(10),
+                    cursor: None,
+                    deadline_ms: None,
+                    scope: VisibilityScope::org_only(),
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(nbrs.neighbors[0].node.id, b.id, "higher-weight edge must rank first");
+    assert_eq!(nbrs.neighbors[1].node.id, a.id);
+
+    let (orig_ev, payload_str): (String, String) = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT originator, payload FROM event_log WHERE channel = ?1 ORDER BY seq DESC LIMIT 1",
+                [EVENT_EDGE_UPDATED],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(orig_ev, "builder-1");
+    let ev: serde_json::Value = serde_json::from_str(&payload_str).unwrap();
+    assert_eq!(ev["edge_id"], eb.id);
+    assert_eq!(ev["old_weight"], 1.0);
+    assert_eq!(ev["new_weight"], 5.0);
+    assert_eq!(ev["changed_fields"], json!(["weight"]));
+    assert_eq!(ev["updated_by"], "builder-1");
+
+    // Retracted/closed edge refuses weight updates (`edge_already_closed`).
+    db.write(|tx| {
+        retract_edge(
+            tx,
+            RetractEdgeRequest {
+                org_id: DEFAULT_ORG.into(),
+                edge_id: ea.id.clone(),
+                retractor: PrincipalId::new("builder-1").unwrap(),
+                retractor_kind: AssertedByKind::Agent,
+                valid_to: None,
+                generic: true,
+            },
+        )
+    })
+    .unwrap();
+    let closed_err = db
+        .write(|tx| {
+            graph_edge_update_weight(
+                tx,
+                UpdateEdgeWeightRequest {
+                    org_id: DEFAULT_ORG.into(),
+                    edge_id: ea.id.clone(),
+                    actor: PrincipalId::new("builder-1").unwrap(),
+                    actor_kind: AssertedByKind::Agent,
+                    weight: 3.0,
+                },
+            )
+        })
+        .unwrap_err();
+    assert_eq!(closed_err.code(), "conflict");
+    assert_eq!(closed_err.reason_code(), Some("edge_already_closed"));
+
+    // Non-default org edge weight update redacts actor and uses originator `system`.
+    let ob1 = ensure_org_node(&db, "org-b", NodeKind::MemoryNote, "ob-ew-1");
+    let ob2 = ensure_org_node(&db, "org-b", NodeKind::MemoryNote, "ob-ew-2");
+    let ob_edge = db
+        .write(|tx| {
+            assert_edge(
+                tx,
+                AssertEdgeRequest {
+                    org_id: "org-b".into(),
+                    src_id: ob1.id.clone(),
+                    dst_id: ob2.id.clone(),
+                    kind: EdgeKind::Extends,
+                    assertion_scope: String::new(),
+                    state: EdgeState::Active,
+                    weight: 1.0,
+                    provenance: prov_system_import(),
+                    valid_from: None,
+                    valid_to: None,
+                    meta_json: None,
+                    scope: VisibilityScope::org_only(),
+                    generic: false,
+                    max_edges_per_org: 0,
+                    max_live_edges_per_node: 0,
+                    cycle_bounds: CycleCheckPolicy::default(),
+                },
+            )
+        })
+        .unwrap();
+    let (_, ch) = db
+        .write(|tx| {
+            graph_edge_update_weight(
+                tx,
+                UpdateEdgeWeightRequest {
+                    org_id: "org-b".into(),
+                    edge_id: ob_edge.id.clone(),
+                    actor: PrincipalId::system(),
+                    actor_kind: AssertedByKind::System,
+                    weight: 4.5,
+                },
+            )
+        })
+        .unwrap();
+    assert!(ch);
+    let (ob_orig, ob_payload): (String, String) = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT originator, payload FROM event_log WHERE channel = ?1 ORDER BY seq DESC LIMIT 1",
+                [EVENT_EDGE_UPDATED],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(ob_orig, "system");
+    let ob_ev: serde_json::Value = serde_json::from_str(&ob_payload).unwrap();
+    assert_eq!(ob_ev["org_id"], "org-b");
+    assert_eq!(ob_ev["edge_id"], ob_edge.id);
+    assert_eq!(ob_ev["old_weight"], 1.0);
+    assert_eq!(ob_ev["new_weight"], 4.5);
+    assert!(ob_ev.get("updated_by").is_none());
 }

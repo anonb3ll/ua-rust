@@ -40,7 +40,10 @@ pub struct Db {
     inner: Arc<Inner>,
 }
 
+static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
+
 struct Inner {
+    id: u64,
     path: Option<PathBuf>,
     writer: Mutex<Connection>,
     /// Optional nanosecond deadline (since process-local epoch; `0` = disabled)
@@ -293,6 +296,7 @@ impl Db {
         let (events, _) = broadcast::channel(1024);
         Self {
             inner: Arc::new(Inner {
+                id: NEXT_DB_ID.fetch_add(1, Ordering::Relaxed),
                 path,
                 writer: Mutex::new(writer),
                 writer_deadline,
@@ -303,6 +307,12 @@ impl Db {
                 ignored_newer,
             }),
         }
+    }
+
+    /// Process-unique identifier for this opened database handle (distinguishes
+    /// separate in-memory databases as well as distinct opens).
+    pub fn instance_id(&self) -> u64 {
+        self.inner.id
     }
 
     pub fn path(&self) -> Option<&Path> {

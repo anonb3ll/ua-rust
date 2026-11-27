@@ -50,10 +50,13 @@ pub(crate) enum Kind {
     /// because `dispatch_runs` are not imported. Legacy tasks are imported
     /// into the default organization.
     Tasks,
-    /// Task dependencies, comments, comment threads, workflow records,
-    /// checks and hold members: imported into the default organization, with
-    /// their tasks.
+    /// Task comments, comment threads, workflow records, checks and hold
+    /// members: imported into the default organization, with their tasks.
     TaskChildren,
+    /// Legacy `task_dependencies` rows: imported directly into
+    /// `graph_edges(kind = 'depends_on')` (because `task_dependencies` is
+    /// frozen read-only under C2a) in the default organization.
+    TaskDependencies,
     /// Task subtree holds: require valid `status` and refuse duplicate active
     /// holds. Imported into the default organization.
     TaskHolds,
@@ -75,15 +78,28 @@ pub(crate) enum Kind {
     /// Legacy delegations are imported into the default organization, with
     /// their tasks (a source `org_id` is never copied).
     Delegations,
-    /// Legacy goals and task-goal links are imported into the default
-    /// organization, with their tasks (a source `org_id` is never copied).
+    /// Legacy goals are imported into the default organization, with their
+    /// tasks (a source `org_id` is never copied).
     Goals,
+    /// Legacy task-goal links become the default organization's
+    /// `serves_goal` graph edges (`ua_tools::families::tasks::import_legacy_link`,
+    /// `source_kind = 'import'`, `source_ref = 'import:<source hash>'`), never
+    /// `task_goal_links` rows: that table is frozen for the default
+    /// organization (`goals.v3.serves_goal_graph`).
+    GoalLinks,
     /// Legacy work proposals and their items are imported into the default
     /// organization (a source `org_id` is never copied).
     WorkProposals,
     /// Legacy memory notes and their versions are imported into the default
     /// organization (a source `org_id` is never copied).
     Memory,
+    /// Legacy note embeddings: imported into the default organization as stale
+    /// by construction (`model = "import:<model or unknown>"`, `content_sha = ""`,
+    /// `dim` computed from the blob) so backfill re-embeds them.
+    MemoryEmbeddings,
+    /// Legacy note chunk embeddings (`chunk_index` -> `idx`): imported into the
+    /// default organization as stale by construction, like `MemoryEmbeddings`.
+    MemoryChunks,
 }
 
 impl Kind {
@@ -97,6 +113,7 @@ impl Kind {
             Kind::GraphCanvas
                 | Kind::Tasks
                 | Kind::TaskChildren
+                | Kind::TaskDependencies
                 | Kind::TaskHolds
                 | Kind::SkillRegistry
                 | Kind::ProjectRepoBindings
@@ -105,8 +122,11 @@ impl Kind {
                 | Kind::Approvals
                 | Kind::Delegations
                 | Kind::Goals
+                | Kind::GoalLinks
                 | Kind::WorkProposals
                 | Kind::Memory
+                | Kind::MemoryEmbeddings
+                | Kind::MemoryChunks
                 | Kind::Nodes
                 | Kind::MessageIndex
                 | Kind::MessageReads
@@ -155,7 +175,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     },
     TableMap {
         refs: &[TASK_REF, Ref { col: "depends_on_task_id", table: "tasks", key: "id" }],
-        kind: Kind::TaskChildren,
+        kind: Kind::TaskDependencies,
         ..plain("task_dependencies")
     },
     TableMap { refs: &[TASK_REF], kind: Kind::TaskChildren, ..plain("task_comment_threads") },
@@ -172,7 +192,7 @@ pub(crate) const MAPS: &[TableMap] = &[
     },
     TableMap {
         refs: &[TASK_REF, Ref { col: "goal_id", table: "goals", key: "id" }],
-        kind: Kind::Goals,
+        kind: Kind::GoalLinks,
         ..plain("task_goal_links")
     },
     TableMap { refs: &[TASK_REF], kind: Kind::TaskChildren, ..plain("task_workflow") },
@@ -203,6 +223,16 @@ pub(crate) const MAPS: &[TableMap] = &[
         refs: &[Ref { col: "note_id", table: "memory", key: "id" }],
         kind: Kind::Memory,
         ..plain("memory_versions")
+    },
+    TableMap {
+        refs: &[Ref { col: "note_id", table: "memory", key: "id" }],
+        kind: Kind::MemoryEmbeddings,
+        ..plain("memory_embeddings")
+    },
+    TableMap {
+        refs: &[Ref { col: "note_id", table: "memory", key: "id" }],
+        kind: Kind::MemoryChunks,
+        ..plain("memory_chunks")
     },
     TableMap { kind: Kind::Approvals, ..plain("approvals") },
     TableMap { kind: Kind::Nodes, ..plain("nodes") },

@@ -12,6 +12,9 @@
 //! who may change a note live in `ua_memory`. Every tool reads and writes
 //! only the caller's organization's notes (`ctx.caller.org_id`).
 
+pub mod models_fetch;
+pub mod remote;
+
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
@@ -23,10 +26,18 @@ use ua_memory::search::{GetRequest, ListRequest, SearchRequest};
 use ua_store::SchemaPart;
 
 pub use ua_memory::embed::{
-    BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embedder_for, register_embedder,
+    BruteForceIndex, EmbedError, Embedder, NoopEmbedder, VectorIndex, embed_batch, embedder_for,
+    embedder_for_org, openai_compat_revision, register_embedder, register_remote_embedder, vector_identity,
+};
+pub use ua_memory::maintenance::{
+    BackfillReport, EmbeddingCounts, MAX_BACKFILL_BATCHES_PER_PASS, backfill_all_orgs_step,
+    backfill_embeddings, backfill_embeddings_capped, embedding_freshness_counts,
 };
 pub(crate) use ua_memory::mark_untrusted;
-pub use ua_memory::schema::{EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA};
+pub use ua_memory::models;
+pub use ua_memory::schema::{
+    CHUNKS_SCHEMA, CHUNKS_TENANT_PART, EMBEDDINGS_SCHEMA, ORG_SCOPE, SCHEMA, TENANT_PART, VERSIONS_SCHEMA,
+};
 
 use crate::registry::{Registry, ToolCtx, tool};
 
@@ -35,6 +46,7 @@ pub fn schema_parts() -> Vec<SchemaPart> {
 }
 
 pub fn register(r: &mut Registry) {
+    remote::install_http_embedder_factory();
     register_save(r);
     register_search(r);
     register_lifecycle(r);
@@ -262,11 +274,11 @@ async fn search(ctx: ToolCtx, a: SearchArgs) -> UaResult<Value> {
 }
 
 async fn list(ctx: ToolCtx, a: ListArgs) -> UaResult<Value> {
-    ua_memory::search::list(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
+    ua_memory::search::list(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller.org_id, a.into()).await
 }
 
 async fn get(ctx: ToolCtx, a: GetArgs) -> UaResult<Value> {
-    ua_memory::search::get(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
+    ua_memory::search::get(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller.org_id, a.into()).await
 }
 
 fn register_search(r: &mut Registry) {
@@ -337,7 +349,7 @@ pub struct FeedbackArgs {
 
 async fn delete(ctx: ToolCtx, a: IdArgs) -> UaResult<Value> {
     let IdArgs { id } = a;
-    ua_memory::lifecycle::delete(ctx.hub.db(), &ctx.caller, id).await
+    ua_memory::lifecycle::delete(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller, id).await
 }
 
 async fn restore(ctx: ToolCtx, a: IdArgs) -> UaResult<Value> {
@@ -347,7 +359,7 @@ async fn restore(ctx: ToolCtx, a: IdArgs) -> UaResult<Value> {
 
 async fn feedback(ctx: ToolCtx, a: FeedbackArgs) -> UaResult<Value> {
     let FeedbackArgs { id, signal } = a;
-    ua_memory::lifecycle::feedback(ctx.hub.db(), &ctx.caller, id, signal).await
+    ua_memory::lifecycle::feedback(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller, id, signal).await
 }
 
 fn register_lifecycle(r: &mut Registry) {
@@ -428,11 +440,12 @@ impl From<MaintenanceArgs> for MaintenanceRequest {
 }
 
 async fn prune_candidates(ctx: ToolCtx, a: PruneArgs) -> UaResult<Value> {
-    ua_memory::maintenance::prune_candidates(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
+    ua_memory::maintenance::prune_candidates(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller.org_id, a.into()).await
 }
 
 async fn recall_maintenance(ctx: ToolCtx, a: MaintenanceArgs) -> UaResult<Value> {
-    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), &ctx.caller.org_id, a.into()).await
+    ua_memory::maintenance::recall_maintenance(ctx.hub.db(), ctx.hub.cfg(), &ctx.caller.org_id, a.into())
+        .await
 }
 
 fn register_maintenance(r: &mut Registry) {
@@ -449,13 +462,85 @@ fn register_maintenance(r: &mut Registry) {
     r.add(
         tool(
             "recall_maintenance",
-            "Report stale (old, never recalled, salience <= 0.5) and low-confidence memory notes for human review. \
+            "Report stale (old, never recalled, salience <= 0.5) and low-confidence memory notes for human review, \
+             and run a best-effort backfill of missing or stale embeddings and chunks in batches of 8. \
              Deletes nothing: dry_run=false is refused; prune with memory_delete per id after review.",
             recall_maintenance,
         )
         .family("memory")
-        .read_only(),
+        .read_only()
+        // Backfills missing/stale derived vector indexes; never modifies or deletes notes.
+        .side_effects(|_| true),
     );
+}
+
+/// Periodic interval between background embedding backfill checks when the
+/// server is idle (after startup catch-up completes).
+const BACKFILL_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+/// Brief pause between consecutive bounded startup catch-up passes so large
+/// post-upgrade backfills yield to interactive writes.
+const BACKFILL_CATCHUP_YIELD: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Spawn the server's background embedding backfill task.
+///
+/// On startup, runs bounded per-organization catch-up passes (strictly per org
+/// under each org's own `allow_remote_embedder` flag; never touching suspended
+/// orgs or downloading models) so an upgraded hub whose prior vectors became
+/// stale automatically re-embeds without requiring a manual `recall_maintenance`
+/// call. Afterward, ticks periodically until `ct` is cancelled.
+pub fn spawn_backfill(
+    hub: &crate::Hub,
+    ct: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if hub.cfg().memory.embedder.trim().eq_ignore_ascii_case("off") {
+        return None;
+    }
+    let hub = hub.clone();
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(BACKFILL_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                _ = ct.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            // Drain stale vectors in bounded passes, yielding briefly between
+            // passes so interactive writes are never starved.
+            loop {
+                if ct.is_cancelled() {
+                    return;
+                }
+                match backfill_all_orgs_step(hub.db(), hub.cfg(), MAX_BACKFILL_BATCHES_PER_PASS).await {
+                    Ok(reports) => {
+                        let total_notes: usize = reports.iter().map(|(_, r)| r.notes_embedded).sum();
+                        let total_chunks: usize = reports.iter().map(|(_, r)| r.chunks_written).sum();
+                        if total_notes > 0 {
+                            tracing::info!(
+                                notes_embedded = total_notes,
+                                chunks_written = total_chunks,
+                                "memory background backfill completed pass"
+                            );
+                        }
+                        let any_more = total_notes > 0
+                            && reports.iter().any(|(_, r)| r.has_more && !r.stopped_unavailable);
+                        if !any_more {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "memory background backfill failed");
+                        break;
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    _ = ct.cancelled() => return,
+                    _ = tokio::time::sleep(BACKFILL_CATCHUP_YIELD) => {}
+                }
+            }
+        }
+    }))
 }
 
 #[cfg(test)]

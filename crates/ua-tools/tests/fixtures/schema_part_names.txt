@@ -148,3 +148,8 @@ organization.v1.graph_counters
 graph.v3.counters_no_delete
 skill_registry.v5.yanks
 organization.v1.tools.skill_yanks
+evidence_key_store.v2.checkpoint_checks
+tasks.v3.depends_on_graph
+goals.v3.serves_goal_graph
+memory.chunks.v1
+organization.v1.memory_chunks

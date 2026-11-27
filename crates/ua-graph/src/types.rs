@@ -19,6 +19,10 @@ pub const EDGE_META_MAX_BYTES: usize = 4_096;
 pub const ASSERTION_SCOPE_MAX_BYTES: usize = 128;
 /// Maximum UTF-8 byte length of `asserted_by` (`PrincipalId`).
 pub const PRINCIPAL_ID_MAX_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of `graph_nodes.team_id`.
+pub const TEAM_ID_MAX_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of `graph_nodes.owner_id`.
+pub const OWNER_ID_MAX_BYTES: usize = 128;
 /// Maximum UTF-8 byte length of `source_ref`.
 pub const SOURCE_REF_MAX_BYTES: usize = 256;
 

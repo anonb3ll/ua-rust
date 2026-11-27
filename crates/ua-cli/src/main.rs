@@ -97,6 +97,8 @@ enum Cmd {
     Doctor(ops::doctor::DoctorArgs),
     /// Manage evidence signing keys and checkpoint signatures.
     Evidence(ops::evidence::EvidenceArgs),
+    /// Manage memory subsystem assets (pinned local embedding models).
+    Memory(ops::memory_models::MemoryArgs),
     /// Take a verified, consistent SQLite snapshot of the hub database (safe while serving).
     Backup(ops::backup::BackupArgs),
     /// Verify and atomically restore a hub database snapshot (requires hub to be stopped).
@@ -435,6 +437,24 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
         tracing_subscriber::registry().with(log_layer(filter, std::io::stderr)).init();
     }
 
+    let is_evidence_verify = matches!(
+        &cli.cmd,
+        Cmd::Evidence(ops::evidence::EvidenceArgs { cmd: ops::evidence::EvidenceCmd::Verify { .. } })
+    );
+    match run_cmd(cli, held).await {
+        Ok(code) => Ok(code),
+        Err(e) if is_evidence_verify => {
+            // `ua evidence verify` reserves exit 1 for cryptographic or ledger
+            // refusals; config, lock, open (including newer-schema refusal),
+            // and database errors exit 2 ("cannot verify").
+            eprintln!("Error: {e:#}");
+            Ok(ExitCode::from(2))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn run_cmd(cli: Cli, held: &mut Held) -> anyhow::Result<ExitCode> {
     let explicit_config = cli.config.clone();
     // Read before any `.env` file is loaded (`load_config`): the override comes
     // only from the command line or the real process environment.
@@ -443,7 +463,7 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
     let allow_newer = || allow_newer_schema(allow_newer_flag, allow_newer_var.clone());
     match cli.cmd {
         Cmd::Init(args) => {
-            ops::init::run(args, explicit_config.as_deref(), allow_newer()?)?;
+            ops::init::run(args, explicit_config.as_deref(), allow_newer()?).await?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Doctor(args) => ops::doctor::run(args, explicit_config.as_deref()),
@@ -456,9 +476,9 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Evidence(ops::evidence::EvidenceArgs {
-            cmd: ops::evidence::EvidenceCmd::Sign { key_file, digest, out },
+            cmd: ops::evidence::EvidenceCmd::Sign { key_file, checkpoint_file, prev_checkpoint, out },
         }) => {
-            ops::evidence::run_sign(&key_file, &digest, out.as_deref())?;
+            ops::evidence::run_sign(&key_file, &checkpoint_file, prev_checkpoint.as_deref(), out.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
         cmd => {
@@ -474,6 +494,10 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
             match cmd {
                 Cmd::Config => {
                     println!("{}", serde_json::to_string_pretty(&cfg)?);
+                    Ok(ExitCode::SUCCESS)
+                }
+                Cmd::Memory(args) => {
+                    ops::memory_models::run(&cfg, args).await?;
                     Ok(ExitCode::SUCCESS)
                 }
                 Cmd::Import { cmd: ImportCmd::PythonHub { from, dry_run, drop_org_scope } } => {
@@ -526,6 +550,9 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
 
                     match cmd {
                         Cmd::Serve => {
+                            // Fail closed before starting background loops or binding any port:
+                            // `enforce_auth = false` is single-organization mode only.
+                            ua_server::auth::check_auth_policy(&hub)?;
                             warn_if_locked_out(&state).await;
                             // One token for the server and every background loop: a signal
                             // cancels it, then `serve_until_shutdown` drains them.
@@ -576,6 +603,10 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                             // Poll the bound repositories' open pull requests when no webhook
                             // can reach this hub (github_poll_interval_s; 0 = off).
                             background.extend(ua_tools::families::github::spawn_poller(&hub, ct.clone()));
+                            // Automatically backfill missing or stale memory vectors/chunks on
+                            // startup (e.g. after an upgrade or identity change) and periodically
+                            // thereafter, strictly per active organization.
+                            background.extend(ua_tools::families::memory::spawn_backfill(&hub, ct.clone()));
                             // Routine fires a previous process left mid-workflow or unstarted.
                             let h = hub.clone();
                             background.push(tokio::spawn(async move {
@@ -677,9 +708,7 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                                 println!("revoked {n} token(s) for {label}");
                             }
                         },
-                        Cmd::Evidence(args) => {
-                            ops::evidence::run(&hub, args)?;
-                        }
+                        Cmd::Evidence(args) => return ops::evidence::run(&hub, args),
                         Cmd::LoginLink { label } => {
                             // A login link signs a browser in as a human; same bar as acting
                             // as a human from the CLI.
@@ -698,6 +727,7 @@ async fn run(held: &mut Held) -> anyhow::Result<ExitCode> {
                         Cmd::Init(_)
                         | Cmd::Doctor(_)
                         | Cmd::Config
+                        | Cmd::Memory(_)
                         | Cmd::Import { .. }
                         | Cmd::Backup(_)
                         | Cmd::Restore(_) => unreachable!(),

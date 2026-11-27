@@ -16,6 +16,8 @@ default = ["code-intel", "readability", "mcp-gateway", "mcp-server", "slack-sock
 # Local semantic memory search with fastembed. Off by default: without it,
 # memory search is lexical (FTS5) only. The feature lives in ua-memory.
 embeddings = ["ua-memory/embeddings"]
+# Same local semantic search loading ONNX Runtime dynamically (`ort/load-dynamic`).
+embeddings-dynamic = ["ua-memory/embeddings-dynamic"]
 # Symbol indexing with tree-sitter: `fs_index_symbols`, `fs_list_symbols`,
 # `fs_search_symbols`, `fs_repo_map`.
 code-intel = [

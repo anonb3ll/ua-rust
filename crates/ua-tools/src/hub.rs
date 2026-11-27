@@ -234,6 +234,7 @@ impl Hub {
     /// sharing check has not run, so every webhook route is refused
     /// ([`Hub::webhook_route_shared`]).
     pub fn new(cfg: Config, db: Db) -> Self {
+        crate::families::memory::remote::install_http_embedder_factory();
         let ci = Arc::new(GitHubCiVerifier::new(cfg.clone(), db.clone()));
         let webhook_scan = WebhookScan::new(cfg.clone(), db.clone());
         let ledger_status = Arc::new(RwLock::new(None));

@@ -3,26 +3,31 @@
   "classes": [
     {
       "class": "exact-term",
+      "n": 2,
       "recall_at_5": 1.0,
       "mrr": 1.0
     },
     {
       "class": "paraphrase",
+      "n": 2,
       "recall_at_5": 0.5,
       "mrr": 0.5
     },
     {
       "class": "temporal",
-      "recall_at_5": 1.0,
-      "mrr": 1.0
+      "n": 3,
+      "recall_at_5": 0.6667,
+      "mrr": 0.6667
     },
     {
       "class": "contradiction",
+      "n": 2,
       "recall_at_5": 1.0,
       "mrr": 1.0
     },
     {
       "class": "long-document",
+      "n": 1,
       "recall_at_5": 1.0,
       "mrr": 1.0
     }

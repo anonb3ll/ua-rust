@@ -34,6 +34,7 @@ slack-socket = [
 ]
 # Off by default, as in ua-tools.
 embeddings = ["ua-tools/embeddings"]
+embeddings-dynamic = ["ua-tools/embeddings-dynamic"]
 
 [dependencies]
 ua-core.workspace = true

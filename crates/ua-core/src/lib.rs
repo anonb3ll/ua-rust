@@ -14,7 +14,7 @@ pub mod profiles;
 pub mod safety;
 pub mod time;
 
-pub use config::{Config, SlackIdentity};
+pub use config::{Config, MemoryConfig, SlackIdentity};
 pub use error::{UaError, UaResult};
 pub use identity::{ActorKind, Caller};
 pub use org::DEFAULT_ORG;

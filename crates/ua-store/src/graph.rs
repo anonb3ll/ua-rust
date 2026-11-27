@@ -149,6 +149,24 @@ pub struct NewGraphNode {
     pub updated_at: String,
 }
 
+/// New values for the mutable columns of an existing `graph_nodes` row
+/// (`docs/graph.md`, C2 slice 1).
+///
+/// Immutable identity and provenance columns (`id`, `org_id`, `kind`,
+/// `external_id`, `asserted_by`, `asserted_by_kind`, `source_kind`,
+/// `source_ref`, `created_at`) are never modified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphNodePatch {
+    pub display_label: Option<String>,
+    pub visibility: String,
+    pub team_id: Option<String>,
+    pub owner_type: Option<String>,
+    pub owner_id: Option<String>,
+    pub meta_json: String,
+    pub archived_at: Option<String>,
+    pub updated_at: String,
+}
+
 /// One row of `graph_edges`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphEdgeRow {
@@ -465,10 +483,15 @@ pub trait GraphRead {
 /// rules — endpoint-kind matrix, domain-owned edge fence, generic empty-scope
 /// enforcement, write-time acyclicity checks, quotas, and ledger appends.
 /// Production callers MUST go through `ua-graph` (`graph_node_ensure`,
-/// `assert_edge`, `retract_edge`) rather than calling these methods directly,
+/// `graph_node_update`, `assert_edge`, `graph_edge_update_weight`,
+/// `retract_edge`) rather than calling these methods directly,
 /// except for controlled bulk import/backfill paths that uphold those
 /// invariants themselves.
 pub trait GraphRepo: GraphRead {
+    /// Look up an existing node by `(org_id, id)` without visibility or
+    /// `archived_at` filtering, for domain-internal [`graph_node_update`].
+    fn find_node_by_id_internal(&mut self, org_id: &str, id: &str) -> UaResult<Option<GraphNodeRow>>;
+
     /// Look up an existing node by `(org_id, kind, external_id)` without
     /// visibility filtering, for domain-internal [`ensure_node`] idempotency.
     fn find_node_by_external_internal(
@@ -484,11 +507,31 @@ pub trait GraphRepo: GraphRead {
     /// callers should use `ua_graph::graph_node_ensure`.
     fn ensure_node(&mut self, node: &NewGraphNode) -> UaResult<(GraphNodeRow, bool)>;
 
+    /// **Low-level unchecked storage primitive.** Update only the mutable
+    /// columns of an existing `graph_nodes` row in `org_id`. Callers MUST go
+    /// through `ua_graph::graph_node_update` (enforced by `update_guard`).
+    fn update_node_mutable(
+        &mut self,
+        org_id: &str,
+        id: &str,
+        patch: &GraphNodePatch,
+    ) -> UaResult<Option<GraphNodeRow>>;
+
     /// **Low-level unchecked storage primitive.** Insert a single edge row.
     /// Enforces non-default-org provenance and temporal invariants only; skips
     /// endpoint-kind validation, domain-owned edge fence, acyclicity checks,
     /// quotas, and ledger appends. Callers must use `ua_graph::assert_edge`.
     fn insert_edge(&mut self, edge: &NewGraphEdge) -> UaResult<GraphEdgeRow>;
+
+    /// **Low-level unchecked storage primitive.** Update `weight` on a live
+    /// (`valid_to IS NULL`) edge in `org_id`. Callers MUST go through
+    /// `ua_graph::graph_edge_update_weight` (enforced by `update_guard`).
+    fn update_edge_weight(
+        &mut self,
+        org_id: &str,
+        edge_id: &str,
+        weight: f64,
+    ) -> UaResult<Option<GraphEdgeRow>>;
 
     /// **Low-level unchecked storage primitive.** Batch-insert nodes inside the
     /// caller's open transaction using a cached prepared statement (provenance
@@ -518,6 +561,31 @@ pub struct SqliteGraph<'a> {
 
 impl<'a> SqliteGraph<'a> {
     pub fn new(conn: &'a mut Connection) -> Self {
+        Self { conn }
+    }
+}
+
+/// Insert-only SQLite graph handle over a shared [`Connection`] for schema
+/// migration procedures and bulk importers (`ua-import`) that must run inside
+/// an existing migration/import transaction without appending to `event_log`
+/// (`docs/organization.md`, item 11: a schema part cannot append to the
+/// hash-chained ledger).
+///
+/// Implements [`GraphRead`] and the ensure/insert methods of [`GraphRepo`] so
+/// migrations and importers still run full `ua-graph` domain validation
+/// (`graph_node_ensure`, `assert_edge`). Update and close operations are
+/// refused.
+///
+/// **Guarded:** `crates/ua-graph/tests/update_guard.rs` enforces that only
+/// explicitly allowlisted migration/import modules may reference
+/// `MigrationGraph`; runtime tool handlers and `ua-server` must always write
+/// through `&mut WriteTx<'_>` so ledger events are recorded.
+pub struct MigrationGraph<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> MigrationGraph<'a> {
+    pub fn new(conn: &'a Connection) -> Self {
         Self { conn }
     }
 }
@@ -1827,196 +1895,486 @@ const INSERT_EDGE_SQL: &str = "INSERT INTO graph_edges (\
     valid_from, valid_to, meta_json\
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
 
-impl GraphRepo for WriteTx<'_> {
+impl GraphRead for MigrationGraph<'_> {
+    fn require_org_exists(&mut self, org_id: &str) -> UaResult<()> {
+        require_org_exists_sql(self.conn, org_id)
+    }
+    fn get_node_by_id(
+        &mut self,
+        org_id: &str,
+        id: &str,
+        scope: &VisibilityScope,
+    ) -> UaResult<Option<GraphNodeRow>> {
+        get_node_by_id_sql(self.conn, org_id, id, scope)
+    }
+    fn get_node_by_external(
+        &mut self,
+        org_id: &str,
+        kind: &str,
+        external_id: &str,
+        scope: &VisibilityScope,
+    ) -> UaResult<Option<GraphNodeRow>> {
+        get_node_by_external_sql(self.conn, org_id, kind, external_id, scope)
+    }
+    fn get_nodes_by_ids(
+        &mut self,
+        org_id: &str,
+        ids: &[String],
+        scope: &VisibilityScope,
+    ) -> UaResult<Vec<GraphNodeRow>> {
+        get_nodes_by_ids_sql(self.conn, org_id, ids, scope)
+    }
+    fn get_edge_by_id(&mut self, org_id: &str, id: &str) -> UaResult<Option<GraphEdgeRow>> {
+        get_edge_by_id_sql(self.conn, org_id, id)
+    }
+    fn get_edges_by_ids(&mut self, org_id: &str, ids: &[String]) -> UaResult<Vec<GraphEdgeRow>> {
+        get_edges_by_ids_sql(self.conn, org_id, ids)
+    }
+    fn get_edges_by_rowids(&mut self, org_id: &str, rowids: &[i64]) -> UaResult<Vec<(i64, GraphEdgeRow)>> {
+        get_edges_by_rowids_sql(self.conn, org_id, rowids)
+    }
+    fn count_org_nodes(&mut self, org_id: &str) -> UaResult<u64> {
+        count_org_nodes_sql(self.conn, org_id)
+    }
+    fn count_org_edges(&mut self, org_id: &str) -> UaResult<u64> {
+        count_org_edges_sql(self.conn, org_id)
+    }
+    fn count_node_live_edges_capped(&mut self, org_id: &str, node_id: &str, cap: usize) -> UaResult<usize> {
+        count_node_live_edges_capped_sql(self.conn, org_id, node_id, cap)
+    }
+    fn with_deadline<F, T>(&mut self, deadline: Instant, f: F) -> UaResult<T>
+    where
+        Self: Sized,
+        F: FnOnce(&mut Self) -> UaResult<T>,
+    {
+        if Instant::now() >= deadline {
+            return Err(deadline_error());
+        }
+        let out = f(self)?;
+        if Instant::now() >= deadline {
+            return Err(deadline_error());
+        }
+        Ok(out)
+    }
+    fn adjacent_edges(&mut self, query: &AdjacencyQuery) -> UaResult<Vec<AdjacencyEntry>> {
+        adjacent_edges_sql(self.conn, query)
+    }
+    fn compact_adjacent(
+        &mut self,
+        org_id: &str,
+        node_id: &str,
+        direction: EdgeDirection,
+        filter: &EdgeFilter,
+        scope: &VisibilityScope,
+        limit: usize,
+    ) -> UaResult<Vec<CompactAdjEdge>> {
+        compact_adjacent_sql(self.conn, org_id, node_id, direction, filter, scope, limit)
+    }
+    #[allow(clippy::type_complexity)]
+    fn with_compact_adjacent<F, T>(
+        &mut self,
+        org_id: &str,
+        directions: EdgeDirection,
+        filter: &EdgeFilter,
+        scope: &VisibilityScope,
+        f: F,
+    ) -> UaResult<T>
+    where
+        F: FnOnce(
+            &mut dyn FnMut(&str, EdgeDirection, usize, &mut Vec<CompactAdjEdge>) -> UaResult<()>,
+        ) -> UaResult<T>,
+    {
+        with_compact_adjacent_sql(self.conn, org_id, directions, filter, scope, f)
+    }
+    fn bounded_acyclic_reach(
+        &mut self,
+        org_id: &str,
+        src_id: &str,
+        dst_id: &str,
+        kind: &str,
+        max_nodes: usize,
+        max_edges: usize,
+        deadline: Instant,
+    ) -> UaResult<AcyclicReachOutcome> {
+        if Instant::now() >= deadline {
+            return Ok(AcyclicReachOutcome::BoundExceeded("deadline"));
+        }
+        let out =
+            bounded_acyclic_reach_sql_inner(self.conn, org_id, src_id, dst_id, kind, max_nodes, max_edges)?;
+        if Instant::now() >= deadline {
+            return Ok(AcyclicReachOutcome::BoundExceeded("deadline"));
+        }
+        Ok(out)
+    }
+    fn eligible_degree(
+        &mut self,
+        org_id: &str,
+        node_id: &str,
+        direction: EdgeDirection,
+        filter: &EdgeFilter,
+        scope: &VisibilityScope,
+        cap_plus_one: usize,
+    ) -> UaResult<usize> {
+        eligible_degree_sql(self.conn, org_id, node_id, direction, filter, scope, cap_plus_one)
+    }
+    fn outgoing_live_targets_of_kind_into(
+        &mut self,
+        org_id: &str,
+        src_id: &str,
+        kind: &str,
+        limit: usize,
+        out: &mut Vec<String>,
+    ) -> UaResult<()> {
+        outgoing_live_targets_of_kind_into_sql(self.conn, org_id, src_id, kind, limit, out)
+    }
+    fn exact_ppr_slice(
+        &mut self,
+        org_id: &str,
+        filter: &EdgeFilter,
+        scope: &VisibilityScope,
+        max_nodes: usize,
+        max_edges: usize,
+    ) -> UaResult<Option<ExactPprSlice>> {
+        exact_ppr_slice_sql(self.conn, org_id, filter, scope, max_nodes, max_edges)
+    }
+}
+
+fn find_node_by_id_internal_sql(conn: &Connection, org_id: &str, id: &str) -> UaResult<Option<GraphNodeRow>> {
+    let mut stmt =
+        conn.prepare_cached(&format!("SELECT {NODE_COLS} FROM graph_nodes WHERE org_id = ?1 AND id = ?2"))?;
+    Ok(stmt.query_row(params![org_id, id], |r| decode_node(r, 0)).optional()?)
+}
+
+fn find_node_by_external_internal_sql(
+    conn: &Connection,
+    org_id: &str,
+    kind: &str,
+    external_id: &str,
+) -> UaResult<Option<GraphNodeRow>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {NODE_COLS} FROM graph_nodes WHERE org_id = ?1 AND kind = ?2 AND external_id = ?3"
+    ))?;
+    Ok(stmt.query_row(params![org_id, kind, external_id], |r| decode_node(r, 0)).optional()?)
+}
+
+fn ensure_node_sql(conn: &Connection, node: &NewGraphNode) -> UaResult<(GraphNodeRow, bool)> {
+    check_provenance(&node.org_id, &node.asserted_by, &node.asserted_by_kind, &node.source_kind)?;
+    let existing: Option<GraphNodeRow> =
+        find_node_by_external_internal_sql(conn, &node.org_id, &node.kind, &node.external_id)?;
+    if let Some(row) = existing {
+        return Ok((row, false));
+    }
+    let created_at = normalize_ts(&node.created_at, "created_at")?;
+    let updated_at = normalize_ts(&node.updated_at, "updated_at")?;
+    {
+        let mut stmt = conn.prepare_cached(INSERT_NODE_SQL)?;
+        stmt.execute(params![
+            node.id,
+            node.org_id,
+            node.kind,
+            node.external_id,
+            node.display_label,
+            node.visibility,
+            node.team_id,
+            node.owner_type,
+            node.owner_id,
+            node.asserted_by,
+            node.asserted_by_kind,
+            node.source_kind,
+            node.source_ref,
+            node.meta_json,
+            created_at,
+            updated_at,
+        ])?;
+    }
+    let row = GraphNodeRow {
+        id: node.id.clone(),
+        org_id: node.org_id.clone(),
+        kind: node.kind.clone(),
+        external_id: node.external_id.clone(),
+        display_label: node.display_label.clone(),
+        visibility: node.visibility.clone(),
+        team_id: node.team_id.clone(),
+        owner_type: node.owner_type.clone(),
+        owner_id: node.owner_id.clone(),
+        asserted_by: node.asserted_by.clone(),
+        asserted_by_kind: node.asserted_by_kind.clone(),
+        source_kind: node.source_kind.clone(),
+        source_ref: node.source_ref.clone(),
+        meta_json: node.meta_json.clone(),
+        created_at,
+        updated_at,
+        archived_at: None,
+    };
+    Ok((row, true))
+}
+
+fn insert_edge_sql(conn: &Connection, edge: &NewGraphEdge) -> UaResult<GraphEdgeRow> {
+    check_provenance(&edge.org_id, &edge.asserted_by, &edge.asserted_by_kind, &edge.source_kind)?;
+    let now_str = now();
+    let (asserted_at, valid_from, valid_to) = check_edge_temporal(
+        &edge.source_kind,
+        &edge.asserted_at,
+        &edge.valid_from,
+        edge.valid_to.as_deref(),
+        &now_str,
+    )?;
+    {
+        let mut stmt = conn.prepare_cached(INSERT_EDGE_SQL)?;
+        stmt.execute(params![
+            edge.id,
+            edge.org_id,
+            edge.src_id,
+            edge.dst_id,
+            edge.kind,
+            edge.assertion_scope,
+            edge.state,
+            edge.weight,
+            edge.asserted_by,
+            edge.asserted_by_kind,
+            asserted_at,
+            edge.source_kind,
+            edge.source_ref,
+            valid_from,
+            valid_to,
+            edge.meta_json,
+        ])?;
+    }
+    Ok(GraphEdgeRow {
+        id: edge.id.clone(),
+        org_id: edge.org_id.clone(),
+        src_id: edge.src_id.clone(),
+        dst_id: edge.dst_id.clone(),
+        kind: edge.kind.clone(),
+        assertion_scope: edge.assertion_scope.clone(),
+        state: edge.state.clone(),
+        weight: edge.weight,
+        asserted_by: edge.asserted_by.clone(),
+        asserted_by_kind: edge.asserted_by_kind.clone(),
+        asserted_at,
+        source_kind: edge.source_kind.clone(),
+        source_ref: edge.source_ref.clone(),
+        valid_from,
+        valid_to,
+        meta_json: edge.meta_json.clone(),
+    })
+}
+
+fn insert_nodes_batch_sql(conn: &Connection, nodes: &[NewGraphNode]) -> UaResult<usize> {
+    for n in nodes {
+        check_provenance(&n.org_id, &n.asserted_by, &n.asserted_by_kind, &n.source_kind)?;
+    }
+    let mut stmt = conn.prepare_cached(INSERT_NODE_SQL)?;
+    let mut inserted = 0usize;
+    for n in nodes {
+        let created_at = normalize_ts(&n.created_at, "created_at")?;
+        let updated_at = normalize_ts(&n.updated_at, "updated_at")?;
+        stmt.execute(params![
+            n.id,
+            n.org_id,
+            n.kind,
+            n.external_id,
+            n.display_label,
+            n.visibility,
+            n.team_id,
+            n.owner_type,
+            n.owner_id,
+            n.asserted_by,
+            n.asserted_by_kind,
+            n.source_kind,
+            n.source_ref,
+            n.meta_json,
+            created_at,
+            updated_at,
+        ])?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
+fn insert_edges_batch_sql(conn: &Connection, edges: &[NewGraphEdge]) -> UaResult<usize> {
+    let now_str = now();
+    let mut normalized = Vec::with_capacity(edges.len());
+    for e in edges {
+        check_provenance(&e.org_id, &e.asserted_by, &e.asserted_by_kind, &e.source_kind)?;
+        normalized.push(check_edge_temporal_cow(
+            &e.source_kind,
+            &e.asserted_at,
+            &e.valid_from,
+            e.valid_to.as_deref(),
+            &now_str,
+        )?);
+    }
+    let mut stmt = conn.prepare_cached(INSERT_EDGE_SQL)?;
+    let mut inserted = 0usize;
+    for (e, (asserted_at, valid_from, valid_to)) in edges.iter().zip(normalized.iter()) {
+        stmt.execute(params![
+            e.id,
+            e.org_id,
+            e.src_id,
+            e.dst_id,
+            e.kind,
+            e.assertion_scope,
+            e.state,
+            e.weight,
+            e.asserted_by,
+            e.asserted_by_kind,
+            asserted_at.as_ref(),
+            e.source_kind,
+            e.source_ref,
+            valid_from.as_ref(),
+            valid_to.as_deref(),
+            e.meta_json,
+        ])?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
+impl GraphRepo for MigrationGraph<'_> {
+    fn find_node_by_id_internal(&mut self, org_id: &str, id: &str) -> UaResult<Option<GraphNodeRow>> {
+        find_node_by_id_internal_sql(self.conn, org_id, id)
+    }
+
     fn find_node_by_external_internal(
         &mut self,
         org_id: &str,
         kind: &str,
         external_id: &str,
     ) -> UaResult<Option<GraphNodeRow>> {
-        let mut stmt = self.prepare_cached(&format!(
-            "SELECT {NODE_COLS} FROM graph_nodes WHERE org_id = ?1 AND kind = ?2 AND external_id = ?3"
-        ))?;
-        Ok(stmt.query_row(params![org_id, kind, external_id], |r| decode_node(r, 0)).optional()?)
+        find_node_by_external_internal_sql(self.conn, org_id, kind, external_id)
     }
 
     fn ensure_node(&mut self, node: &NewGraphNode) -> UaResult<(GraphNodeRow, bool)> {
-        check_provenance(&node.org_id, &node.asserted_by, &node.asserted_by_kind, &node.source_kind)?;
-        let existing: Option<GraphNodeRow> = {
-            let mut stmt = self.prepare_cached(&format!(
-                "SELECT {NODE_COLS} FROM graph_nodes WHERE org_id = ?1 AND kind = ?2 AND external_id = ?3"
-            ))?;
-            stmt.query_row(params![node.org_id, node.kind, node.external_id], |r| decode_node(r, 0))
-                .optional()?
-        };
-        if let Some(row) = existing {
-            return Ok((row, false));
-        }
-        let created_at = normalize_ts(&node.created_at, "created_at")?;
-        let updated_at = normalize_ts(&node.updated_at, "updated_at")?;
-        {
-            let mut stmt = self.prepare_cached(INSERT_NODE_SQL)?;
-            stmt.execute(params![
-                node.id,
-                node.org_id,
-                node.kind,
-                node.external_id,
-                node.display_label,
-                node.visibility,
-                node.team_id,
-                node.owner_type,
-                node.owner_id,
-                node.asserted_by,
-                node.asserted_by_kind,
-                node.source_kind,
-                node.source_ref,
-                node.meta_json,
-                created_at,
-                updated_at,
-            ])?;
-        }
-        let row = GraphNodeRow {
-            id: node.id.clone(),
-            org_id: node.org_id.clone(),
-            kind: node.kind.clone(),
-            external_id: node.external_id.clone(),
-            display_label: node.display_label.clone(),
-            visibility: node.visibility.clone(),
-            team_id: node.team_id.clone(),
-            owner_type: node.owner_type.clone(),
-            owner_id: node.owner_id.clone(),
-            asserted_by: node.asserted_by.clone(),
-            asserted_by_kind: node.asserted_by_kind.clone(),
-            source_kind: node.source_kind.clone(),
-            source_ref: node.source_ref.clone(),
-            meta_json: node.meta_json.clone(),
-            created_at,
-            updated_at,
-            archived_at: None,
-        };
-        Ok((row, true))
+        ensure_node_sql(self.conn, node)
+    }
+
+    fn update_node_mutable(
+        &mut self,
+        _org_id: &str,
+        _id: &str,
+        _patch: &GraphNodePatch,
+    ) -> UaResult<Option<GraphNodeRow>> {
+        Err(UaError::invalid(
+            "MigrationGraph is insert-only; node updates are not supported during migration",
+        ))
     }
 
     fn insert_edge(&mut self, edge: &NewGraphEdge) -> UaResult<GraphEdgeRow> {
-        check_provenance(&edge.org_id, &edge.asserted_by, &edge.asserted_by_kind, &edge.source_kind)?;
-        let now_str = now();
-        let (asserted_at, valid_from, valid_to) = check_edge_temporal(
-            &edge.source_kind,
-            &edge.asserted_at,
-            &edge.valid_from,
-            edge.valid_to.as_deref(),
-            &now_str,
-        )?;
-        {
-            let mut stmt = self.prepare_cached(INSERT_EDGE_SQL)?;
-            stmt.execute(params![
-                edge.id,
-                edge.org_id,
-                edge.src_id,
-                edge.dst_id,
-                edge.kind,
-                edge.assertion_scope,
-                edge.state,
-                edge.weight,
-                edge.asserted_by,
-                edge.asserted_by_kind,
-                asserted_at,
-                edge.source_kind,
-                edge.source_ref,
-                valid_from,
-                valid_to,
-                edge.meta_json,
-            ])?;
-        }
-        Ok(GraphEdgeRow {
-            id: edge.id.clone(),
-            org_id: edge.org_id.clone(),
-            src_id: edge.src_id.clone(),
-            dst_id: edge.dst_id.clone(),
-            kind: edge.kind.clone(),
-            assertion_scope: edge.assertion_scope.clone(),
-            state: edge.state.clone(),
-            weight: edge.weight,
-            asserted_by: edge.asserted_by.clone(),
-            asserted_by_kind: edge.asserted_by_kind.clone(),
-            asserted_at,
-            source_kind: edge.source_kind.clone(),
-            source_ref: edge.source_ref.clone(),
-            valid_from,
-            valid_to,
-            meta_json: edge.meta_json.clone(),
-        })
+        insert_edge_sql(self.conn, edge)
+    }
+
+    fn update_edge_weight(
+        &mut self,
+        _org_id: &str,
+        _edge_id: &str,
+        _weight: f64,
+    ) -> UaResult<Option<GraphEdgeRow>> {
+        Err(UaError::invalid(
+            "MigrationGraph is insert-only; edge updates are not supported during migration",
+        ))
     }
 
     fn insert_nodes_batch(&mut self, nodes: &[NewGraphNode]) -> UaResult<usize> {
-        for n in nodes {
-            check_provenance(&n.org_id, &n.asserted_by, &n.asserted_by_kind, &n.source_kind)?;
-        }
-        let mut stmt = self.prepare_cached(INSERT_NODE_SQL)?;
-        let mut inserted = 0usize;
-        for n in nodes {
-            let created_at = normalize_ts(&n.created_at, "created_at")?;
-            let updated_at = normalize_ts(&n.updated_at, "updated_at")?;
-            stmt.execute(params![
-                n.id,
-                n.org_id,
-                n.kind,
-                n.external_id,
-                n.display_label,
-                n.visibility,
-                n.team_id,
-                n.owner_type,
-                n.owner_id,
-                n.asserted_by,
-                n.asserted_by_kind,
-                n.source_kind,
-                n.source_ref,
-                n.meta_json,
-                created_at,
-                updated_at,
-            ])?;
-            inserted += 1;
-        }
-        Ok(inserted)
+        insert_nodes_batch_sql(self.conn, nodes)
     }
 
     fn insert_edges_batch(&mut self, edges: &[NewGraphEdge]) -> UaResult<usize> {
+        insert_edges_batch_sql(self.conn, edges)
+    }
+
+    fn close_edge(
+        &mut self,
+        _org_id: &str,
+        _edge_id: &str,
+        _valid_to: &str,
+    ) -> UaResult<Option<GraphEdgeRow>> {
+        Err(UaError::invalid(
+            "MigrationGraph is insert-only; closing edges is not supported during migration",
+        ))
+    }
+
+    fn record_event(&mut self, _channel: &str, _payload: Value, _originator: &str) -> UaResult<Option<i64>> {
+        // Schema parts and bulk importers must not append to the hash-chained ledger.
+        Ok(None)
+    }
+}
+
+impl GraphRepo for WriteTx<'_> {
+    fn find_node_by_id_internal(&mut self, org_id: &str, id: &str) -> UaResult<Option<GraphNodeRow>> {
+        find_node_by_id_internal_sql(self, org_id, id)
+    }
+
+    fn find_node_by_external_internal(
+        &mut self,
+        org_id: &str,
+        kind: &str,
+        external_id: &str,
+    ) -> UaResult<Option<GraphNodeRow>> {
+        find_node_by_external_internal_sql(self, org_id, kind, external_id)
+    }
+
+    fn ensure_node(&mut self, node: &NewGraphNode) -> UaResult<(GraphNodeRow, bool)> {
+        ensure_node_sql(self, node)
+    }
+
+    fn update_node_mutable(
+        &mut self,
+        org_id: &str,
+        id: &str,
+        patch: &GraphNodePatch,
+    ) -> UaResult<Option<GraphNodeRow>> {
         let now_str = now();
-        let mut normalized = Vec::with_capacity(edges.len());
-        for e in edges {
-            check_provenance(&e.org_id, &e.asserted_by, &e.asserted_by_kind, &e.source_kind)?;
-            normalized.push(check_edge_temporal_cow(
-                &e.source_kind,
-                &e.asserted_at,
-                &e.valid_from,
-                e.valid_to.as_deref(),
-                &now_str,
-            )?);
-        }
-        let mut stmt = self.prepare_cached(INSERT_EDGE_SQL)?;
-        let mut inserted = 0usize;
-        for (e, (asserted_at, valid_from, valid_to)) in edges.iter().zip(normalized.iter()) {
+        let updated_at = normalize_ts(&patch.updated_at, "updated_at")?;
+        let archived_at = match patch.archived_at.as_deref() {
+            Some(raw) => {
+                let ts = normalize_ts(raw, "archived_at")?;
+                if ts > now_str {
+                    return Err(UaError::invalid_code(
+                        "future_archived_at",
+                        "archived_at must be <= current hub time",
+                    ));
+                }
+                Some(ts)
+            }
+            None => None,
+        };
+        let changed = {
+            let mut stmt = self.prepare_cached(
+                "UPDATE graph_nodes \
+                 SET display_label = ?1, visibility = ?2, team_id = ?3, owner_type = ?4, \
+                     owner_id = ?5, meta_json = ?6, archived_at = ?7, updated_at = ?8 \
+                 WHERE org_id = ?9 AND id = ?10",
+            )?;
             stmt.execute(params![
-                e.id,
-                e.org_id,
-                e.src_id,
-                e.dst_id,
-                e.kind,
-                e.assertion_scope,
-                e.state,
-                e.weight,
-                e.asserted_by,
-                e.asserted_by_kind,
-                asserted_at.as_ref(),
-                e.source_kind,
-                e.source_ref,
-                valid_from.as_ref(),
-                valid_to.as_deref(),
-                e.meta_json,
-            ])?;
-            inserted += 1;
+                patch.display_label,
+                patch.visibility,
+                patch.team_id,
+                patch.owner_type,
+                patch.owner_id,
+                patch.meta_json,
+                archived_at,
+                updated_at,
+                org_id,
+                id,
+            ])?
+        };
+        if changed == 0 {
+            return Ok(None);
         }
-        Ok(inserted)
+        self.find_node_by_id_internal(org_id, id)
+    }
+
+    fn insert_edge(&mut self, edge: &NewGraphEdge) -> UaResult<GraphEdgeRow> {
+        insert_edge_sql(self, edge)
+    }
+
+    fn insert_nodes_batch(&mut self, nodes: &[NewGraphNode]) -> UaResult<usize> {
+        insert_nodes_batch_sql(self, nodes)
+    }
+
+    fn insert_edges_batch(&mut self, edges: &[NewGraphEdge]) -> UaResult<usize> {
+        insert_edges_batch_sql(self, edges)
     }
 
     fn close_edge(&mut self, org_id: &str, edge_id: &str, valid_to: &str) -> UaResult<Option<GraphEdgeRow>> {
@@ -2056,6 +2414,42 @@ impl GraphRepo for WriteTx<'_> {
         let mut closed = existing;
         closed.valid_to = Some(vt);
         Ok(Some(closed))
+    }
+
+    fn update_edge_weight(
+        &mut self,
+        org_id: &str,
+        edge_id: &str,
+        weight: f64,
+    ) -> UaResult<Option<GraphEdgeRow>> {
+        if !weight.is_finite() || weight <= 0.0 || weight > 1000.0 {
+            return Err(UaError::invalid("weight must be finite and in (0.0, 1000.0]"));
+        }
+        let Some(existing) = get_edge_by_id_sql(self, org_id, edge_id)? else {
+            return Ok(None);
+        };
+        if existing.valid_to.is_some() {
+            return Err(UaError::conflict_code(
+                "edge_already_closed",
+                format!("graph edge {edge_id} is already closed"),
+            ));
+        }
+        {
+            let mut stmt = self.prepare_cached(
+                "UPDATE graph_edges SET weight = ?1 \
+                 WHERE org_id = ?2 AND id = ?3 AND valid_to IS NULL",
+            )?;
+            let n = stmt.execute(params![weight, org_id, edge_id])?;
+            if n == 0 {
+                return Err(UaError::conflict_code(
+                    "edge_already_closed",
+                    format!("graph edge {edge_id} is already closed"),
+                ));
+            }
+        }
+        let mut updated = existing;
+        updated.weight = weight;
+        Ok(Some(updated))
     }
 
     fn record_event(&mut self, channel: &str, payload: Value, originator: &str) -> UaResult<Option<i64>> {

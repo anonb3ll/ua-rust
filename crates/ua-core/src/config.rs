@@ -168,6 +168,12 @@ pub struct Config {
     pub agent_workspaces: BTreeMap<String, String>,
     /// Embedding model for semantic memory search (needs the `embeddings` feature).
     pub embed_model: String,
+    /// Memory embedder backend configuration (`[memory]` table).
+    pub memory: MemoryConfig,
+    /// Test hook: OpenAI-compatible embedder API key handed in directly instead
+    /// of through `UA_EMBED_API_KEY`. It cannot be set from TOML or the environment.
+    #[serde(skip)]
+    pub embed_api_key_value: Option<SecretString>,
     /// Edition: `full` (default) or `core`, which hides ledger features.
     pub edition: String,
     /// Public base URL of the hub, e.g. `https://hub.example.com`. It is the
@@ -480,7 +486,48 @@ pub struct Config {
     /// Gate runs (`check` and `draft`) one caller may make per hour, so the
     /// private denylist cannot be probed term by term. 0 refuses every run.
     pub relay_checks_per_hour: u32,
+    /// The clock the memory domain reads for "now" (search recency and age
+    /// discount, expiry, stored timestamps). Always the wall clock in a
+    /// running hub; tests and the retrieval bench inject a fixed one. Not
+    /// configurable from a file or the environment.
+    #[serde(skip)]
+    pub clock: crate::time::Clock,
 }
+
+/// Memory embedder configuration (`[memory]` table in `config.toml`).
+///
+/// The local model name remains the top-level `embed_model` setting. API keys
+/// for `openai_compat` come exclusively from the `UA_EMBED_API_KEY` environment
+/// variable, never from `config.toml`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Embedder backend: `auto` (default), `local`, `ollama`, `openai_compat`, or `off`.
+    pub embedder: String,
+    /// Model name sent to Ollama (Ollama model names differ from Hugging Face ids).
+    pub ollama_model: String,
+    /// Ollama server base URL. Defaults to loopback `http://127.0.0.1:11434`.
+    pub ollama_url: String,
+    /// OpenAI-compatible `/v1/embeddings` base URL (or full endpoint URL).
+    pub openai_compat_url: Option<String>,
+    /// Optional model name for `openai_compat`; defaults to top-level `embed_model`.
+    pub openai_compat_model: Option<String>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            embedder: "auto".into(),
+            ollama_model: "nomic-embed-text".into(),
+            ollama_url: "http://127.0.0.1:11434".into(),
+            openai_compat_url: None,
+            openai_compat_model: None,
+        }
+    }
+}
+
+/// Valid `[memory].embedder` values.
+pub const MEMORY_EMBEDDER_MODES: &[&str] = &["auto", "local", "ollama", "openai_compat", "off"];
 
 /// One Slack user the Slack routes accept, and the hub identity it acts as.
 /// Slack's `user_name` and display names are never used for identity: only
@@ -749,6 +796,8 @@ impl Default for Config {
             profiles: BTreeMap::new(),
             agent_workspaces: BTreeMap::new(),
             embed_model: "BAAI/bge-small-en-v1.5".into(),
+            memory: MemoryConfig::default(),
+            embed_api_key_value: None,
             edition: "full".into(),
             public_url: None,
             oauth_enabled: false,
@@ -833,6 +882,7 @@ impl Default for Config {
             relay_mention_allowlist: Vec::new(),
             relay_redirector_hosts: DEFAULT_REDIRECTOR_HOSTS.iter().map(|h| h.to_string()).collect(),
             relay_checks_per_hour: 60,
+            clock: crate::time::Clock::System,
         }
     }
 }
@@ -885,6 +935,7 @@ impl Config {
     fn load_inner(explicit: Option<&Path>, with_env: bool) -> anyhow::Result<Self> {
         let cfg = Self::figment(explicit, with_env).extract::<Config>().map(Self::normalized)?;
         cfg.check_profiles()?;
+        cfg.check_memory()?;
         cfg.check_slack_identities()?;
         for (name, h) in &cfg.harnesses {
             h.check(name)?;
@@ -958,6 +1009,25 @@ impl Config {
         (hits.next().is_none() && self.is_human(&first.identity)).then_some(first)
     }
 
+    /// Validate `[memory]` settings.
+    pub fn check_memory(&self) -> anyhow::Result<()> {
+        let mode = self.memory.embedder.as_str();
+        if !MEMORY_EMBEDDER_MODES.contains(&mode) {
+            anyhow::bail!(
+                "memory.embedder = {:?}: must be one of {}",
+                mode,
+                MEMORY_EMBEDDER_MODES.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    /// API key for `openai_compat` embeddings, from `UA_EMBED_API_KEY` only
+    /// (never from `config.toml`), trimmed; `None` when unset or blank.
+    pub fn embed_api_key(&self) -> Option<SecretString> {
+        secret_from(&self.embed_api_key_value, Some("UA_EMBED_API_KEY"))
+    }
+
     /// The Slack signing secret, trimmed; `None` when unset or blank.
     pub fn slack_signing_secret(&self) -> Option<SecretString> {
         secret_from(&self.slack_signing_secret, None)
@@ -986,7 +1056,27 @@ impl Config {
         if with_env {
             // MCP servers and the Slack identity map come from TOML only: no
             // JSON-in-an-environment-variable form.
-            fig = fig.merge(Env::prefixed("UA_").ignore(&["config", "mcp_servers", "slack_identities"]));
+            fig = fig.merge(Env::prefixed("UA_").ignore(&[
+                "config",
+                "mcp_servers",
+                "slack_identities",
+                "embed_api_key",
+            ]));
+            // `[memory]` table overrides: map ONLY the five supported keys so
+            // unrelated `UA_MEMORY_*` variables (e.g. from a shared Python hub
+            // env file such as `UA_MEMORY_PROVIDER` or `UA_MEMORY_RRF_K`) do
+            // not collide with `MemoryConfig`'s `deny_unknown_fields`.
+            fig = fig.merge(
+                Env::prefixed("UA_MEMORY_")
+                    .only(&[
+                        "embedder",
+                        "ollama_model",
+                        "ollama_url",
+                        "openai_compat_url",
+                        "openai_compat_model",
+                    ])
+                    .map(|k| format!("memory.{}", k.as_str().to_ascii_lowercase()).into()),
+            );
         }
         fig
     }
@@ -1015,6 +1105,20 @@ impl Config {
             t.path = expand_tilde(&t.path);
             t.sha256 = t.sha256.trim().to_ascii_lowercase();
         }
+        self.memory.embedder = self.memory.embedder.trim().to_ascii_lowercase();
+        self.memory.ollama_model = self.memory.ollama_model.trim().to_string();
+        self.memory.ollama_url = self.memory.ollama_url.trim().trim_end_matches('/').to_string();
+        if self.memory.ollama_url.is_empty() {
+            self.memory.ollama_url = MemoryConfig::default().ollama_url;
+        }
+        self.memory.openai_compat_url = self
+            .memory
+            .openai_compat_url
+            .take()
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty());
+        self.memory.openai_compat_model =
+            self.memory.openai_compat_model.take().map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
         self
     }
 
