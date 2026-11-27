@@ -45,7 +45,7 @@ pub use embed::{
     BruteForceIndex, EmbedError, Embedder, HttpEmbedderFactory, HttpEmbedderRequest, NoopEmbedder,
     VectorIndex, embed_batch, embedder_for, embedder_for_org, embedder_for_with_remote_flag, local_embedder,
     openai_compat_revision, org_allows_remote_embedder, register_embedder, register_http_embedder_factory,
-    register_remote_embedder, vector_identity,
+    register_remote_embedder, registered_embedder, vector_identity,
 };
 pub use maintenance::{
     BackfillReport, EmbeddingCounts, MAX_BACKFILL_BATCHES_PER_PASS, backfill_all_orgs_step,

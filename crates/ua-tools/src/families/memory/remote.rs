@@ -13,7 +13,8 @@
 //! - API keys for `openai_compat` come exclusively from `UA_EMBED_API_KEY`
 //!   (`Config::embed_api_key`) and are attached via `Request::secret_header`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -21,14 +22,58 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::json;
 use ua_core::Config;
+use ua_ingress::addr;
 use ua_ingress::policy::{EMBEDDER_LOCAL, EMBEDDER_REMOTE};
 use ua_ingress::{
     Lookup, Outbound, Request, ResolvedEndpoint, Url, resolve_endpoint, resolve_endpoint_with_lookup,
 };
 use ua_memory::{EmbedError, Embedder, HttpEmbedderRequest};
+use url::Host;
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTO_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_CACHED_HOSTS: usize = 1024;
+
+fn host_remote_cache() -> &'static Mutex<HashMap<String, bool>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn attempted_hosts() -> &'static Mutex<HashSet<String>> {
+    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn record_host_attempt(host: &str) {
+    if let Ok(mut set) = attempted_hosts().lock() {
+        let key = host.to_ascii_lowercase();
+        if set.len() >= MAX_CACHED_HOSTS && !set.contains(&key) {
+            set.clear();
+        }
+        set.insert(key);
+    }
+}
+
+/// Whether `build_guarded_client` ever attempted DNS resolution for `host` in
+/// this process (exposed for zero-network `system_doctor` regression tests).
+#[doc(hidden)]
+pub fn host_lookup_attempted(host: &str) -> bool {
+    attempted_hosts().lock().ok().is_some_and(|set| set.contains(&host.to_ascii_lowercase()))
+}
+
+fn record_host_remote(host: &str, is_remote: bool) {
+    if let Ok(mut map) = host_remote_cache().lock() {
+        let key = host.to_ascii_lowercase();
+        if map.len() >= MAX_CACHED_HOSTS && !map.contains_key(&key) {
+            map.clear();
+        }
+        map.insert(key, is_remote);
+    }
+}
+
+fn cached_host_remote(host: &str) -> Option<bool> {
+    host_remote_cache().lock().ok()?.get(&host.to_ascii_lowercase()).copied()
+}
 
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -52,11 +97,18 @@ pub async fn build_guarded_client(
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("embedder URL scheme {:?} is not http or https", url.scheme()));
     }
+    let use_real_dns = lookup.is_none();
+    if use_real_dns && let Some(host) = url.host_str() {
+        record_host_attempt(host);
+    }
     let resolved = match lookup {
         Some(l) => resolve_endpoint_with_lookup(&url, RESOLVE_TIMEOUT, l).await,
         None => resolve_endpoint(&url, RESOLVE_TIMEOUT).await,
     }
     .map_err(|e| e.to_string())?;
+    if use_real_dns {
+        record_host_remote(&resolved.host, resolved.is_remote);
+    }
 
     if resolved.is_remote && !allow_remote {
         return Err(format!(
@@ -88,16 +140,30 @@ struct OllamaEmbedResponse {
 struct OllamaShowResponse {
     #[serde(default)]
     digest: Option<String>,
-    #[serde(default)]
-    modified_at: Option<String>,
-    #[serde(default)]
-    details: Option<OllamaShowDetails>,
 }
 
 #[derive(Deserialize)]
-struct OllamaShowDetails {
+struct OllamaTagsResponse {
     #[serde(default)]
-    quantization_level: Option<String>,
+    models: Vec<OllamaTagEntry>,
+}
+
+#[derive(Deserialize)]
+struct OllamaTagEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+fn normalize_ollama_model_tag(model: &str) -> String {
+    let trimmed = model.trim();
+    // Only treat `:` after the last `/` as a tag separator so registry ports
+    // like `registry.local:5000/ns/embed` still normalize to `:latest`.
+    let after_slash = trimmed.rsplit_once('/').map_or(trimmed, |(_, tail)| tail);
+    if after_slash.contains(':') { trimmed.to_string() } else { format!("{trimmed}:latest") }
 }
 
 fn ollama_revision_cache() -> &'static Mutex<HashMap<(String, String), String>> {
@@ -122,31 +188,79 @@ fn ollama_endpoint(base: &Url, suffix: &str) -> Result<Url, EmbedError> {
     Ok(u)
 }
 
-async fn probe_ollama_model(base: &Url, client: &Outbound, model: &str, timeout: Duration) -> Option<String> {
-    let url = ollama_endpoint(base, "/api/show").ok()?;
-    let req = Request::post(url).json(&json!({ "model": model })).ok()?;
+async fn probe_ollama_tags_digest(
+    base: &Url,
+    client: &Outbound,
+    model: &str,
+    timeout: Duration,
+) -> Option<String> {
+    if timeout.is_zero() {
+        return None;
+    }
+    let url = ollama_endpoint(base, "/api/tags").ok()?;
+    let req = Request::get(url);
     let resp = tokio::time::timeout(timeout, client.send(req)).await.ok()?.ok()?;
     if !resp.status().is_success() {
         return None;
     }
-    let parsed: OllamaShowResponse = resp.json().await.ok()?;
-    let rev = parsed
-        .digest
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            parsed
-                .details
-                .as_ref()
-                .and_then(|d| d.quantization_level.as_deref())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| parsed.modified_at.as_deref().map(str::trim).filter(|s| !s.is_empty()))
-        .unwrap_or("present")
-        .to_string();
-    Some(rev)
+    let parsed: OllamaTagsResponse = resp.json().await.ok()?;
+    let target = model.trim();
+    let target_norm = normalize_ollama_model_tag(target);
+    for entry in parsed.models {
+        let name_matches =
+            entry.name.trim() == target || normalize_ollama_model_tag(&entry.name) == target_norm;
+        let model_matches = entry
+            .model
+            .as_deref()
+            .is_some_and(|m| m.trim() == target || normalize_ollama_model_tag(m) == target_norm);
+        if (name_matches || model_matches)
+            && let Some(digest) = entry.digest.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            return Some(digest.to_string());
+        }
+    }
+    None
+}
+
+enum OllamaProbe {
+    /// Confirmed model presence AND obtained a real content-addressed digest.
+    Digest(String),
+    /// `/api/show` confirmed the model is served, but neither `/api/show` nor
+    /// `/api/tags` yielded a digest (e.g. transient `/api/tags` failure). Never
+    /// overwrites a cached digest with unstable metadata such as `quantization_level`.
+    ServedWithoutDigest,
+    /// Endpoint unreachable or `/api/show` reported the model is not served.
+    Unavailable,
+}
+
+async fn probe_ollama_model(base: &Url, client: &Outbound, model: &str, timeout: Duration) -> OllamaProbe {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let Ok(url) = ollama_endpoint(base, "/api/show") else {
+        return OllamaProbe::Unavailable;
+    };
+    let Ok(req) = Request::post(url).json(&json!({ "model": model })) else {
+        return OllamaProbe::Unavailable;
+    };
+    let Ok(Ok(resp)) = tokio::time::timeout(timeout, client.send(req)).await else {
+        return OllamaProbe::Unavailable;
+    };
+    if !resp.status().is_success() {
+        return OllamaProbe::Unavailable;
+    }
+    let Ok(parsed) = resp.json::<OllamaShowResponse>().await else {
+        return OllamaProbe::Unavailable;
+    };
+    if let Some(digest) = parsed.digest.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return OllamaProbe::Digest(digest.to_string());
+    }
+    // Real Ollama `/api/show` omits `digest`; query `/api/tags` on the same
+    // pinned client so only a real content-addressed digest establishes or
+    // updates the vector identity.
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if let Some(digest) = probe_ollama_tags_digest(base, client, model, remaining).await {
+        return OllamaProbe::Digest(digest);
+    }
+    OllamaProbe::ServedWithoutDigest
 }
 
 /// Build a guarded Ollama embedder using an optional custom DNS lookup (for tests).
@@ -165,14 +279,23 @@ pub async fn build_ollama_embedder(
     let origin = url.origin().ascii_serialization();
     let probe_timeout = if require_probe { AUTO_PROBE_TIMEOUT } else { Duration::from_secs(3) };
     let revision = match probe_ollama_model(&url, &client, model, probe_timeout).await {
-        Some(rev) => {
+        OllamaProbe::Digest(rev) => {
             store_ollama_revision(&origin, model, &rev);
             rev
         }
-        None if require_probe => {
+        OllamaProbe::ServedWithoutDigest => match cached_ollama_revision(&origin, model) {
+            Some(last_good) => last_good,
+            None => {
+                return Err(format!(
+                    "Ollama at {origin} serves {model:?} but /api/show and /api/tags returned no digest; \
+                     refusing to embed without a pinned revision"
+                ));
+            }
+        },
+        OllamaProbe::Unavailable if require_probe => {
             return Err(format!("loopback Ollama at {origin} does not serve model {model:?}"));
         }
-        None => match cached_ollama_revision(&origin, model) {
+        OllamaProbe::Unavailable => match cached_ollama_revision(&origin, model) {
             Some(last_good) => last_good,
             None => {
                 return Err(format!(
@@ -211,6 +334,12 @@ impl Embedder for OllamaEmbedder {
             message: format!("ollama embedder unreachable: {e}"),
         })?;
         let status = resp.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            return Err(EmbedError::auth_refused(format!(
+                "ollama embedder authentication refused (HTTP {})",
+                status.as_u16()
+            )));
+        }
         if !status.is_success() {
             return Err(EmbedError::runtime(format!("ollama embedder returned HTTP {}", status.as_u16())));
         }
@@ -316,10 +445,10 @@ impl Embedder for OpenAiCompatEmbedder {
         })?;
         let status = resp.status();
         if matches!(status.as_u16(), 401 | 403) {
-            return Err(EmbedError {
-                category: "model_acquisition",
-                message: format!("openai_compat embedder authentication refused (HTTP {})", status.as_u16()),
-            });
+            return Err(EmbedError::auth_refused(format!(
+                "openai_compat embedder authentication refused (HTTP {})",
+                status.as_u16()
+            )));
         }
         if !status.is_success() {
             return Err(EmbedError::runtime(format!(
@@ -390,4 +519,208 @@ pub fn install_http_embedder_factory() {
     ONCE.get_or_init(|| {
         ua_memory::register_http_embedder_factory(Arc::new(resolve_http_embedder));
     });
+}
+
+// ── Zero-network doctor inspection ─────────────────────────────────────────
+
+/// Readiness classification for `system_doctor`, computed strictly without DNS
+/// lookups or HTTP probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorEmbedderAvailability {
+    /// Active vector identity is known locally (registered embedder, local
+    /// ONNX model on disk, `openai_compat` URL permitted for this org, or
+    /// Ollama with a previously cached revision).
+    Available,
+    /// Ollama is configured and permitted for this org, but no embedder call
+    /// has probed it in this process yet (`system_doctor` never touches the
+    /// network).
+    Unprobed,
+    /// Unavailable for this org (off, missing local model, remote endpoint
+    /// blocked by `allow_remote_embedder`, cleartext API key over remote HTTP,
+    /// or invalid URL).
+    Unavailable,
+}
+
+/// Zero-network embedder snapshot for `system_doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorEmbedderState {
+    pub availability: DoctorEmbedderAvailability,
+    pub active_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalHostClass {
+    Loopback,
+    Remote,
+    UnresolvedDomain,
+    Refused,
+}
+
+fn classify_literal_ip(ip: IpAddr) -> LocalHostClass {
+    if addr::is_loopback(ip) {
+        LocalHostClass::Loopback
+    } else if EMBEDDER_REMOTE.addresses.check(ip).is_ok() {
+        LocalHostClass::Remote
+    } else {
+        LocalHostClass::Refused
+    }
+}
+
+fn classify_url_host_without_dns(url: &Url) -> LocalHostClass {
+    match url.host() {
+        Some(Host::Ipv4(v4)) => classify_literal_ip(IpAddr::V4(v4)),
+        Some(Host::Ipv6(v6)) => classify_literal_ip(IpAddr::V6(v6)),
+        Some(Host::Domain(host)) => match cached_host_remote(host) {
+            Some(false) => LocalHostClass::Loopback,
+            Some(true) => LocalHostClass::Remote,
+            None if host.eq_ignore_ascii_case("localhost") => LocalHostClass::Loopback,
+            None => LocalHostClass::UnresolvedDomain,
+        },
+        None => LocalHostClass::Refused,
+    }
+}
+
+fn parse_valid_http_url(raw_url: &str) -> Option<Url> {
+    let url = Url::parse(raw_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    url.host()?;
+    Some(url)
+}
+
+/// Inspect embedder readiness and active canonical identity for `system_doctor`
+/// without performing any DNS lookup, HTTP probe, or model download.
+pub fn inspect_embedder_for_doctor(cfg: &Config, allow_remote: bool) -> DoctorEmbedderState {
+    if let Some(e) = ua_memory::registered_embedder(cfg, allow_remote) {
+        return if e.available() {
+            DoctorEmbedderState {
+                availability: DoctorEmbedderAvailability::Available,
+                active_identity: Some(e.identity()),
+            }
+        } else {
+            DoctorEmbedderState {
+                availability: DoctorEmbedderAvailability::Unavailable,
+                active_identity: None,
+            }
+        };
+    }
+
+    match cfg.memory.embedder.trim().to_ascii_lowercase().as_str() {
+        "off" => DoctorEmbedderState {
+            availability: DoctorEmbedderAvailability::Unavailable,
+            active_identity: None,
+        },
+        "local" => match ua_memory::local_embedder(cfg) {
+            Some(e) if e.available() => DoctorEmbedderState {
+                availability: DoctorEmbedderAvailability::Available,
+                active_identity: Some(e.identity()),
+            },
+            _ => DoctorEmbedderState {
+                availability: DoctorEmbedderAvailability::Unavailable,
+                active_identity: None,
+            },
+        },
+        "ollama" => {
+            let model = cfg.memory.ollama_model.trim();
+            let Some(url) = parse_valid_http_url(&cfg.memory.ollama_url).filter(|_| !model.is_empty()) else {
+                return DoctorEmbedderState {
+                    availability: DoctorEmbedderAvailability::Unavailable,
+                    active_identity: None,
+                };
+            };
+            let class = classify_url_host_without_dns(&url);
+            let permitted = match class {
+                LocalHostClass::Loopback => true,
+                LocalHostClass::Remote | LocalHostClass::UnresolvedDomain => allow_remote,
+                LocalHostClass::Refused => false,
+            };
+            if !permitted {
+                return DoctorEmbedderState {
+                    availability: DoctorEmbedderAvailability::Unavailable,
+                    active_identity: None,
+                };
+            }
+            let origin = url.origin().ascii_serialization();
+            match cached_ollama_revision(&origin, model) {
+                Some(rev) => DoctorEmbedderState {
+                    availability: DoctorEmbedderAvailability::Available,
+                    active_identity: Some(ua_memory::vector_identity("ollama", model, &rev)),
+                },
+                None => DoctorEmbedderState {
+                    availability: DoctorEmbedderAvailability::Unprobed,
+                    active_identity: None,
+                },
+            }
+        }
+        "openai_compat" => {
+            let Some(raw_url) = cfg.memory.openai_compat_url.as_deref() else {
+                return DoctorEmbedderState {
+                    availability: DoctorEmbedderAvailability::Unavailable,
+                    active_identity: None,
+                };
+            };
+            let model = cfg.memory.openai_compat_model.as_deref().unwrap_or(&cfg.embed_model).trim();
+            let Some(url) = parse_valid_http_url(raw_url).filter(|_| !model.is_empty()) else {
+                return DoctorEmbedderState {
+                    availability: DoctorEmbedderAvailability::Unavailable,
+                    active_identity: None,
+                };
+            };
+            let class = classify_url_host_without_dns(&url);
+            let permitted = match class {
+                LocalHostClass::Loopback => true,
+                LocalHostClass::Remote | LocalHostClass::UnresolvedDomain => allow_remote,
+                LocalHostClass::Refused => false,
+            };
+            if !permitted {
+                return DoctorEmbedderState {
+                    availability: DoctorEmbedderAvailability::Unavailable,
+                    active_identity: None,
+                };
+            }
+            if !matches!(class, LocalHostClass::Loopback)
+                && cfg.embed_api_key().is_some()
+                && url.scheme() != "https"
+            {
+                return DoctorEmbedderState {
+                    availability: DoctorEmbedderAvailability::Unavailable,
+                    active_identity: None,
+                };
+            }
+            let rev = ua_memory::openai_compat_revision(raw_url);
+            DoctorEmbedderState {
+                availability: DoctorEmbedderAvailability::Available,
+                active_identity: Some(ua_memory::vector_identity("openai_compat", model, &rev)),
+            }
+        }
+        // `auto`: local ONNX on disk if present, else a previously probed loopback Ollama.
+        _ => {
+            if let Some(e) = ua_memory::local_embedder(cfg)
+                && e.available()
+            {
+                return DoctorEmbedderState {
+                    availability: DoctorEmbedderAvailability::Available,
+                    active_identity: Some(e.identity()),
+                };
+            }
+            let model = cfg.memory.ollama_model.trim();
+            if let Some(url) = parse_valid_http_url(&cfg.memory.ollama_url).filter(|_| !model.is_empty())
+                && classify_url_host_without_dns(&url) == LocalHostClass::Loopback
+                && let Some(rev) = cached_ollama_revision(&url.origin().ascii_serialization(), model)
+            {
+                return DoctorEmbedderState {
+                    availability: DoctorEmbedderAvailability::Available,
+                    active_identity: Some(ua_memory::vector_identity("ollama", model, &rev)),
+                };
+            }
+            DoctorEmbedderState {
+                availability: DoctorEmbedderAvailability::Unavailable,
+                active_identity: None,
+            }
+        }
+    }
 }

@@ -141,12 +141,29 @@ pub const MAX_BACKFILL_BATCHES_PER_PASS: usize = 8;
 /// can advance time deterministically; editing the note (new `content_sha`) or
 /// changing the active vector identity bypasses the cooldown immediately.
 const FAILED_NOTE_COOLDOWN_MS: i64 = 15 * 60 * 1000;
+/// Base and maximum exponential backoff delays after HTTP 401/403
+/// (`auth_refused`) in background backfill (1m → 2m → 4m → … → 60m), measured
+/// on `Config.clock` so a revoked API key never keeps sending bearer tokens
+/// every minute.
+const AUTH_BACKOFF_BASE_MS: i64 = 60_000;
+const AUTH_BACKOFF_MAX_MS: i64 = 60 * 60 * 1000;
 const MAX_TRACKED_CURSORS: usize = 4096;
 const MAX_TRACKED_FAILURES: usize = 8192;
+const MAX_TRACKED_AUTH_BACKOFFS: usize = 4096;
 
 type CursorKey = (u64, String, String);
 type FailedKey = (u64, String, String);
 type FailedEntry = (String, String, i64);
+type AuthBackoffKey = (u64, String);
+
+#[derive(Clone)]
+struct AuthBackoffEntry {
+    target: String,
+    identity: String,
+    failures: u32,
+    recorded_ms: i64,
+    next_retry_ms: i64,
+}
 
 fn cursor_map() -> &'static Mutex<HashMap<CursorKey, i64>> {
     static MAP: OnceLock<Mutex<HashMap<CursorKey, i64>>> = OnceLock::new();
@@ -156,6 +173,65 @@ fn cursor_map() -> &'static Mutex<HashMap<CursorKey, i64>> {
 fn failed_map() -> &'static Mutex<HashMap<FailedKey, FailedEntry>> {
     static MAP: OnceLock<Mutex<HashMap<FailedKey, FailedEntry>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn auth_backoff_map() -> &'static Mutex<HashMap<AuthBackoffKey, AuthBackoffEntry>> {
+    static MAP: OnceLock<Mutex<HashMap<AuthBackoffKey, AuthBackoffEntry>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn auth_backoff_target(cfg: &Config) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        cfg.memory.embedder.trim().to_ascii_lowercase(),
+        cfg.embed_model.trim(),
+        cfg.memory.ollama_url.trim(),
+        cfg.memory.ollama_model.trim(),
+        cfg.memory.openai_compat_url.as_deref().unwrap_or("").trim(),
+        cfg.memory.openai_compat_model.as_deref().unwrap_or("").trim(),
+    )
+}
+
+fn active_auth_backoff(db_id: u64, org: &str, target: &str, now_ms: i64) -> Option<String> {
+    let m = auth_backoff_map().lock().ok()?;
+    let entry = m.get(&(db_id, org.to_string()))?;
+    if entry.target == target && now_ms >= entry.recorded_ms && now_ms < entry.next_retry_ms {
+        Some(entry.identity.clone())
+    } else {
+        None
+    }
+}
+
+fn record_auth_refused(db_id: u64, org: &str, target: &str, identity: &str, clock: Clock) {
+    let now_ms = clock.now_ms();
+    if let Ok(mut m) = auth_backoff_map().lock() {
+        let key = (db_id, org.to_string());
+        if m.len() >= MAX_TRACKED_AUTH_BACKOFFS && !m.contains_key(&key) {
+            m.retain(|_, e| now_ms >= e.recorded_ms && now_ms < e.next_retry_ms);
+            if m.len() >= MAX_TRACKED_AUTH_BACKOFFS {
+                m.clear();
+            }
+        }
+        let failures = m.get(&key).filter(|e| e.target == target).map_or(1, |e| e.failures.saturating_add(1));
+        let shift = failures.saturating_sub(1).min(10);
+        let delay_ms = AUTH_BACKOFF_BASE_MS.saturating_mul(1i64 << shift).min(AUTH_BACKOFF_MAX_MS);
+        m.insert(
+            key,
+            AuthBackoffEntry {
+                target: target.to_string(),
+                identity: identity.to_string(),
+                failures,
+                recorded_ms: now_ms,
+                next_retry_ms: now_ms.saturating_add(delay_ms),
+            },
+        );
+    }
+}
+
+fn clear_auth_refused(db_id: u64, org: &str) {
+    if let Ok(mut m) = auth_backoff_map().lock() {
+        m.remove(&(db_id, org.to_string()));
+    }
 }
 
 fn load_cursor(db_id: u64, org: &str, identity: &str) -> i64 {
@@ -237,8 +313,11 @@ pub struct BackfillReport {
     /// Notes whose embedding failed with a runtime error.
     pub failed: usize,
     /// True when the pass stopped early because the embedder reported
-    /// `model_acquisition` or `disabled`.
+    /// `model_acquisition`, `auth_refused`, or `disabled`.
     pub stopped_unavailable: bool,
+    /// True when the pass stopped or was skipped because the embedder refused
+    /// authentication (HTTP 401/403) and is in exponential backoff.
+    pub stopped_auth_refused: bool,
     /// True when the pass reached the per-call batch cap before exhausting
     /// stale notes; a subsequent pass will continue from the remaining notes.
     pub has_more: bool,
@@ -254,6 +333,7 @@ impl BackfillReport {
             "batches": self.batches,
             "failed": self.failed,
             "stopped_unavailable": self.stopped_unavailable,
+            "stopped_auth_refused": self.stopped_auth_refused,
             "has_more": self.has_more,
         })
     }
@@ -381,6 +461,18 @@ pub async fn backfill_embeddings_capped(
     org: &str,
     max_batches: Option<usize>,
 ) -> UaResult<BackfillReport> {
+    let db_id = db.instance_id();
+    let backoff_target = auth_backoff_target(cfg);
+    if let Some(identity) = active_auth_backoff(db_id, org, &backoff_target, cfg.clock.now_ms()) {
+        return Ok(BackfillReport {
+            identity,
+            available: true,
+            stopped_unavailable: true,
+            stopped_auth_refused: true,
+            ..Default::default()
+        });
+    }
+
     let embedder = embedder_for_org(db, cfg, org).await;
     let identity = embedder.identity();
     let mut report =
@@ -389,7 +481,6 @@ pub async fn backfill_embeddings_capped(
         return Ok(report);
     }
 
-    let db_id = db.instance_id();
     let mut cursor: i64 = load_cursor(db_id, org, &identity);
     let mut batches_attempted: usize = 0;
     loop {
@@ -417,7 +508,20 @@ pub async fn backfill_embeddings_capped(
             match blocking(move || Ok(embed::embed_note(&*e, title.as_deref(), &content))).await? {
                 Ok((single, chunks)) => {
                     clear_failed_note(db_id, org, &note.id);
+                    clear_auth_refused(db_id, org);
                     embedded.push(EmbeddedNote { id: note.id, expected_sha: note.sha, single, chunks });
+                }
+                Err(err) if err.category == "auth_refused" => {
+                    tracing::warn!(
+                        category = err.category,
+                        error = %err.message,
+                        org = %org,
+                        "memory backfill: embedder authentication refused; backing off"
+                    );
+                    record_auth_refused(db_id, org, &backoff_target, &identity, cfg.clock);
+                    report.stopped_unavailable = true;
+                    report.stopped_auth_refused = true;
+                    break;
                 }
                 Err(err) if matches!(err.category, "disabled" | "model_acquisition") => {
                     tracing::debug!(
