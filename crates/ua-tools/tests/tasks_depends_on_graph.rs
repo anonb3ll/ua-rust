@@ -180,9 +180,11 @@ async fn dependency_add_refuses_cycle_and_cycle_check_bound_exceeded() {
     assert_eq!(cyc.code(), "invalid_argument");
     assert_eq!(cyc.reason_code(), Some("cycle_detected"));
 
-    // 2. Reachable subgraph exceeding CycleCheckPolicy's 1,000-node cap returns
-    //    invalid_argument(cycle_check_bound_exceeded) and writes nothing.
-    let chain_len = ua_graph::CYCLE_CHECK_MAX_NODES + 2; // 1,002 tasks -> 1,001 reachable nodes
+    // 2. Reachable subgraph exceeding the 1,000-node work cap returns
+    //    invalid_argument(cycle_check_bound_exceeded) with the visited_nodes reason
+    //    (not the wall-clock deadline) and writes nothing. Use a literal chain size
+    //    rather than reading CYCLE_CHECK_MAX_NODES so raising the cap fails this test fast.
+    let chain_len = 1_002usize; // 1,002 tasks -> 1,001 reachable nodes (> 1,000 cap)
     let base_id = 10_000i64;
     let now = ua_core::time::now();
     h.hub
@@ -246,11 +248,22 @@ async fn dependency_add_refuses_cycle_and_cycle_check_bound_exceeded() {
         .unwrap();
 
     // `extra_task -> head_task` walks from `head_task` along 1,001 reachable nodes,
-    // tripping CYCLE_CHECK_MAX_NODES (1,000) fail-closed.
+    // tripping CYCLE_CHECK_MAX_NODES (1,000) fail-closed well under the 2 s backstop.
+    let node_started = std::time::Instant::now();
     let err =
         h.err(&b1, "dependency_add", json!({ "task_id": extra_task, "depends_on_task_id": head_task })).await;
+    let node_elapsed = node_started.elapsed();
     assert_eq!(err.code(), "invalid_argument", "{err}");
     assert_eq!(err.reason_code(), Some("cycle_check_bound_exceeded"), "{err}");
+    let node_msg = err.to_string();
+    assert!(
+        node_msg.contains("visited_nodes") && !node_msg.contains("deadline"),
+        "expected visited_nodes work-cap refusal, not wall-clock deadline: {node_msg}"
+    );
+    assert!(
+        node_elapsed < std::time::Duration::from_millis(ua_graph::CYCLE_CHECK_DEADLINE_MS),
+        "visited_nodes cap refusal took {node_elapsed:?}, expected well under backstop"
+    );
 
     let edges_after: i64 = h
         .hub
@@ -260,6 +273,100 @@ async fn dependency_add_refuses_cycle_and_cycle_check_bound_exceeded() {
         })
         .unwrap();
     assert_eq!(edges_after, edges_before, "bound refusal must write nothing");
+
+    // 3. Dense DAG with 105 reachable nodes (well below the 1,000-node cap) and
+    //    5,460 reachable edges (> 5,000 edge cap) trips CYCLE_CHECK_MAX_EDGES
+    //    with the visited_edges reason (not deadline) and writes nothing.
+    let dag_nodes = 105usize;
+    let dag_base = 30_000i64;
+    h.hub
+        .db()
+        .write(|tx| {
+            {
+                let mut tstmt = tx.prepare(
+                    "INSERT INTO tasks (id, org_id, title, created_at, updated_at) \
+                     VALUES (?1, 'default', ?2, ?3, ?3)",
+                )?;
+                let mut nstmt = tx.prepare(
+                    "INSERT INTO graph_nodes (id, org_id, kind, external_id, display_label, visibility, \
+                     asserted_by, asserted_by_kind, source_kind, source_ref, meta_json, created_at, updated_at) \
+                     VALUES (?1, 'default', 'task', ?2, ?3, 'org', 'system', 'system', 'import', ?4, '{}', ?5, ?5)",
+                )?;
+                let mut estmt = tx.prepare(
+                    "INSERT INTO graph_edges (id, org_id, src_id, dst_id, kind, assertion_scope, state, weight, \
+                     asserted_by, asserted_by_kind, asserted_at, source_kind, source_ref, valid_from, valid_to, meta_json) \
+                     VALUES (?1, 'default', ?2, ?3, 'depends_on', '', 'active', 1.0, 'builder-1', 'agent', ?4, \
+                     'import', ?5, ?4, NULL, ?6)",
+                )?;
+                for i in 0..=dag_nodes {
+                    let tid = dag_base + i as i64;
+                    let nid = format!("node-dag-{tid}");
+                    tstmt.execute(rusqlite::params![tid, format!("Dag {i}"), now])?;
+                    nstmt.execute(rusqlite::params![
+                        nid,
+                        tid.to_string(),
+                        format!("Dag {i}"),
+                        format!("import:test:dag:{tid}"),
+                        now,
+                    ])?;
+                }
+                let mut edge_idx = 0i64;
+                for i in 0..dag_nodes {
+                    for j in (i + 1)..dag_nodes {
+                        let src_tid = dag_base + i as i64;
+                        let dst_tid = dag_base + j as i64;
+                        let eid = format!("edge-dag-{edge_idx}");
+                        let dep_id = dag_base + 1_000 + edge_idx;
+                        estmt.execute(rusqlite::params![
+                            eid,
+                            format!("node-dag-{src_tid}"),
+                            format!("node-dag-{dst_tid}"),
+                            now,
+                            format!("import:test:dag:edge:{edge_idx}"),
+                            format!("{{\"dependency_id\":{dep_id}}}"),
+                        ])?;
+                        edge_idx += 1;
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let dag_extra = dag_base + dag_nodes as i64;
+    let dag_head = dag_base;
+    let dag_edges_before: i64 = h
+        .hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM graph_edges WHERE kind = 'depends_on'", [], |r| r.get(0))?)
+        })
+        .unwrap();
+
+    let edge_started = std::time::Instant::now();
+    let edge_err =
+        h.err(&b1, "dependency_add", json!({ "task_id": dag_extra, "depends_on_task_id": dag_head })).await;
+    let edge_elapsed = edge_started.elapsed();
+    assert_eq!(edge_err.code(), "invalid_argument", "{edge_err}");
+    assert_eq!(edge_err.reason_code(), Some("cycle_check_bound_exceeded"), "{edge_err}");
+    let edge_msg = edge_err.to_string();
+    assert!(
+        edge_msg.contains("visited_edges") && !edge_msg.contains("deadline"),
+        "expected visited_edges work-cap refusal, not wall-clock deadline: {edge_msg}"
+    );
+    assert!(
+        edge_elapsed < std::time::Duration::from_millis(ua_graph::CYCLE_CHECK_DEADLINE_MS),
+        "visited_edges cap refusal took {edge_elapsed:?}, expected well under backstop"
+    );
+
+    let dag_edges_after: i64 = h
+        .hub
+        .db()
+        .read(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM graph_edges WHERE kind = 'depends_on'", [], |r| r.get(0))?)
+        })
+        .unwrap();
+    assert_eq!(dag_edges_after, dag_edges_before, "edge-cap refusal must write nothing");
 }
 
 #[tokio::test]

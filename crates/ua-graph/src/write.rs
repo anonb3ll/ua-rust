@@ -216,7 +216,7 @@ pub struct AssertEdgeRequest {
     /// Per-node live (`valid_to IS NULL`) incident edge cap (`0` disables the check).
     pub max_live_edges_per_node: u64,
     /// Per-edge-kind write-time acyclicity bounds (each acyclic kind defaults to
-    /// `1,000` nodes / `5,000` edges / `50 ms`).
+    /// `1,000` nodes / `5,000` edges / `2,000 ms`).
     pub cycle_bounds: CycleCheckPolicy,
 }
 

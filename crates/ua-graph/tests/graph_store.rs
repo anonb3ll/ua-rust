@@ -494,6 +494,11 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
         .unwrap_err();
     assert_eq!(node_bound_err.code(), "invalid_argument");
     assert_eq!(node_bound_err.reason_code(), Some("cycle_check_bound_exceeded"));
+    assert!(
+        node_bound_err.to_string().contains("visited_nodes")
+            && !node_bound_err.to_string().contains("deadline"),
+        "expected visited_nodes cap refusal: {node_bound_err}"
+    );
 
     // 3. Edge-cap bound hit => cycle_check_bound_exceeded
     let edge_bound_err = db
@@ -515,6 +520,11 @@ fn cycle_detected_vs_cycle_check_bound_exceeded_are_distinct() {
         .unwrap_err();
     assert_eq!(edge_bound_err.code(), "invalid_argument");
     assert_eq!(edge_bound_err.reason_code(), Some("cycle_check_bound_exceeded"));
+    assert!(
+        edge_bound_err.to_string().contains("visited_edges")
+            && !edge_bound_err.to_string().contains("deadline"),
+        "expected visited_edges cap refusal: {edge_bound_err}"
+    );
 
     // 4. Deadline bound hit (0 ms) => cycle_check_bound_exceeded
     let deadline_err = db
