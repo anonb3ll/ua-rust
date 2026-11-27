@@ -42,6 +42,20 @@ pub enum Kind {
     LongMemEval,
 }
 
+/// Local ONNX embedder settings for hybrid benchmark runs (`--features
+/// embeddings`, after `ua memory models fetch`).
+#[derive(Debug, Clone)]
+pub struct EmbedOptions {
+    /// Directory holding `models/<slug>/<revision>/` (defaults to `UA_HOME`
+    /// or `~/.ua-rust`, matching `ua memory models fetch`).
+    pub home: PathBuf,
+    /// Pinned local embedding model name (defaults to `BAAI/bge-small-en-v1.5`).
+    pub model: String,
+    /// Drop `memory_chunks` after ingest so search scores only each note's
+    /// single vector (pre-#155 ablation against chunked embeddings).
+    pub no_chunks: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub kind: Kind,
@@ -58,11 +72,14 @@ pub struct Options {
     /// drawn elsewhere (the predecessor's `--per-category 20 --seed 2145`) is
     /// reproduced.
     pub ids: Option<Vec<String>>,
+    /// When `Some`, score hybrid retrieval using the fetched local ONNX model
+    /// instead of the lexical-only default.
+    pub embed: Option<EmbedOptions>,
 }
 
 impl Options {
     pub fn fixture() -> Self {
-        Self { kind: Kind::Fixture, data: None, limit: None, ids: None }
+        Self { kind: Kind::Fixture, data: None, limit: None, ids: None, embed: None }
     }
 }
 
@@ -144,8 +161,10 @@ struct SessionScore {
 /// Run the benchmark named by `opts` and return the JSON report.
 pub async fn run(opts: Options) -> UaResult<Value> {
     match opts.kind {
-        Kind::Fixture => run_fixture().await,
-        Kind::LongMemEval => run_longmemeval(opts.data.as_deref(), opts.limit, opts.ids.as_deref()).await,
+        Kind::Fixture => run_fixture(opts.embed.as_ref()).await,
+        Kind::LongMemEval => {
+            run_longmemeval(opts.data.as_deref(), opts.limit, opts.ids.as_deref(), opts.embed.as_ref()).await
+        }
     }
 }
 
@@ -544,6 +563,32 @@ fn bench_config(home: &Path) -> Config {
     cfg
 }
 
+fn bench_config_with_embed(scratch_home: &Path, embed: Option<&EmbedOptions>) -> UaResult<Config> {
+    let Some(opt) = embed else {
+        return Ok(bench_config(scratch_home));
+    };
+    if !crate::EMBEDDINGS_ENABLED {
+        return Err(UaError::invalid(
+            "--embed requires building with `--features embeddings` \
+             (e.g. `cargo run --release --features embeddings -p ua-memory --bin memory-bench -- --embed`)",
+        ));
+    }
+    let mut cfg = Config::for_home(&opt.home);
+    cfg.memory.embedder = "local".into();
+    cfg.embed_model = opt.model.clone();
+    cfg.clock = ua_core::time::Clock::fixed(BENCH_NOW).expect("BENCH_NOW is a valid instant");
+    if crate::embed::local_embedder(&cfg).is_none() {
+        return Err(UaError::not_found(format!(
+            "local embedding model {:?} is not fetched under {}/models; \
+             run `ua memory models fetch --model {}` first",
+            cfg.embed_model,
+            cfg.home.display(),
+            cfg.embed_model
+        )));
+    }
+    Ok(cfg)
+}
+
 fn caller(label: &str) -> Caller {
     Caller {
         label: label.into(),
@@ -720,16 +765,26 @@ async fn search_keys(
     Ok((ranked, mode))
 }
 
-async fn run_fixture() -> UaResult<Value> {
+async fn run_fixture(embed: Option<&EmbedOptions>) -> UaResult<Value> {
     let scratch = Scratch::new("fixture")?;
-    run_fixture_with(CORPUS, FLOOR, &scratch).await
+    run_fixture_with_embed(CORPUS, FLOOR, &scratch, embed).await
+}
+
+#[cfg(test)]
+async fn run_fixture_with(corpus_raw: &str, floor_raw: &str, scratch: &Scratch) -> UaResult<Value> {
+    run_fixture_with_embed(corpus_raw, floor_raw, scratch, None).await
 }
 
 /// The fixture run over a corpus and floor (the checked-in ones outside
 /// tests), with its databases under `scratch`. Each query's copy is removed
 /// when the query finishes; only the base corpus database stays until
 /// `scratch` drops.
-async fn run_fixture_with(corpus_raw: &str, floor_raw: &str, scratch: &Scratch) -> UaResult<Value> {
+async fn run_fixture_with_embed(
+    corpus_raw: &str,
+    floor_raw: &str,
+    scratch: &Scratch,
+    embed: Option<&EmbedOptions>,
+) -> UaResult<Value> {
     let corpus = parse_corpus(corpus_raw)?;
     let floor = parse_floor(floor_raw)?;
     if floor.k != RECALL_K {
@@ -749,11 +804,19 @@ async fn run_fixture_with(corpus_raw: &str, floor_raw: &str, scratch: &Scratch) 
         }
     }
 
-    let cfg = bench_config(&scratch.dir);
+    let cfg = bench_config_with_embed(&scratch.dir, embed)?;
+    let no_chunks = embed.is_some_and(|e| e.no_chunks);
     let base = scratch.sub("corpus")?.join("corpus.db");
     let ids = {
         let db = open_db(&base)?;
         let ids = load_fixture(&db, &cfg, &corpus.notes).await?;
+        if no_chunks {
+            db.write_async(|tx| {
+                tx.execute("DELETE FROM memory_chunks", [])?;
+                Ok(())
+            })
+            .await?;
+        }
         let (busy, _, _) = db.checkpoint_truncate()?;
         if busy {
             return Err(UaError::internal("bench checkpoint was busy; the fixture copy would be partial"));
@@ -932,19 +995,29 @@ struct QuestionRun {
 
 /// Score one question on its own database in its own scratch subdirectory,
 /// which is removed (database, `-wal` and `-shm`) before this returns.
-async fn score_question(q: &LmeQuestion, scratch: &Scratch, cfg: &Config) -> UaResult<QuestionRun> {
+async fn score_question(
+    q: &LmeQuestion,
+    scratch: &Scratch,
+    cfg: &Config,
+    no_chunks: bool,
+) -> UaResult<QuestionRun> {
     if q.haystack_session_ids.len() != q.haystack_dates.len()
         || q.haystack_session_ids.len() != q.haystack_sessions.len()
     {
         return Err(UaError::invalid(format!("question {} has mismatched haystack arrays", q.question_id)));
     }
     let dir = scratch.sub(&q.question_id)?;
-    let run = score_question_in(q, &dir.join("q.db"), cfg).await;
+    let run = score_question_in(q, &dir.join("q.db"), cfg, no_chunks).await;
     Scratch::release(&dir);
     run
 }
 
-async fn score_question_in(q: &LmeQuestion, path: &Path, cfg: &Config) -> UaResult<QuestionRun> {
+async fn score_question_in(
+    q: &LmeQuestion,
+    path: &Path,
+    cfg: &Config,
+    no_chunks: bool,
+) -> UaResult<QuestionRun> {
     let db = open_db(path)?;
     let who = caller("longmemeval-harness");
     let mut session_of: HashMap<String, String> = HashMap::new();
@@ -974,6 +1047,13 @@ async fn score_question_in(q: &LmeQuestion, path: &Path, cfg: &Config) -> UaResu
         date_of.insert(sid.clone(), valid_from);
     }
     backdate_created(&db).await?;
+    if no_chunks {
+        db.write_async(|tx| {
+            tx.execute("DELETE FROM memory_chunks", [])?;
+            Ok(())
+        })
+        .await?;
+    }
 
     let started = std::time::Instant::now();
     let hits = search::search(
@@ -1119,6 +1199,7 @@ async fn run_longmemeval(
     data: Option<&Path>,
     limit: Option<usize>,
     ids: Option<&[String]>,
+    embed: Option<&EmbedOptions>,
 ) -> UaResult<Value> {
     let pin = pin()?;
     let path = locate_dataset(data, &pin)?;
@@ -1139,7 +1220,8 @@ async fn run_longmemeval(
     }
 
     let scratch = Scratch::new("longmemeval")?;
-    let cfg = bench_config(&scratch.dir);
+    let cfg = bench_config_with_embed(&scratch.dir, embed)?;
+    let no_chunks = embed.is_some_and(|e| e.no_chunks);
     let mut rows = Vec::new();
     let mut times = Vec::new();
     let mut as_of_hits = Vec::new();
@@ -1147,7 +1229,7 @@ async fn run_longmemeval(
     let mut older_seen = 0usize;
     let mut mode = String::new();
     for (i, q) in chosen.iter().enumerate() {
-        let run = score_question(q, &scratch, &cfg).await?;
+        let run = score_question(q, &scratch, &cfg, no_chunks).await?;
         if mode.is_empty() {
             mode = run.mode.clone();
         } else if mode != run.mode {
@@ -1481,8 +1563,8 @@ mod tests {
         let scratch = Scratch::new("lme-test").unwrap();
         let cfg = bench_config(&scratch.dir);
         let q = question("tie/1", 8);
-        let first = score_question(&q, &scratch, &cfg).await.unwrap();
-        let again = score_question(&q, &scratch, &cfg).await.unwrap();
+        let first = score_question(&q, &scratch, &cfg, false).await.unwrap();
+        let again = score_question(&q, &scratch, &cfg, false).await.unwrap();
         let want: Vec<String> = (0..8).map(|i| format!("s{i}")).collect();
         assert_eq!(first.row.ranked, want);
         assert_eq!(again.row.ranked, want);

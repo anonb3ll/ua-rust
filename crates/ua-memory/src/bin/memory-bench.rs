@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use ua_memory::bench::{Kind, Options};
+use ua_memory::bench::{EmbedOptions, Kind, Options};
 
 #[tokio::main]
 async fn main() {
@@ -25,13 +25,29 @@ async fn main() {
     std::process::exit(code);
 }
 
+fn default_models_home() -> PathBuf {
+    std::env::var_os("UA_HOME").map(PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join(".ua-rust")
+    })
+}
+
 async fn entry() -> Result<i32, String> {
     let args = parse_args()?;
+    let embed = if args.embed {
+        Some(EmbedOptions {
+            home: args.models_home.unwrap_or_else(default_models_home),
+            model: args.model.unwrap_or_else(|| ua_core::Config::default().embed_model),
+            no_chunks: args.no_chunks,
+        })
+    } else {
+        None
+    };
     let report = ua_memory::bench::run(Options {
         kind: if args.longmemeval { Kind::LongMemEval } else { Kind::Fixture },
         data: args.data,
         limit: args.limit,
         ids: args.ids,
+        embed,
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -56,6 +72,10 @@ struct Args {
     out: Option<PathBuf>,
     limit: Option<usize>,
     ids: Option<Vec<String>>,
+    embed: bool,
+    models_home: Option<PathBuf>,
+    model: Option<String>,
+    no_chunks: bool,
 }
 
 /// Question ids from a file: one per line or comma-separated; blank lines and
@@ -77,13 +97,29 @@ fn read_ids(path: &str) -> Result<Vec<String>, String> {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { longmemeval: false, data: None, out: None, limit: None, ids: None };
+    let mut args = Args {
+        longmemeval: false,
+        data: None,
+        out: None,
+        limit: None,
+        ids: None,
+        embed: false,
+        models_home: None,
+        model: None,
+        no_chunks: false,
+    };
     let mut rest = std::env::args().skip(1);
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--longmemeval" => args.longmemeval = true,
             "--data" => args.data = Some(PathBuf::from(next_value(&mut rest, "--data")?)),
             "--out" => args.out = Some(PathBuf::from(next_value(&mut rest, "--out")?)),
+            "--embed" => args.embed = true,
+            "--models-home" => {
+                args.models_home = Some(PathBuf::from(next_value(&mut rest, "--models-home")?))
+            }
+            "--model" => args.model = Some(next_value(&mut rest, "--model")?),
+            "--no-chunks" => args.no_chunks = true,
             "--limit" => {
                 let raw = next_value(&mut rest, "--limit")?;
                 let n: usize =
@@ -96,10 +132,13 @@ fn parse_args() -> Result<Args, String> {
             "--ids" => args.ids = Some(read_ids(&next_value(&mut rest, "--ids")?)?),
             "-h" | "--help" => {
                 eprintln!(
-                    "memory-bench [--longmemeval] [--data PATH] [--out PATH] [--limit N] [--ids FILE]\n\n\
+                    "memory-bench [--longmemeval] [--data PATH] [--out PATH] [--limit N] [--ids FILE] \
+                     [--embed] [--models-home PATH] [--model NAME] [--no-chunks]\n\n\
                      Scores the checked-in fixture corpus. --longmemeval scores pinned LongMemEval-S.\n\
                      Without --data it reads the cache and downloads a missing file with curl.\n\
                      --ids FILE scores only those question ids (one per line or comma-separated).\n\
+                     --embed runs hybrid retrieval using the fetched local ONNX model (requires --features embeddings).\n\
+                     --no-chunks drops memory_chunks after ingest (single-vector ablation, requires --embed).\n\
                      A table goes to stderr and JSON to stdout. The fixture exits 1 below its floor.\n\
                      `ua memory bench` is not wired in this binary."
                 );
@@ -110,6 +149,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if (args.limit.is_some() || args.ids.is_some() || args.data.is_some()) && !args.longmemeval {
         return Err("--limit, --ids and --data apply only with --longmemeval".into());
+    }
+    if (args.models_home.is_some() || args.model.is_some() || args.no_chunks) && !args.embed {
+        return Err("--models-home, --model and --no-chunks apply only with --embed".into());
     }
     Ok(args)
 }
