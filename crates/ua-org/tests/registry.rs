@@ -217,3 +217,65 @@ fn role_labels_collide_case_insensitively() {
         .unwrap_err();
     assert_eq!(err.code(), "conflict");
 }
+
+#[test]
+fn update_settings_scopes_changes_and_ledger_events_to_the_target_org() {
+    use ua_org::{NEUTRAL_ORIGINATOR, UpdateOrgSettings, update_settings};
+
+    let db = db();
+    db.write(|tx| {
+        tx.execute(
+            "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
+             VALUES ('org-b', 'org-b', 'Org B', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    // Flip `org-b` on: `org-b` updates, `default` stays off, ledger records `org-b` only.
+    let enabled = db
+        .write(|tx| update_settings(tx, "org-b", UpdateOrgSettings { allow_remote_embedder: true }, "op-b"))
+        .unwrap();
+    assert!(enabled.changed);
+    assert!(enabled.value.allow_remote_embedder);
+
+    let (def_flag, b_flag, events): (i64, i64, Vec<(String, String)>) = db
+        .read(|c| {
+            let def: i64 =
+                c.query_row("SELECT allow_remote_embedder FROM orgs WHERE id = 'default'", [], |r| r.get(0))?;
+            let b: i64 =
+                c.query_row("SELECT allow_remote_embedder FROM orgs WHERE id = 'org-b'", [], |r| r.get(0))?;
+            let mut stmt = c.prepare(
+                "SELECT payload, originator FROM event_log WHERE channel = 'agent.org.settings' ORDER BY seq",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            Ok((def, b, rows.collect::<Result<Vec<_>, _>>()?))
+        })
+        .unwrap();
+    assert_eq!(def_flag, 0, "default org flag must stay untouched when org-b updates");
+    assert_eq!(b_flag, 1, "org-b flag must be enabled");
+    assert_eq!(events.len(), 1);
+    let ev: serde_json::Value = serde_json::from_str(&events[0].0).unwrap();
+    assert_eq!(ev["org_id"], "org-b");
+    assert_eq!(ev["allow_remote_embedder"]["old"], false);
+    assert_eq!(ev["allow_remote_embedder"]["new"], true);
+    assert_eq!(events[0].1, NEUTRAL_ORIGINATOR);
+
+    // Flip `org-b` back off: `org-b` returns to 0, `default` remains 0.
+    let disabled = db
+        .write(|tx| update_settings(tx, "org-b", UpdateOrgSettings { allow_remote_embedder: false }, "op-b"))
+        .unwrap();
+    assert!(disabled.changed);
+    assert!(!disabled.value.allow_remote_embedder);
+    let (def_after, b_after): (i64, i64) = db
+        .read(|c| {
+            let def: i64 =
+                c.query_row("SELECT allow_remote_embedder FROM orgs WHERE id = 'default'", [], |r| r.get(0))?;
+            let b: i64 =
+                c.query_row("SELECT allow_remote_embedder FROM orgs WHERE id = 'org-b'", [], |r| r.get(0))?;
+            Ok((def, b))
+        })
+        .unwrap();
+    assert_eq!((def_after, b_after), (0, 0));
+}

@@ -14,7 +14,7 @@ use std::sync::{Mutex, OnceLock};
 
 use ua_core::Config;
 use ua_ingress::Url;
-use ua_ingress::addr;
+use ua_ingress::addr::{is_cloud_metadata, is_loopback, is_private_network, is_public};
 use ua_memory::{local_embedder, openai_compat_revision, registered_embedder, vector_identity};
 use url::Host;
 
@@ -88,9 +88,9 @@ enum LocalHostClass {
 }
 
 fn classify_literal_ip(ip: IpAddr) -> LocalHostClass {
-    if addr::is_loopback(ip) {
+    if is_loopback(ip) {
         LocalHostClass::Loopback
-    } else if !addr::is_cloud_metadata(ip) && (addr::is_public(ip) || addr::is_private_network(ip)) {
+    } else if !is_cloud_metadata(ip) && (is_public(ip) || is_private_network(ip)) {
         LocalHostClass::Remote
     } else {
         LocalHostClass::Refused

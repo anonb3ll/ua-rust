@@ -178,6 +178,11 @@ async fn service(ctx: ToolCtx, args: ServiceArgs) -> UaResult<Value> {
 
 async fn settings_update(ctx: ToolCtx, args: SettingsUpdateArgs) -> UaResult<Value> {
     let org = ctx.caller.org_id.clone();
+    // `docs/organization.md` designates `allow_remote_embedder` as an `org_owner`
+    // decision. Until `organization.v2` lands users and memberships, `ua_org::authz`
+    // only has `Authority::Operator` (which otherwise maps to `OrgAdmin` per
+    // `ua-org/src/authz.rs`). When memberships land, this tool must map to
+    // `OrgRole { min: OrgOwner }`, not `OrgAdmin`.
     require_operator(&ctx, &org)?;
     let actor = ctx.caller.label.clone();
     let input = UpdateOrgSettings { allow_remote_embedder: args.allow_remote_embedder };

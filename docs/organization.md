@@ -2354,7 +2354,7 @@ which records an `agent.org.settings` ledger event with the old and new values:
 | `self_organization` | on | `org_admin` |
 | `proposal_daily_limit` | 10 | `org_admin` |
 | `memory_consolidator_label` | none | `org_admin`; must be an agent of the org |
-| `allow_remote_embedder` | off | `org_owner` |
+| `allow_remote_embedder` | off | `org_owner` (currently uses transitional `Authority::Operator` + `always_gated`; must map to `OrgRole { min: OrgOwner }`, not `OrgAdmin`, when memberships land) |
 
 ## Authority checks
 

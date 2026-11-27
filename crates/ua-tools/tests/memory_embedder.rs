@@ -1830,25 +1830,85 @@ fn audit_doctor_module(masked: &str, allowed_imports: &[&str], allowed_path_root
         }
     }
 
-    for word in ["async", "extern", "mod"] {
+    for word in [
+        "async",
+        "extern",
+        "mod",
+        "TcpStream",
+        "TcpSocket",
+        "UdpSocket",
+        "ToSocketAddrs",
+        "lookup_host",
+        "getaddrinfo",
+        "Outbound",
+        "resolve_endpoint",
+        "to_socket_addrs",
+    ] {
         if contains_word(&non_use, word) {
-            violations.push(format!("forbidden keyword `{word}` in doctor.rs"));
+            violations.push(format!("forbidden identifier `{word}` in doctor.rs"));
         }
     }
-    for token in [".await", "include!", "include_str!", "to_socket_addrs"] {
-        if non_use.contains(token) {
-            violations.push(format!("forbidden token `{token}` in doctor.rs"));
+    for macro_name in ["include", "include_str", "include_bytes"] {
+        if contains_macro_call(&non_use, macro_name) {
+            violations.push(format!("forbidden macro `{macro_name}!` in doctor.rs"));
         }
+    }
+    for method in ["embed", "embed_batch", "embed_one", "embed_note"] {
+        if contains_method_call(&non_use, method) {
+            violations.push(format!("forbidden method `.{method}(` in doctor.rs"));
+        }
+    }
+    if non_use.contains(".await") {
+        violations.push("forbidden token `.await` in doctor.rs".into());
     }
     violations
+}
+
+fn contains_macro_call(src: &str, name: &str) -> bool {
+    let b = src.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(name) {
+        let start = from + rel;
+        let end = start + name.len();
+        from = end;
+        let left_ok = start == 0 || !is_ident_byte(b[start - 1]);
+        let right_ok = end == b.len() || !is_ident_byte(b[end]);
+        if left_ok && right_ok && src[end..].trim_start().starts_with('!') {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_method_call(src: &str, method: &str) -> bool {
+    let b = src.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(method) {
+        let start = from + rel;
+        let end = start + method.len();
+        from = end;
+        let left_ok = start == 0 || !is_ident_byte(b[start - 1]);
+        let right_ok = end == b.len() || !is_ident_byte(b[end]);
+        if !left_ok || !right_ok {
+            continue;
+        }
+        let preceded_by_dot = src[..start].trim_end().ends_with('.');
+        let rest = src[end..].trim_start();
+        if preceded_by_dot && (rest.starts_with('(') || rest.starts_with("::<")) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Hub #2821: `system_doctor` embedder inspection is isolated in
 /// `families/memory/doctor.rs` under a strict import and path-root allowlist
 /// (replacing the partial call-graph walker from #161). This rejects cross-file
 /// helpers (`super::`/`crate::`), aliased imports (`TcpStream as Ts`),
-/// function-pointer indirection (`.map(helper)`), inline `std::net::` /
-/// `tokio::` / `ua_ingress::resolve_endpoint` paths, and `extern`/`async`.
+/// function-pointer indirection (`.map(helper)`), module re-export bypasses
+/// (`addr::TcpStream`), spaced `include ! (...)`, `.embed(...)` on `dyn Embedder`,
+/// inline `std::net::` / `tokio::` / `ua_ingress::resolve_endpoint` paths, and
+/// `extern`/`async`.
 #[test]
 fn memory_doctor_module_import_allowlist_and_zero_network_guard() {
     const ALLOWED_IMPORTS: &[&str] = &[
@@ -1858,7 +1918,10 @@ fn memory_doctor_module_import_allowlist_and_zero_network_guard() {
         "std::sync::OnceLock",
         "ua_core::Config",
         "ua_ingress::Url",
-        "ua_ingress::addr",
+        "ua_ingress::addr::is_cloud_metadata",
+        "ua_ingress::addr::is_loopback",
+        "ua_ingress::addr::is_private_network",
+        "ua_ingress::addr::is_public",
         "ua_memory::local_embedder",
         "ua_memory::openai_compat_revision",
         "ua_memory::registered_embedder",
@@ -1877,10 +1940,9 @@ fn memory_doctor_module_import_allowlist_and_zero_network_guard() {
         "Result",
         "String",
         "Url",
-        "addr",
     ];
 
-    // Self-checks covering every form that got past the #161 walker:
+    // Self-checks covering every bypass class:
     // 1. Cross-file helper in `memory/mod.rs` or `remote.rs` (direct or via `.map(helper)`).
     let cross_file = support::without_tests(
         "use super::helper;\nfn inspect(h: Option<&str>) { let _ = h.map(helper); }\n",
@@ -1910,6 +1972,26 @@ fn memory_doctor_module_import_allowlist_and_zero_network_guard() {
     assert!(
         !audit_doctor_module(&inline_dns, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
         "must reject inline std::net::ToSocketAddrs"
+    );
+    // 4. Module re-export bypass (`use ua_ingress::addr; addr::TcpStream::connect(...)`).
+    let reexport = support::without_tests(
+        "use ua_ingress::addr;\nfn inspect() { let _ = addr::TcpStream::connect(\"127.0.0.1:1\"); }\n",
+    );
+    assert!(
+        !audit_doctor_module(&reexport, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject addr module import / re-export bypass"
+    );
+    // 5. Spaced `include ! ("x.rs")`.
+    let spaced_include = support::without_tests("fn inspect() { include ! (\"x.rs\"); }\n");
+    assert!(
+        !audit_doctor_module(&spaced_include, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject spaced include ! (...) macro"
+    );
+    // 6. Calling `.embed(...)` on a `dyn Embedder` trait object.
+    let trait_embed = support::without_tests("fn inspect(e: &dyn Embedder) { let _ = e.embed(&[]); }\n");
+    assert!(
+        !audit_doctor_module(&trait_embed, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject .embed(...) on dyn Embedder"
     );
 
     let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1969,4 +2051,99 @@ fn memory_doctor_module_import_allowlist_and_zero_network_guard() {
             assert!(!masked.contains(needle), "{} must not contain `{needle}`", path.display());
         }
     }
+}
+
+/// Hub #2821 review: toggling `allow_remote_embedder` via `org_settings_update`
+/// from `false -> true -> false` immediately admits and then refuses the remote
+/// endpoint in `embedder_for_org` (the flag is not cached).
+#[tokio::test]
+async fn org_settings_update_toggles_remote_embedder_on_and_back_off() {
+    use ua_core::UaError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_home(dir.path());
+    cfg.human_identities = vec!["operator".into(), "lead".into()];
+    cfg.memory.embedder = "openai_compat".into();
+    cfg.memory.openai_compat_url = Some("https://10.20.30.40:8443".into());
+    cfg.memory.openai_compat_model = Some("remote-toggle-v1".into());
+    let hub = Hub::in_memory(cfg.clone()).unwrap();
+    let reg = builtin_registry();
+    let human = |label: &str| Caller {
+        label: label.into(),
+        kind: ActorKind::Human,
+        profile: Profile::Coordinator,
+        enforce_profile: true,
+        session_key: Some(format!("{label}-s")),
+        transport: Transport::Mcp,
+        org_id: DEFAULT_ORG.into(),
+    };
+    let op = human("operator");
+    let approver = human("lead");
+
+    // 1. Default (`allow_remote_embedder = 0`): remote endpoint is refused.
+    let before = ua_tools::families::memory::embedder_for_org(hub.db(), &cfg, DEFAULT_ORG).await;
+    assert!(!before.available(), "remote endpoint must be refused initially");
+    assert_eq!(before.backend(), "noop");
+
+    // 2. Flip to `true` via governed `org_settings_update`: remote endpoint is admitted.
+    let parked_on = reg
+        .call(&hub, &op, "org_settings_update", json!({ "allow_remote_embedder": true }))
+        .await
+        .unwrap_err();
+    let UaError::ApprovalRequired { approval_id: on_id, .. } = parked_on else {
+        panic!("expected ApprovalRequired, got {parked_on:?}");
+    };
+    reg.call(&hub, &approver, "approval_resolve", json!({ "id": on_id, "decision": "approve" }))
+        .await
+        .unwrap();
+    let res_on =
+        reg.call(&hub, &op, "org_settings_update", json!({ "allow_remote_embedder": true })).await.unwrap();
+    assert_eq!(res_on["changed"], true);
+    assert_eq!(res_on["settings"]["allow_remote_embedder"], true);
+
+    let enabled = ua_tools::families::memory::embedder_for_org(hub.db(), &cfg, DEFAULT_ORG).await;
+    assert!(enabled.available(), "remote endpoint must be admitted after org_settings_update(true)");
+    assert_eq!(enabled.backend(), "openai_compat");
+
+    // 3. Flip back to `false` via governed `org_settings_update`: remote endpoint is immediately refused.
+    let parked_off = reg
+        .call(&hub, &op, "org_settings_update", json!({ "allow_remote_embedder": false }))
+        .await
+        .unwrap_err();
+    let UaError::ApprovalRequired { approval_id: off_id, .. } = parked_off else {
+        panic!("expected ApprovalRequired, got {parked_off:?}");
+    };
+    reg.call(&hub, &approver, "approval_resolve", json!({ "id": off_id, "decision": "approve" }))
+        .await
+        .unwrap();
+    let res_off =
+        reg.call(&hub, &op, "org_settings_update", json!({ "allow_remote_embedder": false })).await.unwrap();
+    assert_eq!(res_off["changed"], true);
+    assert_eq!(res_off["settings"]["allow_remote_embedder"], false);
+
+    let disabled = ua_tools::families::memory::embedder_for_org(hub.db(), &cfg, DEFAULT_ORG).await;
+    assert!(!disabled.available(), "remote endpoint must be refused again after org_settings_update(false)");
+    assert_eq!(disabled.backend(), "noop");
+
+    // 4. Both transitions (`false -> true`, `true -> false`) are recorded in `agent.org.settings`.
+    let payloads: Vec<String> = hub
+        .db()
+        .read(|c| {
+            let mut stmt =
+                c.prepare("SELECT payload FROM event_log WHERE channel = 'agent.org.settings' ORDER BY seq")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(payloads.len(), 2);
+    let ev1: Value = serde_json::from_str(&payloads[0]).unwrap();
+    let ev2: Value = serde_json::from_str(&payloads[1]).unwrap();
+    assert_eq!(
+        (ev1["allow_remote_embedder"]["old"].as_bool(), ev1["allow_remote_embedder"]["new"].as_bool()),
+        (Some(false), Some(true))
+    );
+    assert_eq!(
+        (ev2["allow_remote_embedder"]["old"].as_bool(), ev2["allow_remote_embedder"]["new"].as_bool()),
+        (Some(true), Some(false))
+    );
 }
