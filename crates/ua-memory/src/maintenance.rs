@@ -461,6 +461,18 @@ pub async fn backfill_embeddings_capped(
     org: &str,
     max_batches: Option<usize>,
 ) -> UaResult<BackfillReport> {
+    let db_id = db.instance_id();
+    let backoff_target = auth_backoff_target(cfg);
+    if let Some(identity) = active_auth_backoff(db_id, org, &backoff_target, cfg.clock.now_ms()) {
+        return Ok(BackfillReport {
+            identity,
+            available: true,
+            stopped_unavailable: true,
+            stopped_auth_refused: true,
+            ..Default::default()
+        });
+    }
+
     let embedder = embedder_for_org(db, cfg, org).await;
     let identity = embedder.identity();
     let mut report =
@@ -469,8 +481,6 @@ pub async fn backfill_embeddings_capped(
         return Ok(report);
     }
 
-    let db_id = db.instance_id();
-    let backoff_target = auth_backoff_target(cfg);
     let mut cursor: i64 = load_cursor(db_id, org, &identity);
     let mut batches_attempted: usize = 0;
     loop {
@@ -687,24 +697,8 @@ pub async fn backfill_all_orgs_step(
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
-    let db_id = db.instance_id();
-    let target = auth_backoff_target(cfg);
-    let now_ms = cfg.clock.now_ms();
     let mut reports = Vec::with_capacity(orgs.len());
     for org in orgs {
-        if let Some(identity) = active_auth_backoff(db_id, &org, &target, now_ms) {
-            reports.push((
-                org,
-                BackfillReport {
-                    identity,
-                    available: true,
-                    stopped_unavailable: true,
-                    stopped_auth_refused: true,
-                    ..Default::default()
-                },
-            ));
-            continue;
-        }
         let rep = backfill_embeddings_capped(db, cfg, &org, Some(max_batches_per_org)).await?;
         reports.push((org, rep));
     }

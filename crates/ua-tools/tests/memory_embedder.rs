@@ -1223,16 +1223,77 @@ async fn auth_refused_backfill_uses_exponential_backoff_on_injected_clock() {
     let _ = ua_tools::families::memory::backfill_all_orgs_step(hub.db(), &cfg_at(180_000), 8).await.unwrap();
     assert_eq!(hits.load(Ordering::SeqCst), 3);
 
-    // t=300s (2 minutes later): still skipped inside the 240s window.
+    // t=300s (2 minutes later): still skipped inside the 240s window, including manual `recall_maintenance`.
     let _ = ua_tools::families::memory::backfill_all_orgs_step(hub.db(), &cfg_at(300_000), 8).await.unwrap();
     assert_eq!(hits.load(Ordering::SeqCst), 3);
+    let manual_rep = ua_tools::families::memory::backfill_embeddings(hub.db(), &cfg_at(300_000), DEFAULT_ORG)
+        .await
+        .unwrap();
+    assert!(
+        manual_rep.stopped_auth_refused,
+        "manual recall_maintenance must respect backoff: {manual_rep:?}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 3, "manual recall_maintenance must not bypass auth backoff");
 
-    // Restore key and step to t=420s: retry succeeds, embeds all 4 notes, and clears backoff.
+    // Escalate through 480s (#4), 960s (#5), 1920s (#6), then #7 caps at 3600s (NOT 3840s).
+    let mut t_ms: i64 = 420_000; // failure #4 -> 480s
+    for expected_delay_ms in [480_000i64, 960_000, 1_920_000, 3_600_000] {
+        let before = hits.load(Ordering::SeqCst);
+        let rep =
+            ua_tools::families::memory::backfill_all_orgs_step(hub.db(), &cfg_at(t_ms), 8).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), before + 1, "expected retry at t={t_ms}");
+        assert!(rep[0].1.stopped_auth_refused);
+        // 1 ms before delay expires: still skipped.
+        let _ = ua_tools::families::memory::backfill_all_orgs_step(
+            hub.db(),
+            &cfg_at(t_ms + expected_delay_ms - 1),
+            8,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            before + 1,
+            "must stay backed off for {expected_delay_ms} ms"
+        );
+        t_ms += expected_delay_ms;
+    }
+    // At exactly +3600s after failure #7 (where unclamped 2^6*60s = 3840s would still skip),
+    // verify the 3600s cap triggers a retry, then recover on 200 and verify clear-on-success.
     revoked.store(false, Ordering::SeqCst);
-    let r_ok =
-        ua_tools::families::memory::backfill_all_orgs_step(hub.db(), &cfg_at(420_000), 8).await.unwrap();
-    assert_eq!(r_ok[0].1.notes_embedded, 4, "{r_ok:?}");
+    let r_ok = ua_tools::families::memory::backfill_all_orgs_step(hub.db(), &cfg_at(t_ms), 8).await.unwrap();
+    assert_eq!(r_ok[0].1.notes_embedded, 4, "3600s cap must retry and embed on recovery: {r_ok:?}");
     assert!(!r_ok[0].1.stopped_auth_refused, "{r_ok:?}");
+
+    // Clear-on-success check: add a new unembedded note and flip back to 401.
+    // Backoff must reset to the 60s base (NOT stay at 3600s).
+    hub.db()
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO memory (id, org_id, title, content, tags, created_at, updated_at) \
+                 VALUES ('auth-after-reset', 'default', 'T', 'body', '[]', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    revoked.store(true, Ordering::SeqCst);
+    let hits_before_reset = hits.load(Ordering::SeqCst);
+    let _ =
+        ua_tools::families::memory::backfill_all_orgs_step(hub.db(), &cfg_at(t_ms + 1_000), 8).await.unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), hits_before_reset + 1);
+    let _ = ua_tools::families::memory::backfill_all_orgs_step(hub.db(), &cfg_at(t_ms + 60_999), 8)
+        .await
+        .unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), hits_before_reset + 1);
+    let _ = ua_tools::families::memory::backfill_all_orgs_step(hub.db(), &cfg_at(t_ms + 61_000), 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        hits_before_reset + 2,
+        "backoff must reset to 60s after a successful embed (clear-on-success)"
+    );
 }
 
 /// Hub #2813 (2): `system_doctor` performs ZERO network probes (`/api/show` or
@@ -1378,6 +1439,42 @@ async fn system_doctor_makes_zero_network_or_dns_calls_for_ollama_and_unflagged_
         .find(|c| c["capability"] == "semantic_search")
         .unwrap();
     assert_eq!(sem_ol_unflagged["status"], "DEGRADED", "{sem_ol_unflagged}");
+
+    // 5. Literal non-routable / link-local / cloud-metadata IPs are refused by
+    //    `EMBEDDER_REMOTE.addresses.check(ip)` even when `allow_remote_embedder = 1`.
+    for bad_url in ["https://169.254.169.254:443", "https://0.0.0.0:443", "https://[fe80::1]:443"] {
+        let mut cfg_bad = Config::for_home(dir.path());
+        cfg_bad.memory.embedder = "openai_compat".into();
+        cfg_bad.memory.openai_compat_url = Some(bad_url.into());
+        cfg_bad.memory.openai_compat_model = Some("m".into());
+        let st_bad = inspect_embedder_for_doctor(&cfg_bad, true);
+        assert_eq!(
+            st_bad.availability,
+            DoctorEmbedderAvailability::Unavailable,
+            "flagged org must still refuse {bad_url}"
+        );
+        let hub_bad = Hub::in_memory(cfg_bad).unwrap();
+        hub_bad
+            .db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, allowed_profiles, allow_remote_embedder, created_at) \
+                     VALUES ('org-flag', 'org-flag', 'Flagged', '[\"developer\"]', 1, '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let doc_bad =
+            reg.call(&hub_bad, &agent("b-flag", "org-flag"), "system_doctor", json!({})).await.unwrap();
+        let sem_bad = doc_bad["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["capability"] == "semantic_search")
+            .unwrap();
+        assert_eq!(sem_bad["status"], "DEGRADED", "doctor must not show {bad_url} as LIVE: {sem_bad}");
+    }
 }
 
 /// Hub #2813 (3): real Ollama `/api/show` omits `digest`, so the embedder
@@ -1497,4 +1594,68 @@ async fn ollama_same_tag_repull_changes_identity_via_api_tags_digest() {
     let hit_v2 = reg.call(&hub, &b1, "memory_search", json!({ "query": "automobile" })).await.unwrap();
     assert_eq!(hit_v2["retrieval"]["mode"], "hybrid", "{hit_v2}");
     assert_eq!(hit_v2["results"][0]["id"], note_id, "{hit_v2}");
+}
+
+/// Hub #2813 review regression: when `/api/show` omits `digest` and `/api/tags`
+/// flakes (alternating 200 and 500), the embedder must keep the cached digest
+/// and NEVER overwrite it with `quantization_level` (`@digest <-> @F16` churn).
+/// Also verifies `:latest` normalization preserves registry host ports
+/// (`registry.local:5000/ns/embed` -> `registry.local:5000/ns/embed:latest`).
+#[tokio::test]
+async fn ollama_flaky_api_tags_keeps_cached_digest_and_supports_registry_port_tags() {
+    let tags_fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let tags_fail_cl = tags_fail.clone();
+    let app = Router::new()
+        .route("/api/show", post(|| async { Json(json!({ "details": { "quantization_level": "F16" } })) }))
+        .route(
+            "/api/tags",
+            get(move || {
+                let f = tags_fail_cl.clone();
+                async move {
+                    if f.load(Ordering::SeqCst) {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "tags timeout" })))
+                            .into_response();
+                    }
+                    Json(json!({
+                        "models": [
+                            { "name": "registry.local:5000/ns/embed:latest", "digest": "sha256:abc123" }
+                        ]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+    let (addr, _srv) = bind_axum(app).await;
+    let url = format!("http://{addr}");
+    let model = "registry.local:5000/ns/embed";
+
+    // 1. Before any digest has been read, a failing `/api/tags` must fail the probe
+    //    rather than inventing an `@F16` revision.
+    assert!(
+        build_ollama_embedder(&url, model, false, false, None).await.is_err(),
+        "must refuse to fall back to quantization_level when /api/tags has never succeeded"
+    );
+
+    // 2. Successful `/api/tags` matches `registry.local:5000/ns/embed` -> `:latest`
+    //    and caches `sha256:abc123`.
+    tags_fail.store(false, Ordering::SeqCst);
+    let e1 = build_ollama_embedder(&url, model, false, false, None)
+        .await
+        .expect("registry-port model tag must match :latest in /api/tags");
+    assert_eq!(e1.revision(), "sha256:abc123");
+
+    // 3. Alternating `/api/tags` failures in both explicit and auto modes must keep
+    //    `sha256:abc123` and NEVER flip to `F16`.
+    for i in 0..4 {
+        let should_fail = i % 2 == 0;
+        tags_fail.store(should_fail, Ordering::SeqCst);
+        let e_explicit = build_ollama_embedder(&url, model, false, false, None)
+            .await
+            .expect("explicit keeps cached digest when /api/tags flakes");
+        assert_eq!(e_explicit.revision(), "sha256:abc123", "explicit flipped on iter {i}");
+        let e_auto = build_ollama_embedder(&url, model, false, true, None)
+            .await
+            .expect("auto keeps cached digest when /api/show succeeds and /api/tags flakes");
+        assert_eq!(e_auto.revision(), "sha256:abc123", "auto flipped on iter {i}");
+    }
 }

@@ -140,16 +140,6 @@ struct OllamaEmbedResponse {
 struct OllamaShowResponse {
     #[serde(default)]
     digest: Option<String>,
-    #[serde(default)]
-    modified_at: Option<String>,
-    #[serde(default)]
-    details: Option<OllamaShowDetails>,
-}
-
-#[derive(Deserialize)]
-struct OllamaShowDetails {
-    #[serde(default)]
-    quantization_level: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -170,7 +160,10 @@ struct OllamaTagEntry {
 
 fn normalize_ollama_model_tag(model: &str) -> String {
     let trimmed = model.trim();
-    if trimmed.contains(':') { trimmed.to_string() } else { format!("{trimmed}:latest") }
+    // Only treat `:` after the last `/` as a tag separator so registry ports
+    // like `registry.local:5000/ns/embed` still normalize to `:latest`.
+    let after_slash = trimmed.rsplit_once('/').map_or(trimmed, |(_, tail)| tail);
+    if after_slash.contains(':') { trimmed.to_string() } else { format!("{trimmed}:latest") }
 }
 
 fn ollama_revision_cache() -> &'static Mutex<HashMap<(String, String), String>> {
@@ -229,35 +222,45 @@ async fn probe_ollama_tags_digest(
     None
 }
 
-async fn probe_ollama_model(base: &Url, client: &Outbound, model: &str, timeout: Duration) -> Option<String> {
+enum OllamaProbe {
+    /// Confirmed model presence AND obtained a real content-addressed digest.
+    Digest(String),
+    /// `/api/show` confirmed the model is served, but neither `/api/show` nor
+    /// `/api/tags` yielded a digest (e.g. transient `/api/tags` failure). Never
+    /// overwrites a cached digest with unstable metadata such as `quantization_level`.
+    ServedWithoutDigest,
+    /// Endpoint unreachable or `/api/show` reported the model is not served.
+    Unavailable,
+}
+
+async fn probe_ollama_model(base: &Url, client: &Outbound, model: &str, timeout: Duration) -> OllamaProbe {
     let deadline = tokio::time::Instant::now() + timeout;
-    let url = ollama_endpoint(base, "/api/show").ok()?;
-    let req = Request::post(url).json(&json!({ "model": model })).ok()?;
-    let resp = tokio::time::timeout(timeout, client.send(req)).await.ok()?.ok()?;
+    let Ok(url) = ollama_endpoint(base, "/api/show") else {
+        return OllamaProbe::Unavailable;
+    };
+    let Ok(req) = Request::post(url).json(&json!({ "model": model })) else {
+        return OllamaProbe::Unavailable;
+    };
+    let Ok(Ok(resp)) = tokio::time::timeout(timeout, client.send(req)).await else {
+        return OllamaProbe::Unavailable;
+    };
     if !resp.status().is_success() {
-        return None;
+        return OllamaProbe::Unavailable;
     }
-    let parsed: OllamaShowResponse = resp.json().await.ok()?;
+    let Ok(parsed) = resp.json::<OllamaShowResponse>().await else {
+        return OllamaProbe::Unavailable;
+    };
     if let Some(digest) = parsed.digest.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        return Some(digest.to_string());
+        return OllamaProbe::Digest(digest.to_string());
     }
     // Real Ollama `/api/show` omits `digest`; query `/api/tags` on the same
-    // pinned client so a same-tag re-pull produces a new content-addressed
-    // revision instead of staying stuck on `quantization_level`.
+    // pinned client so only a real content-addressed digest establishes or
+    // updates the vector identity.
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if let Some(digest) = probe_ollama_tags_digest(base, client, model, remaining).await {
-        return Some(digest);
+        return OllamaProbe::Digest(digest);
     }
-    let rev = parsed
-        .details
-        .as_ref()
-        .and_then(|d| d.quantization_level.as_deref())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| parsed.modified_at.as_deref().map(str::trim).filter(|s| !s.is_empty()))
-        .unwrap_or("present")
-        .to_string();
-    Some(rev)
+    OllamaProbe::ServedWithoutDigest
 }
 
 /// Build a guarded Ollama embedder using an optional custom DNS lookup (for tests).
@@ -276,14 +279,23 @@ pub async fn build_ollama_embedder(
     let origin = url.origin().ascii_serialization();
     let probe_timeout = if require_probe { AUTO_PROBE_TIMEOUT } else { Duration::from_secs(3) };
     let revision = match probe_ollama_model(&url, &client, model, probe_timeout).await {
-        Some(rev) => {
+        OllamaProbe::Digest(rev) => {
             store_ollama_revision(&origin, model, &rev);
             rev
         }
-        None if require_probe => {
+        OllamaProbe::ServedWithoutDigest => match cached_ollama_revision(&origin, model) {
+            Some(last_good) => last_good,
+            None => {
+                return Err(format!(
+                    "Ollama at {origin} serves {model:?} but /api/show and /api/tags returned no digest; \
+                     refusing to embed without a pinned revision"
+                ));
+            }
+        },
+        OllamaProbe::Unavailable if require_probe => {
             return Err(format!("loopback Ollama at {origin} does not serve model {model:?}"));
         }
-        None => match cached_ollama_revision(&origin, model) {
+        OllamaProbe::Unavailable => match cached_ollama_revision(&origin, model) {
             Some(last_good) => last_good,
             None => {
                 return Err(format!(
@@ -544,28 +556,20 @@ enum LocalHostClass {
     Refused,
 }
 
+fn classify_literal_ip(ip: IpAddr) -> LocalHostClass {
+    if addr::is_loopback(ip) {
+        LocalHostClass::Loopback
+    } else if EMBEDDER_REMOTE.addresses.check(ip).is_ok() {
+        LocalHostClass::Remote
+    } else {
+        LocalHostClass::Refused
+    }
+}
+
 fn classify_url_host_without_dns(url: &Url) -> LocalHostClass {
     match url.host() {
-        Some(Host::Ipv4(v4)) => {
-            let ip = IpAddr::V4(v4);
-            if addr::is_cloud_metadata(ip) {
-                LocalHostClass::Refused
-            } else if addr::is_loopback(ip) {
-                LocalHostClass::Loopback
-            } else {
-                LocalHostClass::Remote
-            }
-        }
-        Some(Host::Ipv6(v6)) => {
-            let ip = IpAddr::V6(v6);
-            if addr::is_cloud_metadata(ip) {
-                LocalHostClass::Refused
-            } else if addr::is_loopback(ip) {
-                LocalHostClass::Loopback
-            } else {
-                LocalHostClass::Remote
-            }
-        }
+        Some(Host::Ipv4(v4)) => classify_literal_ip(IpAddr::V4(v4)),
+        Some(Host::Ipv6(v6)) => classify_literal_ip(IpAddr::V6(v6)),
         Some(Host::Domain(host)) => match cached_host_remote(host) {
             Some(false) => LocalHostClass::Loopback,
             Some(true) => LocalHostClass::Remote,
