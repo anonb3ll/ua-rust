@@ -5,6 +5,9 @@
 //! one-time human approval. An agent-kind caller — however senior its profile —
 //! is refused before the row is read or written.
 
+#[path = "../../ua-core/tests/support/mod.rs"]
+mod support;
+
 use serde_json::{Value, json};
 use ua_core::{ActorKind, Caller, Config, Profile, UaError, identity::Transport};
 use ua_tools::{Hub, builtin_registry};
@@ -348,9 +351,15 @@ async fn org_settings_update_refuses_non_default_org_callers_without_touching_de
 
     // 4. `families/org.rs` must scope every handler to `ctx.caller.org_id`, never hardcoding
     //    `DEFAULT_ORG` or `"default"` (which `require_same_org` would otherwise mask until v2).
+    //    Mask comments, strings and `#[cfg(test)]` items via `support::without_tests` so
+    //    comments mentioning `DEFAULT_ORG` or `"default"` never trip this check.
     let org_src =
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/org.rs"))
             .unwrap();
-    assert!(!org_src.contains("DEFAULT_ORG"), "families/org.rs must not hardcode DEFAULT_ORG");
-    assert!(!org_src.contains("\"default\""), "families/org.rs must not hardcode \"default\"");
+    let org_code = support::without_tests(&org_src);
+    let org_raw = support::without_tests_raw(&org_src);
+    assert!(!org_code.contains("DEFAULT_ORG"), "families/org.rs must not hardcode DEFAULT_ORG");
+    let has_default_str =
+        org_raw.match_indices("\"default\"").any(|(at, _)| org_code.as_bytes().get(at) == Some(&b'"'));
+    assert!(!has_default_str, "families/org.rs must not hardcode \"default\"");
 }

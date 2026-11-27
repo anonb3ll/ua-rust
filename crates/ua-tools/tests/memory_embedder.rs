@@ -1842,6 +1842,7 @@ fn audit_doctor_module(masked: &str, allowed_imports: &[&str], allowed_path_root
         "getaddrinfo",
         "Outbound",
         "resolve_endpoint",
+        "socket_addrs",
         "to_socket_addrs",
     ] {
         if contains_word(&non_use, word) {
@@ -1993,6 +1994,12 @@ fn memory_doctor_module_import_allowlist_and_zero_network_guard() {
         !audit_doctor_module(&trait_embed, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
         "must reject .embed(...) on dyn Embedder"
     );
+    // 7. Calling `Url::socket_addrs` through the allowed `Url` type.
+    let url_dns = support::without_tests("fn inspect(u: &Url) { let _ = u.socket_addrs(|| Some(80)); }\n");
+    assert!(
+        !audit_doctor_module(&url_dns, ALLOWED_IMPORTS, ALLOWED_PATH_ROOTS).is_empty(),
+        "must reject Url::socket_addrs DNS lookup"
+    );
 
     let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = crate_dir.parent().unwrap().parent().unwrap();
@@ -2015,6 +2022,7 @@ fn memory_doctor_module_import_allowlist_and_zero_network_guard() {
     const FORBIDDEN_RAW_NET: &[&str] = &[
         "to_socket_addrs",
         "ToSocketAddrs",
+        "socket_addrs",
         "lookup_host",
         "getaddrinfo",
         "dns_lookup",
@@ -2027,6 +2035,8 @@ fn memory_doctor_module_import_allowlist_and_zero_network_guard() {
         "TcpSocket",
         "UdpSocket",
     ];
+    const FORBIDDEN_OBS_EMBEDDER: &[&str] =
+        &["embedder_for_org", "embedder_for(", "embedder_for_with_remote_flag"];
     let obs_src = std::fs::read_to_string(crate_dir.join("src/families/observability.rs")).unwrap();
     let obs_masked = support::without_tests(&obs_src);
     assert!(
@@ -2037,7 +2047,7 @@ fn memory_doctor_module_import_allowlist_and_zero_network_guard() {
         !obs_masked.contains("memory::remote"),
         "observability.rs must not reference memory::remote directly"
     );
-    for &needle in FORBIDDEN_RAW_NET {
+    for &needle in FORBIDDEN_RAW_NET.iter().chain(FORBIDDEN_OBS_EMBEDDER) {
         assert!(!obs_masked.contains(needle), "observability.rs must not contain `{needle}`");
     }
 
