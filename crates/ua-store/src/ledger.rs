@@ -696,6 +696,15 @@ pub fn verify_through(conn: &Connection, through_seq: i64) -> UaResult<VerifyRep
             first_bad_seq: Some(seq),
             reason: Some(reason.to_string()),
         };
+        let entry: Option<String> = r.get(10)?;
+        let Some(entry) = entry else {
+            if report.checked > 0 {
+                return Ok(fail("unhashed row after the hash chain started"));
+            }
+            report.unhashed_legacy_prefix += 1;
+            first_unhashed.get_or_insert(seq);
+            continue;
+        };
         // Read untyped, so a tampered non-integer value is reported, not an error.
         let form: rusqlite::types::Value = r.get(11)?;
         let hash_v = match form {
@@ -719,15 +728,6 @@ pub fn verify_through(conn: &Connection, through_seq: i64) -> UaResult<VerifyRep
                 };
                 return Ok(fail(&format!("unknown hash_v {shown}; this build verifies only hash_v 1 and 2")));
             }
-        };
-        let entry: Option<String> = r.get(10)?;
-        let Some(entry) = entry else {
-            if report.checked > 0 {
-                return Ok(fail("unhashed row after the hash chain started"));
-            }
-            report.unhashed_legacy_prefix += 1;
-            first_unhashed.get_or_insert(seq);
-            continue;
         };
         let prev: Option<String> = r.get(9)?;
         if prev.as_deref() != Some(expected_prev.as_str()) {
@@ -1155,6 +1155,35 @@ mod tests {
         assert!(!report.ok, "{report:?}");
         assert_eq!(report.first_bad_seq, Some(2));
         assert!(report.reason.as_deref().unwrap_or("").contains("downgrade"), "{report:?}");
+    }
+
+    /// An unhashed row (`entry_hash IS NULL`) inserted after `hash_v = 2` rows
+    /// must be diagnosed as an unhashed row rather than a `hash_v` downgrade,
+    /// even though the `hash_v` column defaults to `1` on a raw insert.
+    #[test]
+    fn verify_reports_unhashed_row_after_v2_before_downgrade() {
+        let db = Db::open_in_memory(&[
+            crate::Part::from(SCHEMA),
+            crate::Part::from(META_SCHEMA),
+            crate::Part::from(crate::org::STORE_PART),
+        ])
+        .unwrap();
+        db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "first.v2", json!({ "i": 1 }))))
+            .unwrap();
+        db.write(|tx| {
+            tx.execute(
+                "INSERT INTO event_log (ulid, channel, payload, created_at) \
+                 VALUES ('01ZZZZZZZZZZZZZZZZZZZZZZZZ', 'agent.task.updated', '{}', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let report = db.read(verify).unwrap();
+        assert!(!report.ok, "{report:?}");
+        assert_eq!(report.first_bad_seq, Some(2));
+        assert_eq!(report.reason.as_deref(), Some("unhashed row after the hash chain started"));
+        assert_eq!(report.unhashed_legacy_prefix, 0);
     }
 
     /// The rollback fence: a ledger whose newest row has a newer hash form
