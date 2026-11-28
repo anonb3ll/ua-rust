@@ -190,3 +190,30 @@ async fn semantic_ties_break_on_insertion_order() {
         hits["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
     assert_eq!(ids, saved[..50].iter().map(String::as_str).collect::<Vec<_>>());
 }
+
+/// A single-token query that FTS5 matches is an exact lookup: the semantic
+/// leg may still return a near neighbour, but the exact guard drops it so it
+/// cannot displace the lexical hit. With no lexical match the semantic leg
+/// remains the only source of hits, so a single-word paraphrase still works.
+#[tokio::test]
+async fn exact_guard_drops_semantic_only_neighbours_for_a_single_token() {
+    ua_memory::register_embedder(std::sync::Arc::new(ConstantEmbedder));
+    let db = db();
+    let mut cfg = cfg();
+    cfg.embed_model = "constant-vector-order-test-model".into();
+    let target = put(&db, &cfg, "Quartz handbook", "The quartz key is 17.", None).await;
+    let _noise = put(&db, &cfg, "Rota handbook", "The rota slot is 71.", None).await;
+    let hits = search::search(
+        &db,
+        &cfg,
+        ua_core::DEFAULT_ORG,
+        SearchRequest { query: "quartz".into(), limit: Some(10), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    assert_eq!(hits["retrieval"]["mode"], "hybrid", "{}", hits["retrieval"]);
+    assert_eq!(hits["retrieval"]["exact_guard"], true, "{}", hits["retrieval"]);
+    let ids: Vec<&str> =
+        hits["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec![target.as_str()], "semantic-only neighbour must be dropped: {hits}");
+}
