@@ -242,8 +242,12 @@ Guaranteed:
 
 Not guaranteed:
 
-- The peer check runs after the request was sent. It stops the caller from
-  using the answer; it does not unsend the request.
+- The peer check is detection, not prevention. It runs after the connection
+  was made, when the request may already have been written, so it cannot
+  unsend the request; it only stops the caller from using the answer.
+  Prevention rests on the checks before anything is sent: the resolver's
+  classification of every address a DNS name returns, and `Policy::check_url`
+  for an IP-literal host.
 - The check judges the IP address, not the network path. Something on the
   network that forwards a public address to an internal host is not seen.
 - A pooled keep-alive connection was checked when it was opened and is not
