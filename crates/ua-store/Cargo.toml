@@ -24,6 +24,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "visit"] }
 tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
