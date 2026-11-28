@@ -237,18 +237,27 @@ trait. The following remain direct `rusqlite` SQL:
      `unknown_parts`, `unrecorded_parts`),
    - `ua_store::org` schema procedures (`STORE_PART`, `tenant_part`,
      `pragma_table_info` / `sqlite_master` introspection), and
-   - static `SchemaPart` DDL strings across crates (DDL strings in `SchemaPart`
-     constants are not `prepare`/`execute`/`query_row` call sites).
-2. **Existing `Procedure` backfills outside `ua-store`.**
+   - static `SchemaPart` SQL strings across crates (`SchemaPart` strings are not
+     SQL-method call sites and run uncounted at database open; note that
+     `SchemaPart` SQL is not mechanically restricted to DDL, so one-time DML
+     backfills inside a `SchemaPart` are a reviewed exception).
+2. **Existing and domain-checked `Procedure`s outside `ua-store`.**
    - Today `ua-tools` holds 11 released `Procedure`s (`github/mod.rs:110`,
      `slack.rs:233`, `web.rs:76`, `idempotency.rs:73`, `skill_registry.rs:209`,
      `tasks/goal_links.rs:385`, `tasks/graph.rs:74`,
      `governance/tenant_keys.rs:28`, `harness_config/tenant_keys.rs:44`,
      `managed_secrets/tenant_keys.rs:37`, `node_queue/tenant_keys.rs:63`).
-   - Rather than adding a blanket exemption for migration files in `ua-tools`,
-     their existing SQL calls stay **counted in the per-file ratchet baseline**
-     (frozen in place so no new raw SQL can slip into those files), and **all
-     new `Procedure`s live in `ua-store`** (or reuse `ua_store::org::tenant_part`).
+   - Their SQL calls remain **counted in each file's raw-SQL baseline**, and a
+     companion **`procedure_def`** ratchet counts every `Procedure {` literal
+     outside `ua-store` (excluding `ua_store::org::tenant_part(` calls), so a
+     new `Procedure` outside `ua-store` cannot be introduced silently even if it
+     writes through `MigrationGraph` or a helper rather than raw SQL.
+   - Pure-SQL new `Procedure`s live in `ua-store` (or reuse `tenant_part`). A
+     domain-checked migration that must call a domain crate `ua-store` cannot
+     depend on (such as `tasks/graph.rs:74` `DEPENDS_ON_GRAPH_PART`, which calls
+     `ua_graph` through `MigrationGraph`) is permitted only in an explicitly
+     allowlisted file (matching how `crates/ua-graph/tests/update_guard.rs`
+     fences `MigrationGraph`) and is tracked by `procedure_def`.
 3. **The hash-chained event ledger and evidence store.**
    - `ua_store::ledger` (`event_log`, `append`, `append_surviving`, `verify`,
      `check_hash_form`) and
@@ -285,15 +294,20 @@ workspace crate outside `ua-store`.
 - **Test exclusion (inline and out-of-line):**
   - Inline `#[cfg(test)]` items are stripped with `without_tests` after masking
     comments, strings, and character literals (reusing the lexer approach in
-    `crates/ua-core/tests/support/mod.rs`).
-  - Out-of-line test modules declared as `#[cfg(test)] mod <name>;` (for example
-    `crates/ua-ingress/src/inbound/tests.rs` from `inbound.rs:469`,
-    `crates/ua-ingress/src/outbound/tests.rs` from `outbound.rs:938`, and
-    `crates/ua-tools/src/families/github/org_automation_tests.rs`) are resolved
-    from their parent module declarations (`<dir>/<name>.rs`,
-    `<dir>/<name>/mod.rs`, or `<dir>/<stem>/<name>.rs` for non-`lib.rs`/`mod.rs`
-    parents) and excluded before scanning, so test files are never counted as
-    production code and filename heuristics are not relied on.
+    `crates/ua-core/tests/support/mod.rs`). Files whose entire test body is an
+    inner `#[cfg(test)]` module (such as
+    `crates/ua-tools/src/families/github/org_automation_tests.rs`, declared as
+    plain `mod org_automation_tests;` at `github/mod.rs:45`) are already cleared
+    by `without_tests`.
+  - Out-of-line test modules declared as `#[cfg(test)] mod <name>;` — including
+    `#[cfg(test)] #[path = "..."] mod <name>;` — (for example
+    `crates/ua-ingress/src/inbound/tests.rs` from `inbound.rs:469` and
+    `crates/ua-ingress/src/outbound/tests.rs` from `outbound.rs:938`) are
+    resolved from their parent module declarations (`#[path = "..."]` relative
+    to the parent directory, or `<dir>/<name>.rs`, `<dir>/<name>/mod.rs`, and
+    `<dir>/<stem>/<name>.rs` for non-`lib.rs`/`mod.rs` parents) and excluded
+    before scanning, so test files are never counted as production code and
+    filename heuristics are not relied on.
 
 ### What is counted (closing dynamic and wrapper bypasses)
 
@@ -304,20 +318,46 @@ bound in `let`/`const`, wrapper helpers such as `platform.rs:613` `org_row`,
 and would let a caller *lower* the baseline simply by hoisting a literal into a
 `let`.
 
-The ratchet therefore counts:
+Likewise, restricting the scan to files that mention `rusqlite`/`Connection`/
+`WriteTx`/`Transaction` would miss production SQL inside `read_async` closures
+whose parameter type is inferred (today: `governance/worktrees.rs:310,320`,
+`audit/triage.rs:150`, `ua-server/src/events.rs:625`, and
+`ua-server/src/ui/activity.rs:155`). Every `.execute(`/`.prepare(`/
+`.query_row(` call outside `ua-store` today is SQL; no non-SQL receiver exists
+in the tree.
+
+The ratchet therefore scans **every** non-test source file outside `ua-store`
+(with no SQLite-import filter; an explicit per-site allowlist is added only if
+a genuine non-SQL receiver ever enters the workspace) and enforces three checks:
 
 1. **Every call to a SQL-taking `rusqlite` method regardless of argument
-   shape** — `prepare`, `prepare_cached`, `execute`, `execute_batch`,
-   `query_row`, and `query_row_and_then` (whether passed a literal, `format!`,
-   `let`, `const`, a helper parameter, or `include_str!`) — in every file that
-   touches SQLite (`rusqlite`, `Connection`, `WriteTx`, or `Transaction`).
-   Scoping to SQLite-using files avoids false positives on unrelated
-   `.execute(...)` methods (such as `reqwest` or command runners).
-2. **No raw-SQL escape hatch in `ua-store`.** A companion check scans
-   `crates/ua-store/src/**/*.rs` and forbids adding any `pub fn` (or public
-   trait method) outside `schema.rs` that accepts SQL text as a parameter, so
-   callers outside `ua-store` cannot bypass the ratchet through a passthrough
-   helper.
+   shape** — `prepare`, `prepare_cached`, `prepare_with_flags`, `execute`,
+   `execute_batch`, `query_row`, `query_row_and_then`, `query_one`, and
+   `Batch::new` — in both method-call form (`.execute(...)`) and path-style
+   UFCS form (`Connection::execute(&c, ...)`, `Transaction::execute(...)`),
+   whether passed a literal, `format!`, `let`, `const`, a helper parameter, or
+   `include_str!`.
+2. **No new SQL-taking helper functions or trait methods anywhere in the
+   workspace (and calls to frozen helpers count as SQL calls).** A wrapper that
+   takes SQL text (or a trait method implemented for `Connection`) would
+   otherwise be counted only once in its own body while hiding every new caller.
+   The guard therefore:
+   - forbids any new function or trait method taking SQL text (`sql` /
+     `where_sql` parameters, plus `ua-store` public functions outside
+     `schema.rs` taking SQL text) across the **entire workspace**,
+   - freezes today's existing SQL-taking helpers outside `ua-store` by exact
+     `(crate, file, fn_name)` allowlist (`continuity/queue.rs:352` `task_rows`,
+     `platform.rs:613` `org_row`, `cycles.rs:307` `transition_json`,
+     `evidence.rs:204` `grouped`, `ua-import/src/lib.rs:422` `count`, and the
+     `names` / `name_sql` helpers in the five `tenant_keys` files), and
+   - counts **every call site** to those frozen helpers in the caller's own
+     per-file baseline (for example `merged.rs:185` calling `task_rows`, and
+     each `org_row(...)` call in `platform.rs`), so adding a caller through an
+     existing wrapper raises that file's count immediately.
+3. **Ratcheted `procedure_def` count outside `ua-store`.** Counts every
+   `Procedure {` literal outside `ua-store` (excluding `tenant_part(` calls)
+   against a per-file allowlist/baseline so new procedures cannot appear
+   outside `ua-store` unreviewed.
 
 ### Granularity and drift rule
 
@@ -330,34 +370,44 @@ The ratchet therefore counts:
   new queries through `ua-store` instead). A file below its baseline also fails
   with a message instructing the author to lower `BASELINE` in the same PR. The
   baseline only ever moves down.
+- **File renames and splits.** A pure refactor that renames or splits an
+  existing file may re-key its `(crate, relative_path, count)` entries (removing
+  the old path) **only if the crate's total count does not increase**.
 - **Self-test requirements.** Unit tests in the ratchet test verify:
   - drift reporting in **both directions** (above baseline and below baseline),
-  - detection of every call form: literal, `format!`, `let`, `const`, a wrapper
-    helper forwarding `sql: &str`, `execute_batch`, `prepare_cached`, and
-    `query_row_and_then`,
-  - non-counting of comments, inline `#[cfg(test)]` items, out-of-line
-    `#[cfg(test)] mod ...;` files, and `.execute(...)` in non-SQLite files, and
-  - refusal of a synthetic `pub fn` taking SQL text inside `ua-store`.
+  - detection of every call form: literal, `format!`, `let`, `const`,
+    `execute_batch`, `prepare_cached`, `prepare_with_flags`,
+    `query_row_and_then`, `query_one`, `Batch::new`, path-style
+    `Connection::execute(&c, ...)`, and calls inside an inferred-type closure
+    that never mentions `rusqlite`/`Connection`/`WriteTx`,
+  - detection of a new SQL-taking helper function or `Connection` trait method
+    (both inside `ua-store` and outside `ua-store`) and counting of calls
+    through a frozen helper wrapper,
+  - detection of a new `Procedure {` outside `ua-store` (while not counting
+    `tenant_part(`), and
+  - non-counting of comments, inline `#[cfg(test)]` items, and out-of-line
+    `#[cfg(test)] mod ...;` / `#[cfg(test)] #[path = "..."] mod ...;` files.
 
 ### Relationship to the `rusqlite` authorizer hook (`docs/memory.md`)
 
 [memory.md](memory.md) (§3, "Enforcement is in the SQL, on every path")
-observes that static scans cannot inspect dynamically constructed SQL and
-proposes a runtime `rusqlite` authorizer hook denying reads of `memory`,
+observes that static scans cannot inspect dynamically constructed SQL strings
+and proposes a runtime `rusqlite` authorizer hook denying reads of `memory`,
 `memory_*`, and `memory_fts` outside `MemoryRepo` and an explicit allowlist
 (migrations, `ua-import`, operator-only migration manifest).
 
-The two controls are complementary layers, not competing designs:
+The two controls operate at different layers and complement each other:
 
-- The **raw-SQL ratchet** is a **compile/test-time migration guard** covering
-  the entire workspace outside `ua-store`. By counting every SQL-taking method
-  call regardless of argument shape (including `format!`, variables, and
-  helpers), it blocks new dynamic SQL outside `ua-store` as well as static
-  literals and drives existing files monotonically to `0`.
+- The **raw-SQL ratchet** is a **build/test-time ceiling** across every crate
+  outside `ua-store`: it prevents raw SQL call counts (whether static or
+  dynamic) and SQL-taking helpers from increasing anywhere outside `ua-store`
+  while individual aggregates are migrated behind `ua-store` traits in follow-up
+  PRs. It does not by itself eliminate existing sites or inspect which table a
+  dynamic SQL string touches.
 - The **`rusqlite` authorizer hook** is a **runtime defense-in-depth gate** for
-  high-sensitivity tables with row-level visibility (`memory*`), guaranteeing
-  that even an accidental or dynamically composed query cannot read hidden
-  notes outside `MemoryRepo` at runtime.
+  high-sensitivity tables with row-level visibility (`memory*`), enforcing at
+  execution time which tables a prepared statement may touch even if a dynamic
+  query or missed call site exists.
 
 ## Pilot aggregate: `task_comments`
 
@@ -374,11 +424,12 @@ such as `Claim`, `Sight`, `Settle`, and `Stale` downward into `ua-store`.)
 | File | Current SQL sites | Plan in pilot PR (c) | Baseline change |
 |---|---:|---|---:|
 | `crates/ua-tools/src/families/tasks/comments.rs` | 8 (`:143`, `:152`, `:156`, `:257`, `:270`, `:281`, `:287`, `:292`) | Move all 8 queries behind `ua_store::task_comments::{TaskCommentsRead, TaskCommentsWrite, SqliteTaskComments}` and drop `rusqlite` from `comments.rs` | `8 → 0` (`-8`) |
-| `crates/ua-tools/src/families/platform.rs` | 1 caller at `:744` (`org_row` wrapper at `:613` serves 6 kinds) | Route `"comment"` at `:744` through `SqliteTaskComments::new(c).get_task_comment(&caller.org_id, comment_id)` | `0` (the `org_row` wrapper at `:613` stays until its other 5 kinds migrate, while `task_comments` SQL leaves `platform.rs`) |
+| `crates/ua-tools/src/families/platform.rs` | 1 `org_row` call at `:744` (`org_row` itself at `:613` serves 5 other kinds) | Route `"comment"` at `:744` through `SqliteTaskComments::new(c).get_task_comment(&caller.org_id, comment_id)` | `-1` (removes the counted `org_row` call at `:744`; `:613` stays until the other 5 kinds migrate) |
 | `crates/ua-tools/src/families/continuity/queue.rs` | 1 cross-table join at `:371-375` (`tasks t LEFT JOIN task_comment_threads c`) | **Keep in place** in pilot PR (c): this is a `tasks` / continuity staleness read (`active_rows`) that joins `tasks` with `task_comment_threads.updated_at`. Keeping it avoids N+1 queries and respects the scope fence (no `tasks` rewrite in the pilot). When `tasks` moves to `ua-store`, `active_rows` either stays a single join inside `ua-store` or uses a batched `task_comment_thread_updated_at` read. | `0` |
 
-Total ratchet baseline drop in step (c): **`-8`** (`comments.rs` drops from `8`
-to `0`), with zero schema changes and a two-organization isolation test pinning
+Total ratchet baseline drop in step (c): **`-9`** (`-8` in `comments.rs`
+dropping it to `0`, plus `-1` in `platform.rs` for the removed `org_row` call),
+with zero schema changes and a two-organization isolation test pinning
 `TaskCommentsRead` / `TaskCommentsWrite` directly in `ua-store`.
 
 ### Pinned JSON response shape (`SELECT *` compatibility)
@@ -389,17 +440,24 @@ and decode `mentions` and `refs`. Moving to explicit typed columns in
 `TaskCommentRow` (`id`, `org_id`, `task_id`, `parent_comment_id`, `author`,
 `body`, `mentions_json`, `refs_json`, `idempotency_key`, `thread_revision`,
 `created_at` — matching `tasks.comments.v1` at `tasks/mod.rs:58-69` plus
-`organization.v1.tools.tasks`) must preserve the exact public JSON shape:
+`organization.v1.tools.tasks`) must preserve both exact public JSON shapes —
+including their current handling of malformed JSON in `mentions`/`refs` (neither
+column has a `json_valid` `CHECK` constraint):
 
 - **`task_comment` (`append`, `get`, `list`)** emits the 10 non-`org_id` fields
   (`id`, `task_id`, `parent_comment_id`, `author`, `body`, `mentions` as JSON
   array, `refs` as JSON object, `idempotency_key`, `thread_revision`,
   `created_at`) plus the derived `participants` array (`[author, ...mentions]`).
+  If `mentions` or `refs` holds invalid JSON, `comments.rs:128-132` falls back
+  to `[]` / `{}`.
 - **`platform_object_get(kind = "comment")`** emits the same 10 non-`org_id`
-  fields with `mentions` and `refs` decoded (and without `participants`).
+  fields with `mentions` and `refs` decoded (and without `participants`). If
+  `mentions` or `refs` holds invalid JSON, `platform.rs:601-608` (`decode`)
+  leaves the raw string untouched.
 
-Step (c) will add a test pinning every key and type of both JSON outputs
-against the pre-migration `SELECT *` shape.
+Step (c) will add a test pinning every key and type of both JSON outputs — for
+both valid JSON and invalid JSON in `mentions`/`refs` — against the
+pre-migration `SELECT *` shape.
 
 ## Known multi-path aggregate tracked separately: `tasks`
 
@@ -409,10 +467,11 @@ separate follow-up PRs after the raw-SQL ratchet lands:
 
 - **Direct task inserts bypassing `tasks::insert_task`:** despite
   `crates/ua-tools/src/families/tasks/write.rs:272` stating "Every task
-  creation goes through here", `crates/ua-tools/src/families/routines.rs:338-359`
+  creation goes through here" (which is used by `tasks/write.rs:212`,
+  `continuity/conversation.rs:295`, `governance/proposals.rs:688`, and
+  `audit/triage.rs:185`), `crates/ua-tools/src/families/routines.rs:338-359`
   and `crates/ua-tools/src/families/delegation.rs:703-738` still execute raw
-  `INSERT INTO tasks` statements directly (only `continuity/conversation.rs:295`
-  routes through `insert_task`).
+  `INSERT INTO tasks` statements directly.
 - **Missing `expected_ownership_generation` fence on `task_update`:**
   `UpdateArgs` (`crates/ua-tools/src/families/tasks/write.rs:46-93`) supports
   `expected_project` and `expected_updated_at` (`:520-527`), and `task_update`
