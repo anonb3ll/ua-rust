@@ -259,10 +259,13 @@ pub const OBSIDIAN_LOCAL: Policy = Policy {
 
 /// The operator's notification webhook (`notify_webhook_url`): http or
 /// https, any host and port, [`Addresses::OperatorConfigured`] (the
-/// receiver may be on a private network or this host), no redirects. The
-/// body is never read; 64 KiB is the cap if it were. 120 seconds for
-/// everything, the longest attempt the caller allows; the caller bounds
-/// each attempt more tightly.
+/// receiver may be on a private network or this host), no redirects.
+/// [`crate::Outbound`] refuses to send credentials (a secret header or URL
+/// credentials) over plain `http` unless every resolved address and the
+/// connected peer are loopback; plain `http` without credentials stays
+/// allowed for operator-configured destinations. The body is never read;
+/// 64 KiB is the cap if it were. 120 seconds for everything, the longest
+/// attempt the caller allows; the caller bounds each attempt more tightly.
 pub const NOTIFY_WEBHOOK: Policy = Policy {
     name: "notify.webhook",
     schemes: Schemes::HttpOrHttps,

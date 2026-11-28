@@ -21,12 +21,17 @@
 //!   head arrives, the peer address of the connection that carried it is
 //!   checked once more. See `docs/ingress.md` for what this does and does
 //!   not guarantee.
-//! - **Secret headers stay with their origin.** A header added with
-//!   [`Request::secret_header`] is bound to the origin (scheme, host, port)
-//!   of the request URL and is attached only to a hop with that origin. So
-//!   is every plain header outside the short cross-origin list above.
-//!   [`Request::header`] also refuses names that look like credentials, an
-//!   extra check that cross-origin safety does not rely on.
+//! - **Secret headers stay with their origin, and never leave loopback over
+//!   plain `http`.** A header added with [`Request::secret_header`] is bound
+//!   to the origin (scheme, host, port) of the request URL and is attached
+//!   only to a hop with that origin. So is every plain header outside the
+//!   short cross-origin list above. On any plain `http` hop that would carry
+//!   a secret header (or URL credentials), every resolved address at connect
+//!   time — and the connection's peer address after the response head — must
+//!   be loopback ([`crate::addr::is_loopback`]); any non-loopback address is
+//!   refused with [`OutboundError::CleartextSecret`], on every hop including
+//!   redirects. [`Request::header`] also refuses names that look like
+//!   credentials, an extra check that cross-origin safety does not rely on.
 //! - **Timeouts**: connect, per request (body included) and for the whole
 //!   call (redirects and body included).
 
@@ -101,6 +106,12 @@ pub enum OutboundError {
     /// A header was refused (a credential-like name passed as a plain header,
     /// or a value that is not a valid header).
     HeaderRefused(String),
+    /// A credential header or URL credential would travel over plain `http` to
+    /// a non-loopback address.
+    CleartextSecret {
+        host: String,
+        ip: IpAddr,
+    },
     /// A redirect without a usable target, or too many of them.
     Redirect(String),
     Timeout,
@@ -130,6 +141,10 @@ impl std::fmt::Display for OutboundError {
             }
             Self::Unverified => f.write_str("the connection's peer address could not be checked"),
             Self::HeaderRefused(why) => write!(f, "header refused: {why}"),
+            Self::CleartextSecret { host, ip } => write!(
+                f,
+                "refusing to send credentials over plain http to {host:?} ({ip}, not loopback); use https"
+            ),
             Self::Redirect(why) => write!(f, "redirect refused: {why}"),
             Self::Timeout => f.write_str("the outbound request timed out"),
             Self::TooLarge { limit } => write!(f, "the response body is larger than {limit} bytes"),
@@ -148,7 +163,9 @@ impl From<OutboundError> for ua_core::UaError {
             OutboundError::AddressRefused { .. } | OutboundError::PeerRefused { .. } => {
                 ua_core::UaError::denied("ssrf_blocked", msg)
             }
-            OutboundError::UrlRefused { .. } => ua_core::UaError::denied("outbound_refused", msg),
+            OutboundError::UrlRefused { .. } | OutboundError::CleartextSecret { .. } => {
+                ua_core::UaError::denied("outbound_refused", msg)
+            }
             OutboundError::UnknownPolicy(_) | OutboundError::InvalidPolicy { .. } => {
                 ua_core::UaError::internal(msg)
             }
@@ -173,6 +190,22 @@ impl std::fmt::Display for RefusedAtConnect {
 }
 
 impl StdError for RefusedAtConnect {}
+
+/// The resolver refused a non-loopback address for a plain `http` hop carrying
+/// credentials; found again in the error chain of the failed request.
+#[derive(Debug)]
+struct CleartextSecretAtConnect {
+    host: String,
+    ip: IpAddr,
+}
+
+impl std::fmt::Display for CleartextSecretAtConnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cleartext_secret: {:?} resolves to {} (not loopback)", self.host, self.ip)
+    }
+}
+
+impl StdError for CleartextSecretAtConnect {}
 
 /// A lookup that failed for another reason than the address check.
 #[derive(Debug)]
@@ -209,6 +242,9 @@ fn send_error(e: reqwest::Error) -> OutboundError {
     while let Some(inner) = cur {
         if let Some(r) = inner.downcast_ref::<RefusedAtConnect>() {
             return OutboundError::AddressRefused { host: r.host.clone(), ip: r.ip, reason: r.reason };
+        }
+        if let Some(c) = inner.downcast_ref::<CleartextSecretAtConnect>() {
+            return OutboundError::CleartextSecret { host: c.host.clone(), ip: c.ip };
         }
         if let Some(l) = inner.downcast_ref::<LookupFailed>() {
             return OutboundError::Lookup { host: l.host.clone(), why: l.why.clone() };
@@ -302,6 +338,9 @@ fn system_lookup() -> Lookup {
 /// mixed answer cannot be raced into a connection to the bad one.
 struct GuardedResolver {
     addresses: Addresses,
+    /// When true, every resolved address must also be loopback
+    /// (`addr::is_loopback`); used for plain `http` hops carrying credentials.
+    require_loopback: bool,
     timeout: std::time::Duration,
     lookup: Lookup,
 }
@@ -309,7 +348,7 @@ struct GuardedResolver {
 impl reqwest::dns::Resolve for GuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
-        let (rule, timeout) = (self.addresses, self.timeout);
+        let (rule, require_loopback, timeout) = (self.addresses, self.require_loopback, self.timeout);
         let pending = (self.lookup)(&host);
         Box::pin(async move {
             let failed = |host: &str, why: String| {
@@ -326,6 +365,9 @@ impl reqwest::dns::Resolve for GuardedResolver {
             for a in &addrs {
                 if let Err(reason) = rule.check(a.ip()) {
                     return Err(Box::new(RefusedAtConnect { host, ip: a.ip(), reason }) as _);
+                }
+                if require_loopback && !crate::addr::is_loopback(a.ip()) {
+                    return Err(Box::new(CleartextSecretAtConnect { host, ip: a.ip() }) as _);
                 }
             }
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
@@ -455,10 +497,40 @@ type PeerOf = fn(&reqwest::Response) -> Option<SocketAddr>;
 pub struct Outbound {
     policy: Policy,
     client: reqwest::Client,
+    /// Separate client used only for plain `http` hops that carry credentials:
+    /// its resolver requires every resolved address to be loopback and its
+    /// connection pool is never shared with unauthenticated `http` hops.
+    loopback_secret_client: Option<reqwest::Client>,
     /// `reqwest::Response::remote_addr`, except in tests.
     peer_of: PeerOf,
     /// The one origin a pinned client may send to ([`Outbound::pinned`]).
     pin: Option<url::Origin>,
+}
+
+fn build_reqwest_client(
+    policy: &Policy,
+    resolver: GuardedResolver,
+) -> Result<reqwest::Client, OutboundError> {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .https_only(policy.schemes == Schemes::HttpsOnly)
+        // `validate` allows this only for a loopback-only policy.
+        .danger_accept_invalid_certs(policy.accept_invalid_certs)
+        .connect_timeout(policy.connect_timeout)
+        .timeout(policy.request_timeout)
+        .dns_resolver(resolver)
+        .build()
+        .map_err(|e| OutboundError::Transport(format!("cannot build the HTTP client: {}", error_chain(&e))))
+}
+
+fn url_ip(url: &Url) -> Option<IpAddr> {
+    match url.host()? {
+        url::Host::Ipv4(v4) => Some(IpAddr::V4(v4)),
+        url::Host::Ipv6(v6) => Some(IpAddr::V6(v6)),
+        url::Host::Domain(_) => None,
+    }
 }
 
 impl Outbound {
@@ -570,22 +642,29 @@ impl Outbound {
     ) -> Result<Self, OutboundError> {
         policy.validate()?;
         install_crypto_provider();
-        let resolver = GuardedResolver { addresses: resolver_rule, timeout: policy.connect_timeout, lookup };
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .https_only(policy.schemes == Schemes::HttpsOnly)
-            // `validate` allows this only for a loopback-only policy.
-            .danger_accept_invalid_certs(policy.accept_invalid_certs)
-            .connect_timeout(policy.connect_timeout)
-            .timeout(policy.request_timeout)
-            .dns_resolver(resolver)
-            .build()
-            .map_err(|e| {
-                OutboundError::Transport(format!("cannot build the HTTP client: {}", error_chain(&e)))
-            })?;
-        Ok(Self { policy, client, peer_of, pin: None })
+        let client = build_reqwest_client(
+            &policy,
+            GuardedResolver {
+                addresses: resolver_rule,
+                require_loopback: false,
+                timeout: policy.connect_timeout,
+                lookup: lookup.clone(),
+            },
+        )?;
+        let loopback_secret_client = if policy.schemes == Schemes::HttpOrHttps {
+            Some(build_reqwest_client(
+                &policy,
+                GuardedResolver {
+                    addresses: resolver_rule,
+                    require_loopback: true,
+                    timeout: policy.connect_timeout,
+                    lookup,
+                },
+            )?)
+        } else {
+            None
+        };
+        Ok(Self { policy, client, loopback_secret_client, peer_of, pin: None })
     }
 
     pub fn policy(&self) -> &Policy {
@@ -626,6 +705,24 @@ impl Outbound {
             }
             let origin = req.url.origin();
             left_home |= origin != home;
+            let active_secrets: Vec<&SecretHeader> =
+                req.secrets.iter().filter(|s| !left_home && s.origin == origin).collect();
+            let has_userinfo = !req.url.username().is_empty() || req.url.password().is_some();
+            let cleartext_secret = req.url.scheme() == "http" && (!active_secrets.is_empty() || has_userinfo);
+            if cleartext_secret
+                && let Some(ip) = url_ip(&req.url)
+                && !crate::addr::is_loopback(ip)
+            {
+                return Err(OutboundError::CleartextSecret { host: ip.to_string(), ip });
+            }
+            let client = if cleartext_secret {
+                self.loopback_secret_client.as_ref().ok_or(OutboundError::UrlRefused {
+                    policy: self.policy.name,
+                    why: "scheme not allowed",
+                })?
+            } else {
+                &self.client
+            };
             let headers = if !left_home {
                 req.headers.clone()
             } else {
@@ -637,8 +734,8 @@ impl Outbound {
                 }
                 kept
             };
-            let mut rb = self.client.request(req.method.clone(), req.url.clone()).headers(headers);
-            for s in req.secrets.iter().filter(|s| !left_home && s.origin == origin) {
+            let mut rb = client.request(req.method.clone(), req.url.clone()).headers(headers);
+            for s in active_secrets {
                 rb = rb.header(s.name.clone(), s.value.clone());
             }
             if let Some(b) = &req.body {
@@ -655,6 +752,12 @@ impl Outbound {
                 ip: remote.ip(),
                 reason,
             })?;
+            if cleartext_secret && !crate::addr::is_loopback(remote.ip()) {
+                return Err(OutboundError::CleartextSecret {
+                    host: req.url.host_str().unwrap_or_default().to_string(),
+                    ip: remote.ip(),
+                });
+            }
             let status = resp.status();
             if max == 0 || !status.is_redirection() || status == StatusCode::NOT_MODIFIED {
                 return Ok(Response {

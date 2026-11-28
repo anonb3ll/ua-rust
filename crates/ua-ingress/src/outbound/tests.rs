@@ -428,6 +428,9 @@ fn errors_become_hub_errors_with_stable_codes() {
     assert_eq!(e.reason_code(), Some("ssrf_blocked"));
     let e: ua_core::UaError = OutboundError::UrlRefused { policy: "p", why: "w" }.into();
     assert_eq!(e.reason_code(), Some("outbound_refused"));
+    let e: ua_core::UaError =
+        OutboundError::CleartextSecret { host: "h".into(), ip: "10.0.0.1".parse().unwrap() }.into();
+    assert_eq!(e.reason_code(), Some("outbound_refused"));
 }
 
 // --- cross-origin hops -------------------------------------------------------------------------
@@ -808,4 +811,293 @@ async fn a_pinned_client_sends_only_to_its_origin() {
     // A strict policy may be pinned too, with the same effect.
     let strict = Outbound::pinned(LOCAL, &home.url("/")).unwrap();
     assert!(strict.send(Request::get(other.url("/"))).await.is_err());
+}
+
+// --- cleartext credentials over plain http ---------------------------------------
+
+#[tokio::test]
+async fn cleartext_secret_to_public_ip_is_refused() {
+    let url = Url::parse("http://93.184.215.14/hooks/secret-path").unwrap();
+    let out = Outbound::pinned(crate::policy::NOTIFY_WEBHOOK, &url).unwrap();
+    let req = Request::post(url).secret_header("Authorization", "Bearer top-secret").unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(2), out.send(req))
+        .await
+        .expect("must refuse before attempting to connect")
+        .err()
+        .unwrap();
+    assert_eq!(
+        err,
+        OutboundError::CleartextSecret { host: "93.184.215.14".into(), ip: "93.184.215.14".parse().unwrap() }
+    );
+    let msg = err.to_string();
+    assert!(!msg.contains("secret-path") && !msg.contains("top-secret"), "{msg}");
+}
+
+#[tokio::test]
+async fn cleartext_secret_to_rfc1918_is_refused() {
+    for (host, ip) in [
+        ("10.20.30.40", "10.20.30.40"),
+        ("172.16.5.4", "172.16.5.4"),
+        ("192.168.1.10", "192.168.1.10"),
+        ("[fd00::7]", "fd00::7"),
+        ("[::ffff:10.20.30.40]", "::ffff:10.20.30.40"),
+    ] {
+        let url = Url::parse(&format!("http://{host}/hooks/x")).unwrap();
+        let out = Outbound::pinned(crate::policy::NOTIFY_WEBHOOK, &url).unwrap();
+        let req = Request::post(url).secret_header("X-Webhook-Token", "top-secret").unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), out.send(req))
+            .await
+            .expect("must refuse before attempting to connect")
+            .err()
+            .unwrap();
+        assert_eq!(
+            err,
+            OutboundError::CleartextSecret { host: ip.into(), ip: ip.parse().unwrap() },
+            "{host}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn url_credentials_and_basic_auth_over_http_to_non_loopback_are_refused() {
+    // Raw URL userinfo is refused on every hop before any connect.
+    let raw = Url::parse("http://hook-user:p%40ss@10.20.30.40/hooks/x").unwrap();
+    let out = Outbound::pinned(crate::policy::NOTIFY_WEBHOOK, &raw).unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(2), out.send(Request::post(raw)))
+        .await
+        .expect("must refuse before attempting to connect")
+        .err()
+        .unwrap();
+    assert!(matches!(err, OutboundError::UrlRefused { why: "credentials in the URL", .. }), "{err:?}");
+
+    // Extracted Basic auth carried as a secret header over plain http to
+    // non-loopback is refused as a cleartext secret.
+    let url = Url::parse("http://10.20.30.40/hooks/x").unwrap();
+    let out = Outbound::pinned(crate::policy::NOTIFY_WEBHOOK, &url).unwrap();
+    let req = Request::post(url).secret_header("authorization", "Basic aG9vay11c2VyOnBAc3M=").unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(2), out.send(req))
+        .await
+        .expect("must refuse before attempting to connect")
+        .err()
+        .unwrap();
+    assert_eq!(
+        err,
+        OutboundError::CleartextSecret { host: "10.20.30.40".into(), ip: "10.20.30.40".parse().unwrap() }
+    );
+}
+
+#[tokio::test]
+async fn hostname_resolving_to_non_loopback_over_http_with_secret_is_refused() {
+    // Even the spelling "localhost" is refused if DNS answers a public IP:
+    // the guard judges the resolved address at connect time, not the name.
+    let localhost = Url::parse("http://localhost:8080/hooks/x").unwrap();
+    let public: SocketAddr = "93.184.215.14:8080".parse().unwrap();
+    let out = Outbound::pinned_with_lookup(
+        crate::policy::NOTIFY_WEBHOOK,
+        &localhost,
+        fake_lookup("localhost", vec![public]),
+    )
+    .unwrap();
+    let req = Request::post(localhost).secret_header("Authorization", "Bearer s3cr3t").unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(2), out.send(req))
+        .await
+        .expect("must refuse before attempting to connect")
+        .err()
+        .unwrap();
+    assert_eq!(err, OutboundError::CleartextSecret { host: "localhost".into(), ip: public.ip() });
+
+    // A non-loopback domain resolving to RFC 1918 is refused before connect.
+    let remote = Url::parse("http://hooks.example.test:8080/hooks/x").unwrap();
+    let private: SocketAddr = "10.20.30.40:8080".parse().unwrap();
+    let out = Outbound::pinned_with_lookup(
+        crate::policy::NOTIFY_WEBHOOK,
+        &remote,
+        fake_lookup("hooks.example.test", vec![private]),
+    )
+    .unwrap();
+    let req = Request::post(remote).secret_header("Authorization", "Bearer s3cr3t").unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(2), out.send(req))
+        .await
+        .expect("must refuse before attempting to connect")
+        .err()
+        .unwrap();
+    assert_eq!(err, OutboundError::CleartextSecret { host: "hooks.example.test".into(), ip: private.ip() });
+
+    // Mixed loopback + non-loopback poisons the whole answer: nothing reaches
+    // the loopback server either.
+    let server = Server::start(|_| ok("ok")).await;
+    let mixed = Url::parse(&format!("http://localhost:{}/hooks/x", server.addr.port())).unwrap();
+    let out = Outbound::pinned_with_lookup(
+        crate::policy::NOTIFY_WEBHOOK,
+        &mixed,
+        fake_lookup("localhost", vec![server.addr, private]),
+    )
+    .unwrap();
+    let req = Request::post(mixed).secret_header("Authorization", "Bearer s3cr3t").unwrap();
+    let err = out.send(req).await.err().unwrap();
+    assert_eq!(err, OutboundError::CleartextSecret { host: "localhost".into(), ip: private.ip() });
+    assert!(server.seen().is_empty(), "mixed answer must not race into loopback");
+
+    // Pre-resolved pinned_to_addrs enforces the same rule on the pinned IP.
+    let pinned_url = Url::parse("http://localhost:8080/hooks/x").unwrap();
+    let out = Outbound::pinned_to_addrs(crate::policy::NOTIFY_WEBHOOK, &pinned_url, vec![private]).unwrap();
+    let req = Request::post(pinned_url).secret_header("Authorization", "Bearer s3cr3t").unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(2), out.send(req))
+        .await
+        .expect("must refuse before attempting to connect")
+        .err()
+        .unwrap();
+    assert_eq!(err, OutboundError::CleartextSecret { host: "localhost".into(), ip: private.ip() });
+}
+
+#[tokio::test]
+async fn cleartext_secret_guard_applies_on_redirect_hops() {
+    // Hop 0 resolves `svc.test` to loopback and receives a same-origin 302
+    // (with `Connection: close`, so hop 1 resolves again). Hop 1 rebinds
+    // `svc.test` to a public address while `!left_home` still attaches the
+    // secret header: hop 1 must be refused before connecting.
+    let server =
+        Server::start(|req| if req.starts_with("GET /start ") { redirect(302, "/next") } else { ok("next") })
+            .await;
+    let first = server.addr;
+    let rebound: SocketAddr = format!("93.184.215.14:{}", server.addr.port()).parse().unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls_ref = calls.clone();
+    let lookup: Lookup = Arc::new(move |host: &str| {
+        let n = calls_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ans = if host == "svc.test" {
+            Ok(vec![if n == 0 { first } else { rebound }])
+        } else {
+            Err(io::Error::new(io::ErrorKind::NotFound, "unknown test name"))
+        };
+        Box::pin(async move { ans })
+    });
+    let out = Outbound::with_lookup(Policy { max_redirects: 3, ..LOCAL }, lookup).unwrap();
+    let url = Url::parse(&format!("http://svc.test:{}/start", server.addr.port())).unwrap();
+    let req = Request::get(url).secret_header("Authorization", "Bearer s3cr3t").unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(2), out.send(req))
+        .await
+        .expect("must refuse rebound redirect hop before connecting")
+        .err()
+        .unwrap();
+    assert_eq!(err, OutboundError::CleartextSecret { host: "svc.test".into(), ip: rebound.ip() });
+    assert_eq!(server.seen().len(), 1, "only hop 0 reached loopback");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "hop 1 re-resolved and was refused");
+
+    // A redirect target carrying URL userinfo is refused on that hop too.
+    let creds_redirect = Server::start(|_| redirect(302, "http://hook-user:pass@10.20.30.40/steal")).await;
+    let out = Outbound::new(Policy { max_redirects: 3, ..LOCAL }).unwrap();
+    let err = out.send(Request::get(creds_redirect.url("/start"))).await.err().unwrap();
+    assert!(matches!(err, OutboundError::UrlRefused { why: "credentials in the URL", .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn cleartext_secret_peer_recheck_refuses_non_loopback_peer() {
+    // Even if the resolver passed, a non-loopback peer address on plain http
+    // with a secret is refused by the post-connect peer check.
+    let server = Server::start(|_| ok("ok")).await;
+    let url = Url::parse(&format!("http://hooks.internal:{}/hooks/x", server.addr.port())).unwrap();
+    let out = Outbound::with_seams(
+        crate::policy::NOTIFY_WEBHOOK,
+        fake_lookup("hooks.internal", vec![server.addr]),
+        Addresses::OperatorConfigured,
+        |_| Some("10.20.30.40:80".parse().unwrap()),
+    )
+    .unwrap();
+    let req = Request::post(url).secret_header("Authorization", "Bearer s3cr3t").unwrap();
+    let err = out.send(req).await.err().unwrap();
+    assert_eq!(
+        err,
+        OutboundError::CleartextSecret { host: "hooks.internal".into(), ip: "10.20.30.40".parse().unwrap() }
+    );
+}
+
+#[tokio::test]
+async fn loopback_http_with_secret_is_allowed() {
+    let server = Server::start(|_| ok("delivered")).await;
+    // Literal loopback IP over http with secret.
+    let url = server.url("/hooks/x");
+    let out = Outbound::pinned(crate::policy::NOTIFY_WEBHOOK, &url).unwrap();
+    let req = Request::post(url).secret_header("Authorization", "Bearer local-secret").unwrap();
+    let resp = out.send(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(server.seen()[0].to_ascii_lowercase().contains("authorization: bearer local-secret"));
+
+    // Hostname `localhost` resolving to loopback over http with secret.
+    let localhost = Url::parse(&format!("http://localhost:{}/hooks/y", server.addr.port())).unwrap();
+    let out = Outbound::pinned_with_lookup(
+        crate::policy::NOTIFY_WEBHOOK,
+        &localhost,
+        fake_lookup("localhost", vec![server.addr]),
+    )
+    .unwrap();
+    let req = Request::post(localhost).secret_header("Authorization", "Bearer local-secret-2").unwrap();
+    let resp = out.send(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(server.seen()[1].to_ascii_lowercase().contains("authorization: bearer local-secret-2"));
+}
+
+#[tokio::test]
+async fn https_with_secret_is_allowed() {
+    // An https request with a secret reaches the TLS handshake on the dialed
+    // peer (first byte 0x16 = TLS ClientHello) and is never refused as a
+    // cleartext secret.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let saw_tls = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_tls_task = saw_tls.clone();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut b = [0u8; 1];
+            if sock.read_exact(&mut b).await.is_ok() && b[0] == 0x16 {
+                saw_tls_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    let url = Url::parse(&format!("https://hooks.internal:{}/hooks/x", addr.port())).unwrap();
+    let out = Outbound::pinned_with_lookup(
+        crate::policy::NOTIFY_WEBHOOK,
+        &url,
+        fake_lookup("hooks.internal", vec![addr]),
+    )
+    .unwrap();
+    let req = Request::post(url).secret_header("Authorization", "Bearer tls-secret").unwrap();
+    let err = out.send(req).await.err().unwrap();
+    assert!(!matches!(err, OutboundError::CleartextSecret { .. }), "https must not be refused: {err:?}");
+    assert!(saw_tls.load(std::sync::atomic::Ordering::SeqCst), "expected TLS ClientHello on peer");
+
+    // The resolver `https` uses (`require_loopback: false`) admits non-loopback
+    // `OperatorConfigured` addresses (both RFC 1918 and public), and
+    // `pinned_to_addrs` builds cleanly for an `https` origin on RFC 1918.
+    use reqwest::dns::Resolve;
+    let non_loopback: Vec<SocketAddr> =
+        vec!["10.20.30.40:443".parse().unwrap(), "93.184.215.14:443".parse().unwrap()];
+    let resolver = GuardedResolver {
+        addresses: Addresses::OperatorConfigured,
+        require_loopback: false,
+        timeout: Duration::from_secs(1),
+        lookup: fake_lookup("hooks.internal", non_loopback.clone()),
+    };
+    let name: reqwest::dns::Name = "hooks.internal".parse().unwrap();
+    let resolved: Vec<SocketAddr> = resolver.resolve(name).await.unwrap().collect();
+    assert_eq!(resolved, non_loopback);
+    let https_remote = Url::parse("https://hooks.internal/hooks/x").unwrap();
+    assert!(Outbound::pinned_to_addrs(crate::policy::NOTIFY_WEBHOOK, &https_remote, non_loopback).is_ok());
+}
+
+#[tokio::test]
+async fn plain_http_without_secret_to_operator_configured_peer_is_allowed() {
+    let server = Server::start(|_| ok("plain-ok")).await;
+    let url = Url::parse(&format!("http://hooks.internal:{}/hooks/x", server.addr.port())).unwrap();
+    let out = Outbound::with_seams(
+        crate::policy::NOTIFY_WEBHOOK,
+        fake_lookup("hooks.internal", vec![server.addr]),
+        Addresses::OperatorConfigured,
+        |_| Some("10.20.30.40:80".parse().unwrap()),
+    )
+    .unwrap();
+    let resp = out.send(Request::post(url)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.body().await.unwrap().bytes, b"plain-ok");
+    assert_eq!(server.seen().len(), 1);
 }

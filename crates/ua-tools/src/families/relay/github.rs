@@ -175,7 +175,8 @@ pub async fn post_comment(cfg: &Config, token: &SecretString, t: &Target, body: 
                 // message, as before.
                 OutboundError::AddressRefused { .. }
                 | OutboundError::Lookup { .. }
-                | OutboundError::UrlRefused { .. } => failed(outbound_error(host, e).to_string()),
+                | OutboundError::UrlRefused { .. }
+                | OutboundError::CleartextSecret { .. } => failed(outbound_error(host, e).to_string()),
                 // Nothing left the hub: no connection, or no request built.
                 OutboundError::NotSent { why, .. } => {
                     Outcome::Failed { http_status: None, error: clean(&why) }
