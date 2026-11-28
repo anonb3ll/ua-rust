@@ -184,6 +184,29 @@ END;
 ",
 };
 
+/// Closes the `REPLACE` path on the key store and checkpoint table.
+///
+/// `INSERT OR REPLACE` / `REPLACE` resolve a primary-key conflict by deleting
+/// the old row, and SQLite fires no `DELETE` trigger for that unless
+/// `recursive_triggers` is on. So the `no_delete` and `immutable` triggers of
+/// `evidence_key_store.v1` alone let a raw-SQL writer swap a signed
+/// checkpoint (clearing its signature) or a public key. A `BEFORE INSERT`
+/// trigger fires before conflict resolution and refuses any insert whose key
+/// already exists.
+pub const NO_REPLACE_PART: SchemaPart = SchemaPart {
+    name: "evidence_key_store.v3.no_replace",
+    sql: "
+CREATE TRIGGER IF NOT EXISTS evidence_checkpoint_no_replace
+BEFORE INSERT ON evidence_checkpoint
+WHEN EXISTS (SELECT 1 FROM evidence_checkpoint WHERE checkpoint_id = NEW.checkpoint_id)
+BEGIN SELECT RAISE(ABORT, 'evidence_checkpoint rows are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS evidence_key_no_replace
+BEFORE INSERT ON evidence_key
+WHEN EXISTS (SELECT 1 FROM evidence_key WHERE key_id = NEW.key_id)
+BEGIN SELECT RAISE(ABORT, 'evidence_key rows are immutable'); END;
+",
+};
+
 /// The only signing algorithm this build accepts.
 pub const ALGORITHM_ED25519: &str = "ed25519";
 

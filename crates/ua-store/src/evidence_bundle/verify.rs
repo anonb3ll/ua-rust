@@ -21,7 +21,7 @@
 //!   or revoked key, unsigned bundle/checkpoint, or incremental bundle missing
 //!   its pinned checkpoint)
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -36,16 +36,18 @@ use crate::ledger::{GENESIS_HASH, HASH_V1, HASH_V2, compute_entry_hash_for_versi
 use super::canonical::{empty_org_chain_hash, org_chain_fold, sha256_hex};
 use super::egress::{
     CLASS_APPROVALS_IN_DEFAULT_LEDGER, CLASS_CROSS_ORG_EVENTS, STUB_CLASSES, WithheldReport,
-    find_forbidden_in_ledger_event, find_forbidden_in_text, find_forbidden_in_value, parse_strict_json,
+    find_forbidden_in_text, find_forbidden_in_value, ledger_row_stub_class, parse_strict_json,
     parse_strict_json_bytes,
 };
+use super::export_schema::{CLASS_FREE_TEXT_PAYLOAD, CLASS_UNLISTED_PAYLOAD};
 use super::{
-    ARTIFACT_CONTENT_HASH_ONLY, ApprovalReceipt, ArtifactIndexEntry, BUNDLE_FORMAT, BundleCheckpointFile,
-    BundleLedgerEvent, BundleManifest, CONFIG_REVISION_CHANNEL, EvidenceRow, LABEL_PLACEHOLDER,
-    PolicyRevisionRecord, ProducerInfo, REDACTED_CHANNEL, RELEASE_NOT_IN_BUNDLE,
-    RELEASE_NOT_PROVABLE_IN_ORG_BUNDLE, RELEASE_RELEASED, RELEASE_UNRELEASED, REQUIRED_BUNDLE_FILES, cmp_ts,
-    derive_evidence_row, extract_sod_tools_from_doc, is_evidence_channel, labels_equal, normalize_decision,
-    normalize_signature_hex, normalize_ts_utc, policy_in_force,
+    ARTIFACT_CONTENT_HASH_ONLY, ApprovalHistory, ApprovalReceipt, ArtifactIndexEntry, BUNDLE_FORMAT,
+    BundleCheckpointFile, BundleLedgerEvent, BundleManifest, CONFIG_REVISION_CHANNEL, EvidenceRow,
+    LABEL_PLACEHOLDER, PolicyRevisionRecord, PolicyTimeline, ProducerInfo, REDACTED_CHANNEL,
+    RELEASE_NOT_IN_BUNDLE, RELEASE_NOT_PROVABLE_IN_ORG_BUNDLE, RELEASE_RELEASED, RELEASE_REVOKED,
+    RELEASE_UNRELEASED, REQUIRED_BUNDLE_FILES, ReleaseEvent, ReleaseState, cmp_ts, derive_evidence_row,
+    extract_sod_tools_from_doc, is_evidence_channel, labels_equal, normalize_decision,
+    normalize_signature_hex, normalize_ts_utc, release_events, release_state,
 };
 use crate::evidence::Window;
 use ua_core::DEFAULT_ORG;
@@ -126,6 +128,11 @@ pub enum ClaimStatus {
     /// verifier found nothing hash-verified to bind it to.
     #[serde(rename = "hub-asserted")]
     HubAsserted,
+    /// The claim holds for the rows in clear, but the bundle carries
+    /// redacted stubs the claim cannot see into (a stub could hide an
+    /// approval, a release or a row of the window).
+    #[serde(rename = "partial")]
+    Partial,
 }
 
 /// One of the separate verification claims (`integrity`, `authorship`,
@@ -1050,38 +1057,39 @@ pub fn verify_bundle_dir_with_limits(
         ));
     }
 
-    // Check 10: Private and secret content refusal across every bundle record.
-    // Every unredacted payload must be strict JSON the scanner walks completely.
+    // Check 10: every row in clear must be one the exporter's allow-list
+    // exports in clear (`export_schema`): a listed hub channel, typed
+    // fields, no free text, strict JSON, and nothing the backstop scanner
+    // flags. A row it would stub is refused here.
     for ev in &events {
-        let mut found = None;
-        if !ev.redacted {
-            found = find_forbidden_in_ledger_event(&ev.channel, &ev.payload);
-        }
-        for field in [
-            Some(ev.ulid.as_str()),
+        let envelope = [
             ev.originator.as_deref(),
             ev.episode_id.as_deref(),
             ev.causal_parent_id.as_deref(),
             ev.dedupe_key.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if found.is_none() {
-                found = find_forbidden_in_text(field);
-            }
-        }
-        if let Some(v) = found {
+        ];
+        let found = if ev.redacted {
+            find_forbidden_in_text(&ev.ulid).map(|v| (v.class, v.detail))
+        } else {
+            ledger_row_stub_class(manifest.class, &ev.channel, &ev.payload, &envelope)
+                .or_else(|| find_forbidden_in_text(&ev.ulid).map(|v| (v.class, v.detail)))
+        };
+        if let Some((class, detail)) = found {
+            let reason = if class == CLASS_UNLISTED_PAYLOAD || class == CLASS_FREE_TEXT_PAYLOAD {
+                "unlisted_payload_in_clear"
+            } else {
+                "forbidden_private_content"
+            };
             verdict.integrity =
-                ClaimReport::new(ClaimStatus::Refused, format!("forbidden content: {}", v.detail));
+                ClaimReport::new(ClaimStatus::Refused, format!("forbidden content: {detail}"));
             return Ok(verdict.refuse(
-                "forbidden_private_content",
-                format!("ledger event contains forbidden content ({}): {}", v.class, v.detail),
+                reason,
+                format!("ledger event in clear must be a hash-only stub ({class}): {detail}"),
                 Some(json!({
                     "file": "ledger/events.jsonl",
                     "seq": ev.seq,
                     "org_seq": ev.org_seq,
-                    "class": v.class
+                    "class": class
                 })),
             ));
         }
@@ -1361,8 +1369,8 @@ pub fn verify_bundle_dir_with_limits(
 
     // evidence/rows.jsonl is rebuilt from the unredacted events; any extra,
     // missing or altered row refuses.
-    if verify_evidence_rows(&mut verdict, manifest.class, &events, &policy_revisions, &evidence_rows).is_err()
-    {
+    let timeline = PolicyTimeline::build(&events, &policy_revisions);
+    if verify_evidence_rows(&mut verdict, manifest.class, &events, &timeline, &evidence_rows).is_err() {
         return Ok(verdict);
     }
 
@@ -1397,6 +1405,7 @@ pub fn verify_bundle_dir_with_limits(
         &events,
         &receipts,
         &policy_revisions,
+        &timeline,
         &artifacts,
         &withheld,
     )
@@ -1412,7 +1421,7 @@ pub fn verify_bundle_dir_with_limits(
         manifest.org_id.as_deref(),
         &events,
         &artifacts,
-        &policy_revisions,
+        &timeline,
         &receipts,
     )
     .is_err()
@@ -1421,11 +1430,25 @@ pub fn verify_bundle_dir_with_limits(
     }
 
     if verdict.redacted_events.count > 0 {
+        let n = verdict.redacted_events.count;
         verdict.warnings.push(format!(
-            "{} redacted hash-only stub(s): approval receipts, cross-links and separation of duties {REDACTED_COVERAGE_NOTE}",
-            verdict.redacted_events.count
+            "{n} redacted hash-only stub(s): approval receipts, releases, cross-links and separation of duties \
+             {REDACTED_COVERAGE_NOTE}"
         ));
-        verdict.completeness.basis = format!("{}; {REDACTED_COVERAGE_NOTE}", verdict.completeness.basis);
+        // A stub can hide an approval, a release or any row: no claim that
+        // depends on row contents may read as complete. The status itself
+        // drops to `partial`, not only the text.
+        for claim in [
+            &mut verdict.completeness,
+            &mut verdict.approvals,
+            &mut verdict.separation_of_duties,
+            &mut verdict.artifacts,
+        ] {
+            if matches!(claim.status, ClaimStatus::Verified | ClaimStatus::NotApplicable) {
+                claim.status = ClaimStatus::Partial;
+            }
+            claim.basis = format!("{}; {n} stub(s) in the bundle: {REDACTED_COVERAGE_NOTE}", claim.basis);
+        }
     }
 
     if let Some((reason, detail, offending)) = deferred_cannot_verify {
@@ -2180,19 +2203,41 @@ fn verify_org_chain(
         // assertion must hold: only a foreign ORG-EVENT-DEFAULT approval row
         // may be stubbed in a default-organization bundle and in clear in the
         // hub bundle.
-        let window = &hub_cc.events[start_idx..end_exclusive];
+        let window: HashMap<String, &BundleLedgerEvent> = hub_cc.events[start_idx..end_exclusive]
+            .iter()
+            .filter_map(|h| h.entry_hash.as_deref().map(|x| (x.to_ascii_lowercase(), h)))
+            .collect();
         for stub in events.iter().filter(|e| e.redacted) {
             let Some(eh) = stub.entry_hash.as_deref() else { continue };
-            let Some(hub_row) =
-                window.iter().find(|h| h.entry_hash.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(eh)))
-            else {
+            let Some(hub_row) = window.get(&eh.to_ascii_lowercase()).copied() else {
                 continue;
             };
             if hub_row.redacted {
                 continue;
             }
-            let justified = stub.redacted_class.as_deref() == Some(CLASS_CROSS_ORG_EVENTS)
-                && hub_row.channel.starts_with("agent.approval.");
+            // Only another organization's ORG-EVENT-DEFAULT approval row may be
+            // a `cross_org_events` stub: the hub writes those with `null`
+            // labels and the neutral originator `system`. The default
+            // organization's own approval rows carry their labels.
+            let foreign_shape = hub_row.channel.starts_with("agent.approval.")
+                && hub_row.originator.as_deref().is_none_or(|o| o == "system")
+                && parse_strict_json(&hub_row.payload).is_ok_and(|p| {
+                    ["resolved_by", "requested_by"].iter().all(|k| p.get(*k).is_none_or(Value::is_null))
+                });
+            // Any other stub is justified when the org-class egress rules
+            // would stub the hub's row too (hub-only text such as a policy
+            // diff is in clear only in the operator's hub bundle).
+            let envelope = [
+                hub_row.originator.as_deref(),
+                hub_row.episode_id.as_deref(),
+                hub_row.causal_parent_id.as_deref(),
+                hub_row.dedupe_key.as_deref(),
+            ];
+            let org_rules_stub = stub.redacted_class.as_deref() != Some(CLASS_CROSS_ORG_EVENTS)
+                && ledger_row_stub_class(CheckpointClass::Org, &hub_row.channel, &hub_row.payload, &envelope)
+                    .is_some();
+            let justified = (stub.redacted_class.as_deref() == Some(CLASS_CROSS_ORG_EVENTS) && foreign_shape)
+                || org_rules_stub;
             if !justified {
                 verdict.integrity = ClaimReport::new(
                     ClaimStatus::Refused,
@@ -2252,6 +2297,79 @@ fn verify_org_chain(
     Ok(())
 }
 
+/// Policy revisions whose `document_sha256` is bound to a hash-verified
+/// `agent.config.revision` event in this bundle. Every `kind = "policy"`
+/// config event in clear must have its revision listed with the same digest;
+/// a missing or disagreeing entry refuses.
+fn policy_ledger_bindings(
+    verdict: &mut BundleVerdict,
+    events: &[BundleLedgerEvent],
+    policy_revisions: &[PolicyRevisionRecord],
+) -> Result<BTreeSet<(String, i64)>, ()> {
+    let mut bound = BTreeSet::new();
+    for ev in events.iter().filter(|e| !e.redacted && e.channel == CONFIG_REVISION_CHANNEL) {
+        let Ok(p) = parse_strict_json(&ev.payload) else { continue };
+        let (Some(kind), Some(rev), Some(sha)) = (
+            p.get("kind").and_then(Value::as_str),
+            p.get("revision").and_then(Value::as_i64),
+            p.get("document_sha256").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if ua_core::time::parse_ts(&ev.created_at).is_none() {
+            verdict.integrity =
+                ClaimReport::new(ClaimStatus::Refused, "config revision event time is not RFC 3339");
+            verdict.set_refuse(
+                "invalid_timestamp",
+                format!(
+                    "agent.config.revision ({kind:?}, rev {rev}) created_at {:?} is not RFC 3339",
+                    ev.created_at
+                ),
+                Some(json!({ "kind": kind, "revision": rev })),
+            );
+            return Err(());
+        }
+        match policy_revisions.iter().find(|r| r.kind == kind && r.revision == rev) {
+            Some(pol) if !pol.document_sha256.eq_ignore_ascii_case(sha) => {
+                verdict.integrity = ClaimReport::new(
+                    ClaimStatus::Refused,
+                    format!("policy revision ({kind:?}, {rev}) digest disagrees with its ledger event"),
+                );
+                verdict.set_refuse(
+                    "policy_ledger_mismatch",
+                    format!(
+                        "policy/revisions.json ({kind:?}, rev {rev}) document_sha256 {} disagrees with the \
+                         agent.config.revision event's {sha}",
+                        pol.document_sha256
+                    ),
+                    Some(json!({ "kind": kind, "revision": rev })),
+                );
+                return Err(());
+            }
+            Some(_) => {
+                bound.insert((kind.to_string(), rev));
+            }
+            None if kind == "policy" => {
+                verdict.integrity = ClaimReport::new(
+                    ClaimStatus::Refused,
+                    format!("policy revision {rev} has a ledger event but no policy/revisions.json entry"),
+                );
+                verdict.set_refuse(
+                    "policy_revision_missing",
+                    format!(
+                        "the bundle carries the agent.config.revision event for policy revision {rev}, but \
+                         policy/revisions.json does not list it"
+                    ),
+                    Some(json!({ "kind": kind, "revision": rev })),
+                );
+                return Err(());
+            }
+            None => {}
+        }
+    }
+    Ok(bound)
+}
+
 fn refuse_receipt(
     verdict: &mut BundleVerdict,
     aid: i64,
@@ -2268,45 +2386,8 @@ fn refuse_receipt(
     Err(())
 }
 
-/// Policy revisions whose `document_sha256` is bound to a hash-verified
-/// `agent.config.revision` event in this bundle. A revision whose event
-/// disagrees refuses.
-fn policy_ledger_bindings(
-    verdict: &mut BundleVerdict,
-    events: &[BundleLedgerEvent],
-    policy_revisions: &[PolicyRevisionRecord],
-) -> Result<BTreeSet<(String, i64)>, ()> {
-    let mut bound = BTreeSet::new();
-    for ev in events.iter().filter(|e| !e.redacted && e.channel == CONFIG_REVISION_CHANNEL) {
-        let Ok(p) = parse_strict_json(&ev.payload) else { continue };
-        let (Some(kind), Some(rev), Some(sha)) = (
-            p.get("kind").and_then(Value::as_str),
-            p.get("revision").and_then(Value::as_i64),
-            p.get("document_sha256").and_then(Value::as_str),
-        ) else {
-            continue;
-        };
-        if let Some(pol) = policy_revisions.iter().find(|r| r.kind == kind && r.revision == rev) {
-            if !pol.document_sha256.eq_ignore_ascii_case(sha) {
-                verdict.integrity = ClaimReport::new(
-                    ClaimStatus::Refused,
-                    format!("policy revision ({kind:?}, {rev}) digest disagrees with its ledger event"),
-                );
-                verdict.set_refuse(
-                    "policy_ledger_mismatch",
-                    format!(
-                        "policy/revisions.json ({kind:?}, rev {rev}) document_sha256 {} disagrees with the \
-                         agent.config.revision event's {sha}",
-                        pol.document_sha256
-                    ),
-                    Some(json!({ "kind": kind, "revision": rev })),
-                );
-                return Err(());
-            }
-            bound.insert((kind.to_string(), rev));
-        }
-    }
-    Ok(bound)
+fn is_rfc3339(ts: &str) -> bool {
+    ua_core::time::parse_ts(ts.trim()).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2317,90 +2398,46 @@ fn verify_receipts_and_cross_links(
     events: &[BundleLedgerEvent],
     receipts: &BTreeMap<i64, ApprovalReceipt>,
     policy_revisions: &[PolicyRevisionRecord],
+    timeline: &PolicyTimeline,
     artifacts: &[ArtifactIndexEntry],
     withheld: &WithheldReport,
 ) -> Result<(), ()> {
-    // Collect unredacted agent.approval.resolved events.
-    // - For `hub` class: keyed by approval_id (latest per approval_id).
-    // - For `org` class: keyed by org_seq (receipts carry dense org-local
-    //   approval_ids and bind to the exact event via ledger.org_seq + hash).
-    let mut hub_resolved: BTreeMap<i64, (&BundleLedgerEvent, Value)> = BTreeMap::new();
-    let mut org_resolved_by_seq: BTreeMap<i64, (&BundleLedgerEvent, Value)> = BTreeMap::new();
-    // Requester labels recorded by `agent.approval.requested`, by raw id.
-    let mut requested_by: BTreeMap<i64, Value> = BTreeMap::new();
-    for ev in events {
-        if ev.redacted {
-            continue;
-        }
-        if ev.channel == "agent.approval.requested"
-            && let Ok(p) = parse_strict_json(&ev.payload)
-            && let Some(aid) = p.get("approval_id").and_then(Value::as_i64)
+    let history = ApprovalHistory::build(events);
+    for (idx, p) in &history.payloads {
+        if events[*idx].channel == "agent.approval.resolved"
+            && p.get("approval_id").and_then(Value::as_i64).is_none()
         {
-            requested_by.insert(aid, p.get("requested_by").cloned().unwrap_or(Value::Null));
-        }
-        if ev.channel != "agent.approval.resolved" {
-            continue;
-        }
-        let Ok(parsed) = parse_strict_json(&ev.payload) else {
-            verdict.integrity =
-                ClaimReport::new(ClaimStatus::Refused, "unparseable agent.approval.resolved payload");
-            verdict.set_refuse(
-                "invalid_event_json",
-                "agent.approval.resolved payload is not strict JSON",
-                Some(json!({ "seq": ev.seq, "org_seq": ev.org_seq })),
-            );
-            return Err(());
-        };
-        let Some(aid) = parsed.get("approval_id").and_then(Value::as_i64) else {
             verdict.integrity =
                 ClaimReport::new(ClaimStatus::Refused, "agent.approval.resolved missing approval_id");
             verdict.set_refuse(
                 "cross_link_missing_receipt",
                 "agent.approval.resolved event carries no approval_id",
-                Some(json!({ "seq": ev.seq, "org_seq": ev.org_seq })),
+                Some(json!({ "seq": events[*idx].seq, "org_seq": events[*idx].org_seq })),
             );
             return Err(());
-        };
-        match class {
-            CheckpointClass::Hub => {
-                hub_resolved.insert(aid, (ev, parsed));
-            }
-            CheckpointClass::Org => {
-                // Keep latest resolution per approval_id by replacing any earlier org_seq for same raw aid.
-                if let Some((prev_ev, _)) = hub_resolved.insert(aid, (ev, parsed.clone()))
-                    && let Some(prev_os) = prev_ev.org_seq
-                {
-                    org_resolved_by_seq.remove(&prev_os);
-                }
-                if let Some(os) = ev.org_seq {
-                    org_resolved_by_seq.insert(os, (ev, parsed));
-                }
-            }
         }
     }
+    // The latest resolution per raw approval id is the one a receipt binds.
+    let latest: BTreeMap<i64, usize> =
+        history.resolved.iter().filter_map(|(aid, idxs)| idxs.last().map(|i| (*aid, *i))).collect();
+    let latest_by_org_seq: HashMap<i64, (i64, usize)> =
+        latest.iter().filter_map(|(aid, idx)| events[*idx].org_seq.map(|os| (os, (*aid, *idx)))).collect();
 
     let bound_policies = policy_ledger_bindings(verdict, events, policy_revisions)?;
+    let artifact_index: HashMap<(&str, i64), &ArtifactIndexEntry> =
+        artifacts.iter().map(|a| ((a.id.as_str(), a.revision), a)).collect();
 
-    let mut matched_org_seqs: BTreeSet<i64> = BTreeSet::new();
-    let mut approved = 0usize;
-    let mut sod_bound = 0usize;
-    let mut sod_policy_governed = 0usize;
-    let mut asserted_notes: BTreeSet<&'static str> = BTreeSet::new();
+    let mut matched_raw: BTreeSet<i64> = BTreeSet::new();
+    let mut receipt_for_raw: HashMap<i64, &ApprovalReceipt> = HashMap::new();
     let mut resolver_asserted = 0usize;
 
     // Check 7 & 8b: every receipt must resolve to an event and satisfy all bindings.
     for (&aid, receipt) in receipts {
         let matched = match class {
-            CheckpointClass::Hub => hub_resolved.get(&aid),
-            CheckpointClass::Org => receipt.ledger.org_seq.and_then(|os| {
-                let res = org_resolved_by_seq.get(&os);
-                if res.is_some() {
-                    matched_org_seqs.insert(os);
-                }
-                res
-            }),
+            CheckpointClass::Hub => latest.get(&aid).map(|idx| (aid, *idx)),
+            CheckpointClass::Org => receipt.ledger.org_seq.and_then(|os| latest_by_org_seq.get(&os).copied()),
         };
-        let Some((ev, ev_payload)) = matched else {
+        let Some((raw_aid, ev_idx)) = matched else {
             verdict.integrity =
                 ClaimReport::new(ClaimStatus::Refused, format!("receipt {aid} has no matching ledger event"));
             verdict.set_refuse(
@@ -2410,6 +2447,18 @@ fn verify_receipts_and_cross_links(
             );
             return Err(());
         };
+        if !matched_raw.insert(raw_aid) {
+            return refuse_receipt(
+                verdict,
+                aid,
+                "cross_link_duplicate_receipt",
+                "binds an approval event another receipt already binds".into(),
+                "ledger",
+            );
+        }
+        receipt_for_raw.insert(raw_aid, receipt);
+        let ev = &events[ev_idx];
+        let ev_payload = &history.payloads[&ev_idx];
 
         if let Some(expected_org) = bundle_org_id
             && receipt.org_id != expected_org
@@ -2424,7 +2473,6 @@ fn verify_receipts_and_cross_links(
             return Err(());
         }
 
-        // Receipt self-digest (receipt_id).
         let recomputed_id = match receipt.compute_receipt_id() {
             Ok(id) => id,
             Err(e) => {
@@ -2447,7 +2495,6 @@ fn verify_receipts_and_cross_links(
             );
         }
 
-        // Ledger pointer check.
         let pointer_ok = match class {
             CheckpointClass::Hub => receipt.ledger.seq == ev.seq && receipt.ledger.org_seq.is_none(),
             CheckpointClass::Org => receipt.ledger.org_seq == ev.org_seq && receipt.ledger.seq.is_none(),
@@ -2464,7 +2511,6 @@ fn verify_receipts_and_cross_links(
             return Err(());
         }
 
-        // Action digest binding against event payload.
         let ev_digest = ev_payload
             .get("payload_sha256")
             .or_else(|| ev_payload.get("action_digest"))
@@ -2494,7 +2540,6 @@ fn verify_receipts_and_cross_links(
             }
         }
 
-        // Every field the hash-verified event records must equal the receipt's.
         let ev_tool = ev_payload.get("tool").and_then(Value::as_str);
         if ev_tool != Some(receipt.tool.as_str()) {
             return refuse_receipt(
@@ -2541,23 +2586,31 @@ fn verify_receipts_and_cross_links(
                 "expires_at",
             );
         }
-        if receipt.decided_at.trim().is_empty()
+        // decided_at: well-formed, between the request and the event that
+        // recorded the decision.
+        let requested_ev = history.requested.get(&raw_aid).map(|i| &events[*i]);
+        let after_request = requested_ev
+            .is_none_or(|r| cmp_ts(&receipt.decided_at, &r.created_at) != std::cmp::Ordering::Less);
+        if !is_rfc3339(&receipt.decided_at)
+            || !is_rfc3339(&ev.created_at)
             || cmp_ts(&receipt.decided_at, &ev.created_at) == std::cmp::Ordering::Greater
+            || !after_request
         {
             return refuse_receipt(
                 verdict,
                 aid,
-                "receipt_decided_after_event",
+                "receipt_decided_at_out_of_range",
                 format!(
-                    "decided_at {:?} is after the ledger event that recorded the decision ({})",
-                    receipt.decided_at, ev.created_at
+                    "decided_at {:?} must be RFC 3339, not before the request ({:?}) and not after the event that \
+                     recorded the decision ({})",
+                    receipt.decided_at,
+                    requested_ev.map(|r| r.created_at.as_str()),
+                    ev.created_at
                 ),
                 "decided_at",
             );
         }
 
-        // Resolver label: bound to the event's `resolved_by`, or hub-asserted
-        // when the ledger records `null` (another organization's label).
         let placeholders =
             receipt.resolver.label == LABEL_PLACEHOLDER || receipt.requester.label == LABEL_PLACEHOLDER;
         if placeholders && (class != CheckpointClass::Hub || receipt.org_id == DEFAULT_ORG) {
@@ -2569,7 +2622,7 @@ fn verify_receipts_and_cross_links(
                 "resolver",
             );
         }
-        let resolver_bound = match ev_payload.get("resolved_by") {
+        match ev_payload.get("resolved_by") {
             Some(Value::String(l)) => {
                 if !labels_equal(l, &receipt.resolver.label) {
                     return refuse_receipt(
@@ -2583,12 +2636,8 @@ fn verify_receipts_and_cross_links(
                         "resolver.label",
                     );
                 }
-                true
             }
-            None | Some(Value::Null) => {
-                resolver_asserted += 1;
-                false
-            }
+            None | Some(Value::Null) => resolver_asserted += 1,
             Some(other) => {
                 return refuse_receipt(
                     verdict,
@@ -2598,29 +2647,28 @@ fn verify_receipts_and_cross_links(
                     "resolver.label",
                 );
             }
-        };
-        let raw_aid = ev_payload.get("approval_id").and_then(Value::as_i64).unwrap_or(aid);
-        let requester_bound = match requested_by.get(&raw_aid) {
-            Some(Value::String(l)) => {
-                if !labels_equal(l, &receipt.requester.label) {
-                    return refuse_receipt(
-                        verdict,
-                        aid,
-                        "receipt_event_mismatch",
-                        format!(
-                            "requester {:?} disagrees with the agent.approval.requested event's {l:?}",
-                            receipt.requester.label
-                        ),
-                        "requester.label",
-                    );
-                }
-                true
-            }
-            _ => false,
-        };
-        let resolver_is_requester = if placeholders {
-            receipt.resolver_is_requester
-        } else {
+        }
+        let requested_label = history
+            .requested
+            .get(&raw_aid)
+            .and_then(|i| history.payloads.get(i))
+            .and_then(|p| p.get("requested_by"))
+            .and_then(Value::as_str);
+        if let Some(l) = requested_label
+            && !labels_equal(l, &receipt.requester.label)
+        {
+            return refuse_receipt(
+                verdict,
+                aid,
+                "receipt_event_mismatch",
+                format!(
+                    "requester {:?} disagrees with the agent.approval.requested event's {l:?}",
+                    receipt.requester.label
+                ),
+                "requester.label",
+            );
+        }
+        if !placeholders {
             let computed = labels_equal(&receipt.resolver.label, &receipt.requester.label);
             if computed != receipt.resolver_is_requester {
                 return refuse_receipt(
@@ -2634,10 +2682,7 @@ fn verify_receipts_and_cross_links(
                     "resolver_is_requester",
                 );
             }
-            computed
-        };
-
-        // Verified human resolver check for approved decisions.
+        }
         if receipt.decision == "approved"
             && (receipt.resolver.kind != "human" || receipt.resolver.label.trim().is_empty())
         {
@@ -2653,97 +2698,46 @@ fn verify_receipts_and_cross_links(
             );
         }
 
-        // The policy revision in force when the decision was made: chosen by
-        // the verifier, never trusted from the receipt.
-        let in_force = policy_in_force(policy_revisions, &receipt.decided_at);
-        if receipt.policy_revision != in_force.map(|p| p.revision) {
+        // The policy in force when the decision was recorded, chosen by the
+        // verifier from the hash-verified event time and config events.
+        let in_force = timeline.in_force(&ev.created_at);
+        if receipt.policy_revision != in_force.map(|(rev, _)| rev) {
             return refuse_receipt(
                 verdict,
                 aid,
                 "receipt_policy_mismatch",
                 format!(
-                    "cites policy revision {:?}, but the revision in force at decided_at is {:?}",
+                    "cites policy revision {:?}, but the revision in force when the decision was recorded is {:?}",
                     receipt.policy_revision,
-                    in_force.map(|p| p.revision)
+                    in_force.map(|(rev, _)| rev)
                 ),
                 "policy_revision",
             );
         }
-        if let Some(pol) = in_force
-            && !receipt.policy_digest.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(&pol.document_sha256))
-        {
+        let pol = in_force
+            .and_then(|(rev, _)| policy_revisions.iter().find(|p| p.kind == "policy" && p.revision == rev));
+        let digest_ok = match (pol, receipt.policy_digest.as_deref()) {
+            (Some(p), Some(d)) => d.eq_ignore_ascii_case(&p.document_sha256),
+            (None, None) => true,
+            _ => false,
+        };
+        if !digest_ok {
             return refuse_receipt(
                 verdict,
                 aid,
                 "receipt_policy_digest_mismatch",
-                format!("policy_digest disagrees with policy/revisions.json revision {}", pol.revision),
-                "policy_digest",
-            );
-        }
-        if in_force.is_none() && receipt.policy_digest.is_some() {
-            return refuse_receipt(
-                verdict,
-                aid,
-                "receipt_policy_digest_mismatch",
-                "carries a policy_digest but no policy revision is in force".into(),
+                "policy_digest disagrees with the policy in force".into(),
                 "policy_digest",
             );
         }
 
-        // Separation of duties: the hub refuses any approval whose resolver is
-        // its requester, whatever the policy says. A policy rule naming the
-        // tool is an extra, reported alongside.
-        if receipt.decision == "approved" {
-            approved += 1;
-            if resolver_is_requester {
-                verdict.separation_of_duties = ClaimReport::new(
-                    ClaimStatus::Refused,
-                    format!(
-                        "approval {aid} for {:?} violates separation of duties: resolver {:?} equals requester {:?}",
-                        receipt.tool, receipt.resolver.label, receipt.requester.label
-                    ),
-                );
-                verdict.set_refuse(
-                    "receipt_sod_violation",
-                    format!(
-                        "approvals/{aid}.json violates separation of duties for tool {:?} (resolver == requester {:?})",
-                        receipt.tool, receipt.resolver.label
-                    ),
-                    Some(json!({ "approval_id": aid, "tool": receipt.tool, "field": "resolver" })),
-                );
-                return Err(());
-            }
-            let policy_bound =
-                in_force.is_none_or(|p| bound_policies.contains(&(p.kind.clone(), p.revision)));
-            if in_force.is_some_and(|p| p.sod_tools.iter().any(|t| t == &receipt.tool)) {
-                sod_policy_governed += 1;
-            }
-            if !resolver_bound {
-                asserted_notes.insert("resolver label not recorded in the ledger (ORG-EVENT-DEFAULT)");
-            }
-            if !requester_bound {
-                asserted_notes
-                    .insert("requester label not bound to an agent.approval.requested event in this bundle");
-            }
-            if !policy_bound {
-                asserted_notes
-                    .insert("policy revision not bound to an agent.config.revision event in this bundle");
-            }
-            if resolver_bound && requester_bound && policy_bound {
-                sod_bound += 1;
-            }
-        }
-
-        // Covered artifacts check against artifacts/index.json.
         for cov in &receipt.covers {
-            let matched = artifacts.iter().any(|a| {
-                a.id == cov.id
-                    && a.revision == cov.revision
-                    && a.sha256.eq_ignore_ascii_case(&cov.sha256)
+            let ok = artifact_index.get(&(cov.id.as_str(), cov.revision)).is_some_and(|a| {
+                a.sha256.eq_ignore_ascii_case(&cov.sha256)
                     && a.release_status == RELEASE_RELEASED
                     && a.approval_id == Some(aid)
             });
-            if !matched {
+            if !ok {
                 return refuse_receipt(
                     verdict,
                     aid,
@@ -2758,49 +2752,98 @@ fn verify_receipts_and_cross_links(
         }
     }
 
-    // Check 8a: every unredacted approval event must have a receipt.
-    match class {
-        CheckpointClass::Hub => {
-            for (&aid, (ev, _)) in &hub_resolved {
-                if !receipts.contains_key(&aid) {
-                    verdict.integrity = ClaimReport::new(
-                        ClaimStatus::Refused,
-                        format!("missing approval receipt for approval {aid}"),
-                    );
-                    verdict.set_refuse(
-                        "cross_link_missing_receipt",
-                        format!(
-                            "agent.approval.resolved event for approval {aid} has no approvals/{aid}.json receipt"
-                        ),
-                        Some(json!({ "approval_id": aid, "seq": ev.seq, "org_seq": ev.org_seq })),
-                    );
-                    return Err(());
-                }
-            }
-        }
-        CheckpointClass::Org => {
-            for (&os, (ev, _)) in &org_resolved_by_seq {
-                if !matched_org_seqs.contains(&os) {
-                    verdict.integrity = ClaimReport::new(
-                        ClaimStatus::Refused,
-                        format!("missing approval receipt for org_seq {os}"),
-                    );
-                    verdict.set_refuse(
-                        "cross_link_missing_receipt",
-                        format!(
-                            "agent.approval.resolved event at org_seq {os} has no matching approval receipt"
-                        ),
-                        Some(json!({ "org_seq": ev.org_seq })),
-                    );
-                    return Err(());
-                }
-            }
+    // Check 8a: every unredacted approval resolution must have a receipt.
+    for (&raw_aid, &idx) in &latest {
+        if !matched_raw.contains(&raw_aid) {
+            let ev = &events[idx];
+            verdict.integrity = ClaimReport::new(
+                ClaimStatus::Refused,
+                format!("missing approval receipt for approval {raw_aid}"),
+            );
+            verdict.set_refuse(
+                "cross_link_missing_receipt",
+                format!(
+                    "agent.approval.resolved event for approval {raw_aid} has no matching approval receipt"
+                ),
+                Some(json!({ "approval_id": raw_aid, "seq": ev.seq, "org_seq": ev.org_seq })),
+            );
+            return Err(());
         }
     }
 
-    let redacted = verdict.redacted_events.count > 0;
-    let with_note =
-        |basis: String| if redacted { format!("{basis}; {REDACTED_COVERAGE_NOTE}") } else { basis };
+    // Separation of duties over every approve in the history, not only the
+    // latest resolution: the hub refuses self-approval whatever the policy.
+    let mut approves = 0usize;
+    let mut approves_bound = 0usize;
+    let mut sod_policy_governed = 0usize;
+    let mut asserted_notes: BTreeSet<&'static str> = BTreeSet::new();
+    for (raw_aid, idxs) in &history.resolved {
+        let receipt = receipt_for_raw.get(raw_aid).copied();
+        let requested_label = history
+            .requested
+            .get(raw_aid)
+            .and_then(|i| history.payloads[i].get("requested_by"))
+            .and_then(Value::as_str);
+        for idx in idxs {
+            let p = &history.payloads[idx];
+            if p.get("decision").and_then(Value::as_str).map(normalize_decision).as_deref()
+                != Some("approved")
+            {
+                continue;
+            }
+            approves += 1;
+            let resolver = p.get("resolved_by").and_then(Value::as_str);
+            let requester = requested_label
+                .or_else(|| receipt.map(|r| r.requester.label.as_str()).filter(|l| *l != LABEL_PLACEHOLDER));
+            let same = match (resolver, requester) {
+                (Some(a), Some(b)) => labels_equal(a, b),
+                _ => receipt.is_some_and(|r| r.resolver_is_requester && idxs.last() == Some(idx)),
+            };
+            if same {
+                let aid = receipt.map_or(*raw_aid, |r| r.approval_id);
+                verdict.separation_of_duties = ClaimReport::new(
+                    ClaimStatus::Refused,
+                    format!("approval {aid}: an approve was resolved by its requester"),
+                );
+                verdict.set_refuse(
+                    "receipt_sod_violation",
+                    format!(
+                        "approval {aid} was approved by its own requester {:?} (separation of duties)",
+                        resolver.unwrap_or("[redacted-label]")
+                    ),
+                    Some(json!({ "approval_id": aid, "field": "resolver" })),
+                );
+                return Err(());
+            }
+            let ev_time = &events[*idx].created_at;
+            let in_force = timeline.in_force(ev_time);
+            let policy_bound = in_force
+                .is_none_or(|(rev, bound)| bound && bound_policies.contains(&("policy".to_string(), rev)));
+            let tool = p.get("tool").and_then(Value::as_str).unwrap_or("");
+            if in_force
+                .and_then(|(rev, _)| {
+                    policy_revisions.iter().find(|r| r.kind == "policy" && r.revision == rev)
+                })
+                .is_some_and(|r| r.sod_tools.iter().any(|t| t == tool))
+            {
+                sod_policy_governed += 1;
+            }
+            if resolver.is_none() {
+                asserted_notes.insert("resolver label not recorded in the ledger (ORG-EVENT-DEFAULT)");
+            }
+            if requested_label.is_none() {
+                asserted_notes
+                    .insert("requester label not bound to an agent.approval.requested event in this bundle");
+            }
+            if !policy_bound {
+                asserted_notes
+                    .insert("policy in force not bound to an agent.config.revision event in this bundle");
+            }
+            if resolver.is_some() && requested_label.is_some() && policy_bound {
+                approves_bound += 1;
+            }
+        }
+    }
 
     let org_without_approvals =
         class == CheckpointClass::Org && bundle_org_id.is_some_and(|o| o != DEFAULT_ORG);
@@ -2816,152 +2859,238 @@ fn verify_receipts_and_cross_links(
             ),
         )
     } else if receipts.is_empty() {
-        ClaimReport::new(
-            ClaimStatus::NotApplicable,
-            with_note("no approval resolved in this bundle's window".into()),
-        )
-    } else if resolver_asserted > 0 {
-        ClaimReport::new(
-            ClaimStatus::HubAsserted,
-            with_note(format!(
-                "{} receipt(s) bound to hash-verified agent.approval.resolved events (tool, decision, transport, \
-                 expiry, action digest); {resolver_asserted} resolver label(s) are not recorded in the ledger \
-                 (ORG-EVENT-DEFAULT) and are hub-asserted",
-                receipts.len()
-            )),
-        )
+        ClaimReport::new(ClaimStatus::NotApplicable, "no approval resolution in clear in this bundle")
     } else {
-        ClaimReport::new(
-            ClaimStatus::Verified,
-            with_note(format!(
-                "{} receipt(s) bound to hash-verified agent.approval.resolved events (tool, decision, resolver, \
-                 transport, expiry, action digest)",
-                receipts.len()
-            )),
-        )
+        let base = format!(
+            "{} receipt(s) bound to hash-verified agent.approval.resolved events (tool, decision, transport, \
+             expiry, action digest, decision time{}); hub-asserted: resolver kind, requester kind, request_digest, \
+             run_id/attempt",
+            receipts.len(),
+            if resolver_asserted == 0 { ", resolver label" } else { "" }
+        );
+        if resolver_asserted > 0 {
+            ClaimReport::new(
+                ClaimStatus::HubAsserted,
+                format!(
+                    "{base}, and {resolver_asserted} resolver label(s) the ledger does not record (ORG-EVENT-DEFAULT)"
+                ),
+            )
+        } else {
+            ClaimReport::new(ClaimStatus::Verified, base)
+        }
     };
 
     verdict.separation_of_duties = if org_without_approvals {
         ClaimReport::new(ClaimStatus::NotApplicable, "no approvals of this organization are in an org bundle")
-    } else if approved == 0 {
-        ClaimReport::new(ClaimStatus::NotApplicable, with_note("no approved receipt in this bundle".into()))
-    } else if sod_bound == approved {
+    } else if approves == 0 {
+        ClaimReport::new(ClaimStatus::NotApplicable, "no approve resolution in clear in this bundle")
+    } else if approves_bound == approves {
         ClaimReport::new(
             ClaimStatus::Verified,
-            with_note(format!(
-                "{approved} approved receipt(s): resolver differs from requester (the hub invariant), both labels \
+            format!(
+                "{approves} approve resolution(s): resolver differs from requester (the hub invariant), both labels \
                  bound to hash-verified approval events and the policy in force bound to its agent.config.revision \
                  event; {sod_policy_governed} also named by a policy separation-of-duties rule"
-            )),
+            ),
         )
     } else {
         ClaimReport::new(
             ClaimStatus::HubAsserted,
-            with_note(format!(
-                "{approved} approved receipt(s) show resolver != requester, {} of them hub-asserted: {}",
-                approved - sod_bound,
+            format!(
+                "{approves} approve resolution(s) show resolver != requester, {} of them hub-asserted: {}",
+                approves - approves_bound,
                 asserted_notes.into_iter().collect::<Vec<_>>().join("; ")
-            )),
+            ),
         )
     };
-
     Ok(())
 }
 
 fn refuse_trace(
     verdict: &mut BundleVerdict,
     art: &ArtifactIndexEntry,
+    reason: &str,
     field: &str,
     detail: String,
 ) -> Result<(), ()> {
     verdict.integrity = ClaimReport::new(ClaimStatus::Refused, format!("artifact {}: {detail}", art.id));
     verdict.set_refuse(
-        "broken_artifact_trace",
+        reason,
         format!("artifact {} rev {}: {detail}", art.id, art.revision),
         Some(json!({ "artifact_id": art.id, "revision": art.revision, "field": field })),
     );
     Err(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_artifact_traces(
     verdict: &mut BundleVerdict,
     class: CheckpointClass,
     bundle_org_id: Option<&str>,
     events: &[BundleLedgerEvent],
     artifacts: &[ArtifactIndexEntry],
-    policy_revisions: &[PolicyRevisionRecord],
+    timeline: &PolicyTimeline,
     receipts: &BTreeMap<i64, ApprovalReceipt>,
 ) -> Result<(), ()> {
-    // Deliverable revisions recorded by hash-verified ledger events.
-    let mut ledger_revisions: BTreeSet<(Option<i64>, i64, String)> = BTreeSet::new();
+    let history = ApprovalHistory::build(events);
+    // Deliverable revisions and releases recorded by hash-verified events,
+    // indexed so every lookup is constant time.
+    let mut revised: HashMap<(String, i64), Vec<Value>> = HashMap::new();
     for ev in events.iter().filter(|e| !e.redacted && e.channel == "agent.deliverable.revised") {
         let Ok(p) = parse_strict_json(&ev.payload) else { continue };
         if let (Some(rev), Some(identity)) =
             (p.get("rev_no").and_then(Value::as_i64), p.get("identity").and_then(Value::as_str))
         {
-            let did = p.get("deliverable_id").and_then(Value::as_i64);
-            ledger_revisions.insert((did, rev, identity.to_ascii_lowercase()));
+            revised.entry((identity.to_ascii_lowercase(), rev)).or_default().push(p);
         }
     }
+    let all_releases = release_events(events);
+    let mut releases_by_sha: HashMap<String, Vec<&ReleaseEvent>> = HashMap::new();
+    for e in &all_releases {
+        releases_by_sha.entry(e.sha256.clone()).or_default().push(e);
+    }
+    // The raw approval id each receipt binds, through its resolved event.
+    let by_hash: HashMap<String, usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.entry_hash.as_deref().map(|h| (h.to_ascii_lowercase(), i)))
+        .collect();
+    let receipt_raw: HashMap<i64, i64> = receipts
+        .values()
+        .filter_map(|r| {
+            let idx = by_hash.get(&r.ledger.hash.to_ascii_lowercase())?;
+            history
+                .payloads
+                .get(idx)?
+                .get("approval_id")
+                .and_then(Value::as_i64)
+                .map(|raw| (r.approval_id, raw))
+        })
+        .collect();
+
     let mut unbound = 0usize;
     let org_without_approvals =
         class == CheckpointClass::Org && bundle_org_id.is_some_and(|o| o != DEFAULT_ORG);
 
     for art in artifacts {
         if art.task_id <= 0 {
-            return refuse_trace(verdict, art, "task_id", format!("invalid task_id {}", art.task_id));
-        }
-        let in_force = policy_in_force(policy_revisions, &art.recorded_at);
-        if art.policy_revision != in_force.map(|p| p.revision) {
             return refuse_trace(
                 verdict,
                 art,
+                "broken_artifact_trace",
+                "task_id",
+                format!("invalid task_id {}", art.task_id),
+            );
+        }
+        if !is_rfc3339(&art.recorded_at) {
+            return refuse_trace(
+                verdict,
+                art,
+                "broken_artifact_trace",
+                "recorded_at",
+                "recorded_at is not RFC 3339".into(),
+            );
+        }
+        let in_force = timeline.in_force(&art.recorded_at).map(|(rev, _)| rev);
+        if art.policy_revision != in_force {
+            return refuse_trace(
+                verdict,
+                art,
+                "broken_artifact_trace",
                 "policy_revision",
                 format!(
-                    "cites policy revision {:?}, but the revision in force at recorded_at is {:?} \
-                     (policy/revisions.json, kind=\"policy\")",
-                    art.policy_revision,
-                    in_force.map(|p| p.revision)
+                    "cites policy revision {:?}, but the revision in force at recorded_at is {in_force:?}",
+                    art.policy_revision
                 ),
             );
         }
         let has_run = art.run_id.as_deref().is_some_and(|s| !s.trim().is_empty());
         let has_attempt = art.attempt.is_some_and(|a| a > 0);
         if has_run != has_attempt || art.attempt.is_some_and(|a| a <= 0) {
-            return refuse_trace(verdict, art, "run_id", "must pair run_id with positive attempt".into());
+            return refuse_trace(
+                verdict,
+                art,
+                "broken_artifact_trace",
+                "run_id",
+                "must pair run_id with positive attempt".into(),
+            );
         }
 
         let numeric_id = art.id.strip_prefix("deliverable:").and_then(|n| n.parse::<i64>().ok());
-        let bound = ledger_revisions.iter().any(|(did, rev, identity)| {
-            *rev == art.revision
-                && identity.eq_ignore_ascii_case(&art.sha256)
-                && (class == CheckpointClass::Org || did.is_none() || *did == numeric_id)
+        let sha = art.sha256.to_ascii_lowercase();
+        let bound = revised.get(&(sha.clone(), art.revision)).is_some_and(|cands| {
+            cands.iter().any(|p| {
+                let size_ok = p.get("size_bytes").and_then(Value::as_i64).is_none_or(|s| s == art.size);
+                let ids_ok = class == CheckpointClass::Org
+                    || (p.get("deliverable_id").and_then(Value::as_i64) == numeric_id
+                        && p.get("task_id").and_then(Value::as_i64) == Some(art.task_id));
+                size_ok && ids_ok
+            })
         });
         if !bound {
             unbound += 1;
         }
 
+        // Release state from the hash-verified release and approval events.
+        let matching: Vec<&ReleaseEvent> = releases_by_sha
+            .get(&sha)
+            .map(|v| {
+                v.iter()
+                    .copied()
+                    .filter(|e| {
+                        class == CheckpointClass::Org
+                            || e.deliverable_id.is_none()
+                            || e.deliverable_id == numeric_id
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let state = release_state(&matching, &history);
+
         match art.release_status.as_str() {
-            RELEASE_UNRELEASED | RELEASE_NOT_IN_BUNDLE => {
+            RELEASE_UNRELEASED
+            | RELEASE_NOT_IN_BUNDLE
+            | RELEASE_NOT_PROVABLE_IN_ORG_BUNDLE
+            | RELEASE_REVOKED => {
                 if art.approval_id.is_some() {
                     return refuse_trace(
                         verdict,
                         art,
+                        "broken_artifact_trace",
                         "release_status",
                         format!("carries approval_id but release_status is {:?}", art.release_status),
                     );
                 }
-                continue;
-            }
-            RELEASE_NOT_PROVABLE_IN_ORG_BUNDLE => {
-                if !org_without_approvals || art.approval_id.is_some() {
+                if art.release_status == RELEASE_NOT_PROVABLE_IN_ORG_BUNDLE && !org_without_approvals {
                     return refuse_trace(
                         verdict,
                         art,
+                        "broken_artifact_trace",
                         "release_status",
-                        "not_provable_in_org_bundle is valid only without approval_id in a non-default \
-                         organization's org bundle"
+                        "not_provable_in_org_bundle is valid only in a non-default organization's org bundle"
                             .into(),
+                    );
+                }
+                if let ReleaseState::Released(_) = state {
+                    return refuse_trace(
+                        verdict,
+                        art,
+                        "release_hidden",
+                        "release_status",
+                        format!(
+                            "reports {:?}, but the bundle's hash-verified agent.deliverable.released and approval \
+                             events show it released",
+                            art.release_status
+                        ),
+                    );
+                }
+                if art.release_status == RELEASE_REVOKED && state != ReleaseState::Revoked {
+                    return refuse_trace(
+                        verdict,
+                        art,
+                        "broken_artifact_trace",
+                        "release_status",
+                        "release_revoked without a cancelled release or a denied or revoked approval in the bundle".into(),
                     );
                 }
                 continue;
@@ -2971,6 +3100,7 @@ fn verify_artifact_traces(
                 return refuse_trace(
                     verdict,
                     art,
+                    "broken_artifact_trace",
                     "release_status",
                     format!("unknown release_status {other:?}"),
                 );
@@ -2978,11 +3108,13 @@ fn verify_artifact_traces(
         }
 
         // Released artifacts must carry the complete trace:
-        // artifact -> task -> run/attempt -> policy revision -> approval -> receipt.covers.
+        // artifact -> task -> run/attempt -> policy revision -> approval -> receipt.covers,
+        // and a hash-verified release under an approval that still approves it.
         if !has_run {
             return refuse_trace(
                 verdict,
                 art,
+                "broken_artifact_trace",
                 "run_id",
                 "released artifact is missing run_id trace link".into(),
             );
@@ -2991,6 +3123,7 @@ fn verify_artifact_traces(
             return refuse_trace(
                 verdict,
                 art,
+                "broken_artifact_trace",
                 "approval_id",
                 "released artifact is missing approval_id".into(),
             );
@@ -2999,6 +3132,7 @@ fn verify_artifact_traces(
             return refuse_trace(
                 verdict,
                 art,
+                "broken_artifact_trace",
                 "approval_id",
                 format!("cites approval {aid}, absent from approvals/"),
             );
@@ -3010,8 +3144,22 @@ fn verify_artifact_traces(
             return refuse_trace(
                 verdict,
                 art,
+                "broken_artifact_trace",
                 "approval_id",
                 format!("approvals/{aid}.json does not cover sha256 {}", art.sha256),
+            );
+        }
+        let release_ok = matches!(state, ReleaseState::Released(raw) if receipt_raw.get(&aid) == Some(&raw));
+        if !release_ok || receipt.decision != "approved" {
+            return refuse_trace(
+                verdict,
+                art,
+                "release_not_bound",
+                "release_status",
+                format!(
+                    "reports released, but the bundle holds no hash-verified agent.deliverable.released event for it \
+                     under approval {aid} whose latest resolution approves it (release state: {state:?})"
+                ),
             );
         }
     }
@@ -3022,8 +3170,10 @@ fn verify_artifact_traces(
         ClaimReport::new(
             ClaimStatus::Verified,
             format!(
-                "{} artifact revision(s) bound to hash-verified agent.deliverable.revised events (revision and sha256)",
-                artifacts.len()
+                "{} artifact revision(s) bound to hash-verified agent.deliverable.revised events (revision, sha256, \
+                 size{}) and release state bound to agent.deliverable.released and approval events",
+                artifacts.len(),
+                if class == CheckpointClass::Hub { ", deliverable and task ids" } else { "" }
             ),
         )
     } else {
@@ -3031,7 +3181,7 @@ fn verify_artifact_traces(
             ClaimStatus::HubAsserted,
             format!(
                 "{unbound} of {} artifact revision(s) are not bound to an agent.deliverable.revised event in this \
-                 bundle; their index entries are hub-asserted",
+                 bundle (revision, sha256, size, ids); their index entries are hub-asserted",
                 artifacts.len()
             ),
         )
@@ -3048,7 +3198,7 @@ fn verify_evidence_rows(
     verdict: &mut BundleVerdict,
     class: CheckpointClass,
     events: &[BundleLedgerEvent],
-    policy_revisions: &[PolicyRevisionRecord],
+    timeline: &PolicyTimeline,
     rows: &[EvidenceRow],
 ) -> Result<(), ()> {
     let mut seen = BTreeSet::new();
@@ -3058,7 +3208,7 @@ fn verify_evidence_rows(
             continue;
         }
         let Ok(parsed) = parse_strict_json(&ev.payload) else { continue };
-        expected.push(derive_evidence_row(ev, &parsed, policy_revisions));
+        expected.push(derive_evidence_row(ev, &parsed, timeline));
     }
     let refuse = |verdict: &mut BundleVerdict, idx: usize, detail: String| {
         verdict.integrity =

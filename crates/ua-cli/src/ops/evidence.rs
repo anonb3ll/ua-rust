@@ -31,7 +31,7 @@ use ua_store::evidence_bundle::{
     BUNDLE_FORMAT, BundleCheckpointFile, BundleManifest, BundleVerifyTrust, ExportBundleOptions,
     MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_TOTAL_BYTES, PinnedHubHead, PinnedOrgHead,
     compute_org_window_checkpoint, export_bundle, load_verified_hub_cross_check, sha256_hex,
-    snapshot_checkpoint, verify_bundle_dir,
+    snapshot_checkpoint, snapshot_load, verify_bundle_dir,
 };
 use ua_tools::Hub;
 
@@ -369,7 +369,12 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
             };
             // A checkpoint written before export snapshots existed freezes its
             // snapshot on first export.
-            hub.db().write(|tx| snapshot_checkpoint(tx, &opts.checkpoint_id, &opts.exported_at))?;
+            // Read first: the write transaction is taken only when the
+            // snapshot is missing.
+            let frozen = hub.db().read(|c| Ok(snapshot_load(c, &opts.checkpoint_id)?.is_some()))?;
+            if !frozen {
+                hub.db().write(|tx| snapshot_checkpoint(tx, &opts.checkpoint_id, &opts.exported_at))?;
+            }
             let result = hub.db().read(|c| export_bundle(c, &out, &opts))?;
             let summary = json!({
                 "format": result.manifest.format,

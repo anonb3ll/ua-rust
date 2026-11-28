@@ -35,6 +35,9 @@ use serde_json::{Map, Number, Value};
 use ua_core::{UaError, UaResult};
 use unicode_normalization::UnicodeNormalization;
 
+use super::export_schema::{envelope_is_typed, schema_stub_class};
+use crate::evidence::CheckpointClass;
+
 /// Summary of classes deliberately excluded from a bundle (`withheld.json`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,9 +76,21 @@ pub const CLASS_UNPARSEABLE_PAYLOAD: &str = "unparseable_payload";
 /// that organization cannot carry their receipts.
 pub const CLASS_APPROVALS_IN_DEFAULT_LEDGER: &str = "approvals_in_default_ledger";
 
+/// A row the backstop pattern scanner flagged (a token, key or credential
+/// pattern in a row the allow-list would otherwise export). Stubbed and
+/// counted; never a refusal, so row contents cannot block an export.
+pub const CLASS_SCANNER_WITHHELD: &str = "scanner_withheld";
+
 /// Redacted stub classes the verifier accepts on a `redacted: true` row.
-pub const STUB_CLASSES: &[&str] =
-    &[CLASS_PRIVATE_MESSAGES, CLASS_PRIVATE_RECORDS, CLASS_CROSS_ORG_EVENTS, CLASS_UNPARSEABLE_PAYLOAD];
+pub const STUB_CLASSES: &[&str] = &[
+    CLASS_PRIVATE_MESSAGES,
+    CLASS_PRIVATE_RECORDS,
+    CLASS_CROSS_ORG_EVENTS,
+    CLASS_UNPARSEABLE_PAYLOAD,
+    super::export_schema::CLASS_UNLISTED_PAYLOAD,
+    super::export_schema::CLASS_FREE_TEXT_PAYLOAD,
+    CLASS_SCANNER_WITHHELD,
+];
 
 /// Longest single string the scanner inspects. A longer string fails closed
 /// ([`CLASS_UNPARSEABLE_PAYLOAD`]).
@@ -229,26 +244,23 @@ impl EgressFilter {
         self.withheld.record(class, count);
     }
 
-    /// Inspect a ledger event before writing it to `ledger/events.jsonl`.
-    ///
-    /// - Restricted/private channels, rows marked private and payloads the
-    ///   scanner cannot walk completely return
-    ///   `Ok(LedgerEgressAction::RedactToHashOnly(class))`, so export writes a
-    ///   hash-only chain-link stub and counts it in `withheld.json`.
-    /// - Any secret, token, credential, or PEM key on a non-private channel
-    ///   refuses the export outright (`Err(egress_refused)`).
-    pub fn inspect_ledger_event(&mut self, channel: &str, payload_str: &str) -> UaResult<LedgerEgressAction> {
-        if let Some(v) = find_forbidden_in_ledger_event(channel, payload_str) {
-            self.withheld.record(v.class, 1);
-            if v.is_stubbable() {
-                return Ok(LedgerEgressAction::RedactToHashOnly(v.class));
+    /// Decide how a ledger row leaves the hub: in clear, or as a hash-only
+    /// stub under a counted withheld class. Never refuses: row contents can
+    /// never block an export (see [`ledger_row_stub_class`]).
+    pub fn inspect_ledger_event(
+        &mut self,
+        class: CheckpointClass,
+        channel: &str,
+        payload_str: &str,
+        envelope: &[Option<&str>],
+    ) -> LedgerEgressAction {
+        match ledger_row_stub_class(class, channel, payload_str, envelope) {
+            Some((stub_class, _)) => {
+                self.withheld.record(stub_class, 1);
+                LedgerEgressAction::RedactToHashOnly(stub_class)
             }
-            return Err(UaError::denied(
-                "egress_refused",
-                format!("refusing to export ledger event on {channel:?}: {} ({})", v.detail, v.class),
-            ));
+            None => LedgerEgressAction::Allow,
         }
-        Ok(LedgerEgressAction::Allow)
     }
 
     /// Inspect an arbitrary structured bundle record (approval receipt,
@@ -673,6 +685,66 @@ fn is_material(k: SecretKey, shape: ValueShape) -> bool {
 // ---------------------------------------------------------------------------
 // Value walk
 // ---------------------------------------------------------------------------
+
+/// Why a ledger row may not leave the hub in clear, as `(stub class, detail)`,
+/// or `None` when it may. Shared by exporter (which stubs) and verifier
+/// (which refuses a row in clear that this would stub). In order:
+/// 1. restricted/private channels;
+/// 2. payloads that are not strict JSON;
+/// 3. the allow-list ([`super::export_schema`]): unlisted channels, unknown
+///    keys, mistyped values, free text;
+/// 4. envelope fields (originator, episode, causal parent, dedupe key) that
+///    are not safe labels;
+/// 5. the backstop pattern scanner (private markers stub as private records,
+///    any secret pattern as [`CLASS_SCANNER_WITHHELD`]).
+pub fn ledger_row_stub_class(
+    class: CheckpointClass,
+    channel: &str,
+    payload_str: &str,
+    envelope: &[Option<&str>],
+) -> Option<(&'static str, String)> {
+    if let Some(c) = restricted_channel_class(channel) {
+        return Some((c, format!("restricted/private channel {channel:?}")));
+    }
+    let parsed = match parse_strict_json(payload_str) {
+        Ok(v) => v,
+        Err(e) => return Some((CLASS_UNPARSEABLE_PAYLOAD, format!("payload is not strict JSON ({e})"))),
+    };
+    if let Some(c) = schema_stub_class(channel, &parsed, class) {
+        return Some((
+            c,
+            format!("channel {channel:?} row is not exported in clear by the egress allow-list"),
+        ));
+    }
+    if !envelope_is_typed(envelope) {
+        return Some((
+            super::export_schema::CLASS_UNLISTED_PAYLOAD,
+            "row envelope field is not a safe label".into(),
+        ));
+    }
+    // The allow-list fixed every key and type, so the backstop scans values
+    // only: every string the row would carry in clear, and its envelope.
+    let mut strings = Vec::new();
+    collect_strings(&parsed, &mut strings);
+    let scanned =
+        strings.into_iter().chain(envelope.iter().flatten().copied()).find_map(find_forbidden_in_text);
+    if let Some(v) = scanned {
+        return Some((CLASS_SCANNER_WITHHELD, v.detail));
+    }
+    None
+}
+
+fn collect_strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+    match v {
+        Value::String(s) => out.push(s),
+        Value::Array(a) => a.iter().for_each(|x| collect_strings(x, out)),
+        Value::Object(m) => m.iter().for_each(|(k, x)| {
+            out.push(k);
+            collect_strings(x, out);
+        }),
+        _ => {}
+    }
+}
 
 /// Inspect an unredacted ledger event `(channel, payload_str)` for forbidden
 /// private or secret content, or a payload the scanner cannot walk. Shared by
@@ -1610,12 +1682,20 @@ mod tests {
             "a".repeat(n),
             "%2".repeat(n / 2),
         ];
-        let started = std::time::Instant::now();
-        for s in &inputs {
-            let _ = find_forbidden_in_value(&json!({ "note": s }));
-        }
-        let elapsed = started.elapsed();
-        assert!(elapsed < std::time::Duration::from_secs(10), "scanner took {elapsed:?}");
+        // Run on a worker with a deadline, so a quadratic regression (M24)
+        // fails the test instead of hanging the suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            for s in &inputs {
+                let _ = find_forbidden_in_value(&json!({ "note": s }));
+            }
+            let _ = tx.send(started.elapsed());
+        });
+        let elapsed = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the scanner did not finish 512 KB adversarial inputs within 20 s (quadratic?)");
+        assert!(elapsed < std::time::Duration::from_secs(20), "scanner took {elapsed:?}");
     }
 
     #[test]

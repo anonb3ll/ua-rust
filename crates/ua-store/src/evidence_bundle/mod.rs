@@ -19,6 +19,7 @@
 pub mod canonical;
 pub mod egress;
 pub mod export;
+pub mod export_schema;
 pub mod snapshot;
 pub mod verify;
 
@@ -37,14 +38,15 @@ pub use canonical::{
 pub use egress::{
     CLASS_APPROVALS_IN_DEFAULT_LEDGER, CLASS_AUTH_TOKENS, CLASS_CROSS_ORG_EVENTS, CLASS_MANAGED_SECRETS,
     CLASS_PASSKEYS, CLASS_PRIVATE_MESSAGES, CLASS_PRIVATE_RECORDS, CLASS_PROVIDER_CREDENTIALS,
-    CLASS_SESSION_CREDENTIALS, CLASS_UNPARSEABLE_PAYLOAD, EgressFilter, EgressViolation,
-    MAX_SCANNED_STRING_BYTES, STUB_CLASSES, WithheldReport, find_forbidden_in_ledger_event,
-    find_forbidden_in_text, find_forbidden_in_value, is_restricted_channel, parse_strict_json,
-    restricted_channel_class,
+    CLASS_SCANNER_WITHHELD, CLASS_SESSION_CREDENTIALS, CLASS_UNPARSEABLE_PAYLOAD, EgressFilter,
+    EgressViolation, MAX_SCANNED_STRING_BYTES, STUB_CLASSES, WithheldReport, find_forbidden_in_ledger_event,
+    find_forbidden_in_text, find_forbidden_in_value, is_restricted_channel, ledger_row_stub_class,
+    parse_strict_json, restricted_channel_class,
 };
 pub use export::{
     ExportBundleOptions, ExportBundleResult, OrgWindowSummary, compute_org_window_checkpoint, export_bundle,
 };
+pub use export_schema::{CHANNEL_RULES, CLASS_FREE_TEXT_PAYLOAD, CLASS_UNLISTED_PAYLOAD, rule_for};
 pub use snapshot::{EXPORT_SNAPSHOT_PART, ExportSnapshot, snapshot_checkpoint, snapshot_load};
 pub use verify::{
     BundleVerdict, BundleVerifyTrust, ClaimReport, ClaimStatus, HubCrossCheck, LegacyPrefixReport,
@@ -77,6 +79,9 @@ pub const RELEASE_NOT_PROVABLE_IN_ORG_BUNDLE: &str = "not_provable_in_org_bundle
 /// `release_status`: the revision has a live release whose approval event
 /// falls outside this bundle's window.
 pub const RELEASE_NOT_IN_BUNDLE: &str = "release_not_in_bundle";
+/// `release_status`: the revision was released, but the release was
+/// cancelled or its approval was denied or revoked.
+pub const RELEASE_REVOKED: &str = "release_revoked";
 
 /// Channel of the hub's policy, profile and approval-rule revision events.
 pub const CONFIG_REVISION_CHANNEL: &str = "agent.config.revision";
@@ -121,26 +126,180 @@ pub fn is_evidence_channel(channel: &str) -> bool {
         || channel.starts_with("sdk.")
 }
 
-/// The policy revision in force at `ts`: the latest `kind = "policy"`
-/// revision created at or before `ts`.
-pub fn policy_in_force<'a>(
-    policy_revisions: &'a [PolicyRevisionRecord],
-    ts: &str,
-) -> Option<&'a PolicyRevisionRecord> {
-    policy_revisions
+/// The policy revisions a bundle knows, ordered by when each came into force.
+///
+/// A revision whose `agent.config.revision` event is in the bundle in clear
+/// comes into force at that hash-verified event's `created_at` and is
+/// *bound*. A revision listed only in `policy/revisions.json` comes into
+/// force at its listed `created_at` and is the hub's word. The exporter and
+/// the verifier build the same timeline, so the revision a receipt, artifact
+/// or evidence row cites is the verifier's choice, not the exporter's.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyTimeline {
+    /// `(effective timestamp, revision, bound to a ledger event)`.
+    entries: Vec<(String, i64, bool)>,
+}
+
+impl PolicyTimeline {
+    pub fn build(events: &[BundleLedgerEvent], revisions: &[PolicyRevisionRecord]) -> Self {
+        let mut entries: Vec<(String, i64, bool)> = Vec::new();
+        let mut bound_revs = BTreeSet::new();
+        for (rev, ts) in config_policy_events(events) {
+            if bound_revs.insert(rev) {
+                entries.push((normalize_ts_utc(&ts), rev, true));
+            }
+        }
+        for r in revisions.iter().filter(|r| r.kind == "policy") {
+            if !bound_revs.contains(&r.revision) {
+                entries.push((normalize_ts_utc(&r.created_at), r.revision, false));
+            }
+        }
+        entries.sort_by(|a, b| cmp_ts(&a.0, &b.0).then(a.1.cmp(&b.1)));
+        Self { entries }
+    }
+
+    /// The revision in force at `ts` and whether it is bound to a ledger
+    /// event: the latest entry effective at or before `ts`.
+    pub fn in_force(&self, ts: &str) -> Option<(i64, bool)> {
+        self.entries
+            .iter()
+            .filter(|(at, _, _)| cmp_ts(at, ts) != Ordering::Greater)
+            .max_by(|a, b| cmp_ts(&a.0, &b.0).then(a.1.cmp(&b.1)))
+            .map(|(_, rev, bound)| (*rev, *bound))
+    }
+}
+
+/// `(revision, created_at)` of every unredacted `kind = "policy"`
+/// `agent.config.revision` event in `events`.
+pub fn config_policy_events(events: &[BundleLedgerEvent]) -> Vec<(i64, String)> {
+    let mut out = Vec::new();
+    for ev in events.iter().filter(|e| !e.redacted && e.channel == CONFIG_REVISION_CHANNEL) {
+        let Ok(p) = parse_strict_json(&ev.payload) else { continue };
+        if p.get("kind").and_then(Value::as_str) == Some("policy")
+            && let Some(rev) = p.get("revision").and_then(Value::as_i64)
+        {
+            out.push((rev, ev.created_at.clone()));
+        }
+    }
+    out
+}
+
+/// The hash-verified approval history in a bundle's unredacted rows.
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalHistory {
+    /// Raw approval id -> indexes of its `agent.approval.resolved` events, in
+    /// ledger order.
+    pub resolved: BTreeMap<i64, Vec<usize>>,
+    /// Raw approval id -> index of its (latest) `agent.approval.requested`.
+    pub requested: BTreeMap<i64, usize>,
+    /// Parsed payload per event index.
+    pub payloads: BTreeMap<usize, Value>,
+}
+
+impl ApprovalHistory {
+    pub fn build(events: &[BundleLedgerEvent]) -> Self {
+        let mut h = Self::default();
+        for (idx, ev) in events.iter().enumerate() {
+            if ev.redacted || !ev.channel.starts_with("agent.approval.") {
+                continue;
+            }
+            let Ok(p) = parse_strict_json(&ev.payload) else { continue };
+            let Some(aid) = p.get("approval_id").and_then(Value::as_i64) else { continue };
+            match ev.channel.as_str() {
+                "agent.approval.resolved" => h.resolved.entry(aid).or_default().push(idx),
+                "agent.approval.requested" => {
+                    h.requested.insert(aid, idx);
+                }
+                _ => continue,
+            }
+            h.payloads.insert(idx, p);
+        }
+        h
+    }
+
+    /// The decision of the latest resolution of `aid` in the bundle.
+    pub fn latest_decision(&self, aid: i64) -> Option<String> {
+        let idx = *self.resolved.get(&aid)?.last()?;
+        self.payloads.get(&idx)?.get("decision").and_then(Value::as_str).map(normalize_decision)
+    }
+}
+
+/// A release lifecycle event (`agent.deliverable.released` or
+/// `.release_cancelled`) in a bundle's unredacted rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseEvent {
+    pub idx: usize,
+    pub cancelled: bool,
+    pub revision_id: Option<i64>,
+    pub deliverable_id: Option<i64>,
+    pub sha256: String,
+    pub approval_id: Option<i64>,
+}
+
+pub fn release_events(events: &[BundleLedgerEvent]) -> Vec<ReleaseEvent> {
+    let mut out = Vec::new();
+    for (idx, ev) in events.iter().enumerate() {
+        let cancelled = match ev.channel.as_str() {
+            "agent.deliverable.released" => false,
+            "agent.deliverable.release_cancelled" => true,
+            _ => continue,
+        };
+        if ev.redacted {
+            continue;
+        }
+        let Ok(p) = parse_strict_json(&ev.payload) else { continue };
+        out.push(ReleaseEvent {
+            idx,
+            cancelled,
+            revision_id: p.get("revision_id").and_then(Value::as_i64),
+            deliverable_id: p.get("deliverable_id").and_then(Value::as_i64),
+            sha256: p.get("sha256").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase(),
+            approval_id: p.get("approval_id").and_then(Value::as_i64),
+        });
+    }
+    out
+}
+
+/// What the hash-verified rows say about one artifact revision's release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseState {
+    /// No release event for it in the bundle.
+    NoEvent,
+    /// Released under this raw approval id, whose latest resolution in the
+    /// bundle approves it, with no later cancellation.
+    Released(i64),
+    /// A release event exists, but it was cancelled, or its approval's latest
+    /// resolution is a deny or revoke.
+    Revoked,
+    /// A release event exists, but its approval's resolution is not in the
+    /// bundle.
+    ApprovalNotInBundle,
+}
+
+/// Derive the release state of the revision whose release events are
+/// `matching` (in ledger order).
+pub fn release_state(matching: &[&ReleaseEvent], history: &ApprovalHistory) -> ReleaseState {
+    let Some(last_release) = matching.iter().rev().find(|e| !e.cancelled) else {
+        return if matching.is_empty() { ReleaseState::NoEvent } else { ReleaseState::Revoked };
+    };
+    let cancelled_after = matching
         .iter()
-        .filter(|p| p.kind == "policy" && cmp_ts(&p.created_at, ts) != Ordering::Greater)
-        .max_by(|a, b| cmp_ts(&a.created_at, &b.created_at).then(a.revision.cmp(&b.revision)))
+        .any(|e| e.cancelled && e.idx > last_release.idx && e.approval_id == last_release.approval_id);
+    if cancelled_after {
+        return ReleaseState::Revoked;
+    }
+    let Some(aid) = last_release.approval_id else { return ReleaseState::ApprovalNotInBundle };
+    match history.latest_decision(aid).as_deref() {
+        Some("approved") => ReleaseState::Released(aid),
+        Some(_) => ReleaseState::Revoked,
+        None => ReleaseState::ApprovalNotInBundle,
+    }
 }
 
 /// Derive the evidence row for an unredacted evidence-channel event from its
 /// hash-verified fields. `task_id` and `approval_id` carry the payload's raw
 /// hub ids; an `org` exporter maps them to dense ordinals (or `None`).
-pub fn derive_evidence_row(
-    ev: &BundleLedgerEvent,
-    parsed: &Value,
-    policy_revisions: &[PolicyRevisionRecord],
-) -> EvidenceRow {
+pub fn derive_evidence_row(ev: &BundleLedgerEvent, parsed: &Value, policies: &PolicyTimeline) -> EvidenceRow {
     let mut labels = vec![ev.channel.clone()];
     if ev.channel.starts_with("sdk.") {
         labels.push("client_asserted".into());
@@ -152,7 +311,7 @@ pub fn derive_evidence_row(
         task_id: parsed.get("task_id").and_then(Value::as_i64),
         run_id: parsed.get("run_id").and_then(Value::as_str).map(str::to_string),
         attempt: parsed.get("attempt").and_then(Value::as_i64),
-        policy_revision: policy_in_force(policy_revisions, &ev.created_at).map(|p| p.revision),
+        policy_revision: policies.in_force(&ev.created_at).map(|(rev, _)| rev),
         approval_id: parsed.get("approval_id").and_then(Value::as_i64),
         labels,
         created_at: normalize_ts_utc(&ev.created_at),
@@ -406,9 +565,9 @@ pub struct ApprovalReceipt {
     /// [`LABEL_PLACEHOLDER`]s (another organization's labels in a `hub`
     /// bundle).
     pub resolver_is_requester: bool,
-    /// `"approved"`, `"denied"`, or `"revoked"`.
+    /// `"approved"`, `"denied"`, or `"revoked"`. Free-text reasons are not
+    /// carried: they are not in the ledger and change on a later resolution.
     pub decision: String,
-    pub reason: Option<String>,
     pub decided_at: String,
     pub expires_at: Option<String>,
     pub ledger: ReceiptLedgerRef,
@@ -430,7 +589,6 @@ struct ReceiptWithoutId<'a> {
     org_id: &'a str,
     policy_digest: &'a Option<String>,
     policy_revision: Option<i64>,
-    reason: &'a Option<String>,
     request_digest: &'a str,
     requester: &'a ReceiptActor,
     resolver: &'a ReceiptResolver,
@@ -455,7 +613,6 @@ impl ApprovalReceipt {
             org_id: &self.org_id,
             policy_digest: &self.policy_digest,
             policy_revision: self.policy_revision,
-            reason: &self.reason,
             request_digest: &self.request_digest,
             requester: &self.requester,
             resolver: &self.resolver,

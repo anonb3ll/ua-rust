@@ -1000,6 +1000,43 @@ mod bundle_corpus {
         )
         .await;
 
+        // Node session credentials sit behind `session_credentials_enabled`
+        // and an MCP revoke needs a registered server: write their exact
+        // payload shapes (`node_queue/credentials.rs`, `mcp/mod.rs`) so the
+        // bundle carries them (review A-NB1).
+        hub.db()
+            .write(|tx| {
+                for (ch, payload) in [
+                    (
+                        "hub.session_credential.minted",
+                        json!({ "credential_id": "a1b2c3d4e5f60718", "item_id": "item-1", "attempt": 1,
+                                "node": "node-a", "task_id": 1, "run_id": "run-1", "agent_label": "builder-1",
+                                "tools": ["fs_read"], "idle_expires_at": "2026-11-20T01:00:00Z",
+                                "expires_at": "2026-11-20T02:00:00Z", "superseded": [] }),
+                    ),
+                    (
+                        "hub.session_credential.revoked",
+                        json!({ "credential_id": "a1b2c3d4e5f60718", "reason": "expired", "actor": null }),
+                    ),
+                    (
+                        "hub.session_credential.refused",
+                        json!({ "check": "expired", "credential_id": "a1b2c3d4e5f60718" }),
+                    ),
+                    (
+                        "agent.mcp_server",
+                        json!({ "op": "revoked", "name": "srv", "spec_sha256": "ab12", "approval_id": 3,
+                                "orphaned_secrets": ["GITHUB_DEPLOY_NAME"] }),
+                    ),
+                ] {
+                    ua_store::ledger::append(
+                        tx,
+                        ua_store::EventInput::new(ua_core::DEFAULT_ORG, ch, payload),
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
         let channels: Vec<String> = hub
             .db()
             .read(|c| {
@@ -1099,7 +1136,15 @@ mod bundle_corpus {
             for secret in [v1, v2] {
                 assert!(!events.contains(secret), "{name} bundle carries a token value");
             }
-            assert!(events.contains("agent.token.issued"), "{name} bundle dropped the token events");
+            for ch in [
+                "agent.token.issued",
+                "agent.token.rotated",
+                "hub.session_credential.minted",
+                "agent.mcp_server",
+            ] {
+                let in_clear = events.lines().any(|l| l.contains(&format!("\"channel\":\"{ch}\"")));
+                assert!(in_clear, "{name} bundle does not carry {ch} in clear");
+            }
         }
     }
 }

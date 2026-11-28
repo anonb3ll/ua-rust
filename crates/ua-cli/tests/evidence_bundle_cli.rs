@@ -231,6 +231,19 @@ fn end_to_end_export_offline_sign_and_verify_hub_and_org_bundles() {
         "org checkpoint failed:\nstderr:\n{}",
         String::from_utf8_lossy(&org_cp_out.stderr)
     );
+    // `ua evidence checkpoint` freezes the export snapshot in the same
+    // transaction (review M04).
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM evidence_export_snapshot WHERE checkpoint_id = 'cp-e2e-org'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the checkpoint command must freeze its export snapshot");
+    }
     let org_sig_out = run_ua(
         offline_home.path(),
         &[

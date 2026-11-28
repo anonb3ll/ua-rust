@@ -34,10 +34,12 @@ use super::egress::{
 };
 use super::{cmp_ts, normalize_ts_utc};
 
-/// The snapshot table. Append-only: one row per checkpoint, never updated or
-/// deleted, so a re-export reads the same snapshot forever. Keyed by
-/// `checkpoint_id` without a foreign key, so the snapshot never stands in the
-/// way of the checkpoint table's own rules.
+/// The snapshot table. Append-only: one row per checkpoint, never updated,
+/// deleted or replaced (`INSERT OR REPLACE` and `REPLACE` are refused by the
+/// `BEFORE INSERT` trigger, which fires before SQLite's conflict resolution),
+/// and never written for a checkpoint that does not exist. The snapshot also
+/// records its checkpoint's class, organization and digest, and the exporter
+/// refuses a snapshot that does not match the checkpoint it exports.
 pub const EXPORT_SNAPSHOT_PART: SchemaPart = SchemaPart {
     name: "evidence_bundle_snapshot.v1",
     sql: "
@@ -50,6 +52,12 @@ CREATE TRIGGER IF NOT EXISTS evidence_export_snapshot_no_update BEFORE UPDATE ON
 BEGIN SELECT RAISE(ABORT, 'evidence export snapshots are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS evidence_export_snapshot_no_delete BEFORE DELETE ON evidence_export_snapshot
 BEGIN SELECT RAISE(ABORT, 'evidence export snapshots are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS evidence_export_snapshot_no_replace BEFORE INSERT ON evidence_export_snapshot
+WHEN EXISTS (SELECT 1 FROM evidence_export_snapshot WHERE checkpoint_id = NEW.checkpoint_id)
+BEGIN SELECT RAISE(ABORT, 'evidence export snapshots are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS evidence_export_snapshot_needs_checkpoint BEFORE INSERT ON evidence_export_snapshot
+WHEN NOT EXISTS (SELECT 1 FROM evidence_checkpoint WHERE checkpoint_id = NEW.checkpoint_id)
+BEGIN SELECT RAISE(ABORT, 'an evidence export snapshot needs its checkpoint'); END;
 ",
 };
 
@@ -70,6 +78,11 @@ pub struct SnapshotMessageRow {
 #[serde(deny_unknown_fields)]
 pub struct ExportSnapshot {
     pub format: String,
+    /// The checkpoint this snapshot belongs to: its class, organization and
+    /// digest. A snapshot whose binding disagrees is never used.
+    pub class: String,
+    pub org_id: Option<String>,
+    pub checkpoint_digest: String,
     pub cutoff_ts: String,
     /// Withheld class -> normalized timestamps of its rows at or before
     /// `cutoff_ts`, ascending.
@@ -80,6 +93,15 @@ pub struct ExportSnapshot {
     pub task_ids: Vec<i64>,
     pub approval_ids: Vec<i64>,
     pub deliverable_ids: Vec<i64>,
+    /// Deliverable revision ids with a live (not cancelled) release at
+    /// capture, in scope; ascending. Tells "unreleased" from "a release this
+    /// bundle cannot show" without reading live tables at export.
+    pub release_revision_ids: Vec<i64>,
+    /// Approval ids, in scope and resolved at or before the cutoff, whose
+    /// resolver was their requester at capture; ascending. The ledger records
+    /// `null` labels for other organizations, so a `hub` bundle's
+    /// `resolver_is_requester` for them comes from here (hub-asserted).
+    pub self_resolved_approval_ids: Vec<i64>,
 }
 
 fn ordinal_of(ids: &[i64], raw: i64) -> Option<i64> {
@@ -87,6 +109,19 @@ fn ordinal_of(ids: &[i64], raw: i64) -> Option<i64> {
 }
 
 impl ExportSnapshot {
+    /// Whether this snapshot was captured for `cp`.
+    pub fn is_for(&self, cp: &Checkpoint) -> bool {
+        self.class == cp.class.as_str() && self.org_id == cp.org_id && self.checkpoint_digest == cp.digest()
+    }
+
+    pub fn has_live_release(&self, revision_id: i64) -> bool {
+        self.release_revision_ids.binary_search(&revision_id).is_ok()
+    }
+
+    pub fn self_resolved(&self, approval_id: i64) -> bool {
+        self.self_resolved_approval_ids.binary_search(&approval_id).is_ok()
+    }
+
     pub fn task_ordinal(&self, raw: i64) -> Option<i64> {
         ordinal_of(&self.task_ids, raw)
     }
@@ -356,13 +391,83 @@ pub fn snapshot_capture(conn: &Connection, cp: &Checkpoint) -> UaResult<ExportSn
     }
     Ok(ExportSnapshot {
         format: SNAPSHOT_FORMAT.to_string(),
+        class: cp.class.as_str().to_string(),
+        org_id: cp.org_id.clone(),
+        checkpoint_digest: cp.digest(),
         message_rows: message_rows(conn, org, &cutoff_ts)?,
+        release_revision_ids: live_release_revisions(conn, org)?,
+        self_resolved_approval_ids: self_resolved_approvals(conn, org, &cutoff_ts)?,
         cutoff_ts,
         withheld_rows,
         task_ids,
         approval_ids,
         deliverable_ids,
     })
+}
+
+fn live_release_revisions(conn: &Connection, org: Option<&str>) -> UaResult<Vec<i64>> {
+    if !table_exists(conn, "deliverable_releases")? {
+        return Ok(Vec::new());
+    }
+    let cancelled = if column_exists(conn, "deliverable_releases", "cancelled_at")? {
+        "cancelled_at IS NULL"
+    } else {
+        "1 = 1"
+    };
+    let has_org = column_exists(conn, "deliverable_releases", "org_id")?;
+    let mut ids: Vec<i64> = match org {
+        Some(o) if has_org => {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT revision_id FROM deliverable_releases WHERE {cancelled} AND org_id = ?1"
+            ))?;
+            stmt.query_map([o], |r| r.get(0))?.collect::<Result<_, _>>()?
+        }
+        Some(_) => Vec::new(),
+        None => {
+            let mut stmt =
+                conn.prepare(&format!("SELECT revision_id FROM deliverable_releases WHERE {cancelled}"))?;
+            stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
+        }
+    };
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn self_resolved_approvals(conn: &Connection, org: Option<&str>, cutoff_ts: &str) -> UaResult<Vec<i64>> {
+    if !table_exists(conn, "approvals")?
+        || !column_exists(conn, "approvals", "resolved_by")?
+        || !column_exists(conn, "approvals", "resolved_at")?
+    {
+        return Ok(Vec::new());
+    }
+    let has_org = column_exists(conn, "approvals", "org_id")?;
+    let base =
+        "SELECT id, requested_by, resolved_by, resolved_at FROM approvals WHERE resolved_at IS NOT NULL";
+    let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, Option<String>, Option<String>, String)> {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    };
+    let rows: Vec<(i64, Option<String>, Option<String>, String)> = match org {
+        Some(o) if has_org => {
+            let mut stmt = conn.prepare(&format!("{base} AND org_id = ?1"))?;
+            stmt.query_map([o], map)?.collect::<Result<_, _>>()?
+        }
+        Some(_) => Vec::new(),
+        None => {
+            let mut stmt = conn.prepare(base)?;
+            stmt.query_map([], map)?.collect::<Result<_, _>>()?
+        }
+    };
+    let mut ids: Vec<i64> = rows
+        .into_iter()
+        .filter(|(_, req, res, at)| {
+            cmp_ts(at, cutoff_ts) != Ordering::Greater
+                && matches!((req, res), (Some(a), Some(b)) if a.trim().eq_ignore_ascii_case(b.trim()))
+        })
+        .map(|(id, ..)| id)
+        .collect();
+    ids.sort_unstable();
+    Ok(ids)
 }
 
 /// The stored snapshot for `checkpoint_id`, if the table and row exist.

@@ -15,12 +15,13 @@ use ua_store::evidence::{
 };
 use ua_store::evidence_bundle::{
     ApprovalReceipt, ArtifactIndexEntry, BundleCheckpointFile, BundleLedgerEvent, BundleManifest,
-    BundleVerifyTrust, CLASS_APPROVALS_IN_DEFAULT_LEDGER, CLASS_CROSS_ORG_EVENTS, CLASS_PRIVATE_MESSAGES,
-    CLASS_PRIVATE_RECORDS, CLASS_UNPARSEABLE_PAYLOAD, ClaimStatus, EXPORT_SNAPSHOT_PART, EvidenceRow,
-    ExportBundleOptions, LABEL_PLACEHOLDER, PinnedHubHead, PinnedOrgHead, PolicyRevisionRecord, ProducerInfo,
-    REDACTED_CHANNEL, WithheldReport, compute_org_window_checkpoint, export_bundle,
-    load_verified_hub_cross_check, org_chain_fold, sha256_hex, snapshot_checkpoint, to_canonical_bytes,
-    verify_bundle_dir, verify_bundle_dir_with_limits,
+    BundleVerifyTrust, CLASS_APPROVALS_IN_DEFAULT_LEDGER, CLASS_CROSS_ORG_EVENTS, CLASS_FREE_TEXT_PAYLOAD,
+    CLASS_PRIVATE_MESSAGES, CLASS_PRIVATE_RECORDS, CLASS_SCANNER_WITHHELD, CLASS_UNLISTED_PAYLOAD,
+    CLASS_UNPARSEABLE_PAYLOAD, ClaimStatus, EXPORT_SNAPSHOT_PART, EvidenceRow, ExportBundleOptions,
+    LABEL_PLACEHOLDER, PinnedHubHead, PinnedOrgHead, PolicyRevisionRecord, ProducerInfo, REDACTED_CHANNEL,
+    WithheldReport, compute_org_window_checkpoint, export_bundle, load_verified_hub_cross_check,
+    org_chain_fold, sha256_hex, snapshot_checkpoint, to_canonical_bytes, verify_bundle_dir,
+    verify_bundle_dir_with_limits,
 };
 use ua_store::ledger::{
     self, EventInput, GENESIS_HASH, HASH_V1, HASH_V2, compute_entry_hash, compute_entry_hash_v2,
@@ -278,6 +279,7 @@ CREATE TABLE IF NOT EXISTS message_index (
         ua_store::org::STORE_PART.into(),
         KEY_STORE_PART.into(),
         CHECKPOINT_CHECKS_PART.into(),
+        ua_store::evidence::NO_REPLACE_PART.into(),
         EXPORT_SNAPSHOT_PART.into(),
         extra.into(),
     ];
@@ -412,7 +414,7 @@ fn populate_sample_db(db: &Db, sk: &SigningKey, key_id: &str) -> (String, String
             )?;
             ledger::append(
                 tx,
-                EventInput::new("default", "agent.task.created", json!({ "task_id": 42, "title": "Audit report" }))
+                EventInput::new("default", "agent.task.created", json!({ "task_id": 42, "title": null }))
                     .by("builder-1"),
             )?;
             ledger::append(
@@ -441,7 +443,7 @@ fn populate_sample_db(db: &Db, sk: &SigningKey, key_id: &str) -> (String, String
             )?;
             ledger::append(
                 tx,
-                EventInput::new("acme", "agent.task.created", json!({ "task_id": 101, "title": "Acme review" }))
+                EventInput::new("acme", "agent.task.created", json!({ "task_id": 101, "title": null }))
                     .by("acme-bot"),
             )?;
             ledger::append(
@@ -466,10 +468,27 @@ fn populate_sample_db(db: &Db, sk: &SigningKey, key_id: &str) -> (String, String
                 EventInput::new("acme", "agent.task.completed", json!({ "task_id": 101 }))
                     .by("acme-bot"),
             )?;
+            ledger::append(
+                tx,
+                EventInput::new(
+                    "default",
+                    "agent.deliverable.released",
+                    json!({
+                        "task_id": 42, "deliverable_id": 1, "revision_id": 1, "sha256": artifact_sha,
+                        "size_bytes": 4096, "approval_id": 10, "approver": "operator",
+                        "destination": "release/report.md", "root_identity": "root-1"
+                    }),
+                )
+                .by("builder-1"),
+            )?;
             let last_ev = ledger::append(
                 tx,
-                EventInput::new("acme", "evidence.attestation", json!({ "task_id": 101, "ok": true }))
-                    .by("acme-bot"),
+                EventInput::new(
+                    "acme",
+                    "agent.deliverable.created",
+                    json!({ "org_id": "acme", "deliverable_id": 7, "task_id": 101, "kind": "file" }),
+                )
+                .by("acme-bot"),
             )?
             .unwrap();
 
@@ -1196,11 +1215,12 @@ fn exporter_refuses_forbidden_egress_and_non_empty_dir() {
         })
         .unwrap();
 
+    // A secret in a row never blocks the export: the row is a hash-only stub.
     let out = tempdir().unwrap();
     let bundle_dir = out.path().join("leaked");
-    let err = db.read(|c| export_bundle(c, &bundle_dir, &export_opts(&cp_id))).unwrap_err();
-    assert!(err.to_string().contains("egress") || err.to_string().contains("uas_"), "got: {err}");
-    assert!(!bundle_dir.exists(), "refused export must not leave bundle files behind");
+    db.read(|c| export_bundle(c, &bundle_dir, &export_opts(&cp_id))).unwrap();
+    let text = std::fs::read_to_string(bundle_dir.join("ledger/events.jsonl")).unwrap();
+    assert!(!text.contains("uas_0123456789abcdef9999"));
 
     // Non-empty output directory is refused.
     let non_empty = tempdir().unwrap();
@@ -1223,9 +1243,9 @@ fn incremental_org_windows_and_hub_cross_check_catches_mid_window_omission() {
                 [],
             )?;
             key_add(tx, FIXTURE_KEY_ID, &pk, "2026-11-20T00:00:00Z", None)?;
-            ledger::append(tx, EventInput::new("acme", "a.1", json!({ "n": 1 })))?;
-            ledger::append(tx, EventInput::new("default", "d.1", json!({ "n": 1 })))?;
-            ledger::append(tx, EventInput::new("acme", "a.2", json!({ "n": 2 })))?;
+            ledger::append(tx, EventInput::new("acme", "agent.task.completed", json!({ "task_id": 1 })))?;
+            ledger::append(tx, EventInput::new("default", "agent.task.completed", json!({ "task_id": 1 })))?;
+            ledger::append(tx, EventInput::new("acme", "agent.task.completed", json!({ "task_id": 2 })))?;
 
             let s1 = compute_org_window_checkpoint(
                 tx,
@@ -1252,8 +1272,8 @@ fn incremental_org_windows_and_hub_cross_check_catches_mid_window_omission() {
             checkpoint_attach(tx, &c1.checkpoint_id, &sign_hex_digest(&sk, &d1))?;
 
             // Window 2 events.
-            ledger::append(tx, EventInput::new("acme", "a.3", json!({ "n": 3 })))?;
-            ledger::append(tx, EventInput::new("acme", "a.4", json!({ "n": 4 })))?;
+            ledger::append(tx, EventInput::new("acme", "agent.task.completed", json!({ "task_id": 3 })))?;
+            ledger::append(tx, EventInput::new("acme", "agent.task.completed", json!({ "task_id": 4 })))?;
             let s2 = compute_org_window_checkpoint(
                 tx,
                 "acme",
@@ -1479,15 +1499,21 @@ fn all_twelve_review_egress_probes_are_blocked_or_hash_only_redacted() {
                 write_hub_cp_at_head(tx, "cp-secret-probe", &sk, FIXTURE_KEY_ID)
             })
             .unwrap();
+        // Client payloads are never exported in clear: the row is a counted
+        // hash-only stub, and its content never blocks the export.
         let out = tempdir().unwrap();
         let bundle_dir = out.path().join("bundle");
-        let err = db.read(|c| export_bundle(c, &bundle_dir, &export_opts(&cp_id))).unwrap_err();
-        assert_eq!(
-            err.reason_code(),
-            Some("egress_refused"),
-            "probe {label} should refuse export with egress_refused, got: {err}"
+        db.read(|c| export_bundle(c, &bundle_dir, &export_opts(&cp_id)))
+            .unwrap_or_else(|e| panic!("probe {label} must export (stubbed), got: {e}"));
+        sign_bundle_offline(&bundle_dir, &sk);
+        let evs = read_events(&bundle_dir);
+        assert!(evs.iter().all(|e| e.channel != *channel), "probe {label} channel left in clear");
+        assert!(
+            evs.iter().any(|e| e.redacted_class.as_deref() == Some(CLASS_UNLISTED_PAYLOAD)),
+            "probe {label}"
         );
-        assert!(!bundle_dir.exists(), "probe {label} must not write files");
+        let v = verify_bundle_dir(&bundle_dir, &trust).unwrap();
+        assert!(v.ok, "probe {label} bundle must verify: {v:?}");
 
         // Also prove verifier refuses if the same secret is injected into an existing bundle.
         let vtmp = tempdir().unwrap();
@@ -1510,7 +1536,10 @@ fn all_twelve_review_egress_probes_are_blocked_or_hash_only_redacted() {
         remanifest_and_resign(vtmp.path(), &sk, false);
         let v = verify_bundle_dir(vtmp.path(), &trust).unwrap();
         assert_eq!(v.exit_code, 1, "verifier must refuse probe {label}: {v:?}");
-        assert_eq!(v.reason.as_deref(), Some("forbidden_private_content"), "probe {label}");
+        assert!(
+            matches!(v.reason.as_deref(), Some("forbidden_private_content" | "unlisted_payload_in_clear")),
+            "probe {label}: {v:?}"
+        );
     }
 
     // The 4 restricted-channel probes + a default message event with a body:
@@ -1623,7 +1652,7 @@ fn all_twelve_review_egress_probes_are_blocked_or_hash_only_redacted() {
         remanifest_and_resign(vtmp.path(), &sk, false);
         let v = verify_bundle_dir(vtmp.path(), &trust).unwrap();
         assert_eq!(v.exit_code, 1, "unredacted {ch} must be refused: {v:?}");
-        assert_eq!(v.reason.as_deref(), Some("forbidden_private_content"));
+        assert_eq!(v.reason.as_deref(), Some("forbidden_private_content"), "{v:?}");
     }
 }
 
@@ -1782,7 +1811,7 @@ fn real_hub_org_event_default_unhashed_org_and_unreleased_deliverables() {
     assert_eq!(rec.requester.label, LABEL_PLACEHOLDER);
     assert_eq!(rec.resolver.label, LABEL_PLACEHOLDER);
     assert!(!rec.resolver_is_requester);
-    assert_eq!(rec.reason, None);
+    assert!(!receipt_raw.contains("\"reason\""), "receipts carry no free-text reason");
 }
 
 /// Proves policy revisions match strictly on `(kind, revision)`, `sod_tools` is
@@ -1802,13 +1831,12 @@ fn policy_kind_revision_collision_and_document_derived_sod_verification() {
         revs.retain(|r| r.kind != "policy");
         assert!(revs.iter().any(|r| r.kind == "profile" && r.revision == 1));
         std::fs::write(&p, to_canonical_bytes(&revs).unwrap()).unwrap();
-        // Keep the evidence rows consistent with the shrunken policy list so
-        // the receipt check is what refuses.
-        rewrite_jsonl::<EvidenceRow>(&tmp.path().join("evidence/rows.jsonl"), |r| r.policy_revision = None);
+        // Rev 1's agent.config.revision event is still in the bundle: the
+        // list is incomplete (review NS2).
         remanifest_and_resign(tmp.path(), &sk, false);
         let v = verify_bundle_dir(tmp.path(), &trust).unwrap();
         assert_eq!(v.exit_code, 1);
-        assert_eq!(v.reason.as_deref(), Some("receipt_policy_mismatch"));
+        assert_eq!(v.reason.as_deref(), Some("policy_revision_missing"));
     }
 
     // 2. Claiming extra `sod_tools` not backed by `document` -> MUST REFUSE (`policy_sod_mismatch`).
@@ -2332,7 +2360,7 @@ fn redaction_stubs_are_counted_scoped_cross_checked_and_reported() {
     // S3: an evidence row whose event is stubbed no longer matches the rebuilt rows.
     let tmp = good_copy("good_hub");
     let mut evs = read_events(tmp.path());
-    let i = idx_of(&evs, "evidence.attestation");
+    let i = idx_of(&evs, "agent.deliverable.revised");
     make_stub(&mut evs[i], CLASS_PRIVATE_MESSAGES);
     write_events(tmp.path(), &evs);
     bump_withheld(tmp.path(), CLASS_PRIVATE_MESSAGES, 1);
@@ -2467,8 +2495,16 @@ fn receipts_bind_every_field_to_the_hash_verified_approval_event() {
         ),
         (("resolver_is_requester", Box::new(|r| r.resolver_is_requester = true)), "receipt_event_mismatch"),
         (
-            ("decided_at", Box::new(|r| r.decided_at = "2099-01-01T00:00:00Z".into())),
-            "receipt_decided_after_event",
+            ("decided_at after", Box::new(|r| r.decided_at = "2099-01-01T00:00:00Z".into())),
+            "receipt_decided_at_out_of_range",
+        ),
+        (
+            ("decided_at before request", Box::new(|r| r.decided_at = "2001-01-01T00:00:00Z".into())),
+            "receipt_decided_at_out_of_range",
+        ),
+        (
+            ("decided_at not RFC 3339", Box::new(|r| r.decided_at = "!".into())),
+            "receipt_decided_at_out_of_range",
         ),
         (
             (
@@ -2500,6 +2536,12 @@ struct ReleaseSeed {
     config_event: bool,
     requester: &'static str,
     resolver: &'static str,
+    /// A second policy revision (with its config event) created after the
+    /// first and before the approval.
+    second_policy: bool,
+    /// `(decision, resolver)` resolutions after the request; empty means one
+    /// approve by `resolver`. The release event follows the first approve.
+    resolutions: &'static [(&'static str, &'static str)],
 }
 
 fn seed_release_hub(db: &Db, sk: &SigningKey, pk: &str, seed: &ReleaseSeed) -> String {
@@ -2530,6 +2572,27 @@ fn seed_release_hub(db: &Db, sk: &SigningKey, pk: &str, seed: &ReleaseSeed) -> S
                     .by("operator"),
                 )?;
             }
+        }
+        if seed.second_policy {
+            let doc = json!({ "version": 2, "rules": [{ "tool": "deliverable_release", "action": "require_approval" }] });
+            let doc_canon = ua_core::canonical::to_string(&doc);
+            let doc_sha = sha256_hex(doc_canon.as_bytes());
+            tx.execute(
+                "INSERT INTO config_revisions (kind, revision, action, actor, document, document_sha256, raw_sha256, created_at) \
+                 VALUES ('policy', 2, 'commit', 'operator', ?1, ?2, ?2, '2026-11-20T00:04:30Z')",
+                params![doc_canon, doc_sha],
+            )?;
+            ledger::append(
+                tx,
+                EventInput::new(
+                    "default",
+                    "agent.config.revision",
+                    json!({ "schema": 1, "kind": "policy", "revision": 2, "action": "commit",
+                            "actor": "operator", "document_sha256": doc_sha, "raw_sha256": doc_sha,
+                            "approval_id": null, "diff": "" }),
+                )
+                .by("operator"),
+            )?;
         }
         tx.execute(
             "INSERT INTO tasks (id, org_id, title, created_at) VALUES (42, 'default', 'Report', '2026-11-20T00:02:00Z')",
@@ -2569,17 +2632,31 @@ fn seed_release_hub(db: &Db, sk: &SigningKey, pk: &str, seed: &ReleaseSeed) -> S
             )
             .by(seed.requester),
         )?;
-        ledger::append(
-            tx,
-            EventInput::new(
-                "default",
-                "agent.approval.resolved",
-                json!({ "approval_id": 10, "tool": "deliverable_release", "decision": "approve",
-                        "resolved_by": seed.resolver, "transport": "ui", "payload_sha256": digest,
-                        "expires_at": "2026-11-21T00:05:00Z" }),
-            )
-            .by(seed.resolver),
-        )?;
+        let default_res = [("approve", seed.resolver)];
+        let resolutions: &[(&str, &str)] = if seed.resolutions.is_empty() { &default_res } else { seed.resolutions };
+        let mut released = false;
+        for (decision, by) in resolutions {
+            let mut ev = json!({ "approval_id": 10, "tool": "deliverable_release", "decision": decision,
+                                 "resolved_by": by, "transport": "ui", "payload_sha256": digest });
+            if *decision == "approve" {
+                ev["expires_at"] = json!("2026-11-21T00:05:00Z");
+            }
+            ledger::append(tx, EventInput::new("default", "agent.approval.resolved", ev).by(*by))?;
+            if *decision == "approve" && !released {
+                released = true;
+                ledger::append(
+                    tx,
+                    EventInput::new(
+                        "default",
+                        "agent.deliverable.released",
+                        json!({ "task_id": 42, "deliverable_id": 1, "revision_id": 1, "sha256": artifact_sha,
+                                "approval_id": 10, "approver": by, "destination": "release/report.md",
+                                "root_identity": "root" }),
+                    )
+                    .by(seed.requester),
+                )?;
+            }
+        }
         write_hub_cp_at_head(tx, "cp-release", sk, FIXTURE_KEY_ID)
     })
     .unwrap()
@@ -2608,6 +2685,8 @@ fn self_approval_is_refused_whatever_the_policy_says() {
             config_event: true,
             requester: "operator",
             resolver: "operator",
+            second_policy: false,
+            resolutions: &[],
         },
     );
     let out = tempdir().unwrap();
@@ -2627,6 +2706,8 @@ fn self_approval_is_refused_whatever_the_policy_says() {
             config_event: true,
             requester: "builder-1",
             resolver: "operator",
+            second_policy: false,
+            resolutions: &[],
         },
     );
     export_signed(&db, &cp, &out.path().join("c"), &sk);
@@ -2646,6 +2727,8 @@ fn self_approval_is_refused_whatever_the_policy_says() {
             config_event: false,
             requester: "builder-1",
             resolver: "operator",
+            second_policy: false,
+            resolutions: &[],
         },
     );
     export_signed(&db, &cp, &out.path().join("d"), &sk);
@@ -2662,7 +2745,14 @@ fn self_approval_is_refused_whatever_the_policy_says() {
         &db,
         &sk,
         &pk,
-        &ReleaseSeed { policy: None, config_event: false, requester: "builder-1", resolver: "operator" },
+        &ReleaseSeed {
+            policy: None,
+            config_event: false,
+            requester: "builder-1",
+            resolver: "operator",
+            second_policy: false,
+            resolutions: &[],
+        },
     );
     let dir = out.path().join("e");
     export_signed(&db, &cp, &dir, &sk);
@@ -2866,7 +2956,10 @@ fn org_bundle_reports_releases_and_approvals_as_not_covered() {
                  VALUES (20, 3, 'acme', 'acme-bot', 'acme-human', 'out', 'root', 'stage', 1, 1)",
                 [],
             )?;
-            ledger::append(tx, EventInput::new("acme", "evidence.attestation", json!({ "task_id": 101 })).by("acme-bot"))?;
+            ledger::append(
+                tx,
+                EventInput::new("acme", "agent.task.completed", json!({ "task_id": 101 })).by("acme-bot"),
+            )?;
             ledger::append(
                 tx,
                 EventInput::new(
@@ -2874,6 +2967,16 @@ fn org_bundle_reports_releases_and_approvals_as_not_covered() {
                     "agent.approval.resolved",
                     json!({ "approval_id": 20, "tool": "deliverable_release", "decision": "approve",
                             "resolved_by": null, "transport": "ui", "payload_sha256": digest }),
+                )
+                .by("system"),
+            )?;
+            ledger::append(
+                tx,
+                EventInput::new(
+                    "default",
+                    "agent.deliverable.released",
+                    json!({ "task_id": 101, "deliverable_id": 3, "revision_id": 3, "sha256": "f".repeat(64),
+                            "approval_id": 20, "approver": null, "destination": "out", "root_identity": "root" }),
                 )
                 .by("system"),
             )?;
@@ -2984,8 +3087,17 @@ fn org_evidence_rows_use_task_ordinals() {
                  VALUES (4, 'acme', 4, 1, ?1, 'acme-bot', '2026-11-20T00:03:00Z')",
                 ["a".repeat(64)],
             )?;
-            ledger::append(tx, EventInput::new("acme", "evidence.attestation", json!({ "task_id": 5 })).by("acme-bot"))?;
-            ledger::append(tx, EventInput::new("acme", "evidence.attestation", json!({ "task_id": 9 })).by("acme-bot"))?;
+            for tid in [5, 9] {
+                ledger::append(
+                    tx,
+                    EventInput::new(
+                        "acme",
+                        "agent.deliverable.created",
+                        json!({ "org_id": "acme", "deliverable_id": 4, "task_id": tid, "kind": "file" }),
+                    )
+                    .by("acme-bot"),
+                )?;
+            }
             let sum = compute_org_window_checkpoint(tx, "acme", "2026-11-01T00:00:00Z", "2099-12-31T23:59:59Z", None)?;
             let cp = Checkpoint {
                 checkpoint_id: "cp-acme-ord".into(),
@@ -3132,4 +3244,822 @@ fn reexport_is_byte_identical_after_deletes() {
     assert!(
         db.write(|tx| Ok(tx.execute("UPDATE evidence_export_snapshot SET snapshot = '{}'", [])?)).is_err()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 3 (#2716 S3b+S3c, reviews at d2d6763b): allow-list egress
+// ---------------------------------------------------------------------------
+
+/// Literals that look like channels but are not ledger channels (schema part
+/// names, hostnames, test placeholders).
+const NOT_CHANNELS: &[&str] = &["hub.db", "hub.db.away", "hub.example.com", "agent.x", "agent.y"];
+
+fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            rust_sources(&p, out);
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// Every hub channel literal in the workspace's sources is classified for
+/// egress on purpose: an exact export rule, a stub family, or a restricted
+/// channel. A new channel that matches nothing fails here (it would be
+/// stubbed as `unlisted_payload` at export, which is safe, but the table
+/// must say so).
+#[test]
+fn every_hub_channel_is_classified_for_egress() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut files = Vec::new();
+    for c in std::fs::read_dir(crates).unwrap().flatten() {
+        let src = c.path().join("src");
+        if src.is_dir() {
+            rust_sources(&src, &mut files);
+        }
+    }
+    let mut unclassified = std::collections::BTreeSet::new();
+    let mut seen = 0usize;
+    for f in files {
+        let text = std::fs::read_to_string(&f).unwrap();
+        for (i, _) in text.match_indices('"') {
+            let rest = &text[i + 1..];
+            let Some(end) = rest.find('"') else { continue };
+            let lit = &rest[..end];
+            let is_channel_shape =
+                ["agent.", "hub.", "evidence.", "github.credential."].iter().any(|p| lit.starts_with(p))
+                    && lit.len() < 80
+                    && lit
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_'))
+                    && !lit.ends_with('.');
+            if !is_channel_shape || NOT_CHANNELS.contains(&lit) {
+                continue;
+            }
+            // Schema part names (`github.v1`, `evidence_key_store.v1`) are not channels.
+            if lit.split('.').any(|seg| {
+                seg.len() > 1 && seg.starts_with('v') && seg[1..].bytes().all(|b| b.is_ascii_digit())
+            }) {
+                continue;
+            }
+            seen += 1;
+            if ua_store::evidence_bundle::rule_for(lit).is_none()
+                && !ua_store::evidence_bundle::is_restricted_channel(lit)
+            {
+                unclassified.insert(format!("{lit} ({})", f.display()));
+            }
+        }
+    }
+    assert!(seen > 100, "the scan found only {seen} channel literals");
+    assert!(
+        unclassified.is_empty(),
+        "classify these channels in export_schema::CHANNEL_RULES: {unclassified:#?}"
+    );
+}
+
+fn seed_hub_rows(rows: &[(&str, Value)]) -> (tempfile::TempDir, Db, String) {
+    let (sk, pk) = signing_key(FIXTURE_KEY_SEED);
+    let (dir, db) = open_test_db();
+    let cp = db
+        .write(|tx| {
+            key_add(tx, FIXTURE_KEY_ID, &pk, "2026-11-20T00:00:00Z", None)?;
+            for (ch, payload) in rows {
+                ledger::append(tx, EventInput::new("default", *ch, payload.clone()).by("builder-1"))?;
+            }
+            write_hub_cp_at_head(tx, "cp-rows", &sk, FIXTURE_KEY_ID)
+        })
+        .unwrap();
+    (dir, db, cp)
+}
+
+/// Owner decision (allow-list): client `sdk.*` payloads never leave in clear,
+/// whatever their keys (review B-B1 matrix); hub rows with free text or a
+/// scanner hit are stubbed and never block the export (A-NB1, B-S3); the
+/// hub's own typed rows export in clear (session credentials, MCP revokes).
+#[test]
+fn egress_is_an_allow_list_and_row_contents_never_block_export() {
+    let (sk, pk) = signing_key(FIXTURE_KEY_SEED);
+    let trust = BundleVerifyTrust::from_anchor(TrustAnchor { key_id: FIXTURE_KEY_ID.into(), public_key: pk });
+    let plants = [
+        json!({ "signing_key": "FAKE-PLANTED-SIGNING-0001" }),
+        json!({ "access_key": "FAKE-PLANTED-ACCESS-0002" }),
+        json!({ "passcode": "FAKE-PLANTED-PASSCODE-0003" }),
+        json!({ "secrets": [70, 65, 75, 69, 45, 80, 76, 65, 78, 84] }),
+        json!({ "cmd": "psql 'password=FAKE-PLANTED-DSN-0005'" }),
+        json!({ "note": "{'password': 'FAKE-PLANTED-REPR-0006'}" }),
+        json!({ "passw\u{0585}rd": "FAKE-PLANTED-ARMENIAN-0007" }),
+        json!({ "headers": "Cookie: session=FAKE-PLANTED-COOKIE-0008" }),
+        json!({ "note": "see ghp_0123456789abcdefFAKEFAKEFAKEFAKE0123" }),
+        json!({ "token_count": "12" }),
+    ];
+    let mut rows: Vec<(&str, Value)> = plants.iter().map(|p| ("sdk.note", p.clone())).collect();
+    rows.push((
+        "agent.task.created",
+        json!({ "task_id": 1, "title": "Rotate Bearer tokens on the gateway" }),
+    ));
+    rows.push(("agent.token.issued", json!({ "agent": "ghp_0123456789abcdefFAKEFAKEFAKE", "token_id": 9 })));
+    rows.push((
+        "hub.session_credential.minted",
+        json!({ "credential_id": "a1b2c3d4e5f60718", "item_id": 1, "attempt": 1, "task_id": 42,
+                "run_id": "run-001", "tools": ["fs_read"], "superseded": [] }),
+    ));
+    rows.push((
+        "agent.mcp_server",
+        json!({ "op": "revoked", "name": "srv", "spec_sha256": "abc", "approval_id": 3,
+                "orphaned_secrets": ["GITHUB_DEPLOY_NAME"] }),
+    ));
+    let (_d, db, cp) = seed_hub_rows(&rows);
+    let out = tempdir().unwrap();
+    let dir = out.path().join("b");
+    export_signed(&db, &cp, &dir, &sk);
+    let text = std::fs::read_to_string(dir.join("ledger/events.jsonl")).unwrap();
+    for needle in ["FAKE-PLANTED", "70,65,75,69", "Rotate Bearer", "ghp_0123", "\"12\""] {
+        assert!(!text.contains(needle), "{needle} left the hub in clear");
+    }
+    let evs = read_events(&dir);
+    let class_of = |ch: &str| -> Vec<Option<String>> {
+        evs.iter()
+            .filter(|e| e.channel == ch || (e.redacted && ch.is_empty()))
+            .map(|e| e.redacted_class.clone())
+            .collect()
+    };
+    let stubs: Vec<String> = evs.iter().filter_map(|e| e.redacted_class.clone()).collect();
+    assert_eq!(stubs.iter().filter(|c| *c == CLASS_UNLISTED_PAYLOAD).count(), plants.len());
+    assert!(stubs.iter().any(|c| c == CLASS_FREE_TEXT_PAYLOAD), "{stubs:?}");
+    assert!(stubs.iter().any(|c| c == CLASS_SCANNER_WITHHELD), "{stubs:?}");
+    assert_eq!(class_of("hub.session_credential.minted"), vec![None], "typed hub row exports in clear");
+    assert_eq!(class_of("agent.mcp_server"), vec![None]);
+    let withheld: WithheldReport = read_json(&dir.join("withheld.json"));
+    assert_eq!(withheld.classes.get(CLASS_UNLISTED_PAYLOAD), Some(&(plants.len() as u64)));
+    let v = verify_bundle_dir(&dir, &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    assert_eq!(v.completeness.status, ClaimStatus::Partial, "stubs drop completeness to partial");
+
+    // A client row put back in clear (hash still valid) is refused.
+    let raw: (String, String) = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT channel, payload FROM event_log WHERE channel = 'sdk.note' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    let mut evs = read_events(&dir);
+    let ev = evs
+        .iter_mut()
+        .find(|e| e.redacted && e.redacted_class.as_deref() == Some(CLASS_UNLISTED_PAYLOAD))
+        .unwrap();
+    ev.channel = raw.0;
+    ev.payload = raw.1;
+    ev.originator = Some("builder-1".into());
+    ev.redacted = false;
+    ev.redacted_class = None;
+    write_events(&dir, &evs);
+    bump_withheld(&dir, CLASS_UNLISTED_PAYLOAD, 0);
+    remanifest_and_resign(&dir, &sk, false);
+    let v = verify_bundle_dir(&dir, &trust).unwrap();
+    assert_eq!(v.exit_code, 1, "{v:?}");
+    assert!(
+        matches!(v.reason.as_deref(), Some("unlisted_payload_in_clear" | "withheld_count_mismatch")),
+        "{v:?}"
+    );
+}
+
+fn release_seed(resolutions: &'static [(&'static str, &'static str)], second_policy: bool) -> ReleaseSeed {
+    ReleaseSeed {
+        policy: Some(
+            json!({ "version": 1, "rules": [{ "tool": "deliverable_release", "action": "require_approval" }] }),
+        ),
+        config_event: true,
+        requester: "builder-1",
+        resolver: "operator",
+        second_policy,
+        resolutions,
+    }
+}
+
+/// NB2: the snapshot table refuses `INSERT OR REPLACE`, `REPLACE` and rows
+/// for a checkpoint that does not exist; a snapshot bound to another
+/// checkpoint is refused at export. `evidence_checkpoint` and `evidence_key`
+/// refuse REPLACE too (`evidence_key_store.v3.no_replace`).
+#[test]
+fn snapshot_and_checkpoint_rows_cannot_be_replaced_or_planted() {
+    let (sk, _) = signing_key(FIXTURE_KEY_SEED);
+    let (_d, db) = open_test_db();
+    let (hub_cp, org_cp) = populate_sample_db(&db, &sk, FIXTURE_KEY_ID);
+    db.write(|tx| snapshot_checkpoint(tx, &hub_cp, "2026-11-25T12:06:00Z")).unwrap();
+    for sql in [
+        "INSERT OR REPLACE INTO evidence_export_snapshot (checkpoint_id, snapshot, created_at) VALUES ('cp-hub-1', '{}', 'x')",
+        "REPLACE INTO evidence_export_snapshot (checkpoint_id, snapshot, created_at) VALUES ('cp-hub-1', '{}', 'x')",
+        "INSERT INTO evidence_export_snapshot (checkpoint_id, snapshot, created_at) VALUES ('cp-future', '{}', 'x')",
+        "INSERT OR REPLACE INTO evidence_checkpoint SELECT checkpoint_id, class, org_id, seq, hash, window_start, \
+         window_end, global_from_hash, global_head_hash, org_row_count, org_chain_hash, key_id, signed_at, digest, \
+         NULL, created_at FROM evidence_checkpoint WHERE checkpoint_id = 'cp-hub-1'",
+        "INSERT OR REPLACE INTO evidence_key SELECT key_id, algorithm, '00', created_at, retired_at, revoked_at, note \
+         FROM evidence_key",
+    ] {
+        let r = db.write(|tx| Ok(tx.execute(sql, [])?));
+        assert!(r.is_err(), "{sql} must be refused");
+    }
+    // A snapshot captured for one checkpoint and stored under another's id
+    // is refused at export.
+    let foreign = db
+        .read(|c| {
+            let cp = ua_store::evidence::checkpoint_get(c, &hub_cp)?.unwrap();
+            ua_store::evidence_bundle::snapshot::snapshot_capture(c, &cp)
+        })
+        .unwrap();
+    db.write(|tx| {
+        tx.execute(
+            "INSERT INTO evidence_export_snapshot (checkpoint_id, snapshot, created_at) VALUES (?1, ?2, 'x')",
+            params![org_cp, String::from_utf8(to_canonical_bytes(&foreign).unwrap()).unwrap()],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let out = tempdir().unwrap();
+    let err = db.read(|c| export_bundle(c, &out.path().join("o"), &export_opts(&org_cp))).unwrap_err();
+    assert!(err.to_string().contains("different checkpoint"), "{err}");
+}
+
+/// B2/NS1/NS2: the policy in force is the verifier's choice from the
+/// hash-verified `agent.config.revision` events and the resolved event's
+/// time; neither a backdated `decided_at` nor an edited or shortened
+/// `policy/revisions.json` moves it.
+#[test]
+fn policy_in_force_comes_from_config_events_not_receipt_inputs() {
+    let (sk, pk) = signing_key(FIXTURE_KEY_SEED);
+    let trust =
+        BundleVerifyTrust::from_anchor(TrustAnchor { key_id: FIXTURE_KEY_ID.into(), public_key: pk.clone() });
+    let (_d, db) = open_test_db();
+    let cp = seed_release_hub(&db, &sk, &pk, &release_seed(&[], true));
+    let out = tempdir().unwrap();
+    let base = out.path().join("base");
+    export_signed(&db, &cp, &base, &sk);
+    let v = verify_bundle_dir(&base, &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    let rec: ApprovalReceipt = read_json(&base.join("approvals/10.json"));
+    assert_eq!(rec.policy_revision, Some(2), "the honest receipt cites the revision in force");
+
+    // A: decided_at moved before the request, citing rev 1.
+    let t = tempdir().unwrap();
+    copy_dir_recursive(&base, t.path());
+    edit_receipt(t.path(), 10, |r| {
+        r.decided_at = "2026-11-20T00:02:00Z".into();
+        r.policy_revision = Some(1);
+    });
+    remanifest_and_resign(t.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(t.path(), &trust).unwrap(), "receipt_decided_at_out_of_range");
+    // B: a decided_at that is not RFC 3339.
+    let t = tempdir().unwrap();
+    copy_dir_recursive(&base, t.path());
+    edit_receipt(t.path(), 10, |r| {
+        r.decided_at = "!".into();
+        r.policy_revision = None;
+        r.policy_digest = None;
+    });
+    remanifest_and_resign(t.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(t.path(), &trust).unwrap(), "receipt_decided_at_out_of_range");
+    // B2: with the request event stubbed (no lower bound), a decided_at that
+    // is not RFC 3339 is still refused, not compared lexically.
+    let t = tempdir().unwrap();
+    copy_dir_recursive(&base, t.path());
+    let mut evs = read_events(t.path());
+    let i = evs.iter().position(|e| e.channel == "agent.approval.requested").unwrap();
+    let ulid = evs[i].ulid.clone();
+    make_stub(&mut evs[i], CLASS_FREE_TEXT_PAYLOAD);
+    write_events(t.path(), &evs);
+    let rows_path = t.path().join("evidence/rows.jsonl");
+    let kept: String = std::fs::read_to_string(&rows_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.contains(ulid.as_str()))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&rows_path, kept).unwrap();
+    bump_withheld(t.path(), CLASS_FREE_TEXT_PAYLOAD, 1);
+    remanifest_and_resign(t.path(), &sk, false);
+    assert!(verify_bundle_dir(t.path(), &trust).unwrap().ok, "control without the request event verifies");
+    edit_receipt(t.path(), 10, |r| r.decided_at = "!".into());
+    remanifest_and_resign(t.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(t.path(), &trust).unwrap(), "receipt_decided_at_out_of_range");
+    // C: rev 2 deleted from the list while its config event stays.
+    let t = tempdir().unwrap();
+    copy_dir_recursive(&base, t.path());
+    let pp = t.path().join("policy/revisions.json");
+    let mut revs: Vec<PolicyRevisionRecord> = read_json(&pp);
+    revs.retain(|r| r.revision != 2);
+    write_json(&pp, &revs);
+    remanifest_and_resign(t.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(t.path(), &trust).unwrap(), "policy_revision_missing");
+    // D: rev 2's listed created_at pushed into the future does not move the
+    // revision in force (the config event's time governs): the receipt
+    // citing rev 2 still verifies, and one citing rev 1 is refused.
+    let t = tempdir().unwrap();
+    copy_dir_recursive(&base, t.path());
+    let pp = t.path().join("policy/revisions.json");
+    let mut revs: Vec<PolicyRevisionRecord> = read_json(&pp);
+    revs.iter_mut().find(|r| r.revision == 2).unwrap().created_at = "2099-01-01T00:00:00Z".into();
+    write_json(&pp, &revs);
+    remanifest_and_resign(t.path(), &sk, false);
+    assert!(verify_bundle_dir(t.path(), &trust).unwrap().ok);
+    let p1 = revs.iter().find(|r| r.revision == 1).unwrap().document_sha256.clone();
+    edit_receipt(t.path(), 10, |r| {
+        r.policy_revision = Some(1);
+        r.policy_digest = Some(p1);
+    });
+    remanifest_and_resign(t.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(t.path(), &trust).unwrap(), "receipt_policy_mismatch");
+}
+
+/// B3: release state comes from the full approval history. Approve then
+/// revoke is `release_revoked`, a forged `released` is refused, and SoD runs
+/// on every approve, not only the latest resolution.
+#[test]
+fn releases_follow_the_full_approval_history() {
+    let (sk, pk) = signing_key(FIXTURE_KEY_SEED);
+    let trust =
+        BundleVerifyTrust::from_anchor(TrustAnchor { key_id: FIXTURE_KEY_ID.into(), public_key: pk.clone() });
+    let out = tempdir().unwrap();
+
+    // Approve, release, then revoke.
+    let (_d, db) = open_test_db();
+    let cp = seed_release_hub(
+        &db,
+        &sk,
+        &pk,
+        &release_seed(&[("approve", "operator"), ("revoke", "operator")], false),
+    );
+    let dir = out.path().join("revoked");
+    export_signed(&db, &cp, &dir, &sk);
+    let arts: Vec<ArtifactIndexEntry> = read_json(&dir.join("artifacts/index.json"));
+    assert_eq!(arts[0].release_status, "release_revoked");
+    let v = verify_bundle_dir(&dir, &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    // Forging it back to released (with a receipt that covers it) is refused.
+    let ap = dir.join("artifacts/index.json");
+    let mut forged = arts.clone();
+    forged[0].release_status = "released".into();
+    forged[0].approval_id = Some(10);
+    write_json(&ap, &forged);
+    let cov = ua_store::evidence_bundle::CoveredArtifact {
+        id: forged[0].id.clone(),
+        revision: forged[0].revision,
+        sha256: forged[0].sha256.clone(),
+    };
+    edit_receipt(&dir, 10, |r| r.covers = vec![cov]);
+    remanifest_and_resign(&dir, &sk, false);
+    assert_refused(&verify_bundle_dir(&dir, &trust).unwrap(), "release_not_bound");
+
+    // A self-approval later revoked by someone else is still a violation.
+    let (_d, db) = open_test_db();
+    let cp = seed_release_hub(
+        &db,
+        &sk,
+        &pk,
+        &release_seed(&[("approve", "builder-1"), ("revoke", "operator")], false),
+    );
+    let dir = out.path().join("selfapprove");
+    export_signed(&db, &cp, &dir, &sk);
+    assert_refused(&verify_bundle_dir(&dir, &trust).unwrap(), "receipt_sod_violation");
+
+    // Deny only: never released.
+    let (_d, db) = open_test_db();
+    let cp = seed_release_hub(&db, &sk, &pk, &release_seed(&[("deny", "operator")], false));
+    let dir = out.path().join("denied");
+    export_signed(&db, &cp, &dir, &sk);
+    let arts: Vec<ArtifactIndexEntry> = read_json(&dir.join("artifacts/index.json"));
+    assert_ne!(arts[0].release_status, "released");
+    assert!(verify_bundle_dir(&dir, &trust).unwrap().ok);
+}
+
+/// B4: receipts and release state come from immutable ledger rows and the
+/// snapshot, so a revoke, cancel or label change after the checkpoint
+/// leaves the re-export byte-identical and verifiable.
+#[test]
+fn reexport_is_byte_identical_after_later_revoke_and_cancel() {
+    let (sk, pk) = signing_key(FIXTURE_KEY_SEED);
+    let trust =
+        BundleVerifyTrust::from_anchor(TrustAnchor { key_id: FIXTURE_KEY_ID.into(), public_key: pk.clone() });
+    let (_d, db) = open_test_db();
+    let cp = seed_release_hub(&db, &sk, &pk, &release_seed(&[], false));
+    db.write(|tx| snapshot_checkpoint(tx, &cp, "2026-11-25T12:06:00Z")).unwrap();
+    let out = tempdir().unwrap();
+    let r1 = db.read(|c| export_bundle(c, &out.path().join("a"), &export_opts(&cp))).unwrap();
+    db.write(|tx| {
+        tx.execute(
+            "UPDATE approvals SET status = 'revoked', reason = 'later', resolved_by = 'someone', \
+             resolved_transport = 'slack', resolved_at = '2030-01-01T00:00:00Z' WHERE id = 10",
+            [],
+        )?;
+        tx.execute("UPDATE deliverable_releases SET cancelled_at = '2030-01-01T00:00:00Z'", [])?;
+        ledger::append(
+            tx,
+            EventInput::new(
+                "default",
+                "agent.approval.resolved",
+                json!({ "approval_id": 10, "decision": "revoke" }),
+            ),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let r2 = db.read(|c| export_bundle(c, &out.path().join("b"), &export_opts(&cp))).unwrap();
+    assert_eq!(r1.manifest, r2.manifest, "re-export drifted after a later revoke and cancel");
+    for f in ["approvals/10.json", "artifacts/index.json"] {
+        assert_eq!(
+            std::fs::read(out.path().join("a").join(f)).unwrap(),
+            std::fs::read(out.path().join("b").join(f)).unwrap(),
+            "{f}"
+        );
+    }
+    sign_bundle_offline(&out.path().join("b"), &sk);
+    assert!(verify_bundle_dir(&out.path().join("b"), &trust).unwrap().ok);
+}
+
+/// NB3: exit-0 verdicts may not state something false. Stubs drop the
+/// statuses to `partial`; a default-org bundle cannot hide its own approval as
+/// `cross_org_events` under `--hub-bundle`; a hidden release is refused; and
+/// forged artifact task/size fields are hub-asserted.
+#[test]
+fn exit_zero_statuses_never_overstate_what_is_bound() {
+    let trust = fixture_trust();
+    let (sk, _) = signing_key(FIXTURE_KEY_SEED);
+    let base = verify_bundle_dir(&fixtures_root().join("good_hub"), &trust).unwrap();
+    assert_eq!(base.approvals.status, ClaimStatus::Verified);
+    assert_eq!(base.artifacts.status, ClaimStatus::Verified);
+
+    // Stubbed approval with its receipt dropped: statuses are partial.
+    let tmp = good_copy("good_hub");
+    let mut evs = read_events(tmp.path());
+    let i = evs.iter().position(|e| e.channel == "agent.approval.resolved").unwrap();
+    let j = evs.iter().position(|e| e.channel == "agent.deliverable.released").unwrap();
+    let ulids = [evs[i].ulid.clone(), evs[j].ulid.clone()];
+    make_stub(&mut evs[i], CLASS_UNPARSEABLE_PAYLOAD);
+    make_stub(&mut evs[j], CLASS_UNPARSEABLE_PAYLOAD);
+    write_events(tmp.path(), &evs);
+    std::fs::remove_file(tmp.path().join("approvals/10.json")).unwrap();
+    let ap = tmp.path().join("artifacts/index.json");
+    let mut arts: Vec<ArtifactIndexEntry> = read_json(&ap);
+    arts[0].release_status = "unreleased".into();
+    arts[0].approval_id = None;
+    write_json(&ap, &arts);
+    let rows_path = tmp.path().join("evidence/rows.jsonl");
+    let kept: String = std::fs::read_to_string(&rows_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !ulids.iter().any(|u| l.contains(u.as_str())))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&rows_path, kept).unwrap();
+    edit_manifest(tmp.path(), &sk, |m| {
+        m.files.remove("approvals/10.json");
+    });
+    bump_withheld(tmp.path(), CLASS_UNPARSEABLE_PAYLOAD, 2);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    let v = verify_bundle_dir(tmp.path(), &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    for c in [&v.completeness, &v.approvals, &v.separation_of_duties, &v.artifacts] {
+        assert_eq!(c.status, ClaimStatus::Partial, "{c:?}");
+        assert!(!c.basis.starts_with("no approval resolved in this bundle's window"), "{c:?}");
+    }
+
+    // A hidden release (released event in clear, artifact says unreleased).
+    let tmp = good_copy("good_hub");
+    let ap = tmp.path().join("artifacts/index.json");
+    let mut arts: Vec<ArtifactIndexEntry> = read_json(&ap);
+    arts[0].release_status = "unreleased".into();
+    arts[0].approval_id = None;
+    write_json(&ap, &arts);
+    edit_receipt(tmp.path(), 10, |r| r.covers.clear());
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "release_hidden");
+
+    // Forged task_id and size: the artifact is no longer bound.
+    let tmp = good_copy("good_hub");
+    let ap = tmp.path().join("artifacts/index.json");
+    let mut arts: Vec<ArtifactIndexEntry> = read_json(&ap);
+    arts[0].size = 1;
+    write_json(&ap, &arts);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    let v = verify_bundle_dir(tmp.path(), &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    assert_eq!(v.artifacts.status, ClaimStatus::HubAsserted);
+
+    // A default-org org bundle stubs its own approval as cross_org_events:
+    // refused under --hub-bundle.
+    let (_d, db) = open_test_db();
+    populate_sample_db(&db, &sk, FIXTURE_KEY_ID);
+    let (def_cp, hub_cp) = db
+        .write(|tx| {
+            let sum = compute_org_window_checkpoint(
+                tx,
+                "default",
+                "2026-11-01T00:00:00Z",
+                "2099-12-31T23:59:59Z",
+                None,
+            )?;
+            let cp = Checkpoint {
+                checkpoint_id: "cp-def".into(),
+                class: CheckpointClass::Org,
+                org_id: Some("default".into()),
+                seq: None,
+                hash: None,
+                window: Some(sum.window),
+                global_from_hash: Some(sum.global_from_hash),
+                global_head_hash: Some(sum.global_head_hash),
+                org_row_count: Some(sum.org_row_count),
+                org_chain_hash: Some(sum.org_chain_hash),
+                key_id: FIXTURE_KEY_ID.into(),
+                signed_at: "2026-11-25T12:00:00Z".into(),
+            };
+            let d = checkpoint_write(tx, &cp, "2026-11-25T12:00:00Z")?;
+            checkpoint_attach(tx, &cp.checkpoint_id, &sign_hex_digest(&sk, &d))?;
+            let hub = write_hub_cp_at_head(tx, "cp-hub-late", &sk, FIXTURE_KEY_ID)?;
+            Ok((cp.checkpoint_id, hub))
+        })
+        .unwrap();
+    let out = tempdir().unwrap();
+    let def_dir = out.path().join("def");
+    let hub_dir = out.path().join("hub");
+    export_signed(&db, &def_cp, &def_dir, &sk);
+    export_signed(&db, &hub_cp, &hub_dir, &sk);
+    let mut evs = read_events(&def_dir);
+    let i = evs.iter().position(|e| e.channel == "agent.approval.resolved").unwrap();
+    let ulid = evs[i].ulid.clone();
+    make_stub(&mut evs[i], CLASS_CROSS_ORG_EVENTS);
+    write_events(&def_dir, &evs);
+    std::fs::remove_file(def_dir.join("approvals/1.json")).unwrap();
+    let ap = def_dir.join("artifacts/index.json");
+    let mut arts: Vec<ArtifactIndexEntry> = read_json(&ap);
+    for a in &mut arts {
+        a.release_status = "release_not_in_bundle".into();
+        a.approval_id = None;
+    }
+    write_json(&ap, &arts);
+    let rows_path = def_dir.join("evidence/rows.jsonl");
+    let kept: String = std::fs::read_to_string(&rows_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.contains(ulid.as_str()))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&rows_path, kept).unwrap();
+    edit_manifest(&def_dir, &sk, |m| {
+        m.files.remove("approvals/1.json");
+    });
+    bump_withheld(&def_dir, CLASS_CROSS_ORG_EVENTS, 1);
+    remanifest_and_resign(&def_dir, &sk, false);
+    let hub_cc = load_verified_hub_cross_check(&hub_dir, &trust).unwrap().unwrap();
+    let mut cc = trust.clone();
+    cc.hub_cross_check = Some(hub_cc);
+    assert_refused(&verify_bundle_dir(&def_dir, &cc).unwrap(), "unjustified_redaction");
+}
+
+/// Pins V11 (org approval event without a receipt), V12 (artifact-side
+/// covers), M17 (placeholder labels outside a hub bundle's non-default
+/// receipts), N25 (withheld counts follow the bundle window) and the
+/// duplicate-receipt nit.
+#[test]
+fn pins_for_surviving_round_three_mutations() {
+    let trust = fixture_trust();
+    let (sk, _) = signing_key(FIXTURE_KEY_SEED);
+
+    // V11: a default-org org bundle that drops a receipt.
+    let (_d, db) = open_test_db();
+    let (hub_cp, _) = populate_sample_db(&db, &sk, FIXTURE_KEY_ID);
+    let def_cp = db
+        .write(|tx| {
+            let sum = compute_org_window_checkpoint(
+                tx,
+                "default",
+                "2026-11-01T00:00:00Z",
+                "2099-12-31T23:59:59Z",
+                None,
+            )?;
+            let cp = Checkpoint {
+                checkpoint_id: "cp-def-v11".into(),
+                class: CheckpointClass::Org,
+                org_id: Some("default".into()),
+                seq: None,
+                hash: None,
+                window: Some(sum.window),
+                global_from_hash: Some(sum.global_from_hash),
+                global_head_hash: Some(sum.global_head_hash),
+                org_row_count: Some(sum.org_row_count),
+                org_chain_hash: Some(sum.org_chain_hash),
+                key_id: FIXTURE_KEY_ID.into(),
+                signed_at: "2026-11-25T12:00:00Z".into(),
+            };
+            let d = checkpoint_write(tx, &cp, "2026-11-25T12:00:00Z")?;
+            checkpoint_attach(tx, &cp.checkpoint_id, &sign_hex_digest(&sk, &d))?;
+            Ok(cp.checkpoint_id)
+        })
+        .unwrap();
+    let out = tempdir().unwrap();
+    let def_dir = out.path().join("def");
+    export_signed(&db, &def_cp, &def_dir, &sk);
+    assert!(verify_bundle_dir(&def_dir, &trust).unwrap().ok);
+    let t = tempdir().unwrap();
+    copy_dir_recursive(&def_dir, t.path());
+    std::fs::remove_file(t.path().join("approvals/1.json")).unwrap();
+    edit_manifest(t.path(), &sk, |m| {
+        m.files.remove("approvals/1.json");
+    });
+    remanifest_and_resign(t.path(), &sk, false);
+    let v = verify_bundle_dir(t.path(), &trust).unwrap();
+    assert_eq!(v.exit_code, 1, "{v:?}");
+
+    // Nit: a second org receipt bound to the same event.
+    let t = tempdir().unwrap();
+    copy_dir_recursive(&def_dir, t.path());
+    let mut r: ApprovalReceipt = read_json(&t.path().join("approvals/1.json"));
+    r.approval_id = 2;
+    r.covers.clear();
+    r.receipt_id = r.compute_receipt_id().unwrap();
+    write_json(&t.path().join("approvals/2.json"), &r);
+    remanifest_and_resign(t.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(t.path(), &trust).unwrap(), "cross_link_duplicate_receipt");
+
+    // M17: a placeholder label in a default-organization receipt.
+    let t = good_copy("good_hub");
+    edit_receipt(t.path(), 10, |r| r.requester.label = LABEL_PLACEHOLDER.into());
+    remanifest_and_resign(t.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(t.path(), &trust).unwrap(), "receipt_label_placeholder");
+
+    // V12: a released artifact whose receipt covers nothing.
+    let t = good_copy("good_hub");
+    edit_receipt(t.path(), 10, |r| r.covers.clear());
+    remanifest_and_resign(t.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(t.path(), &trust).unwrap(), "broken_artifact_trace");
+
+    // N25: an incremental hub bundle counts only its own window's withheld rows.
+    let full = db.read(|c| export_bundle(c, &out.path().join("full"), &export_opts(&hub_cp))).unwrap();
+    let cp_seq: i64 = db
+        .read(|c| {
+            Ok(c.query_row("SELECT seq FROM evidence_checkpoint WHERE checkpoint_id = ?1", [&hub_cp], |r| {
+                r.get(0)
+            })?)
+        })
+        .unwrap();
+    let mut inc = export_opts(&hub_cp);
+    inc.from_seq = Some(cp_seq - 1);
+    let part = db.read(|c| export_bundle(c, &out.path().join("inc"), &inc)).unwrap();
+    assert!(full.withheld.classes.contains_key("session_credentials"), "{:?}", full.withheld);
+    assert!(!part.withheld.classes.contains_key("session_credentials"), "{:?}", part.withheld);
+    assert!(
+        full.withheld.total > part.withheld.total,
+        "full {:?} vs incremental {:?}",
+        full.withheld,
+        part.withheld
+    );
+}
+
+/// M24/S2: verification is linear. The scanner and the artifact/release
+/// bindings finish well inside a deadline on inputs that took minutes when
+/// quadratic; the deadline fails the test instead of hanging it.
+#[test]
+fn verification_is_linear_on_large_unsigned_bundles() {
+    let n = 6000usize;
+    let mut events = Vec::new();
+    let mut prev = GENESIS_HASH.to_string();
+    let mut artifacts = Vec::new();
+    for i in 0..n {
+        let identity = format!("{:064x}", i + 1);
+        let payload = json!({ "org_id": "default", "deliverable_id": i as i64 + 1, "task_id": 1,
+                              "revision_id": i as i64 + 1, "rev_no": 1, "kind": "file", "identity": identity });
+        let payload = ua_core::canonical::to_string(&payload);
+        let ulid = format!("01SYN{i:021}");
+        let ts = "2026-11-20T00:00:00Z";
+        let eh = compute_entry_hash_v2(
+            Some(&prev),
+            &ulid,
+            "agent.deliverable.revised",
+            &payload,
+            None,
+            None,
+            None,
+            ts,
+            None,
+            "default",
+        );
+        events.push(BundleLedgerEvent {
+            seq: Some(i as i64 + 1),
+            org_seq: None,
+            ulid,
+            channel: "agent.deliverable.revised".into(),
+            payload,
+            originator: None,
+            episode_id: None,
+            causal_parent_id: None,
+            created_at: ts.into(),
+            dedupe_key: None,
+            prev_hash: Some(prev.clone()),
+            entry_hash: Some(eh.clone()),
+            org_id: "default".into(),
+            hash_v: HASH_V2,
+            redacted: false,
+            redacted_class: None,
+        });
+        prev = eh;
+        artifacts.push(ArtifactIndexEntry {
+            id: format!("deliverable:{}", i + 1),
+            revision: 1,
+            sha256: format!("{:064x}", n * 2 + i),
+            size: 0,
+            media_type: "application/octet-stream".into(),
+            task_id: 1,
+            run_id: None,
+            attempt: None,
+            policy_revision: None,
+            approval_id: None,
+            release_status: "unreleased".into(),
+            recorded_at: "2026-11-20T00:00:00Z".into(),
+        });
+    }
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("ledger")).unwrap();
+    std::fs::create_dir_all(dir.path().join("evidence")).unwrap();
+    std::fs::create_dir_all(dir.path().join("policy")).unwrap();
+    std::fs::create_dir_all(dir.path().join("artifacts")).unwrap();
+    write_events(dir.path(), &events);
+    let timeline = ua_store::evidence_bundle::PolicyTimeline::default();
+    let mut rows = String::new();
+    for ev in &events {
+        let p: Value = serde_json::from_str(&ev.payload).unwrap();
+        let row = ua_store::evidence_bundle::derive_evidence_row(ev, &p, &timeline);
+        rows.push_str(&String::from_utf8(to_canonical_bytes(&row).unwrap()).unwrap());
+        rows.push('\n');
+    }
+    std::fs::write(dir.path().join("evidence/rows.jsonl"), rows).unwrap();
+    write_json(&dir.path().join("artifacts/index.json"), &artifacts);
+    write_json(&dir.path().join("policy/revisions.json"), &Vec::<PolicyRevisionRecord>::new());
+    write_json(&dir.path().join("withheld.json"), &WithheldReport::default());
+    let cp = Checkpoint {
+        checkpoint_id: "cp-syn".into(),
+        class: CheckpointClass::Hub,
+        org_id: None,
+        seq: Some(n as i64),
+        hash: Some(prev),
+        window: None,
+        global_from_hash: None,
+        global_head_hash: None,
+        org_row_count: None,
+        org_chain_hash: None,
+        key_id: "k-syn".into(),
+        signed_at: "2026-11-25T12:00:00Z".into(),
+    };
+    let cpf = BundleCheckpointFile {
+        format: ua_store::evidence::CHECKPOINT_FORMAT.into(),
+        digest: cp.digest(),
+        checkpoint: cp,
+        signature: None,
+    };
+    write_json(&dir.path().join("ledger/checkpoint.json"), &cpf);
+    let mut files = BTreeMap::new();
+    for rel in [
+        "artifacts/index.json",
+        "evidence/rows.jsonl",
+        "ledger/checkpoint.json",
+        "ledger/events.jsonl",
+        "policy/revisions.json",
+        "withheld.json",
+    ] {
+        files.insert(rel.to_string(), sha256_hex(&std::fs::read(dir.path().join(rel)).unwrap()));
+    }
+    let mut m = BundleManifest {
+        format: "ua.evidence.bundle.v1".into(),
+        class: CheckpointClass::Hub,
+        org_id: None,
+        artifact_content: "hash_only".into(),
+        window: Window { start: "2026-11-20T00:00:00Z".into(), end: "2026-11-20T00:00:00Z".into() },
+        counts: ua_store::evidence_bundle::ManifestCounts {
+            events: n as u64,
+            redacted_events: 0,
+            unhashed_legacy_prefix: 0,
+            approvals: 0,
+            evidence_rows: n as u64,
+            policy_revisions: 0,
+            artifacts: n as u64,
+            withheld_total: 0,
+        },
+        files,
+        digest: String::new(),
+    };
+    m.digest = m.recompute_digest().unwrap();
+    write_json(&dir.path().join("manifest.json"), &m);
+
+    let path = dir.path().to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let v = verify_bundle_dir(&path, &BundleVerifyTrust::default()).unwrap();
+        let _ = tx.send(v);
+    });
+    let v =
+        rx.recv_timeout(std::time::Duration::from_secs(60)).expect("verification did not finish within 60 s");
+    assert_eq!(v.reason.as_deref(), Some("unsigned_checkpoint"), "{v:?}");
+    assert_eq!(v.artifacts.status, ClaimStatus::HubAsserted);
 }

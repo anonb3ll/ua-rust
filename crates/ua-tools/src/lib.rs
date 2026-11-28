@@ -257,6 +257,8 @@ pub fn schema_parts() -> Vec<Part> {
     // and org ordinals), so a re-export after deletes stays byte-identical
     // (docs/evidence-export.md, Determinism). After the checkpoint parts.
     parts.push(ua_store::evidence_bundle::EXPORT_SNAPSHOT_PART.into());
+    // REPLACE-proof key store and checkpoint table (docs/evidence-export.md, S2).
+    parts.push(ua_store::evidence::NO_REPLACE_PART.into());
     parts
 }
 
