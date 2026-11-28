@@ -239,6 +239,15 @@ pub async fn search(db: &Db, cfg: &Config, org: &str, a: SearchRequest) -> UaRes
         db.read_async(move |c| gather(c, &tokens, &elig, qvec.as_deref(), &model)).await?
     };
 
+    // Lever B: exact/phrase guard for single-token identifier queries.
+    // A one-token query is an exact lookup, not a paraphrase. When FTS5's
+    // phrase (AND) pass matched, a candidate the lexical leg rejected is a
+    // semantic-only near-miss — the fixture's `exact-noise` (`quartz-falcon-71`
+    // for `quartz-falcon-17`) — and must not take a top-5 slot. When the
+    // lexical leg found nothing, the semantic leg stays the only source of
+    // hits, so a single-word paraphrase (`sedan` -> `automobile`) still works.
+    let exact_guard = tokens.len() == 1 && g.lexical.iter().any(|(_, hit)| hit.and_mode);
+
     let lex: HashMap<&str, &LexHit> = g.lexical.iter().map(|(id, h)| (id.as_str(), h)).collect();
     let sem: HashMap<&str, f32> = g.semantic.iter().map(|(id, s)| (id.as_str(), *s)).collect();
     let at = as_of.clone().unwrap_or_else(|| now.clone());
@@ -249,6 +258,9 @@ pub async fn search(db: &Db, cfg: &Config, org: &str, a: SearchRequest) -> UaRes
         let lexical_hit = lex.contains_key(n.id.as_str());
         let semantic_hit = sem.contains_key(n.id.as_str());
         if !lexical_hit && !semantic_hit {
+            continue;
+        }
+        if exact_guard && !lexical_hit {
             continue;
         }
         let fts = lex.get(n.id.as_str());
@@ -338,13 +350,24 @@ pub async fn search(db: &Db, cfg: &Config, org: &str, a: SearchRequest) -> UaRes
         expl["rrf"] = json!((rrf * 1e6).round() / 1e6);
         expl["why"] = json!(rank::why(&parts, c.lexical_hit, c.semantic_hit, &prior_inputs));
     }
+    // Lever A: on an exact RRF tie, prefer the candidate the lexical leg ranked
+    // higher. `exact-title` (`signing key`) ties `exact-key` (lex #1, sem #2)
+    // with `exact-near` (lex #2, sem #1); the title tie-break used to invert
+    // them alphabetically. Lexical rank is the retrieval evidence that the
+    // query's terms actually occur in the note, so it decides the tie before
+    // title or insertion order.
     cands.sort_by(|a, b| {
         let (sa, sb) = (
             a.item["combined_score"].as_f64().unwrap_or(0.0),
             b.item["combined_score"].as_f64().unwrap_or(0.0),
         );
+        let (la, lb) = (
+            lexical_rank.get(a.note.id.as_str()).copied().unwrap_or(usize::MAX),
+            lexical_rank.get(b.note.id.as_str()).copied().unwrap_or(usize::MAX),
+        );
         sb.partial_cmp(&sa)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| la.cmp(&lb))
             .then_with(|| a.note.title.as_deref().unwrap_or("").cmp(b.note.title.as_deref().unwrap_or("")))
             // Insertion order, not the random note id, so a tie (two notes
             // with the same score and title) orders the same on every run.
@@ -391,6 +414,7 @@ pub async fn search(db: &Db, cfg: &Config, org: &str, a: SearchRequest) -> UaRes
         "retrieval": {
             "version": 1,
             "mode": if has_semantic { "hybrid" } else { "lexical_fallback" },
+            "exact_guard": exact_guard,
             "lexical": { "status": "queried", "matched_count": g.lexical.len() },
             "semantic": {
                 "status": if has_semantic { "available" } else { "unavailable" },
