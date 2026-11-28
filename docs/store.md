@@ -299,7 +299,9 @@ workspace crate outside `ua-store`.
   generics, and a top-level `<` inside call arguments never confuse the count.
   Macro invocation bodies (`format!`, `vec!`, `json!`, `tokio::select!`, ...)
   are parsed as expressions and scanned too. The workspace is scanned once per
-  test binary and shared by the three workspace checks.
+  test binary and shared by the three workspace checks. A file `syn` cannot
+  parse fails the test with the file's path (fail closed); fix the file or the
+  parse, never skip it.
 - **Test exclusion (inline and out-of-line):**
   - Inline `#[cfg(test)]` (and `#[cfg(all(test, ...))]`) items, statements,
     and expressions are skipped. An inner `#![cfg(test)]` excludes its inline
@@ -343,8 +345,9 @@ a genuine non-SQL receiver ever enters the workspace) and enforces three checks:
    shape** — `prepare`, `prepare_cached`, `prepare_with_flags`, `execute`,
    `execute_batch`, `query_row`, `query_row_and_then`, `query_one`, and
    `Batch::new` — in both method-call form (`.execute(...)`) and path-style
-   UFCS form (`Connection::execute(&c, ...)`, `Transaction::execute(...)`),
-   whether passed a literal, `format!`, `let`, `const`, a helper parameter, or
+   UFCS form (`Connection::execute(&c, ...)`, `Transaction::execute(...)`,
+   and the qualified-self forms `<Connection>::execute(&c, ...)` and
+   `<Connection as Trait>::execute(&c, ...)`), whether passed a literal, `format!`, `let`, `const`, a helper parameter, or
    `include_str!`. Any `Type::sql_method` path used as a value is a fn
    pointer to one of these methods and counts too: each call through a local
    alias (`let f = Connection::execute; f(c, ..)`) counts once, and an
@@ -364,15 +367,36 @@ a genuine non-SQL receiver ever enters the workspace) and enforces three checks:
      `ua-store` (and any `pub fn` or public trait method inside `ua-store`
      outside `schema.rs`) whose parameter, of **any type**, reaches the SQL
      argument of a counted SQL method, or of a local helper's SQL-taking
-     parameter: directly, through `let`/assignment/`push_str`/`write!`,
-     through `format!`, through a field (`q.0` of a newtype, `filter.sql`,
+     parameter: directly, through `let`/assignment, through string building
+     (`push_str`, `push`, `+=`, `extend`, `insert_str`, `write!`, or a
+     `&mut String` out-parameter another fn fills), through `format!`, through a field (`q.0` of a newtype, `filter.sql`,
      `map.source`), or through `impl Display` / generic `T: AsRef<str>`
      formatting. Struct-literal laundering is followed: `let w = Wrap { sql: q }`
      taints `w.sql`, and a whole use of `w` (`w.render()`, `format!("{w}")`) is
      tainted. Two kinds of parameter are not traced because they cannot carry
-     caller-chosen SQL text: database and runtime handles (`Connection`,
-     `Transaction`, `WriteTx`, `Savepoint`, `Db`, `Hub`, `ToolCtx`, `AppState`,
-     `Registry`), and `bool` and numeric primitives (a clamped `LIMIT {n}`).
+     caller-chosen SQL text, and both are matched by **resolved type**, not by
+     name:
+     - the real database and runtime handles: `rusqlite::{Connection,
+       Transaction, Savepoint}`, `ua_store::{Db, WriteTx}`,
+       `ua_tools::{Hub, ToolCtx, Registry}`, and `ua_server::AppState`, when
+       the type is written with such a path, or is imported by a `use` that
+       resolves to one (`crate::`, `self::`, `super::`, and module-relative
+       paths are resolved from the file's module), or appears in the file
+       that defines it;
+     - `bool` and numeric primitives (a clamped `LIMIT {n}`).
+
+     A generic parameter named like a handle (`Db: AsRef<str>`), a same-named
+     local `struct`/`type`, a glob-imported name, and a look-alike from
+     another path are all traced. So is a parameter of every other type, which
+     makes "any type" literal apart from these two exclusions. Return
+     summaries of local fns (which parameter reaches which returned value or
+     `&mut` parameter) are keyed by `Type::method` for methods, and are used
+     only when the receiver's type is known: a parameter's declared type, a
+     local's annotated or inferred type, `self`, or a chain of known
+     constructors and methods. A file-local `fn as_str(&self) -> &'static
+     str` therefore never makes `String::as_str` look clean. `clamp` and `min`
+     clear taint only with numeric bounds (literals, numeric `const`s, or
+     numeric locals).
      The rule follows data, not control flow. A parameter that only selects
      between SQL literals, or is only bound as a parameter value, does not
      make a helper. Struct fields and tuple slots are tracked separately, so
@@ -400,7 +424,9 @@ a genuine non-SQL receiver ever enters the workspace) and enforces three checks:
      nothing, and every invocation counts once in the invoking file. A
      crate-local macro is in scope for its whole crate. In `ua-store`, a
      `#[macro_export]` macro is a public SQL helper (see below) and its
-     invocations anywhere outside `ua-store` count. A macro whose body builds a
+     invocations anywhere outside `ua-store` count. A macro whose body calls an
+     in-scope SQL-taking helper or helper macro (`task_rows($c, $s, [])`) is
+     promoted to a helper as well, to a fixed point. A macro whose body builds a
      `Procedure { .. }` literal is a forbidden local constructor (check 3).
    - **Scanner-generated frozen inventory:** step (b)'s scanner **generates**
      the complete inventory of existing SQL-taking helpers outside `ua-store`
@@ -418,7 +444,14 @@ a genuine non-SQL receiver ever enters the workspace) and enforces three checks:
      call in its caller's own per-file baseline (for example `merged.rs:185`
      calling `task_rows`, and each `org_row(...)` call in `platform.rs`), so
      adding a caller through an existing wrapper raises that file's count
-     immediately.
+     immediately. A free fn the calling file declares with the same name
+     shadows an imported helper only in the scope that declares it: the
+     file's top level, a block, or an inline `mod` (whose own fns shadow only
+     calls inside it).
+   - **Known limit:** helper detection follows calls to helpers defined in
+     the same file. A function that passes caller text to a helper in another
+     file is not itself flagged as a helper; its call to that helper still
+     counts in its own file.
 3. **Ratcheted `procedure_def` count outside `ua-store`.** Counts every
    `Procedure {` literal outside `ua-store` against a per-file
    allowlist/baseline, and forbids local `Procedure`-returning constructor
@@ -467,11 +500,21 @@ a genuine non-SQL receiver ever enters the workspace) and enforces three checks:
     bound-only, numeric, and bound-slot callers as controls,
   - fn pointers to any `Type::sql_method` path (alias, uncalled alias, bare
     reference) and to a helper, but not a called path with a non-SQL arity,
-    and
+  - qualified-self UFCS calls and a UFCS-form helper's SQL argument,
+  - a nested `fn` that shadows an imported helper only in its own scope,
+  - a `macro_rules!` wrapping a helper (and one wrapping that macro),
+  - runtime-handle exclusion by resolved type (generic, local struct, `type`
+    alias, and returned look-alike are traced; real handles are not),
+  - method summaries that need the receiver type (`String::as_str` next to
+    a local `as_str`), and `clamp`/`min` on text,
+  - string building through `+=`, `extend`, `insert_str` and a `&mut`
+    out-parameter, and an inline struct literal passed to a helper or into
+    a SQL argument,
+  - `cfg(any(test, ..))` and `cfg(not(test))` code counted, and
   - a top-level `<` inside call arguments.
 
-  Each of the #2833 gap tests fails when its fix is reverted (mutation
-  checked when the scanner moved to `syn`).
+  Each of these tests fails when its fix is reverted (mutation checked for
+  #2833 and its review).
 - **Reviewing a count.** `cargo test -p ua-store --test sql_guard
   print_generated_baselines -- --ignored --nocapture` regenerates every
   baseline, and with `SQL_GUARD_SITES=1` it also lists each counted site as

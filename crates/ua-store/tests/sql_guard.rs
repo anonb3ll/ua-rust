@@ -386,12 +386,18 @@ fn ufcs_sql_path_signature(path: &syn::Path) -> Option<(usize, usize)> {
     None
 }
 
-/// Stricter check for bare fn-pointer paths (not immediately invoked in `path(...)`):
-/// avoids matching unrelated `SomeService::execute` fn pointers while catching
-/// `Connection::execute`, `Transaction::query_row`, `WriteTx::prepare`,
-/// `Savepoint::execute_batch`, `Batch::new`, or anything under `rusqlite::`.
-fn is_sql_fn_pointer_path(path: &syn::Path) -> Option<(usize, usize)> {
-    ufcs_sql_path_signature(path)
+/// `ufcs_sql_path_signature` for an expression path, including qualified-self
+/// forms `<Connection>::execute` and `<Connection as Trait>::execute`, where
+/// the method is still the last path segment.
+fn ufcs_sql_signature(ep: &ExprPath) -> Option<(usize, usize)> {
+    let Some(qself) = &ep.qself else { return ufcs_sql_path_signature(&ep.path) };
+    let last = ep.path.segments.last()?.ident.to_string();
+    let self_is_batch =
+        matches!(&*qself.ty, Type::Path(tp) if tp.path.segments.last().is_some_and(|s| s.ident == "Batch"));
+    if self_is_batch && last == "new" {
+        return Some((2, 1));
+    }
+    expected_sql_method_args(&last).map(|expected| (expected + 1, 1))
 }
 
 fn unwrap_parens(mut expr: &Expr) -> &Expr {
@@ -531,8 +537,7 @@ impl<'ast> DirectSqlCollector<'ast> {
 
     fn record_alias_binding(&mut self, pat: &Pat, init: &Expr) -> bool {
         if let Expr::Path(ep) = unwrap_ref_or_cast(init)
-            && ep.qself.is_none()
-            && let Some((arity, sql_idx)) = is_sql_fn_pointer_path(&ep.path)
+            && let Some((arity, sql_idx)) = ufcs_sql_signature(ep)
         {
             let mut names = Vec::new();
             collect_pat_idents(pat, &mut names);
@@ -570,8 +575,7 @@ impl<'ast> Visit<'ast> for DirectSqlCollector<'ast> {
         if let Item::Const(ItemConst { ident, expr, .. }) | Item::Static(ItemStatic { ident, expr, .. }) =
             node
             && let Expr::Path(ep) = unwrap_ref_or_cast(expr)
-            && ep.qself.is_none()
-            && let Some((arity, sql_idx)) = is_sql_fn_pointer_path(&ep.path)
+            && let Some((arity, sql_idx)) = ufcs_sql_signature(ep)
         {
             self.aliases.insert(ident.to_string(), (arity, sql_idx, false, ident.span().start().line));
             return;
@@ -645,15 +649,13 @@ impl<'ast> Visit<'ast> for DirectSqlCollector<'ast> {
         }
         let inner_func = unwrap_parens(&node.func);
         let mut handled_func = false;
-        if let Expr::Path(ep) = inner_func
-            && ep.qself.is_none()
-        {
-            if let Some((expected_arity, sql_idx)) = ufcs_sql_path_signature(&ep.path) {
+        if let Expr::Path(ep) = inner_func {
+            if let Some((expected_arity, sql_idx)) = ufcs_sql_signature(ep) {
                 if node.args.len() == expected_arity {
                     self.sites.push(DirectSqlSite::Call(&node.args[sql_idx], ep.span().start().line));
                     handled_func = true;
                 }
-            } else if ep.path.segments.len() == 1 {
+            } else if ep.qself.is_none() && ep.path.segments.len() == 1 {
                 let name = ep.path.segments[0].ident.to_string();
                 if let Some((expected_arity, sql_idx, called, _)) = self.aliases.get_mut(&name)
                     && node.args.len() == *expected_arity
@@ -679,7 +681,7 @@ impl<'ast> Visit<'ast> for DirectSqlCollector<'ast> {
         if attrs_have_cfg_test(&node.attrs) {
             return;
         }
-        if !self.skip_direct_path && node.qself.is_none() && is_sql_fn_pointer_path(&node.path).is_some() {
+        if !self.skip_direct_path && ufcs_sql_signature(node).is_some() {
             self.sites.push(DirectSqlSite::FnPointer(node.span().start().line));
         }
         visit::visit_expr_path(self, node);
@@ -1089,8 +1091,211 @@ struct StructReturnSummary {
     fields: BTreeMap<String, BTreeSet<usize>>,
 }
 
-/// `(fn_or_method_name, has_self, explicit_arity)`.
+/// `(name, has_self, explicit_arity)`, where `name` is `Type::method` for a
+/// fn in an `impl Type` (or `Trait::method` for a trait default) and the bare
+/// name for a free fn. A method summary is used only when the receiver's type
+/// is known, so a file-local `fn as_str(&self) -> &'static str` never vouches
+/// for `String::as_str`.
 type SummaryKey = (String, bool, usize);
+
+/// What the callable being analyzed knows about types: its `impl` owner (for
+/// `self` / `Self`), its locals' types where declared or inferable, and the
+/// crate's numeric `const` names (for `clamp` / `min` bounds).
+#[derive(Default)]
+struct CallCtx {
+    owner: Option<String>,
+    vars: BTreeMap<String, Option<String>>,
+    numeric_consts: Rc<BTreeSet<String>>,
+}
+
+thread_local! {
+    static CALL_CTX: RefCell<CallCtx> = RefCell::new(CallCtx::default());
+}
+
+/// Installs the type context of one callable for the duration of its analysis.
+struct CallCtxGuard;
+
+impl CallCtxGuard {
+    fn install(
+        c: &CandidateCallable<'_>,
+        numeric_consts: &Rc<BTreeSet<String>>,
+        rt: &LocalReturnTaint,
+    ) -> Self {
+        CALL_CTX.with(|cx| {
+            *cx.borrow_mut() = CallCtx {
+                owner: c.owner.clone(),
+                vars: BTreeMap::new(),
+                numeric_consts: numeric_consts.clone(),
+            }
+        });
+        let mut vars: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let bind = |vars: &mut BTreeMap<String, Option<String>>, name: String, ty: Option<String>| match vars
+            .get(&name)
+        {
+            Some(prev) if *prev != ty => {
+                vars.insert(name, None);
+            }
+            Some(_) => {}
+            None => {
+                vars.insert(name, ty);
+            }
+        };
+        for (name, ty) in &c.param_types {
+            bind(&mut vars, name.clone(), ty.clone());
+        }
+        CALL_CTX.with(|cx| cx.borrow_mut().vars = vars.clone());
+        // Locals in source order: `let x: T`, or `let x = <expr of known type>`.
+        struct Locals<'v, 'r> {
+            vars: &'v mut BTreeMap<String, Option<String>>,
+            rt: &'r LocalReturnTaint,
+        }
+        impl<'ast> Visit<'ast> for Locals<'_, '_> {
+            fn visit_local(&mut self, node: &'ast Local) {
+                visit::visit_local(self, node);
+                let (pat, declared) = match &node.pat {
+                    Pat::Type(pt) => (&*pt.pat, type_name(&pt.ty, None)),
+                    other => (other, None),
+                };
+                if let Pat::Ident(pi) = pat {
+                    let ty = declared.or_else(|| node.init.as_ref().and_then(|i| type_of(&i.expr, self.rt)));
+                    let name = pi.ident.to_string();
+                    let merged = match self.vars.get(&name) {
+                        Some(prev) if *prev != ty => None,
+                        _ => ty,
+                    };
+                    self.vars.insert(name, merged);
+                    let snapshot = self.vars.clone();
+                    CALL_CTX.with(|cx| cx.borrow_mut().vars = snapshot);
+                }
+            }
+        }
+        let mut locals = Locals { vars: &mut vars, rt };
+        match c.body {
+            CallableBody::Block(b) => locals.visit_block(b),
+            CallableBody::Expr(e) => locals.visit_expr(e),
+        }
+        CALL_CTX.with(|cx| cx.borrow_mut().vars = vars);
+        CallCtxGuard
+    }
+}
+
+impl Drop for CallCtxGuard {
+    fn drop(&mut self) {
+        CALL_CTX.with(|cx| *cx.borrow_mut() = CallCtx::default());
+    }
+}
+
+/// Last path segment of a type (behind references), `Self` resolved to
+/// `owner`; `Option<T>` / `Result<T, _>` / `UaResult<T>` unwrap to `T`.
+fn type_name(ty: &Type, owner: Option<&str>) -> Option<String> {
+    match ty {
+        Type::Reference(r) => type_name(&r.elem, owner),
+        Type::Paren(p) => type_name(&p.elem, owner),
+        Type::Group(g) => type_name(&g.elem, owner),
+        Type::Path(tp) if tp.qself.is_none() => {
+            let last = tp.path.segments.last()?;
+            let name = last.ident.to_string();
+            if matches!(name.as_str(), "Option" | "Result" | "UaResult")
+                && let syn::PathArguments::AngleBracketed(ab) = &last.arguments
+                && let Some(syn::GenericArgument::Type(inner)) = ab.args.first()
+            {
+                return type_name(inner, owner);
+            }
+            if name == "Self" { owner.map(str::to_string) } else { Some(name) }
+        }
+        _ => None,
+    }
+}
+
+/// Summary name of a called path: `f` for `f(..)`, `T::f` for `T::f(..)` /
+/// `<T>::f(..)` / `<T as Tr>::f(..)` (`Self` resolved to the current owner).
+fn call_summary_name(ep: &ExprPath) -> Option<String> {
+    let last = ep.path.segments.last()?.ident.to_string();
+    let owner = || CALL_CTX.with(|cx| cx.borrow().owner.clone());
+    let ty = if let Some(q) = &ep.qself {
+        type_name(&q.ty, owner().as_deref())?
+    } else if ep.path.segments.len() == 1 {
+        return Some(last);
+    } else {
+        let t = ep.path.segments[ep.path.segments.len() - 2].ident.to_string();
+        if t == "Self" { owner()? } else { t }
+    };
+    Some(format!("{ty}::{last}"))
+}
+
+/// Summary name of `recv.m(..)`: `Type::m` when the receiver's type is known.
+fn method_summary_name(mc: &ExprMethodCall, rt: &LocalReturnTaint) -> Option<String> {
+    type_of(&mc.receiver, rt).map(|t| format!("{t}::{}", mc.method))
+}
+
+/// Best-effort static type (last segment) of an expression, from the current
+/// callable's owner and locals and the crate's recorded return types.
+fn type_of(expr: &Expr, rt: &LocalReturnTaint) -> Option<String> {
+    match expr {
+        Expr::Paren(p) => type_of(&p.expr, rt),
+        Expr::Group(g) => type_of(&g.expr, rt),
+        Expr::Reference(r) => type_of(&r.expr, rt),
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => type_of(&u.expr, rt),
+        Expr::Try(t) => type_of(&t.expr, rt),
+        Expr::Path(ep) if ep.qself.is_none() && ep.path.segments.len() == 1 => {
+            let id = ep.path.segments[0].ident.to_string();
+            CALL_CTX.with(|cx| {
+                let cx = cx.borrow();
+                if id == "self" { cx.owner.clone() } else { cx.vars.get(&id).cloned().flatten() }
+            })
+        }
+        Expr::Struct(es) => {
+            let last = es.path.segments.last()?.ident.to_string();
+            if last == "Self" { CALL_CTX.with(|cx| cx.borrow().owner.clone()) } else { Some(last) }
+        }
+        Expr::Call(c) => {
+            let Expr::Path(ep) = unwrap_parens(&c.func) else { return None };
+            rt.ret_type(&(call_summary_name(ep)?, false, c.args.len())).cloned()
+        }
+        Expr::MethodCall(mc) => {
+            let recv = type_of(&mc.receiver, rt)?;
+            if mc.method == "clone" && mc.args.is_empty() {
+                return Some(recv);
+            }
+            rt.ret_type(&(format!("{recv}::{}", mc.method), true, mc.args.len())).cloned()
+        }
+        Expr::Lit(l) => match &l.lit {
+            syn::Lit::Int(i) => {
+                Some(if i.suffix().is_empty() { "i64".to_string() } else { i.suffix().to_string() })
+            }
+            syn::Lit::Float(f) => {
+                Some(if f.suffix().is_empty() { "f64".to_string() } else { f.suffix().to_string() })
+            }
+            syn::Lit::Bool(_) => Some("bool".to_string()),
+            _ => None,
+        },
+        Expr::Cast(c) => type_name(&c.ty, None),
+        Expr::Block(b) => match b.block.stmts.last() {
+            Some(Stmt::Expr(tail, None)) => type_of(tail, rt),
+            _ => None,
+        },
+        Expr::If(ei) => {
+            let then_t = match ei.then_branch.stmts.last() {
+                Some(Stmt::Expr(tail, None)) => type_of(tail, rt)?,
+                _ => return None,
+            };
+            let else_t = type_of(&ei.else_branch.as_ref()?.1, rt)?;
+            // Unsuffixed integer literals type as `i64`; any two scalars agree.
+            let both_scalar =
+                SCALAR_TYPES.contains(&then_t.as_str()) && SCALAR_TYPES.contains(&else_t.as_str());
+            (then_t == else_t || both_scalar).then_some(then_t)
+        }
+        Expr::Binary(b)
+            if matches!(
+                b.op,
+                BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_) | BinOp::Rem(_)
+            ) =>
+        {
+            type_of(&b.left, rt).filter(|t| SCALAR_TYPES.contains(&t.as_str()))
+        }
+        _ => None,
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 struct LocalReturnTaint {
@@ -1100,6 +1305,13 @@ struct LocalReturnTaint {
     /// Per-field struct return summary, populated only when every callable
     /// with that key returns a field-tracked struct value.
     structs: BTreeMap<SummaryKey, StructReturnSummary>,
+    /// Declared return type (last segment, `Self` resolved, `Result`/`Option`
+    /// unwrapped) of each callable, for `type_of` on calls.
+    ret_types: BTreeMap<SummaryKey, String>,
+    /// `&mut` parameter index -> parameter indices whose taint the callee
+    /// writes into it (`fill(&mut out, t)`), in the same index space as
+    /// `slots`. Present (possibly empty) for every analyzed callable.
+    out_flows: BTreeMap<SummaryKey, BTreeMap<usize, BTreeSet<usize>>>,
     /// Crate-wide summaries consulted for keys this layer does not define.
     base: Option<Rc<LocalReturnTaint>>,
     /// Keys defined by this layer; they shadow `base` even when absent here.
@@ -1109,13 +1321,40 @@ struct LocalReturnTaint {
 impl PartialEq for LocalReturnTaint {
     /// Fixed-point check: only this layer changes between iterations.
     fn eq(&self, other: &Self) -> bool {
-        self.slots == other.slots && self.structs == other.structs
+        self.slots == other.slots && self.structs == other.structs && self.out_flows == other.out_flows
     }
 }
 
 impl LocalReturnTaint {
     fn layered(base: Option<Rc<LocalReturnTaint>>, local_keys: Rc<BTreeSet<SummaryKey>>) -> Self {
-        Self { slots: BTreeMap::new(), structs: BTreeMap::new(), base, local_keys }
+        Self {
+            slots: BTreeMap::new(),
+            structs: BTreeMap::new(),
+            ret_types: BTreeMap::new(),
+            out_flows: BTreeMap::new(),
+            base,
+            local_keys,
+        }
+    }
+
+    fn out_flow(&self, key: &SummaryKey) -> Option<&BTreeMap<usize, BTreeSet<usize>>> {
+        if let Some(m) = self.out_flows.get(key) {
+            return Some(m);
+        }
+        if self.local_keys.contains(key) {
+            return None;
+        }
+        self.base.as_deref()?.out_flow(key)
+    }
+
+    fn ret_type(&self, key: &SummaryKey) -> Option<&String> {
+        if let Some(t) = self.ret_types.get(key) {
+            return Some(t);
+        }
+        if self.local_keys.contains(key) {
+            return None;
+        }
+        self.base.as_deref()?.ret_type(key)
     }
 
     fn slot_map(&self, key: &SummaryKey) -> Option<&BTreeMap<usize, BTreeSet<usize>>> {
@@ -1317,10 +1556,8 @@ fn eval_struct_expr_taint(
         }
         Expr::Call(c) => {
             if let Expr::Path(ep) = unwrap_parens(&c.func)
-                && ep.qself.is_none()
-                && let Some(last) = ep.path.segments.last()
+                && let Some(name) = call_summary_name(ep)
             {
-                let name = last.ident.to_string();
                 let key = (name, false, c.args.len());
                 if let Some(summary) = ret_taint.struct_summary(&key) {
                     let args_t: Vec<bool> =
@@ -1337,7 +1574,7 @@ fn eval_struct_expr_taint(
             None
         }
         Expr::MethodCall(mc) => {
-            let name = mc.method.to_string();
+            let name = method_summary_name(mc, ret_taint)?;
             let key = (name, true, mc.args.len());
             if let Some(summary) = ret_taint.struct_summary(&key) {
                 let args_t: Vec<bool> =
@@ -1439,17 +1676,15 @@ fn is_struct_shaped_ret(expr: &Expr, has_self: bool, ret_taint: &LocalReturnTain
         Expr::Path(ep) => has_self && ep.qself.is_none() && ep.path.is_ident("self"),
         Expr::Call(c) => {
             if let Expr::Path(ep) = unwrap_parens(&c.func)
-                && ep.qself.is_none()
-                && let Some(last) = ep.path.segments.last()
+                && let Some(name) = call_summary_name(ep)
             {
-                ret_taint.struct_summary(&(last.ident.to_string(), false, c.args.len())).is_some()
+                ret_taint.struct_summary(&(name, false, c.args.len())).is_some()
             } else {
                 false
             }
         }
-        Expr::MethodCall(mc) => {
-            ret_taint.struct_summary(&(mc.method.to_string(), true, mc.args.len())).is_some()
-        }
+        Expr::MethodCall(mc) => method_summary_name(mc, ret_taint)
+            .is_some_and(|name| ret_taint.struct_summary(&(name, true, mc.args.len())).is_some()),
         Expr::Block(b) => match b.block.stmts.last() {
             Some(Stmt::Expr(tail, None)) => is_struct_shaped_ret(tail, has_self, ret_taint),
             _ => false,
@@ -1477,9 +1712,9 @@ fn ret_passes_self_through(expr: &Expr, ret_taint: &LocalReturnTaint) -> bool {
     match e {
         Expr::Path(ep) => ep.qself.is_none() && ep.path.is_ident("self"),
         Expr::MethodCall(mc) => {
-            let key = (mc.method.to_string(), true, mc.args.len());
-            ret_taint.struct_summary(&key).is_some_and(|s| s.passthrough_self)
-                && ret_passes_self_through(&mc.receiver, ret_taint)
+            method_summary_name(mc, ret_taint).is_some_and(|name| {
+                ret_taint.struct_summary(&(name, true, mc.args.len())).is_some_and(|s| s.passthrough_self)
+            }) && ret_passes_self_through(&mc.receiver, ret_taint)
         }
         Expr::Block(b) => match b.block.stmts.last() {
             Some(Stmt::Expr(tail, None)) => ret_passes_self_through(tail, ret_taint),
@@ -1499,14 +1734,28 @@ fn ret_passes_self_through(expr: &Expr, ret_taint: &LocalReturnTaint) -> bool {
     }
 }
 
-/// Whether `expr` is an integer literal or ALL_CAPS constant path (used to
-/// recognize bounded integer limits like `n.min(MAX_LIMIT)`).
-fn is_int_or_const_bound(expr: &Expr) -> bool {
+/// Is `expr` a numeric bound: an integer or float literal (possibly negated
+/// or cast), or a `const` the crate declares with a numeric type?
+fn is_numeric_bound(expr: &Expr) -> bool {
     match unwrap_parens(expr) {
-        Expr::Lit(l) => matches!(l.lit, syn::Lit::Int(_)),
+        Expr::Lit(l) => matches!(l.lit, syn::Lit::Int(_) | syn::Lit::Float(_)),
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => is_numeric_bound(&u.expr),
+        Expr::Cast(c) => {
+            matches!(&*c.ty, Type::Path(tp) if tp.path.get_ident().is_some_and(|i| SCALAR_TYPES.contains(&i.to_string().as_str())))
+        }
         Expr::Path(ep) => ep.path.segments.last().is_some_and(|s| {
             let id = s.ident.to_string();
-            !id.is_empty() && id.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            CALL_CTX.with(|cx| {
+                let cx = cx.borrow();
+                cx.numeric_consts.contains(&id)
+                    || (ep.path.segments.len() == 1
+                        && cx
+                            .vars
+                            .get(&id)
+                            .cloned()
+                            .flatten()
+                            .is_some_and(|t| SCALAR_TYPES.contains(&t.as_str())))
+            })
         }),
         _ => false,
     }
@@ -1538,7 +1787,11 @@ fn expr_uses_tainted(expr: &Expr, tainted: &BTreeSet<String>, ret_taint: &LocalR
             {
                 return false;
             }
-            if m == "clamp" || (m == "min" && mc.args.len() == 1 && is_int_or_const_bound(&mc.args[0])) {
+            // An integer clamped to numeric bounds is a number, not text; `clamp`
+            // and `min` on a `&str` / `String` return text and stay tainted.
+            if (m == "clamp" && mc.args.len() == 2 || m == "min" && mc.args.len() == 1)
+                && mc.args.iter().all(is_numeric_bound)
+            {
                 return false;
             }
             if let Some(res) = tuple_projection_taint(mc, tainted, ret_taint) {
@@ -1547,7 +1800,10 @@ fn expr_uses_tainted(expr: &Expr, tainted: &BTreeSet<String>, ret_taint: &LocalR
             let recv_t = expr_uses_tainted(&mc.receiver, tainted, ret_taint);
             let args_t: Vec<bool> =
                 mc.args.iter().map(|a| expr_uses_tainted(a, tainted, ret_taint)).collect();
-            if let Some(res) = ret_taint.any_slot_tainted_by_args(&m, true, mc.args.len(), recv_t, &args_t) {
+            if let Some(name) = method_summary_name(mc, ret_taint)
+                && let Some(res) =
+                    ret_taint.any_slot_tainted_by_args(&name, true, mc.args.len(), recv_t, &args_t)
+            {
                 return res;
             }
             recv_t || args_t.into_iter().any(|x| x)
@@ -1917,6 +2173,49 @@ impl TaintPropagator<'_, '_> {
         }
     }
 
+    /// A call may write its inputs into `&mut place` arguments
+    /// (`fill(&mut sql, t)`). With a summary (`key`, a local callee) only the
+    /// recorded parameter -> `&mut` parameter flows apply. Otherwise any
+    /// tainted input that is not itself a `&mut` argument taints every `&mut`
+    /// argument.
+    fn taint_mut_out_args(&mut self, key: Option<SummaryKey>, receiver: Option<&Expr>, args: &[&Expr]) {
+        let mut_place = |a: &Expr| match unwrap_parens(a) {
+            Expr::Reference(r) if r.mutability.is_some() => place_key_of_expr(&r.expr),
+            _ => None,
+        };
+        // Summary index space: the receiver is 0 for a method.
+        let shift = usize::from(receiver.is_some());
+        let arg_tainted = |i: usize, me: &Self| -> bool {
+            if i < shift {
+                receiver.is_some_and(|r| expr_uses_tainted(r, me.tainted, me.ret_taint))
+            } else {
+                args.get(i - shift).is_some_and(|a| expr_uses_tainted(a, me.tainted, me.ret_taint))
+            }
+        };
+        if let Some(flows) = key.as_ref().and_then(|k| self.ret_taint.out_flow(k)).cloned() {
+            for (mi, srcs) in flows {
+                if mi >= shift
+                    && srcs.iter().any(|&src| arg_tainted(src, self))
+                    && let Some(place) = args.get(mi - shift).and_then(|a| mut_place(a))
+                {
+                    self.tainted.insert(place);
+                }
+            }
+            return;
+        }
+        let input_tainted = receiver.is_some_and(|r| expr_uses_tainted(r, self.tainted, self.ret_taint))
+            || args
+                .iter()
+                .any(|a| mut_place(a).is_none() && expr_uses_tainted(a, self.tainted, self.ret_taint));
+        if input_tainted {
+            for a in args {
+                if let Some(place) = mut_place(a) {
+                    self.tainted.insert(place);
+                }
+            }
+        }
+    }
+
     fn probe_macro(&mut self, mac: &syn::Macro) {
         if let Some(p) = self.probe.as_mut()
             && !p.hit
@@ -1952,6 +2251,12 @@ impl<'ast> Visit<'ast> for TaintPropagator<'_, '_> {
         {
             p.hit = true;
         }
+        let key = match unwrap_parens(&node.func) {
+            Expr::Path(ep) => call_summary_name(ep).map(|n| (n, false, node.args.len())),
+            _ => None,
+        };
+        let args: Vec<&Expr> = node.args.iter().collect();
+        self.taint_mut_out_args(key, None, &args);
         visit::visit_expr_call(self, node);
     }
 
@@ -1987,10 +2292,8 @@ impl<'ast> Visit<'ast> for TaintPropagator<'_, '_> {
                 let matched_slots = match unwrapped_init {
                     Expr::Call(c) => {
                         if let Expr::Path(ep) = unwrap_parens(&c.func)
-                            && ep.qself.is_none()
-                            && ep.path.segments.len() == 1
+                            && let Some(name) = call_summary_name(ep)
                         {
-                            let name = ep.path.segments[0].ident.to_string();
                             if self.ret_taint.known(&name, false, c.args.len()) {
                                 let args_t: Vec<bool> = c
                                     .args
@@ -2006,8 +2309,8 @@ impl<'ast> Visit<'ast> for TaintPropagator<'_, '_> {
                         }
                     }
                     Expr::MethodCall(mc) => {
-                        let name = mc.method.to_string();
-                        if self.ret_taint.known(&name, true, mc.args.len()) {
+                        let name = method_summary_name(mc, self.ret_taint).unwrap_or_default();
+                        if !name.is_empty() && self.ret_taint.known(&name, true, mc.args.len()) {
                             let recv_t = expr_uses_tainted(&mc.receiver, self.tainted, self.ret_taint);
                             let args_t: Vec<bool> = mc
                                 .args
@@ -2120,8 +2423,29 @@ impl<'ast> Visit<'ast> for TaintPropagator<'_, '_> {
             } else if expr_uses_tainted(&node.args[0], self.tainted, self.ret_taint) {
                 self.tainted.insert(place);
             }
+        } else if matches!(
+            m.as_str(),
+            "extend" | "extend_from_slice" | "insert" | "insert_str" | "append" | "write_str" | "write_fmt"
+        ) && node.args.iter().any(|a| expr_uses_tainted(a, self.tainted, self.ret_taint))
+            && let Some(place) = place_key_of_expr(&node.receiver)
+        {
+            self.tainted.insert(place);
         }
+        let key = method_summary_name(node, self.ret_taint).map(|n| (n, true, node.args.len()));
+        let args: Vec<&Expr> = node.args.iter().collect();
+        self.taint_mut_out_args(key, Some(&node.receiver), &args);
         visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        // `s += t` appends `t` to `s`.
+        if matches!(node.op, BinOp::AddAssign(_))
+            && expr_uses_tainted(&node.right, self.tainted, self.ret_taint)
+            && let Some(place) = place_key_of_expr(&node.left)
+        {
+            self.tainted.insert(place);
+        }
+        visit::visit_expr_binary(self, node);
     }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
@@ -2353,18 +2677,12 @@ fn call_hits_helper(
 ) -> bool {
     let Expr::Path(ep) = unwrap_parens(&node.func) else { return false };
     let Some(last) = ep.path.segments.last() else { return false };
-    if ep.qself.is_some() {
-        return false;
-    }
     let raw_name = last.ident.to_string();
-    let resolved = if ep.path.segments.len() == 1 {
-        aliases.get(&raw_name).cloned().unwrap_or(raw_name)
-    } else {
-        raw_name
-    };
+    let resolved =
+        if !is_qualified_path(ep) { aliases.get(&raw_name).cloned().unwrap_or(raw_name) } else { raw_name };
     let Some((kind, flows)) = helpers.get(&resolved) else { return false };
     let shift = match kind {
-        HelperKind::Method if ep.path.segments.len() >= 2 => 1usize,
+        HelperKind::Method if is_qualified_path(ep) => 1usize,
         HelperKind::Fn | HelperKind::Closure => 0usize,
         _ => return false,
     };
@@ -2494,87 +2812,331 @@ struct CandidateCallable<'a> {
     /// Whether the return type can carry text (`false` for `()`, `bool`, and
     /// numbers, also inside `Result`/`Option`): such returns get no taint.
     ret_carrier: bool,
+    /// `impl` self type (or trait name for a default method).
+    owner: Option<String>,
+    /// Declared return type, as `type_name` gives it.
+    ret_type: Option<String>,
+    /// Declared parameter types, as `type_name` gives them (`None` for generics).
+    param_types: Vec<(String, Option<String>)>,
+    /// `(explicit argument position, name)` of each `&mut` parameter.
+    mut_params: Vec<(usize, String)>,
 }
 
-/// Can a value of this return type carry SQL text? `()`, `bool`, and numeric
-/// primitives cannot, also when wrapped in `Result<T, _>` / `Option<T>` or a
-/// `*Result<T>` alias; everything else (including `Value`, structs, and
-/// generics) is assumed to.
-fn return_type_carries_text(ret: &ReturnType) -> bool {
-    match ret {
-        ReturnType::Default => false,
-        ReturnType::Type(_, ty) => type_carries_text(ty),
+impl CandidateCallable<'_> {
+    fn summary_key(&self) -> SummaryKey {
+        let name = match &self.owner {
+            Some(o) => format!("{o}::{}", self.name),
+            None => self.name.clone(),
+        };
+        (name, self.kind == HelperKind::Method, self.explicit_arity)
     }
 }
 
-fn type_carries_text(ty: &Type) -> bool {
-    match ty {
-        Type::Tuple(t) => t.elems.iter().any(type_carries_text),
-        Type::Paren(p) => type_carries_text(&p.elem),
-        Type::Group(g) => type_carries_text(&g.elem),
-        Type::Never(_) => false,
-        Type::Path(tp) => {
-            let Some(last) = tp.path.segments.last() else { return true };
-            let name = last.ident.to_string();
-            if name == "Option" || name.ends_with("Result") {
-                return match &last.arguments {
-                    syn::PathArguments::AngleBracketed(ab) => match ab.args.first() {
-                        Some(syn::GenericArgument::Type(inner)) => type_carries_text(inner),
-                        _ => true,
-                    },
-                    _ => true,
-                };
-            }
-            !is_non_sql_carrier_type(ty)
+/// `(explicit argument position, name)` of each `name: &mut T` parameter.
+fn mut_params(inputs: &Punctuated<FnArg, Token![,]>) -> Vec<(usize, String)> {
+    inputs
+        .iter()
+        .filter_map(|a| if let FnArg::Typed(pt) = a { Some(pt) } else { None })
+        .enumerate()
+        .filter_map(|(i, pt)| match (&*pt.pat, &*pt.ty) {
+            (Pat::Ident(pi), Type::Reference(r)) if r.mutability.is_some() => Some((i, pi.ident.to_string())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `(name, type)` of each typed parameter; a generic type is unknown.
+fn param_types(
+    inputs: &Punctuated<FnArg, Token![,]>,
+    owner: Option<&str>,
+    generics: &BTreeSet<String>,
+) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    for arg in inputs {
+        if let FnArg::Typed(pt) = arg
+            && let Pat::Ident(pi) = &*pt.pat
+        {
+            let ty = type_name(&pt.ty, owner).filter(|t| !generics.contains(t));
+            out.push((pi.ident.to_string(), ty));
         }
-        _ => true,
+    }
+    out
+}
+
+/// Runtime handles that cannot carry caller-chosen SQL text, identified by
+/// their real definition: `(name, crate, module, defining (crate dir, file))`.
+/// A parameter of one of these types is not traced; anything else named the
+/// same (a generic `Db: AsRef<str>`, a local `struct Registry { sql }`, a
+/// `type Hub = String`) is.
+/// `(name, crate, module, defining (crate dir, file))`.
+type RuntimeHandle = (&'static str, &'static str, &'static str, Option<(&'static str, &'static str)>);
+
+const RUNTIME_HANDLES: &[RuntimeHandle] = &[
+    ("Connection", "rusqlite", "", None),
+    ("Transaction", "rusqlite", "", None),
+    ("Savepoint", "rusqlite", "", None),
+    ("Db", "ua_store", "db", Some(("ua-store", "src/db.rs"))),
+    ("WriteTx", "ua_store", "db", Some(("ua-store", "src/db.rs"))),
+    ("Hub", "ua_tools", "hub", Some(("ua-tools", "src/hub.rs"))),
+    ("ToolCtx", "ua_tools", "registry", Some(("ua-tools", "src/registry.rs"))),
+    ("Registry", "ua_tools", "registry", Some(("ua-tools", "src/registry.rs"))),
+    ("AppState", "ua_server", "", Some(("ua-server", "src/lib.rs"))),
+];
+
+/// `bool` and numeric primitives: a value of these types is never SQL text.
+const SCALAR_TYPES: &[&str] = &[
+    "bool", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32",
+    "f64",
+];
+
+/// Per-file name resolution for types: `use` imports, locally defined type
+/// names, and the file's module path, enough to tell the real runtime handles
+/// from look-alikes.
+struct FileTypes {
+    krate: String,
+    krate_ident: String,
+    rel: String,
+    module: Vec<String>,
+    /// Imported name -> every path it is imported from (as written).
+    uses: BTreeMap<String, Vec<Vec<String>>>,
+    /// `struct`/`enum`/`union`/`type`/`trait` names defined anywhere in the file.
+    local_types: BTreeSet<String>,
+    /// `const` names declared with a scalar type.
+    numeric_consts: BTreeSet<String>,
+}
+
+impl FileTypes {
+    fn new(krate: &str, rel: &str, file: &File) -> Self {
+        struct Collect {
+            uses: BTreeMap<String, Vec<Vec<String>>>,
+            local_types: BTreeSet<String>,
+            numeric_consts: BTreeSet<String>,
+        }
+        fn use_tree(tree: &syn::UseTree, prefix: &[String], out: &mut BTreeMap<String, Vec<Vec<String>>>) {
+            let with = |id: &proc_macro2::Ident| {
+                let mut p = prefix.to_vec();
+                p.push(id.to_string());
+                p
+            };
+            match tree {
+                syn::UseTree::Path(up) => use_tree(&up.tree, &with(&up.ident), out),
+                syn::UseTree::Name(un) if un.ident == "self" => {
+                    if let Some(last) = prefix.last() {
+                        out.entry(last.clone()).or_default().push(prefix.to_vec());
+                    }
+                }
+                syn::UseTree::Name(un) => out.entry(un.ident.to_string()).or_default().push(with(&un.ident)),
+                syn::UseTree::Rename(ur) => {
+                    out.entry(ur.rename.to_string()).or_default().push(with(&ur.ident))
+                }
+                syn::UseTree::Glob(_) => {}
+                syn::UseTree::Group(g) => {
+                    for t in &g.items {
+                        use_tree(t, prefix, out);
+                    }
+                }
+            }
+        }
+        impl<'ast> Visit<'ast> for Collect {
+            fn visit_item(&mut self, node: &'ast Item) {
+                if item_has_cfg_test(node) {
+                    return;
+                }
+                let name = match node {
+                    Item::Struct(i) => Some(&i.ident),
+                    Item::Enum(i) => Some(&i.ident),
+                    Item::Union(i) => Some(&i.ident),
+                    Item::Type(i) => Some(&i.ident),
+                    Item::Trait(i) => Some(&i.ident),
+                    Item::TraitAlias(i) => Some(&i.ident),
+                    _ => None,
+                };
+                if let Some(n) = name {
+                    self.local_types.insert(n.to_string());
+                }
+                if let Item::Use(u) = node {
+                    use_tree(&u.tree, &[], &mut self.uses);
+                }
+                if let Item::Const(c) = node
+                    && let Type::Path(tp) = &*c.ty
+                    && tp.path.get_ident().is_some_and(|i| SCALAR_TYPES.contains(&i.to_string().as_str()))
+                {
+                    self.numeric_consts.insert(c.ident.to_string());
+                }
+                visit::visit_item(self, node);
+            }
+        }
+        let mut c =
+            Collect { uses: BTreeMap::new(), local_types: BTreeSet::new(), numeric_consts: BTreeSet::new() };
+        c.visit_file(file);
+        let stem = rel.trim_start_matches("src/").trim_end_matches(".rs");
+        let mut module: Vec<String> = stem.split('/').map(str::to_string).collect();
+        if matches!(module.last().map(String::as_str), Some("lib" | "main" | "mod")) {
+            module.pop();
+        }
+        Self {
+            krate: krate.to_string(),
+            krate_ident: krate.replace('-', "_"),
+            rel: rel.to_string(),
+            module,
+            uses: c.uses,
+            local_types: c.local_types,
+            numeric_consts: c.numeric_consts,
+        }
+    }
+
+    /// Absolute path of `segs` as written in this file (`crate::`, `self::`,
+    /// `super::`, or module-relative), with a leading imported name expanded.
+    fn resolve(&self, segs: &[String]) -> Vec<Vec<String>> {
+        let Some(first) = segs.first() else { return Vec::new() };
+        let expanded: Vec<Vec<String>> = match self.uses.get(first) {
+            Some(paths) if first != "crate" && first != "self" && first != "super" => {
+                paths.iter().map(|p| p.iter().chain(&segs[1..]).cloned().collect()).collect()
+            }
+            _ => vec![segs.to_vec()],
+        };
+        expanded.into_iter().map(|p| self.absolute(&p)).collect()
+    }
+
+    fn absolute(&self, segs: &[String]) -> Vec<String> {
+        let first = segs[0].as_str();
+        let rest = |n: usize| segs[n..].iter().cloned();
+        match first {
+            "crate" => std::iter::once(self.krate_ident.clone()).chain(rest(1)).collect(),
+            "self" => std::iter::once(self.krate_ident.clone())
+                .chain(self.module.iter().cloned())
+                .chain(rest(1))
+                .collect(),
+            "super" => {
+                let ups = segs.iter().take_while(|s| *s == "super").count();
+                let keep = self.module.len().saturating_sub(ups);
+                std::iter::once(self.krate_ident.clone())
+                    .chain(self.module[..keep].iter().cloned())
+                    .chain(rest(ups))
+                    .collect()
+            }
+            _ if first == "rusqlite"
+                || first.starts_with("ua_")
+                || matches!(first, "std" | "core" | "alloc") =>
+            {
+                segs.to_vec()
+            }
+            _ => std::iter::once(self.krate_ident.clone())
+                .chain(self.module.iter().cloned())
+                .chain(rest(0))
+                .collect(),
+        }
+    }
+
+    /// Is `path` (a parameter or return type) one of `RUNTIME_HANDLES` by its
+    /// real definition? Generic parameters and same-named local types never are.
+    fn is_runtime_handle(&self, path: &syn::Path, generics: &BTreeSet<String>) -> bool {
+        let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+        let Some(name) = segs.last() else { return false };
+        let Some(&(_, krate, module, home)) = RUNTIME_HANDLES.iter().find(|h| h.0 == name) else {
+            return false;
+        };
+        if segs.len() == 1 {
+            if generics.contains(name) {
+                return false;
+            }
+            if self.local_types.contains(name) {
+                return home.is_some_and(|(k, r)| k == self.krate && r == self.rel);
+            }
+            if !self.uses.contains_key(name) {
+                return false;
+            }
+        }
+        let candidates = self.resolve(&segs);
+        !candidates.is_empty()
+            && candidates.iter().all(|abs| {
+                abs.first().is_some_and(|c| c == krate)
+                    && abs.last() == Some(name)
+                    && (abs.len() == 2 || (abs.len() == 3 && !module.is_empty() && abs[1] == module))
+            })
+    }
+
+    /// `bool`/numeric primitive, unless the name is a generic or a local type.
+    fn is_scalar(&self, path: &syn::Path, generics: &BTreeSet<String>) -> bool {
+        path.segments.len() == 1
+            && path.leading_colon.is_none()
+            && SCALAR_TYPES.contains(&path.segments[0].ident.to_string().as_str())
+            && !generics.contains(&path.segments[0].ident.to_string())
+            && !self.local_types.contains(&path.segments[0].ident.to_string())
+    }
+
+    /// Types whose values never carry SQL text: resolved runtime handles and
+    /// scalars, behind references or parentheses.
+    fn is_non_sql_carrier(&self, ty: &Type, generics: &BTreeSet<String>) -> bool {
+        match ty {
+            Type::Reference(r) => self.is_non_sql_carrier(&r.elem, generics),
+            Type::Paren(p) => self.is_non_sql_carrier(&p.elem, generics),
+            Type::Group(g) => self.is_non_sql_carrier(&g.elem, generics),
+            Type::Path(tp) if tp.qself.is_none() => {
+                self.is_scalar(&tp.path, generics) || self.is_runtime_handle(&tp.path, generics)
+            }
+            _ => false,
+        }
+    }
+
+    /// Can a value of this return type carry SQL text? `()`, `!`, `bool`,
+    /// numbers, and runtime handles cannot, also inside `Result<T, _>`,
+    /// `UaResult<T>` or `Option<T>`; everything else (including `Value`,
+    /// structs and generics) is assumed to.
+    fn return_carries_text(&self, ret: &ReturnType, generics: &BTreeSet<String>) -> bool {
+        match ret {
+            ReturnType::Default => false,
+            ReturnType::Type(_, ty) => self.type_carries_text(ty, generics),
+        }
+    }
+
+    fn type_carries_text(&self, ty: &Type, generics: &BTreeSet<String>) -> bool {
+        match ty {
+            Type::Tuple(t) => t.elems.iter().any(|e| self.type_carries_text(e, generics)),
+            Type::Paren(p) => self.type_carries_text(&p.elem, generics),
+            Type::Group(g) => self.type_carries_text(&g.elem, generics),
+            Type::Never(_) => false,
+            Type::Path(tp) => {
+                let Some(last) = tp.path.segments.last() else { return true };
+                let name = last.ident.to_string();
+                if matches!(name.as_str(), "Option" | "Result" | "UaResult")
+                    && !generics.contains(&name)
+                    && !self.local_types.contains(&name)
+                {
+                    return match &last.arguments {
+                        syn::PathArguments::AngleBracketed(ab) => match ab.args.first() {
+                            Some(syn::GenericArgument::Type(inner)) => {
+                                self.type_carries_text(inner, generics)
+                            }
+                            _ => true,
+                        },
+                        _ => true,
+                    };
+                }
+                !self.is_non_sql_carrier(ty, generics)
+            }
+            _ => true,
+        }
     }
 }
 
-/// Database / hub runtime handles and scalar numeric/bool primitives that are
-/// never SQL text carriers. Skipping them prevents a connection handle's own
-/// query results or a clamped integer `LIMIT` from falsely flagging a function,
-/// while still tracing every struct, newtype, enum, `impl Display`, generic `T`,
-/// and string type.
-fn is_non_sql_carrier_type(ty: &Type) -> bool {
-    match ty {
-        Type::Reference(r) => is_non_sql_carrier_type(&r.elem),
-        Type::Paren(p) => is_non_sql_carrier_type(&p.elem),
-        Type::Group(g) => is_non_sql_carrier_type(&g.elem),
-        Type::Path(tp) => tp.path.segments.last().is_some_and(|s| {
-            matches!(
-                s.ident.to_string().as_str(),
-                "Connection"
-                    | "Transaction"
-                    | "WriteTx"
-                    | "Savepoint"
-                    | "Db"
-                    | "Hub"
-                    | "ToolCtx"
-                    | "AppState"
-                    | "Registry"
-                    | "bool"
-                    | "i8"
-                    | "i16"
-                    | "i32"
-                    | "i64"
-                    | "i128"
-                    | "isize"
-                    | "u8"
-                    | "u16"
-                    | "u32"
-                    | "u64"
-                    | "u128"
-                    | "usize"
-                    | "f32"
-                    | "f64"
-            )
-        }),
-        _ => false,
+fn type_name_of_return(ret: &ReturnType, owner: Option<&str>) -> Option<String> {
+    match ret {
+        ReturnType::Default => None,
+        ReturnType::Type(_, ty) => type_name(ty, owner),
     }
 }
 
-fn extract_fn_params(inputs: &Punctuated<FnArg, Token![,]>) -> (Vec<(usize, String)>, bool, usize) {
+/// Type parameter names declared by `generics`.
+fn generic_names(generics: &syn::Generics) -> BTreeSet<String> {
+    generics.type_params().map(|tp| tp.ident.to_string()).collect()
+}
+
+fn extract_fn_params(
+    inputs: &Punctuated<FnArg, Token![,]>,
+    types: &FileTypes,
+    generics: &BTreeSet<String>,
+) -> (Vec<(usize, String)>, bool, usize) {
     let mut out = Vec::new();
     let mut has_self = false;
     let mut arg_idx = 0usize;
@@ -2582,7 +3144,7 @@ fn extract_fn_params(inputs: &Punctuated<FnArg, Token![,]>) -> (Vec<(usize, Stri
         match arg {
             FnArg::Receiver(_) => has_self = true,
             FnArg::Typed(pt) => {
-                if !is_non_sql_carrier_type(&pt.ty) {
+                if !types.is_non_sql_carrier(&pt.ty, generics) {
                     let mut names = Vec::new();
                     collect_pat_idents(&pt.pat, &mut names);
                     for n in names {
@@ -2609,20 +3171,43 @@ fn extract_closure_params(inputs: &Punctuated<Pat, Token![,]>) -> Vec<(usize, St
 }
 
 /// Collect all functions, methods, closures, and `macro_rules!` SQL wrappers in a file.
-struct CallableCollector<'ast> {
+struct CallableCollector<'ast, 't> {
     callables: Vec<CandidateCallable<'ast>>,
     macros: Vec<DetectedHelper>,
     enclosing_fn: Option<String>,
     in_pub_trait_impl: bool,
+    types: &'t FileTypes,
+    /// Type parameters of the enclosing `impl` / `trait` items.
+    outer_generics: Vec<BTreeSet<String>>,
+    /// Self type of the enclosing `impl` (or the enclosing trait's name).
+    owner: Option<String>,
 }
 
-impl<'ast> CallableCollector<'ast> {
-    fn new() -> Self {
-        Self { callables: Vec::new(), macros: Vec::new(), enclosing_fn: None, in_pub_trait_impl: false }
+impl<'ast, 't> CallableCollector<'ast, 't> {
+    fn new(types: &'t FileTypes) -> Self {
+        Self {
+            callables: Vec::new(),
+            macros: Vec::new(),
+            enclosing_fn: None,
+            in_pub_trait_impl: false,
+            types,
+            outer_generics: Vec::new(),
+            owner: None,
+        }
+    }
+
+    /// Generic names in scope for a fn with `sig`: its own and every enclosing
+    /// `impl` / `trait` item's.
+    fn generics_for(&self, sig: &syn::Signature) -> BTreeSet<String> {
+        let mut g = generic_names(&sig.generics);
+        for outer in &self.outer_generics {
+            g.extend(outer.iter().cloned());
+        }
+        g
     }
 }
 
-impl<'ast> Visit<'ast> for CallableCollector<'ast> {
+impl<'ast> Visit<'ast> for CallableCollector<'ast, '_> {
     fn visit_item(&mut self, node: &'ast Item) {
         if item_has_cfg_test(node) {
             return;
@@ -2636,7 +3221,11 @@ impl<'ast> Visit<'ast> for CallableCollector<'ast> {
         }
         let prev = self.in_pub_trait_impl;
         self.in_pub_trait_impl = matches!(node.vis, Visibility::Public(_));
+        self.outer_generics.push(generic_names(&node.generics));
+        let prev_owner = self.owner.replace(node.ident.to_string());
         visit::visit_item_trait(self, node);
+        self.owner = prev_owner;
+        self.outer_generics.pop();
         self.in_pub_trait_impl = prev;
     }
 
@@ -2646,7 +3235,11 @@ impl<'ast> Visit<'ast> for CallableCollector<'ast> {
         }
         let prev = self.in_pub_trait_impl;
         self.in_pub_trait_impl = node.trait_.is_some();
+        self.outer_generics.push(generic_names(&node.generics));
+        let prev_owner = std::mem::replace(&mut self.owner, type_name(&node.self_ty, None));
         visit::visit_item_impl(self, node);
+        self.owner = prev_owner;
+        self.outer_generics.pop();
         self.in_pub_trait_impl = prev;
     }
 
@@ -2656,7 +3249,8 @@ impl<'ast> Visit<'ast> for CallableCollector<'ast> {
         }
         let name = node.sig.ident.to_string();
         let (vis, is_pub) = vis_of(&node.vis, false);
-        let (params, has_self, explicit_arity) = extract_fn_params(&node.sig.inputs);
+        let generics = self.generics_for(&node.sig);
+        let (params, has_self, explicit_arity) = extract_fn_params(&node.sig.inputs, self.types, &generics);
         self.callables.push(CandidateCallable {
             name: name.clone(),
             vis,
@@ -2666,7 +3260,11 @@ impl<'ast> Visit<'ast> for CallableCollector<'ast> {
             explicit_arity,
             params,
             body: CallableBody::Block(&node.block),
-            ret_carrier: return_type_carries_text(&node.sig.output),
+            ret_carrier: self.types.return_carries_text(&node.sig.output, &generics),
+            owner: None,
+            ret_type: type_name_of_return(&node.sig.output, None),
+            param_types: param_types(&node.sig.inputs, None, &generics),
+            mut_params: mut_params(&node.sig.inputs),
         });
         let prev_fn = self.enclosing_fn.replace(name);
         let prev_trait = self.in_pub_trait_impl;
@@ -2682,7 +3280,8 @@ impl<'ast> Visit<'ast> for CallableCollector<'ast> {
         }
         let name = node.sig.ident.to_string();
         let (vis, is_pub) = vis_of(&node.vis, self.in_pub_trait_impl);
-        let (params, has_self, explicit_arity) = extract_fn_params(&node.sig.inputs);
+        let generics = self.generics_for(&node.sig);
+        let (params, has_self, explicit_arity) = extract_fn_params(&node.sig.inputs, self.types, &generics);
         self.callables.push(CandidateCallable {
             name: name.clone(),
             vis,
@@ -2692,7 +3291,11 @@ impl<'ast> Visit<'ast> for CallableCollector<'ast> {
             explicit_arity,
             params,
             body: CallableBody::Block(&node.block),
-            ret_carrier: return_type_carries_text(&node.sig.output),
+            ret_carrier: self.types.return_carries_text(&node.sig.output, &generics),
+            owner: self.owner.clone(),
+            ret_type: type_name_of_return(&node.sig.output, self.owner.as_deref()),
+            param_types: param_types(&node.sig.inputs, self.owner.as_deref(), &generics),
+            mut_params: mut_params(&node.sig.inputs),
         });
         let prev_fn = self.enclosing_fn.replace(name);
         let prev_trait = self.in_pub_trait_impl;
@@ -2710,7 +3313,9 @@ impl<'ast> Visit<'ast> for CallableCollector<'ast> {
             let name = node.sig.ident.to_string();
             let (vis, is_pub) =
                 if self.in_pub_trait_impl { (HelperVis::Pub, true) } else { (HelperVis::Private, false) };
-            let (params, has_self, explicit_arity) = extract_fn_params(&node.sig.inputs);
+            let generics = self.generics_for(&node.sig);
+            let (params, has_self, explicit_arity) =
+                extract_fn_params(&node.sig.inputs, self.types, &generics);
             self.callables.push(CandidateCallable {
                 name: name.clone(),
                 vis,
@@ -2720,7 +3325,11 @@ impl<'ast> Visit<'ast> for CallableCollector<'ast> {
                 explicit_arity,
                 params,
                 body: CallableBody::Block(body),
-                ret_carrier: return_type_carries_text(&node.sig.output),
+                ret_carrier: self.types.return_carries_text(&node.sig.output, &generics),
+                owner: self.owner.clone(),
+                ret_type: type_name_of_return(&node.sig.output, self.owner.as_deref()),
+                param_types: param_types(&node.sig.inputs, self.owner.as_deref(), &generics),
+                mut_params: mut_params(&node.sig.inputs),
             });
             let prev_fn = self.enclosing_fn.replace(name);
             let prev_trait = self.in_pub_trait_impl;
@@ -2756,6 +3365,10 @@ impl<'ast> Visit<'ast> for CallableCollector<'ast> {
                 params,
                 body: CallableBody::Expr(body),
                 ret_carrier: true,
+                owner: None,
+                ret_type: None,
+                param_types: Vec::new(),
+                mut_params: Vec::new(),
             });
         }
         visit::visit_local(self, node);
@@ -2896,10 +3509,7 @@ const METAVAR_PREFIX: &str = "__mv_";
 /// code. Returns `(has_sql_call, metavars_reaching_sql_arg)`, or `None` when
 /// the body does not parse (the token scan below is the fallback).
 fn parse_macro_body_for_sql(body: TokenStream) -> Option<(bool, BTreeSet<String>)> {
-    let tokens = substitute_metavars(body);
-    // Leaked so macros nested in the body keep unique addresses for `macro_parse`.
-    let block: &'static syn::Block =
-        Box::leak(Box::new(syn::parse2::<syn::Block>(quote_braces(tokens)).ok()?));
+    let block = parse_macro_arm(body)?;
     let mut direct = DirectSqlCollector::new();
     direct.visit_block(block);
     let sites = direct.finish();
@@ -2918,6 +3528,95 @@ fn parse_macro_body_for_sql(body: TokenStream) -> Option<(bool, BTreeSet<String>
         }
     }
     Some((!sites.is_empty(), used))
+}
+
+/// Parse a `macro_rules!` arm body as a block after metavariable
+/// substitution. Leaked so macros nested in the body keep unique addresses for
+/// `macro_parse`.
+fn parse_macro_arm(body: TokenStream) -> Option<&'static syn::Block> {
+    let tokens = substitute_metavars(body);
+    Some(Box::leak(Box::new(syn::parse2::<syn::Block>(quote_braces(tokens)).ok()?)))
+}
+
+/// A `macro_rules!` definition outside `#[cfg(test)]`, kept so a macro that
+/// wraps a SQL-taking helper (rather than a SQL method) can be promoted to a
+/// helper once every helper is known.
+struct MacroDef {
+    name: String,
+    exported: bool,
+    line: usize,
+    /// Per arm: matcher metavariable -> comma position, the parsed body (when
+    /// it parses), and the raw body for the token fallback.
+    arms: Vec<(BTreeMap<String, usize>, Option<&'static syn::Block>, TokenStream)>,
+}
+
+fn collect_macro_defs(file: &File) -> Vec<MacroDef> {
+    struct Defs(Vec<MacroDef>);
+    impl<'ast> Visit<'ast> for Defs {
+        fn visit_item(&mut self, node: &'ast Item) {
+            if item_has_cfg_test(node) {
+                return;
+            }
+            visit::visit_item(self, node);
+        }
+        fn visit_stmt(&mut self, node: &'ast Stmt) {
+            if stmt_has_cfg_test(node) {
+                return;
+            }
+            visit::visit_stmt(self, node);
+        }
+        fn visit_item_macro(&mut self, node: &'ast ItemMacro) {
+            if node.mac.path.is_ident("macro_rules")
+                && let Some(ident) = &node.ident
+            {
+                let arms = extract_macro_rule_arms(node.mac.tokens.clone())
+                    .into_iter()
+                    .map(|(pat, body)| {
+                        (extract_macro_pat_metavar_indices(pat), parse_macro_arm(body.clone()), body)
+                    })
+                    .collect();
+                self.0.push(MacroDef {
+                    name: ident.to_string(),
+                    exported: attrs_have_macro_export(&node.attrs),
+                    line: ident.span().start().line,
+                    arms,
+                });
+            }
+        }
+    }
+    let mut defs = Defs(Vec::new());
+    defs.visit_file(file);
+    defs.0
+}
+
+/// Does a macro arm call an in-scope helper? Parsed arms go through the same
+/// counter as ordinary code; an arm that does not parse falls back to a token
+/// scan for `helper(` / `.helper(` / `helper!`.
+fn macro_arm_calls_helper(
+    block: Option<&'static syn::Block>,
+    raw: &TokenStream,
+    in_scope: &BTreeMap<String, BTreeSet<HelperKind>>,
+) -> bool {
+    if let Some(block) = block {
+        let no_own = BTreeSet::new();
+        let mut counter = HelperCallCounter::new(in_scope, &no_own, &[]);
+        counter.visit_block(block);
+        return !counter.finish().is_empty();
+    }
+    fn scan(stream: TokenStream, in_scope: &BTreeMap<String, BTreeSet<HelperKind>>) -> bool {
+        let tts: Vec<TokenTree> = stream.into_iter().collect();
+        tts.iter().enumerate().any(|(i, tt)| match tt {
+            TokenTree::Ident(id) if in_scope.contains_key(&id.to_string()) => {
+                matches!(
+                    tts.get(i + 1),
+                    Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis
+                ) || matches!(tts.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+            }
+            TokenTree::Group(g) => scan(g.stream(), in_scope),
+            _ => false,
+        })
+    }
+    scan(raw.clone(), in_scope)
 }
 
 /// `{ident}` captures of every `format!`-family macro inside `expr`.
@@ -3170,30 +3869,42 @@ impl ParamFieldUsageVisitor<'_> {
 fn compute_local_return_taint(
     callables: &[CandidateCallable<'_>],
     base: Option<Rc<LocalReturnTaint>>,
+    numeric_consts: &Rc<BTreeSet<String>>,
 ) -> LocalReturnTaint {
     let local_keys: Rc<BTreeSet<SummaryKey>> = Rc::new(
         callables
             .iter()
             .filter(|c| c.kind != HelperKind::Closure && c.kind != HelperKind::Macro)
-            .map(|c| (c.name.clone(), c.kind == HelperKind::Method, c.explicit_arity))
+            .map(|c| c.summary_key())
             .collect(),
     );
+    let ret_types: BTreeMap<SummaryKey, String> = callables
+        .iter()
+        .filter(|c| c.kind != HelperKind::Closure && c.kind != HelperKind::Macro)
+        .filter_map(|c| Some((c.summary_key(), c.ret_type.clone()?)))
+        .collect();
     let mut summary = LocalReturnTaint::layered(base.clone(), local_keys.clone());
+    summary.ret_types = ret_types.clone();
     let (no_sql_args, no_helpers) = (HashSet::new(), KnownHelpers::new());
     for _ in 0..4 {
         let mut next = LocalReturnTaint::layered(base.clone(), local_keys.clone());
+        next.ret_types = ret_types.clone();
         let mut non_struct_keys: BTreeSet<(String, bool, usize)> = BTreeSet::new();
         for c in callables {
             if c.kind == HelperKind::Closure || c.kind == HelperKind::Macro {
                 continue;
             }
             let has_self = c.kind == HelperKind::Method;
-            let key = (c.name.clone(), has_self, c.explicit_arity);
+            let key = c.summary_key();
+            let _ctx = CallCtxGuard::install(c, numeric_consts, &summary);
             let slot_entry = next.slots.entry(key.clone()).or_default();
+            let out_entry = next.out_flows.entry(key.clone()).or_default();
             if !c.ret_carrier {
                 // Known, and no parameter taints the (text-free) result.
-                non_struct_keys.insert(key);
-                continue;
+                non_struct_keys.insert(key.clone());
+                if c.mut_params.is_empty() {
+                    continue;
+                }
             }
 
             let mut seeds: Vec<(usize, String)> = Vec::new();
@@ -3230,6 +3941,15 @@ fn compute_local_return_taint(
                     if tainted.len() == before {
                         break;
                     }
+                }
+                for (pos, name) in &c.mut_params {
+                    let mi = pos + usize::from(has_self);
+                    if mi != slot_param_idx && place_tainted(&tainted, name) {
+                        out_entry.entry(mi).or_default().insert(slot_param_idx);
+                    }
+                }
+                if !c.ret_carrier {
+                    continue;
                 }
                 let live_at_return = probe.map(|p| p.returns).unwrap_or_default();
                 for ret in &ret_exprs {
@@ -3432,8 +4152,13 @@ impl<'ast> Visit<'ast> for NameCollector {
     }
 }
 
-fn detect_sql_helpers(file: &File, ret_taint: &LocalReturnTaint) -> Vec<DetectedHelper> {
-    let mut collector = CallableCollector::new();
+fn detect_sql_helpers(
+    file: &File,
+    types: &FileTypes,
+    ret_taint: &LocalReturnTaint,
+    numeric_consts: &Rc<BTreeSet<String>>,
+) -> Vec<DetectedHelper> {
+    let mut collector = CallableCollector::new(types);
     collector.visit_file(file);
 
     let mut known = KnownHelpers::new();
@@ -3491,6 +4216,7 @@ fn detect_sql_helpers(file: &File, ret_taint: &LocalReturnTaint) -> Vec<Detected
             if !relevant {
                 continue;
             }
+            let _ctx = CallCtxGuard::install(c, numeric_consts, ret_taint);
             let mut sql_flows: BTreeMap<usize, ParamSqlFlow> = BTreeMap::new();
             for (p_idx, p_name) in &c.params {
                 if let Some(flow) = param_sql_flow(&c.body, sql_args, p_name, &known, ret_taint) {
@@ -3545,16 +4271,39 @@ struct HelperCallCounter<'a> {
     /// reference to a helper of the same name.
     local_vars: Vec<BTreeSet<String>>,
     skip_direct_path: bool,
+    /// Helpers defined in the scanned file itself: a same-named `fn` there is
+    /// the helper, not a shadow.
+    own_helpers: &'a BTreeSet<String>,
 }
 
 impl<'a> HelperCallCounter<'a> {
-    fn new(helpers: &'a BTreeMap<String, BTreeSet<HelperKind>>) -> Self {
+    /// The file's own top-level free fns shadow an imported helper of the
+    /// same name at the file's module scope.
+    fn new(
+        helpers: &'a BTreeMap<String, BTreeSet<HelperKind>>,
+        own_helpers: &'a BTreeSet<String>,
+        file_items: &[Item],
+    ) -> Self {
+        let file_fns = scope_fn_names(file_items.iter(), own_helpers);
         Self {
             helpers,
             sites: Vec::new(),
             aliases: BTreeMap::new(),
-            local_vars: vec![BTreeSet::new()],
+            local_vars: vec![file_fns],
             skip_direct_path: false,
+            own_helpers,
+        }
+    }
+
+    /// Bind the free fns a block declares (`fn inner() {}` inside a body) in
+    /// the current scope.
+    fn bind_block_fns(&mut self, block: &syn::Block) {
+        let names = scope_fn_names(
+            block.stmts.iter().filter_map(|s| if let Stmt::Item(i) = s { Some(i) } else { None }),
+            self.own_helpers,
+        );
+        if let Some(scope) = self.local_vars.last_mut() {
+            scope.extend(names);
         }
     }
 
@@ -3640,6 +4389,7 @@ impl<'ast> Visit<'ast> for HelperCallCounter<'_> {
                 self.bind_pat(&pt.pat);
             }
         }
+        self.bind_block_fns(&node.block);
         visit::visit_block(self, &node.block);
         self.pop_scope();
     }
@@ -3654,6 +4404,7 @@ impl<'ast> Visit<'ast> for HelperCallCounter<'_> {
                 self.bind_pat(&pt.pat);
             }
         }
+        self.bind_block_fns(&node.block);
         visit::visit_block(self, &node.block);
         self.pop_scope();
     }
@@ -3669,6 +4420,7 @@ impl<'ast> Visit<'ast> for HelperCallCounter<'_> {
                     self.bind_pat(&pt.pat);
                 }
             }
+            self.bind_block_fns(body);
             visit::visit_block(self, body);
             self.pop_scope();
         }
@@ -3676,8 +4428,24 @@ impl<'ast> Visit<'ast> for HelperCallCounter<'_> {
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
         self.push_scope();
+        self.bind_block_fns(node);
         visit::visit_block(self, node);
         self.pop_scope();
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast ItemMod) {
+        if attrs_have_cfg_test(&node.attrs) {
+            return;
+        }
+        // An inline module is its own name scope: its fns shadow only calls
+        // inside it, and the enclosing file's fns do not reach into it.
+        let Some((_, items)) = &node.content else { return };
+        let inner = scope_fn_names(items.iter(), self.own_helpers);
+        let outer = std::mem::replace(&mut self.local_vars, vec![inner]);
+        for item in items {
+            self.visit_item(item);
+        }
+        self.local_vars = outer;
     }
 
     fn visit_expr_closure(&mut self, node: &'ast ExprClosure) {
@@ -3736,14 +4504,13 @@ impl<'ast> Visit<'ast> for HelperCallCounter<'_> {
         }
         if let Some(init) = &node.init
             && let Expr::Path(ep) = unwrap_ref_or_cast(&init.expr)
-            && ep.qself.is_none()
             && let Some(last) = ep.path.segments.last()
         {
             let target = last.ident.to_string();
-            let is_callable_helper = (ep.path.segments.len() == 1
+            let is_callable_helper = (!is_qualified_path(ep)
                 && self.has_fn_or_closure(&target)
                 && !self.is_shadowed_by_local(&target))
-                || (ep.path.segments.len() >= 2
+                || (is_qualified_path(ep)
                     && (self.has_fn_or_closure(&target) || self.matches_kind(&target, HelperKind::Method)));
             if is_callable_helper {
                 let mut vars = Vec::new();
@@ -3815,20 +4582,19 @@ impl<'ast> Visit<'ast> for HelperCallCounter<'_> {
         let inner = unwrap_parens(&node.func);
         let mut matched = false;
         if let Expr::Path(ep) = inner
-            && ep.qself.is_none()
             && let Some(last) = ep.path.segments.last()
         {
             let name = last.ident.to_string();
-            if ep.path.segments.len() == 1
+            if !is_qualified_path(ep)
                 && let Some((target, called, _)) = self.aliases.get_mut(&name)
             {
                 *called = true;
                 self.sites.push((last.ident.span().start().line, format!("{target} (via {name})")));
                 matched = true;
-            } else if (ep.path.segments.len() == 1
+            } else if (!is_qualified_path(ep)
                 && self.has_fn_or_closure(&name)
                 && !self.is_shadowed_by_local(&name))
-                || (ep.path.segments.len() >= 2
+                || (is_qualified_path(ep)
                     && (self.has_fn_or_closure(&name) || self.matches_kind(&name, HelperKind::Method)))
             {
                 self.sites.push((last.ident.span().start().line, name.clone()));
@@ -3850,14 +4616,13 @@ impl<'ast> Visit<'ast> for HelperCallCounter<'_> {
             return;
         }
         if !self.skip_direct_path
-            && node.qself.is_none()
             && let Some(last) = node.path.segments.last()
         {
             let name = last.ident.to_string();
             // Count a bare fn-pointer reference to an in-scope helper (e.g. `apply(run_sql)` or
             // `items.map(crate::helpers::run_sql)`). Only count multi-segment paths for methods,
             // or non-shadowed paths for Fn/Closure.
-            let is_helper_ref = if node.path.segments.len() >= 2 {
+            let is_helper_ref = if is_qualified_path(node) {
                 self.has_fn_or_closure(&name) || self.matches_kind(&name, HelperKind::Method)
             } else {
                 self.has_fn_or_closure(&name)
@@ -3870,6 +4635,24 @@ impl<'ast> Visit<'ast> for HelperCallCounter<'_> {
         }
         visit::visit_expr_path(self, node);
     }
+}
+
+/// A path with a type or module qualifier (`a::f`, `<T>::f`, `<T as Tr>::f`).
+fn is_qualified_path(ep: &ExprPath) -> bool {
+    ep.qself.is_some() || ep.path.segments.len() >= 2
+}
+
+/// Names of the free fns among `items` (outside `#[cfg(test)]`), minus the
+/// file's own helpers.
+fn scope_fn_names<'i>(
+    items: impl Iterator<Item = &'i Item>,
+    own_helpers: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    items
+        .filter(|i| !item_has_cfg_test(i))
+        .filter_map(|i| if let Item::Fn(f) = i { Some(f.sig.ident.to_string()) } else { None })
+        .filter(|n| !own_helpers.contains(n))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -4116,25 +4899,52 @@ struct ScanReport {
     procedure_constructors: Vec<(String, String, String, usize)>,
 }
 
-/// Collect names of free `fn` items declared in `file` (outside `#[cfg(test)]`)
-/// so a file's own non-helper function (e.g. `cycles.rs:fn transition`) shadows
-/// a same-named `pub(crate)` SQL helper from another module on unqualified calls.
-fn collect_local_fn_names(file: &File) -> BTreeSet<String> {
-    struct LocalFnNames(BTreeSet<String>);
-    impl<'ast> Visit<'ast> for LocalFnNames {
-        fn visit_item(&mut self, node: &'ast Item) {
-            if item_has_cfg_test(node) {
-                return;
+/// Every detected helper with its defining `(crate, relative_path, dir)`,
+/// including `ua-store`'s frozen public SQL helpers.
+fn all_helper_defs(
+    report: &ScanReport,
+    files: &[ScannedFile],
+) -> Vec<(String, String, PathBuf, DetectedHelper)> {
+    let mut defs: Vec<(String, String, PathBuf, DetectedHelper)> = report
+        .helpers
+        .iter()
+        .map(|((krate, rel, _), h)| {
+            let dir = files
+                .iter()
+                .find(|f| &f.krate == krate && &f.rel == rel)
+                .map(|f| f.dir.clone())
+                .unwrap_or_default();
+            (krate.clone(), rel.clone(), dir, h.clone())
+        })
+        .collect();
+    for ((rel, _), h) in &report.ua_store_pub_sql_fns {
+        defs.push(("ua-store".to_string(), rel.clone(), PathBuf::new(), h.clone()));
+    }
+    defs
+}
+
+/// The helpers visible from `f` (by name -> kinds) and those `f` defines.
+fn helpers_in_scope(
+    f: &ScannedFile,
+    defs: &[(String, String, PathBuf, DetectedHelper)],
+) -> (BTreeMap<String, BTreeSet<HelperKind>>, BTreeSet<String>) {
+    let mut in_scope: BTreeMap<String, BTreeSet<HelperKind>> = BTreeMap::new();
+    let mut own = BTreeSet::new();
+    for (h_crate, h_rel, h_dir, h) in defs {
+        let visible = match h.vis {
+            HelperVis::Private => &f.krate == h_crate && &f.rel == h_rel,
+            HelperVis::PubSuper => &f.krate == h_crate && &f.dir == h_dir,
+            HelperVis::PubCrate => &f.krate == h_crate,
+            HelperVis::Pub => true,
+        };
+        if visible {
+            in_scope.entry(h.name.clone()).or_default().insert(h.kind);
+            if &f.krate == h_crate && &f.rel == h_rel {
+                own.insert(h.name.clone());
             }
-            if let Item::Fn(f) = node {
-                self.0.insert(f.sig.ident.to_string());
-            }
-            visit::visit_item(self, node);
         }
     }
-    let mut v = LocalFnNames(BTreeSet::new());
-    v.visit_file(file);
-    v.0
+    (in_scope, own)
 }
 
 fn analyze(files: &[ScannedFile]) -> ScanReport {
@@ -4145,10 +4955,11 @@ fn analyze(files: &[ScannedFile]) -> ScanReport {
     // (e.g. `pub(crate) fn filter` in `note.rs` called from `search.rs`) share
     // per-field / per-tuple return taint without private helpers in unrelated
     // modules colliding on common names like `set` or `sql`.
+    let file_types: Vec<FileTypes> = files.iter().map(|f| FileTypes::new(&f.krate, &f.rel, &f.ast)).collect();
     let mut crate_pub_callables: BTreeMap<String, Vec<CandidateCallable<'_>>> = BTreeMap::new();
     let mut file_callables: Vec<Vec<CandidateCallable<'_>>> = Vec::with_capacity(files.len());
     for f in files {
-        let mut col = CallableCollector::new();
+        let mut col = CallableCollector::new(&file_types[file_callables.len()]);
         col.visit_file(&f.ast);
         for c in &col.callables {
             if c.vis != HelperVis::Private {
@@ -4158,19 +4969,29 @@ fn analyze(files: &[ScannedFile]) -> ScanReport {
         file_callables.push(col.callables);
     }
 
+    let mut crate_numeric: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (f, t) in files.iter().zip(&file_types) {
+        crate_numeric.entry(f.krate.clone()).or_default().extend(t.numeric_consts.iter().cloned());
+    }
+    let crate_numeric: BTreeMap<String, Rc<BTreeSet<String>>> =
+        crate_numeric.into_iter().map(|(k, v)| (k, Rc::new(v))).collect();
     let crate_pub_ret_taint: BTreeMap<String, Rc<LocalReturnTaint>> = crate_pub_callables
         .into_iter()
-        .map(|(k, cs)| (k, Rc::new(compute_local_return_taint(&cs, None))))
+        .map(|(k, cs)| {
+            let summary = compute_local_return_taint(&cs, None, &crate_numeric[&k]);
+            (k, Rc::new(summary))
+        })
         .collect();
 
     // Step 1: detect direct SQL calls, SQL-taking helpers, procedures, and constructors.
     for (idx, f) in files.iter().enumerate() {
         let base_ret = crate_pub_ret_taint.get(&f.krate).cloned();
-        let ret_taint = compute_local_return_taint(&file_callables[idx], base_ret);
+        let numeric = &crate_numeric[&f.krate];
+        let ret_taint = compute_local_return_taint(&file_callables[idx], base_ret, numeric);
 
         if f.krate == "ua-store" {
             if f.rel != "src/schema.rs" {
-                for h in detect_sql_helpers(&f.ast, &ret_taint) {
+                for h in detect_sql_helpers(&f.ast, &file_types[idx], &ret_taint, numeric) {
                     if h.is_pub {
                         report.ua_store_pub_sql_fns.entry((f.rel.clone(), h.name.clone())).or_insert(h);
                     }
@@ -4194,7 +5015,7 @@ fn analyze(files: &[ScannedFile]) -> ScanReport {
             *report.sql_counts.entry((f.krate.clone(), f.rel.clone())).or_default() += direct_count;
         }
 
-        for h in detect_sql_helpers(&f.ast, &ret_taint) {
+        for h in detect_sql_helpers(&f.ast, &file_types[idx], &ret_taint, numeric) {
             report.helpers.entry((f.krate.clone(), f.rel.clone(), h.name.clone())).or_insert(h);
         }
 
@@ -4208,54 +5029,74 @@ fn analyze(files: &[ScannedFile]) -> ScanReport {
         }
     }
 
-    // Step 2: count calls (including fn-pointer refs and macro invocations) to
-    // every detected helper in its visibility scope.
-    let mut helper_defs: Vec<(String, String, PathBuf, DetectedHelper)> = report
-        .helpers
-        .iter()
-        .map(|((krate, rel, _), h)| {
-            let dir = files
-                .iter()
-                .find(|f| &f.krate == krate && &f.rel == rel)
-                .map(|f| f.dir.clone())
-                .unwrap_or_default();
-            (krate.clone(), rel.clone(), dir, h.clone())
-        })
-        .collect();
-    for ((rel, _), h) in &report.ua_store_pub_sql_fns {
-        helper_defs.push(("ua-store".to_string(), rel.clone(), PathBuf::new(), h.clone()));
+    // Step 1b: a `macro_rules!` whose body calls an in-scope SQL-taking helper
+    // (or another such macro) is itself a helper. Iterate to a fixed point.
+    let macro_defs: Vec<Vec<MacroDef>> = files.iter().map(|f| collect_macro_defs(&f.ast)).collect();
+    loop {
+        let helper_defs = all_helper_defs(&report, files);
+        let mut promoted = Vec::new();
+        for (f, defs) in files.iter().zip(&macro_defs) {
+            let in_store = f.krate == "ua-store";
+            let (in_scope, _) = helpers_in_scope(f, &helper_defs);
+            if in_scope.is_empty() {
+                continue;
+            }
+            for m in defs {
+                let known = if in_store {
+                    !m.exported || report.ua_store_pub_sql_fns.contains_key(&(f.rel.clone(), m.name.clone()))
+                } else {
+                    report.helpers.contains_key(&(f.krate.clone(), f.rel.clone(), m.name.clone()))
+                };
+                if known {
+                    continue;
+                }
+                // Conservatively, every metavariable of a calling arm is a SQL position.
+                let mut calls = false;
+                let mut indices = BTreeSet::new();
+                for (metavars, block, raw) in &m.arms {
+                    if macro_arm_calls_helper(*block, raw, &in_scope) {
+                        calls = true;
+                        indices.extend(metavars.values().copied());
+                    }
+                }
+                if calls {
+                    let helper = DetectedHelper {
+                        name: m.name.clone(),
+                        vis: if m.exported { HelperVis::Pub } else { HelperVis::PubCrate },
+                        kind: HelperKind::Macro,
+                        is_pub: m.exported,
+                        line: m.line,
+                        sql_param_indices: indices.into_iter().collect(),
+                    };
+                    promoted.push((f.krate.clone(), f.rel.clone(), helper));
+                }
+            }
+        }
+        if promoted.is_empty() {
+            break;
+        }
+        for (krate, rel, h) in promoted {
+            if krate == "ua-store" {
+                report.ua_store_pub_sql_fns.insert((rel, h.name.clone()), h);
+            } else {
+                report.helpers.insert((krate, rel, h.name.clone()), h);
+            }
+        }
     }
 
+    // Step 2: count calls (including fn-pointer refs and macro invocations) to
+    // every detected helper in its visibility scope.
+    let helper_defs = all_helper_defs(&report, files);
     for f in files {
         if f.krate == "ua-store" {
             continue;
         }
-        let mut in_scope_helpers: BTreeMap<String, BTreeSet<HelperKind>> = BTreeMap::new();
-        let mut own_file_helpers: BTreeSet<String> = BTreeSet::new();
-        for (h_crate, h_rel, h_dir, h) in &helper_defs {
-            let in_scope = match h.vis {
-                HelperVis::Private => &f.krate == h_crate && &f.rel == h_rel,
-                HelperVis::PubSuper => &f.krate == h_crate && &f.dir == h_dir,
-                HelperVis::PubCrate => &f.krate == h_crate,
-                HelperVis::Pub => true,
-            };
-            if in_scope {
-                in_scope_helpers.entry(h.name.clone()).or_default().insert(h.kind);
-                if &f.krate == h_crate && &f.rel == h_rel {
-                    own_file_helpers.insert(h.name.clone());
-                }
-            }
-        }
+        let (in_scope_helpers, own_file_helpers) = helpers_in_scope(f, &helper_defs);
         if !in_scope_helpers.is_empty() {
-            let mut counter = HelperCallCounter::new(&in_scope_helpers);
-            // Any free `fn` declared in `f` itself that is NOT a SQL helper
-            // shadows an identically named helper imported from another module
-            // on unqualified single-segment calls.
-            for local_fn in collect_local_fn_names(&f.ast) {
-                if !own_file_helpers.contains(&local_fn) {
-                    counter.local_vars[0].insert(local_fn);
-                }
-            }
+            // A free `fn` the file declares that is not itself a SQL helper
+            // (`cycles.rs` `fn transition`) shadows an imported helper of the
+            // same name for unqualified calls in the scope that declares it.
+            let mut counter = HelperCallCounter::new(&in_scope_helpers, &own_file_helpers, &f.ast.items);
             counter.visit_file(&f.ast);
             let helper_sites = counter.finish();
             let extra = helper_sites.len();
@@ -5045,6 +5886,363 @@ fn self_test_inner_cfg_test_attribute() {
     let report = analyze(&scan_crates_dir(tmp.path()));
     assert_eq!(count_of(&report, "ua-tools", "src/inner_test_file.rs"), None);
     assert_eq!(count_of(&report, "ua-tools", "src/inner_mod_test.rs"), Some(1));
+}
+
+/// #173 review B1: qualified-self UFCS calls and fn pointers count like plain
+/// UFCS (`<Connection>::execute`, `<Connection as Exec>::execute`).
+#[test]
+fn self_test_qualified_self_ufcs() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/qself.rs",
+        r#"
+            fn sites(c: &Connection) {
+                let _ = <Connection>::execute(c, "DELETE FROM a", []);
+                let _ = <Connection as Exec>::execute(c, "DELETE FROM b", []);
+                let _ = <rusqlite::Connection>::prepare(c, "SELECT 1");
+                let f = <Connection>::execute_batch;
+                let _ = f(c, "VACUUM");
+            }
+        "#,
+    );
+    let report = analyze(&scan_crates_dir(tmp.path()));
+    assert_eq!(count_of(&report, "ua-tools", "src/qself.rs"), Some(4));
+}
+
+/// #173 review (surviving mutation): a helper whose SQL call is path-style
+/// UFCS takes its SQL from the second argument, not the receiver.
+#[test]
+fn self_test_ufcs_helper_sql_argument() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/ufcs_helper.rs",
+        r#"
+            fn run(c: &Connection, q: &str) {
+                let _ = Connection::execute(c, q, []);
+            }
+            fn run_qself(c: &Connection, q: &str) {
+                let _ = <Connection as Exec>::execute(c, q, []);
+            }
+            fn bound_only(c: &Connection, v: &str) {
+                let _ = Connection::execute(c, "DELETE FROM t WHERE id = ?1", [v]);
+            }
+        "#,
+    );
+    let report = analyze(&scan_crates_dir(tmp.path()));
+    assert_eq!(helper_names(&report), BTreeSet::from(["run", "run_qself"]));
+}
+
+/// #173 review B2: a same-named fn in a nested module shadows only calls
+/// inside that module, so file-level calls to an imported helper still count.
+#[test]
+fn self_test_nested_fn_does_not_shadow_imported_helper() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/rows.rs",
+        r#"
+            pub(crate) fn task_rows(c: &Connection, sql: &str) {
+                let _ = c.prepare(sql);
+            }
+        "#,
+    );
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/caller.rs",
+        r#"
+            use crate::rows::task_rows;
+            fn outer(c: &Connection) {
+                task_rows(c, "SELECT 1");
+                task_rows(c, "SELECT 2");
+                fn local_only() {}
+            }
+            mod inner {
+                fn task_rows() {}
+                fn uses_local() {
+                    task_rows();
+                }
+            }
+        "#,
+    );
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/shadowing.rs",
+        r#"
+            fn task_rows() {}
+            fn uses_own() {
+                task_rows();
+            }
+        "#,
+    );
+    let report = analyze(&scan_crates_dir(tmp.path()));
+    assert_eq!(count_of(&report, "ua-tools", "src/caller.rs"), Some(2));
+    assert_eq!(count_of(&report, "ua-tools", "src/shadowing.rs"), None, "a file's own top-level fn shadows");
+}
+
+/// #173 review B3: a `macro_rules!` that wraps a SQL-taking helper (not a
+/// SQL method) is a helper too, and its invocations count.
+#[test]
+fn self_test_macro_wrapping_a_helper() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/rows.rs",
+        r#"
+            pub(crate) fn task_rows(c: &Connection, sql: &str, p: &[&str]) {
+                let _ = c.prepare(sql);
+                let _ = p;
+            }
+        "#,
+    );
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/wrapped.rs",
+        r#"
+            macro_rules! tr {
+                ($c:expr, $s:expr) => {
+                    crate::rows::task_rows($c, $s, &[])
+                };
+            }
+            // Wraps the wrapper: promoted on the next round.
+            macro_rules! tr2 {
+                ($c:expr) => {
+                    tr!($c, "SELECT 2")
+                };
+            }
+            fn callers(c: &Connection) {
+                tr!(c, "SELECT 1");
+                tr!(c, "SELECT 3");
+                tr2!(c);
+            }
+        "#,
+    );
+    let report = analyze(&scan_crates_dir(tmp.path()));
+    assert_eq!(helper_names(&report), BTreeSet::from(["task_rows", "tr", "tr2"]));
+    assert_eq!(count_of(&report, "ua-tools", "src/wrapped.rs"), Some(3));
+}
+
+/// #173 review B4: only the real runtime handles are exempt. A generic named
+/// like a handle, a local type of the same name, a `type` alias, and a
+/// handle look-alike returned from a fn are all traced.
+#[test]
+fn self_test_runtime_handle_exclusion_by_resolved_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/handles.rs",
+        r#"
+            use crate::registry::ToolCtx;
+            use ua_store::Db;
+            fn generic_db<Db: AsRef<str>>(c: &Connection, q: Db) {
+                let _ = c.execute(q.as_ref(), []);
+            }
+            fn generic_registry<Registry: std::fmt::Display>(c: &Connection, q: Registry) {
+                let _ = c.prepare(&format!("SELECT * FROM {q}"));
+            }
+            // Real handles: not traced, so these are not helpers.
+            fn real_ctx(c: &Connection, ctx: &ToolCtx) {
+                let _ = c.prepare(&format!("SELECT {}", ctx.hub.name()));
+            }
+            fn real_db(c: &Connection, db: &Db) {
+                let _ = c.prepare(&format!("SELECT {}", db.path()));
+            }
+        "#,
+    );
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/lookalike.rs",
+        r#"
+            struct Registry { sql: String }
+            type Hub = String;
+            fn local_struct(c: &Connection, r: &Registry) {
+                let _ = c.execute(&r.sql, []);
+            }
+            fn alias(c: &Connection, h: Hub) {
+                let _ = c.execute(&h, []);
+            }
+            fn make(t: &str) -> Registry {
+                Registry { sql: t.to_string() }
+            }
+            fn returned(c: &Connection, t: &str) {
+                let r = make(t);
+                let _ = c.execute(&r.sql, []);
+            }
+        "#,
+    );
+    write_src(
+        tmp.path(),
+        "ua-store",
+        "src/generic_leak.rs",
+        r#"
+            pub fn store_generic<Db: AsRef<str>>(c: &Connection, q: Db) {
+                let _ = c.execute(q.as_ref(), []);
+            }
+        "#,
+    );
+    let report = analyze(&scan_crates_dir(tmp.path()));
+    assert_eq!(
+        helper_names(&report),
+        BTreeSet::from(["generic_db", "generic_registry", "local_struct", "alias", "returned"])
+    );
+    let store_pubs: BTreeSet<(&str, &str)> =
+        report.ua_store_pub_sql_fns.keys().map(|(r, n)| (r.as_str(), n.as_str())).collect();
+    assert_eq!(store_pubs, BTreeSet::from([("src/generic_leak.rs", "store_generic")]));
+}
+
+/// #173 review B5: a file-local `fn as_str(&self) -> &'static str` does not
+/// make `String::as_str` look clean, and `clamp` / `min` on text stay tainted;
+/// a number clamped to numeric bounds is still not a helper.
+#[test]
+fn self_test_method_summaries_need_the_receiver_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/as_str.rs",
+        r#"
+            enum Kind { A, B }
+            impl Kind {
+                fn as_str(&self) -> &'static str {
+                    match self { Kind::A => "a", Kind::B => "b" }
+                }
+            }
+            const MAX_ROWS: i64 = 500;
+            fn via_string(c: &Connection, q: String) {
+                let _ = c.execute(q.as_str(), []);
+            }
+            fn via_clamp(c: &Connection, q: &str) {
+                let _ = c.execute(q.clamp("a", "z"), []);
+            }
+            fn via_min(c: &Connection, q: &str) {
+                let _ = c.execute(q.min(SQL_MAX), []);
+            }
+            // Not helpers: the summary applies to a known `Kind`, and a number
+            // clamped to numeric bounds.
+            fn via_kind(c: &Connection, k: Kind) {
+                let _ = c.prepare(&format!("SELECT * FROM t WHERE kind = '{}'", k.as_str()));
+            }
+            fn limited(c: &Connection, limit: Option<i64>, compact: bool) {
+                let n = limit.unwrap_or(100);
+                let max = if compact { 100_000 } else { 500 };
+                let _ = c.prepare(&format!("SELECT * FROM t LIMIT {} OFFSET {}", n.clamp(1, max), n.min(MAX_ROWS)));
+            }
+            fn callers(c: &Connection) {
+                via_string(c, "DELETE FROM a".to_string());
+                via_string(c, "DELETE FROM b".to_string());
+            }
+        "#,
+    );
+    let report = analyze(&scan_crates_dir(tmp.path()));
+    assert_eq!(helper_names(&report), BTreeSet::from(["via_string", "via_clamp", "via_min"]));
+    // 5 direct calls plus 2 `via_string` calls.
+    assert_eq!(count_of(&report, "ua-tools", "src/as_str.rs"), Some(7));
+}
+
+/// #173 review S2: SQL text built with `+=`, `extend`, `insert_str`, or
+/// through a `&mut String` another function fills.
+#[test]
+fn self_test_string_building_forms() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/build.rs",
+        r#"
+            fn fill(out: &mut String, t: &str) {
+                out.push_str(t);
+            }
+            fn add_assign(c: &Connection, t: &str) {
+                let mut s = String::from("SELECT * FROM ");
+                s += t;
+                let _ = c.prepare(&s);
+            }
+            fn extend(c: &Connection, t: &str) {
+                let mut s = String::new();
+                s.extend([t]);
+                let _ = c.prepare(&s);
+            }
+            fn insert_str(c: &Connection, t: &str) {
+                let mut s = String::from(" WHERE 1");
+                s.insert_str(0, t);
+                let _ = c.prepare(&s);
+            }
+            fn out_param(c: &Connection, t: &str) {
+                let mut s = String::new();
+                fill(&mut s, t);
+                let _ = c.prepare(&s);
+            }
+        "#,
+    );
+    let report = analyze(&scan_crates_dir(tmp.path()));
+    assert_eq!(helper_names(&report), BTreeSet::from(["add_assign", "extend", "insert_str", "out_param"]));
+}
+
+/// #173 review S4: a struct literal passed straight into a call carries its
+/// fields' taint, both into a helper and into a SQL argument.
+#[test]
+fn self_test_inline_struct_literal_arguments() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/inline.rs",
+        r#"
+            pub struct Wrap { pub sql: String }
+            fn by_struct(c: &Connection, w: Wrap) {
+                let _ = c.execute(&w.sql, []);
+            }
+            fn render(w: Wrap) -> String {
+                w.sql
+            }
+            fn into_helper(c: &Connection, q: &str) {
+                by_struct(c, Wrap { sql: q.to_string() });
+            }
+            fn into_sql_arg(c: &Connection, q: &str) {
+                let _ = c.execute(&render(Wrap { sql: q.to_string() }), []);
+            }
+        "#,
+    );
+    let report = analyze(&scan_crates_dir(tmp.path()));
+    assert_eq!(helper_names(&report), BTreeSet::from(["by_struct", "into_helper", "into_sql_arg"]));
+}
+
+/// #173 review (surviving mutation): only `test`-only cfgs are excluded;
+/// `cfg(any(test, ..))` and `cfg(not(test))` code ships and is counted.
+#[test]
+fn self_test_cfg_any_test_is_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_src(
+        tmp.path(),
+        "ua-tools",
+        "src/cfgs.rs",
+        r#"
+            #[cfg(any(test, feature = "extra"))]
+            fn any_test(c: &Connection) {
+                let _ = c.execute("DELETE FROM a", []);
+            }
+            #[cfg(not(test))]
+            fn not_test(c: &Connection) {
+                let _ = c.execute("DELETE FROM b", []);
+            }
+            #[cfg(all(test, unix))]
+            fn all_test(c: &Connection) {
+                let _ = c.execute("DELETE FROM c", []);
+            }
+        "#,
+    );
+    let report = analyze(&scan_crates_dir(tmp.path()));
+    assert_eq!(count_of(&report, "ua-tools", "src/cfgs.rs"), Some(2));
 }
 
 #[test]
