@@ -249,9 +249,12 @@ trait. The following remain direct `rusqlite` SQL:
      `managed_secrets/tenant_keys.rs:37`, `node_queue/tenant_keys.rs:63`).
    - Their SQL calls remain **counted in each file's raw-SQL baseline**, and a
      companion **`procedure_def`** ratchet counts every `Procedure {` literal
-     outside `ua-store` (excluding `ua_store::org::tenant_part(` calls), so a
-     new `Procedure` outside `ua-store` cannot be introduced silently even if it
-     writes through `MigrationGraph` or a helper rather than raw SQL.
+     outside `ua-store` while forbidding local `Procedure`-returning
+     constructor functions (`fn`/`const fn` returning `Procedure`) outside
+     `ua-store` (calls to `ua_store::org::tenant_part(` remain permitted). A
+     new `Procedure` outside `ua-store` therefore cannot be introduced silently
+     even if it writes through `MigrationGraph` or a helper rather than raw
+     SQL.
    - Pure-SQL new `Procedure`s live in `ua-store` (or reuse `tenant_part`). A
      domain-checked migration that must call a domain crate `ua-store` cannot
      depend on (such as `tasks/graph.rs:74` `DEPENDS_ON_GRAPH_PART`, which calls
@@ -337,27 +340,44 @@ a genuine non-SQL receiver ever enters the workspace) and enforces three checks:
    UFCS form (`Connection::execute(&c, ...)`, `Transaction::execute(...)`),
    whether passed a literal, `format!`, `let`, `const`, a helper parameter, or
    `include_str!`.
-2. **No new SQL-taking helper functions or trait methods anywhere in the
-   workspace (and calls to frozen helpers count as SQL calls).** A wrapper that
-   takes SQL text (or a trait method implemented for `Connection`) would
-   otherwise be counted only once in its own body while hiding every new caller.
-   The guard therefore:
-   - forbids any new function or trait method taking SQL text (`sql` /
-     `where_sql` parameters, plus `ua-store` public functions outside
-     `schema.rs` taking SQL text) across the **entire workspace**,
-   - freezes today's existing SQL-taking helpers outside `ua-store` by exact
-     `(crate, file, fn_name)` allowlist (`continuity/queue.rs:352` `task_rows`,
-     `platform.rs:613` `org_row`, `cycles.rs:307` `transition_json`,
-     `evidence.rs:204` `grouped`, `ua-import/src/lib.rs:422` `count`, and the
-     `names` / `name_sql` helpers in the five `tenant_keys` files), and
-   - counts **every call site** to those frozen helpers in the caller's own
-     per-file baseline (for example `merged.rs:185` calling `task_rows`, and
-     each `org_row(...)` call in `platform.rs`), so adding a caller through an
-     existing wrapper raises that file's count immediately.
+2. **No new SQL-taking helpers anywhere in the workspace (defined by
+   behaviour), and calls to frozen helpers count as SQL calls.** A wrapper
+   function, trait method, or closure that forwards SQL text or SQL fragments
+   into a SQL call would otherwise be counted only once in its own body while
+   hiding every new caller. Matching only on parameter names such as `sql`
+   would miss `stmt` parameters passed to `execute_batch`, `filter`/`table`
+   fragments interpolated into `format!`, and SQL-taking closures. The guard
+   therefore defines a SQL-taking helper **by behaviour**:
+   - **Behaviour rule:** any function, trait method, or closure outside
+     `ua-store` (and any `pub fn` or public trait method inside `ua-store`
+     outside `schema.rs`) whose string-typed parameter reaches the first
+     argument of a counted SQL method — either directly or through a `format!`
+     expression. Representative shapes in today's tree (illustrations only,
+     not a hand-maintained list) include:
+     - direct SQL wrappers (`platform.rs:613` `org_row`,
+       `continuity/queue.rs:352` `task_rows`),
+     - `stmt` parameters passed into `execute_batch` (`idempotency.rs:132`
+       `run`, `skill_registry.rs:321` `step`),
+     - `filter`/`table` fragments interpolated into SQL
+       (`dispatch/mod.rs:228` `runs_where`, `export.rs:636` `for_each_row`), and
+     - SQL-taking closures (`agents.rs:918` `count_by`).
+   - **Scanner-generated frozen inventory:** step (b)'s scanner **generates**
+     the complete inventory of existing SQL-taking helpers outside `ua-store`
+     keyed by `(crate, relative_path, name)` and commits it as the frozen
+     baseline. Any helper not in that baseline fails the test (and removing a
+     helper requires dropping it from the baseline). No public SQL-taking
+     function is allowed in `ua-store` outside `schema.rs`.
+   - **Caller counting:** every call site to a frozen helper counts as a SQL
+     call in its caller's own per-file baseline (for example `merged.rs:185`
+     calling `task_rows`, and each `org_row(...)` call in `platform.rs`), so
+     adding a caller through an existing wrapper raises that file's count
+     immediately.
 3. **Ratcheted `procedure_def` count outside `ua-store`.** Counts every
-   `Procedure {` literal outside `ua-store` (excluding `tenant_part(` calls)
-   against a per-file allowlist/baseline so new procedures cannot appear
-   outside `ua-store` unreviewed.
+   `Procedure {` literal outside `ua-store` against a per-file
+   allowlist/baseline, and forbids local `Procedure`-returning constructor
+   functions (`fn` / `const fn` returning `Procedure`) outside `ua-store` so
+   multiple procedures cannot hide behind one local constructor (calls to
+   `ua_store::org::tenant_part(` remain allowed).
 
 ### Granularity and drift rule
 
@@ -380,11 +400,13 @@ a genuine non-SQL receiver ever enters the workspace) and enforces three checks:
     `query_row_and_then`, `query_one`, `Batch::new`, path-style
     `Connection::execute(&c, ...)`, and calls inside an inferred-type closure
     that never mentions `rusqlite`/`Connection`/`WriteTx`,
-  - detection of a new SQL-taking helper function or `Connection` trait method
-    (both inside `ua-store` and outside `ua-store`) and counting of calls
-    through a frozen helper wrapper,
-  - detection of a new `Procedure {` outside `ua-store` (while not counting
-    `tenant_part(`), and
+  - behaviour-based detection of SQL-taking helpers across all shapes — direct
+    `sql` wrapper, `stmt` into `execute_batch`, `filter` and `table` fragments
+    interpolated via `format!`, a SQL-taking closure, a `Connection` trait
+    method, and a `pub fn` in `ua-store` — plus counting of calls through a
+    frozen helper wrapper,
+  - detection of a new `Procedure {` literal and a local `const fn -> Procedure`
+    constructor outside `ua-store` (while allowing `tenant_part(` calls), and
   - non-counting of comments, inline `#[cfg(test)]` items, and out-of-line
     `#[cfg(test)] mod ...;` / `#[cfg(test)] #[path = "..."] mod ...;` files.
 
@@ -424,7 +446,7 @@ such as `Claim`, `Sight`, `Settle`, and `Stale` downward into `ua-store`.)
 | File | Current SQL sites | Plan in pilot PR (c) | Baseline change |
 |---|---:|---|---:|
 | `crates/ua-tools/src/families/tasks/comments.rs` | 8 (`:143`, `:152`, `:156`, `:257`, `:270`, `:281`, `:287`, `:292`) | Move all 8 queries behind `ua_store::task_comments::{TaskCommentsRead, TaskCommentsWrite, SqliteTaskComments}` and drop `rusqlite` from `comments.rs` | `8 → 0` (`-8`) |
-| `crates/ua-tools/src/families/platform.rs` | 1 `org_row` call at `:744` (`org_row` itself at `:613` serves 5 other kinds) | Route `"comment"` at `:744` through `SqliteTaskComments::new(c).get_task_comment(&caller.org_id, comment_id)` | `-1` (removes the counted `org_row` call at `:744`; `:613` stays until the other 5 kinds migrate) |
+| `crates/ua-tools/src/families/platform.rs` | 1 `org_row` call at `:744` (`org_row` itself at `:613` serves 6 other kinds) | Route `"comment"` at `:744` through `SqliteTaskComments::new(c).get_task_comment(&caller.org_id, comment_id)` | `-1` (removes the counted `org_row` call at `:744`; `:613` stays until the other 6 kinds migrate) |
 | `crates/ua-tools/src/families/continuity/queue.rs` | 1 cross-table join at `:371-375` (`tasks t LEFT JOIN task_comment_threads c`) | **Keep in place** in pilot PR (c): this is a `tasks` / continuity staleness read (`active_rows`) that joins `tasks` with `task_comment_threads.updated_at`. Keeping it avoids N+1 queries and respects the scope fence (no `tasks` rewrite in the pilot). When `tasks` moves to `ua-store`, `active_rows` either stays a single join inside `ua-store` or uses a batched `task_comment_thread_updated_at` read. | `0` |
 
 Total ratchet baseline drop in step (c): **`-9`** (`-8` in `comments.rs`
