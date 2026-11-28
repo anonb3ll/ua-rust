@@ -294,14 +294,20 @@ workspace crate outside `ua-store`.
 
 - **Scope:** walks `crates/*/src/**/*.rs` for every workspace crate **except
   `ua-store`**.
+- **Parser:** every file is parsed with `syn` 2 (a `ua-store`
+  dev-dependency, features `full` and `visit`), so comments, strings,
+  generics, and a top-level `<` inside call arguments never confuse the count.
+  Macro invocation bodies (`format!`, `vec!`, `json!`, `tokio::select!`, ...)
+  are parsed as expressions and scanned too. The workspace is scanned once per
+  test binary and shared by the three workspace checks.
 - **Test exclusion (inline and out-of-line):**
-  - Inline `#[cfg(test)]` items are stripped with `without_tests` after masking
-    comments, strings, and character literals (reusing the lexer approach in
-    `crates/ua-core/tests/support/mod.rs`). Files whose entire test body is an
-    inner `#[cfg(test)]` module (such as
+  - Inline `#[cfg(test)]` (and `#[cfg(all(test, ...))]`) items, statements,
+    and expressions are skipped. An inner `#![cfg(test)]` excludes its inline
+    module, or the whole file when it is the file's first attribute. Files
+    whose entire test body is an inner `#[cfg(test)]` module (such as
     `crates/ua-tools/src/families/github/org_automation_tests.rs`, declared as
-    plain `mod org_automation_tests;` at `github/mod.rs:45`) are already cleared
-    by `without_tests`.
+    plain `mod org_automation_tests;` at `github/mod.rs:45`) therefore count
+    nothing.
   - Out-of-line test modules declared as `#[cfg(test)] mod <name>;` — including
     `#[cfg(test)] #[path = "..."] mod <name>;` — (for example
     `crates/ua-ingress/src/inbound/tests.rs` from `inbound.rs:469` and
@@ -339,7 +345,13 @@ a genuine non-SQL receiver ever enters the workspace) and enforces three checks:
    `Batch::new` — in both method-call form (`.execute(...)`) and path-style
    UFCS form (`Connection::execute(&c, ...)`, `Transaction::execute(...)`),
    whether passed a literal, `format!`, `let`, `const`, a helper parameter, or
-   `include_str!`.
+   `include_str!`. Any `Type::sql_method` path used as a value is a fn
+   pointer to one of these methods and counts too: each call through a local
+   alias (`let f = Connection::execute; f(c, ..)`) counts once, and an
+   uncalled alias or a bare reference (`apply(WriteTx::prepare)`) counts once.
+   A called path whose arity does not match a SQL method
+   (`engine::execute(a, b, c, d)`, prepared `Statement::execute(&mut s, p)`)
+   is not counted.
 2. **No new SQL-taking helpers anywhere in the workspace (defined by
    behaviour), and calls to frozen helpers count as SQL calls.** A wrapper
    function, trait method, or closure that forwards SQL text or SQL fragments
@@ -350,23 +362,58 @@ a genuine non-SQL receiver ever enters the workspace) and enforces three checks:
    therefore defines a SQL-taking helper **by behaviour**:
    - **Behaviour rule:** any function, trait method, or closure outside
      `ua-store` (and any `pub fn` or public trait method inside `ua-store`
-     outside `schema.rs`) whose string-typed parameter reaches the first
-     argument of a counted SQL method — either directly or through a `format!`
-     expression. Representative shapes in today's tree (illustrations only,
-     not a hand-maintained list) include:
+     outside `schema.rs`) whose parameter, of **any type**, reaches the SQL
+     argument of a counted SQL method, or of a local helper's SQL-taking
+     parameter: directly, through `let`/assignment/`push_str`/`write!`,
+     through `format!`, through a field (`q.0` of a newtype, `filter.sql`,
+     `map.source`), or through `impl Display` / generic `T: AsRef<str>`
+     formatting. Struct-literal laundering is followed: `let w = Wrap { sql: q }`
+     taints `w.sql`, and a whole use of `w` (`w.render()`, `format!("{w}")`) is
+     tainted. Two kinds of parameter are not traced because they cannot carry
+     caller-chosen SQL text: database and runtime handles (`Connection`,
+     `Transaction`, `WriteTx`, `Savepoint`, `Db`, `Hub`, `ToolCtx`, `AppState`,
+     `Registry`), and `bool` and numeric primitives (a clamped `LIMIT {n}`).
+     The rule follows data, not control flow. A parameter that only selects
+     between SQL literals, or is only bound as a parameter value, does not
+     make a helper. Struct fields and tuple slots are tracked separately, so
+     `for (col, v) in fields` that puts `col` in the text and binds `v` is a
+     helper for its column slot only. A caller that passes a parameter only as
+     a bound value (`fields.push(("name", v))`) is not one. SQL calls, helper
+     calls, and returns are checked where they occur, so a call inside a
+     `for` loop or an `if let` sees the bindings in scope at that point.
+     Representative shapes in today's tree (illustrations only, not a
+     hand-maintained list) include:
      - direct SQL wrappers (`platform.rs:613` `org_row`,
        `continuity/queue.rs:352` `task_rows`),
      - `stmt` parameters passed into `execute_batch` (`idempotency.rs:132`
        `run`, `skill_registry.rs:321` `step`),
      - `filter`/`table` fragments interpolated into SQL
-       (`dispatch/mod.rs:228` `runs_where`, `export.rs:636` `for_each_row`), and
+       (`dispatch/mod.rs:228` `runs_where`, `export.rs:636` `for_each_row`),
+     - struct parameters whose fields are SQL text or identifiers
+       (`ua-memory` `note.rs` `fetch_many` with `filter.sql`, `ua-import`
+       `copy_table` with `map.source`/`plan.cols`, `dispatch/mod.rs`
+       `transition` with the column names in `edge.sets`), and
      - SQL-taking closures (`agents.rs:918` `count_by`).
+   - **`macro_rules!` wrappers:** any `macro_rules!` whose body makes a
+     counted SQL call (found by parsing each arm with `syn` after substituting
+     its `$metavariables`) is a SQL-taking helper. The definition counts
+     nothing, and every invocation counts once in the invoking file. A
+     crate-local macro is in scope for its whole crate. In `ua-store`, a
+     `#[macro_export]` macro is a public SQL helper (see below) and its
+     invocations anywhere outside `ua-store` count. A macro whose body builds a
+     `Procedure { .. }` literal is a forbidden local constructor (check 3).
    - **Scanner-generated frozen inventory:** step (b)'s scanner **generates**
      the complete inventory of existing SQL-taking helpers outside `ua-store`
      keyed by `(crate, relative_path, name)` and commits it as the frozen
      baseline. Any helper not in that baseline fails the test (and removing a
      helper requires dropping it from the baseline). No public SQL-taking
-     function is allowed in `ua-store` outside `schema.rs`.
+     function, public trait method, or `#[macro_export]` macro is allowed in
+     `ua-store` outside `schema.rs`, with one frozen exception
+     (`FROZEN_UA_STORE_PUB_SQL_FNS`): `ua_store::ledger::query_filtered`, whose
+     `predicate: &'static str` is a code-defined WHERE expression (its one
+     caller outside `ua-store` is `ua-tools` `events.rs`, passing the
+     `VISIBLE_EVENT` constant). Each call to it outside `ua-store` counts as a
+     SQL call, and no second such function may be added.
    - **Caller counting:** every call site to a frozen helper counts as a SQL
      call in its caller's own per-file baseline (for example `merged.rs:185`
      calling `task_rows`, and each `org_row(...)` call in `platform.rs`), so
@@ -405,10 +452,31 @@ a genuine non-SQL receiver ever enters the workspace) and enforces three checks:
     interpolated via `format!`, a SQL-taking closure, a `Connection` trait
     method, and a `pub fn` in `ua-store` — plus counting of calls through a
     frozen helper wrapper,
-  - detection of a new `Procedure {` literal and a local `const fn -> Procedure`
-    constructor outside `ua-store` (while allowing `tenant_part(` calls), and
-  - non-counting of comments, inline `#[cfg(test)]` items, and out-of-line
-    `#[cfg(test)] mod ...;` / `#[cfg(test)] #[path = "..."] mod ...;` files.
+  - detection of a new `Procedure {` literal, a local `const fn -> Procedure`
+    constructor, and a `Procedure`-building `macro_rules!` outside `ua-store`
+    (while allowing `tenant_part(` calls),
+  - non-counting of comments, inline `#[cfg(test)]` items, inner
+    `#![cfg(test)]` files and inline modules, and out-of-line
+    `#[cfg(test)] mod ...;` / `#[cfg(test)] #[path = "..."] mod ...;` files,
+  - `macro_rules!` wrappers inside and outside `ua-store` (every invocation
+    counts, including a fixed-SQL body and callers of a `#[macro_export]`ed
+    `ua-store` macro),
+  - any-type parameters: newtype, `impl Display`, generic, struct field,
+    struct-literal laundering (field and whole use), SQL text in a later
+    tuple slot, and a SQL call inside a loop over a tuple parameter, with
+    bound-only, numeric, and bound-slot callers as controls,
+  - fn pointers to any `Type::sql_method` path (alias, uncalled alias, bare
+    reference) and to a helper, but not a called path with a non-SQL arity,
+    and
+  - a top-level `<` inside call arguments.
+
+  Each of the #2833 gap tests fails when its fix is reverted (mutation
+  checked when the scanner moved to `syn`).
+- **Reviewing a count.** `cargo test -p ua-store --test sql_guard
+  print_generated_baselines -- --ignored --nocapture` regenerates every
+  baseline, and with `SQL_GUARD_SITES=1` it also lists each counted site as
+  `crate/path:line` with what was counted (direct call, helper call, fn
+  pointer).
 
 ### Relationship to the `rusqlite` authorizer hook (`docs/memory.md`)
 
