@@ -417,12 +417,11 @@ options (none measured or recommended here):
 ##### Slice 2b: exact guard and lexical tie-break (`b9eaa29`, `--features embeddings`)
 
 The decision on 2026-11-28 was tuning first, levers **B then A**, measured on
-both corpora. This section records the fixture half; the LongMemEval-S
-120-question stratified set (`longmemeval-strat120-seed2145.txt`, the same set
-the table above measures) follows once it completes. The 470-question set is
-not used here: on this 4-core desktop a hybrid pass costs roughly three minutes
+both corpora. This section records both halves. The 470-question set is not
+used here: on this 4-core desktop a hybrid pass costs roughly three minutes
 per question, so a full 470 run would take about 22 hours and the 120-question
-set already carries the comparison baselines.
+stratified set (`longmemeval-strat120-seed2145.txt`, the same set the table
+above measures) already carries the comparison baselines.
 
 **Changes.** In `crates/ua-memory/src/search.rs`:
 
@@ -459,9 +458,21 @@ covers it.
 
 **Risk stated.** The guard drops semantic-only candidates only when the query
 is one token and FTS5 found the token. A single-word paraphrase whose token
-does not occur in the target note still falls through to the semantic leg; the
-LongMemEval-S 120-question hybrid run checks that the guard does not cost
-paraphrase recall at scale.
+does not occur in the target note still falls through to the semantic leg.
+
+**LongMemEval-S result** (120-question stratified sample, seed `2145`, hybrid
+chunked, pinned `BAAI/bge-small-en-v1.5`): strict recall@5 `0.9000` (108/120),
+MRR@10 `0.9111`, `recall_any@5` `0.9750`, `as_of` accuracy `0.5000` (10/20),
+search p95 `67.0 ms`. That reproduces the pre-guard hybrid chunked baseline in
+the table above exactly (`0.9000` / `0.9111`), so the guard costs nothing on
+this set.
+
+**Limit of that evidence.** LongMemEval-S contains no single-token question
+(`0` of `500`), so the guard's firing path cannot execute there. The run shows
+the guard does not disturb paraphrase ranking at scale; it does not exercise
+the guard. The fixture `exact-term` class is the only measurement that fires
+it, and the unit test in `crates/ua-memory/tests/order.rs` pins the behaviour
+without the model.
 
 ##### Reproducing the `--features embeddings` run
 
