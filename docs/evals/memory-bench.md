@@ -414,6 +414,51 @@ options (none measured or recommended here):
 | **C. Recalibrate `SEMANTIC_MIN_SIMILARITY` or query-relative gating** | Lower the fixed `0.65` floor (e.g. `0.55–0.60`) or combine a lower floor with a margin/top-k cap when lexical hits are absent. | `para-gap` (`0.5965` vs `0.5239` runner-up) and `long-tail` tail chunk (`0.6469` vs `0.5954` `long-noise`) both rank #1 semantically yet are dropped by `0.65`. | Lowering `0.65` alone admits more `exact-noise` / `temporal-old` false positives unless paired with A/B. |
 | **D. BGE query instruction prefix** | Prepend BGE's asymmetric query prefix (`"Represent this sentence for searching relevant passages: "`) for `BAAI/bge-*` queries in `search.rs`. | `BAAI/bge-small-en-v1.5` was trained asymmetrically with a query prefix; raw-query cosines compressed `para-gap` (`0.5965`) and `long-tail` (`0.6469`) under `0.65`. | Model-family-specific; requires re-measuring cosine separation across both fixture and LongMemEval-S before changing floors. |
 
+##### Slice 2b: exact guard and lexical tie-break (`b9eaa29`, `--features embeddings`)
+
+The decision on 2026-11-28 was tuning first, levers **B then A**, measured on
+both corpora. This section records the fixture half; the LongMemEval-S
+470-question run follows once it completes.
+
+**Changes.** In `crates/ua-memory/src/search.rs`:
+
+- **B — exact guard.** For a one-token query whose FTS5 phrase match finds the
+  token, candidates the lexical leg did not return are dropped. A single-token
+  query is an exact lookup; a semantic near neighbour that shares the term but
+  not the phrase must not displace the exact note. Queries with no lexical
+  match keep the semantic leg as their only source, so paraphrase recall is
+  unaffected. The retrieval block reports `exact_guard`.
+- **A — lexical tie-break.** On an exact fused-score tie, order by lexical leg
+  rank before the note title. `exact-title` (`signing key`) had tied
+  `exact-key` (lex #1, sem #2) with `exact-near` (lex #2, sem #1) and lost to
+  the alphabetical sort.
+
+**Fixture result** (release build, `--features embeddings`, pinned
+`BAAI/bge-small-en-v1.5`):
+
+| Class | n | Lexical R@5 / MRR | Hybrid before R@5 / MRR | Hybrid after R@5 / MRR | Floor R@5 / MRR |
+|---|---:|---:|---:|---:|---:|
+| exact-term | 2 | 1.0000 / 1.0000 | 0.0000 / 0.7500 (FAIL) | **1.0000 / 1.0000** | 1.0000 / 1.0000 |
+| paraphrase | 2 | 0.5000 / 0.5000 | 0.5000 / 0.5000 | 0.5000 / 0.5000 | 0.5000 / 0.5000 |
+| temporal | 3 | 0.6667 / 0.6667 | 0.6667 / 0.6667 | 0.6667 / 0.6667 | 0.6667 / 0.6667 |
+| contradiction | 2 | 1.0000 / 1.0000 | 1.0000 / 1.0000 | 1.0000 / 1.0000 | 1.0000 / 1.0000 |
+| long-document | 1 | 1.0000 / 1.0000 | 1.0000 / 1.0000 | 1.0000 / 1.0000 | 1.0000 / 1.0000 |
+| **overall** | **10** | **0.8000 / 0.8000** | **0.6000 / 0.7500** | **0.8000 / 0.8000** | — |
+| `stale_share` | — | 0.0000 (0/12) | 0.0000 (0/13) | 0.0000 (0/13) | — |
+| `must_not_share` | — | 0.0000 | 0.0769 (1/13) | **0.0000** | — |
+
+Hybrid now matches lexical on every class and clears the floor in both modes.
+The regression test in `crates/ua-memory/tests/order.rs`
+(`exact_guard_drops_semantic_only_neighbours_for_a_single_token`) pins the
+guard's behaviour without needing the ONNX model, so the embeddings CI job
+covers it.
+
+**Risk stated.** The guard drops semantic-only candidates only when the query
+is one token and FTS5 found the token. A single-word paraphrase whose token
+does not occur in the target note still falls through to the semantic leg; the
+LongMemEval-S 470 run checks that the guard does not cost paraphrase recall at
+scale.
+
 ##### Reproducing the `--features embeddings` run
 
 `--embed` is opt-in and off by default so `cargo test -p ua-memory` and CI
