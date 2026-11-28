@@ -31,7 +31,7 @@ use ua_store::evidence_bundle::{
     BUNDLE_FORMAT, BundleCheckpointFile, BundleManifest, BundleVerifyTrust, ExportBundleOptions,
     MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_TOTAL_BYTES, PinnedHubHead, PinnedOrgHead,
     compute_org_window_checkpoint, export_bundle, load_verified_hub_cross_check, sha256_hex,
-    verify_bundle_dir,
+    snapshot_checkpoint, verify_bundle_dir,
 };
 use ua_tools::Hub;
 
@@ -323,7 +323,13 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
                 .read(|c| latest_signed_checkpoint(c, checkpoint.class, checkpoint.org_id.as_deref()))?
                 .as_ref()
                 .map(PreviousCheckpointHead::from_checkpoint);
-            let digest = hub.db().write(|tx| checkpoint_write(tx, &checkpoint, &now))?;
+            // The export snapshot (withheld counts, org ordinals) is frozen in
+            // the same transaction, so later deletes never change a re-export.
+            let digest = hub.db().write(|tx| {
+                let digest = checkpoint_write(tx, &checkpoint, &now)?;
+                snapshot_checkpoint(tx, &checkpoint.checkpoint_id, &now)?;
+                Ok(digest)
+            })?;
             let file_payload = CheckpointFile {
                 format: CHECKPOINT_FORMAT.to_string(),
                 checkpoint: checkpoint.clone(),
@@ -361,6 +367,9 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
                 host: std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into()),
                 tool_version: env!("CARGO_PKG_VERSION").to_string(),
             };
+            // A checkpoint written before export snapshots existed freezes its
+            // snapshot on first export.
+            hub.db().write(|tx| snapshot_checkpoint(tx, &opts.checkpoint_id, &opts.exported_at))?;
             let result = hub.db().read(|c| export_bundle(c, &out, &opts))?;
             let summary = json!({
                 "format": result.manifest.format,
@@ -655,6 +664,25 @@ pub fn run_sign_bundle(key_file: &Path, bundle_dir: &Path, out: Option<&Path>) -
     let cp_file: BundleCheckpointFile = serde_json::from_slice(&cp_bytes).with_context(|| {
         format!("parsing bundle checkpoint {}", bundle_dir.join("ledger/checkpoint.json").display())
     })?;
+
+    // Run every verifier check except authorship before signing: the operator
+    // never attests a bundle the offline verifier would refuse. Without trust
+    // input the verifier stops at authorship (`unanchored`, `unsigned_bundle`
+    // or `unsigned_checkpoint`), having run every other check first.
+    let verdict = verify_bundle_dir(bundle_dir, &BundleVerifyTrust::default())
+        .map_err(|e| anyhow::anyhow!("verifying bundle before signing: {e}"))?;
+    let authorship_only = verdict.exit_code == 2
+        && matches!(
+            verdict.reason.as_deref(),
+            Some("unanchored" | "unsigned_bundle" | "unsigned_checkpoint")
+        );
+    if !verdict.ok && !authorship_only {
+        anyhow::bail!(
+            "refusing to sign bundle: the offline verifier refuses it ({}: {})",
+            verdict.reason.as_deref().unwrap_or("unknown"),
+            verdict.detail.as_deref().unwrap_or("")
+        );
+    }
 
     let (sig, public_key) = sign_digest(key_file, &recomputed)?;
 

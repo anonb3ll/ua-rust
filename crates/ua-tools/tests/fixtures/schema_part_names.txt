@@ -153,3 +153,4 @@ tasks.v3.depends_on_graph
 goals.v3.serves_goal_graph
 memory.chunks.v1
 organization.v1.memory_chunks
+evidence_bundle_snapshot.v1

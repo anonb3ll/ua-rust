@@ -117,13 +117,43 @@ or `--prev-checkpoint` is supplied; an incremental `org` bundle starting after
 genesis without `--prev-checkpoint` cannot refold `org_chain_hash` at all and
 exits `2` (`missing_pinned_checkpoint`).
 
-To avoid leaking cross-organization volume through hub-wide autoincrement gaps,
-`org`-class bundles map entity IDs in `approvals/`, `artifacts/index.json`, and
-`evidence/rows.jsonl` to dense cumulative per-organization ordinals (`1, 2, …`),
-omit hub-global `config_revisions.id`/`approval_id`/`event_ulid` from
-`policy/revisions.json`, and include only the policy revisions actually cited by
-the bundle. (Existing unredacted ledger event payloads keep the raw JSON text
-recorded at write time so `entry_hash` remains verifiable.)
+`org`-class bundles map the entity ids the exporter writes in `approvals/`,
+`artifacts/index.json` and `evidence/rows.jsonl` to dense per-organization
+ordinals (`1, 2, …`, the id's position among the organization's rows in the
+checkpoint's export snapshot, see Determinism), omit hub-global
+`config_revisions.id`/`approval_id`/`event_ulid` from `policy/revisions.json`,
+and include only the policy revisions the bundle cites, with each revision's
+digest but without its document (policy documents name identities across the
+hub).
+
+What an `org` bundle still exposes, because the ledger rows must hash:
+
+- **Hub-wide ids in ledger payloads.** Each unredacted row in
+  `ledger/events.jsonl` keeps the payload text recorded at write time, so its
+  `task_id`, `approval_id`, `deliverable_id` and similar fields are the
+  hub-wide autoincrement ids. The dense ordinals cover only the files the
+  exporter writes; they do not hide hub-wide volume from a reader of the
+  ledger rows.
+- **Foreign row hashes and adjacency.** Every row's `prev_hash` is the
+  `entry_hash` of the previous *global* row, which is often another
+  organization's. A reader learns those foreign hashes and whether any foreign
+  rows sit between two consecutive rows of this organization.
+- **Other organizations' ORG-EVENT-DEFAULT rows (default organization only).**
+  Until `org_guard` admits another organization's ledger, the hub writes most
+  events of every organization (tasks, memory, graph, tokens, deliverables,
+  approvals) to the default organization's ledger, stripped of labels and free
+  text at write time. A default-organization `org` bundle therefore carries
+  those rows: their ids, counts and timing, and for graph rows the other
+  organization's `org_id` in clear. Only `agent.approval.*` rows that belong to
+  another organization are stubbed (`cross_org_events`); the rest are
+  documented here, not hidden.
+- **No approvals for a non-default organization.** The same rule puts every
+  non-default organization's approval events in the default ledger, so its
+  `org` bundle carries none of its own approvals. A released artifact reports
+  `release_status: "not_provable_in_org_bundle"` (never "unreleased"), the
+  approvals resolved in the window are counted in `withheld.json` as
+  `approvals_in_default_ledger`, and the verdict's `approvals` claim says
+  approvals are not covered. The hub bundle carries those receipts.
 
 ## Bundle layout
 
@@ -137,7 +167,7 @@ bundle/
   approvals/<id>.json      # one receipt per approval in range
   evidence/rows.jsonl      # evidence records and their labels
   policy/revisions.json    # the policy revisions the receipts cite
-  artifacts/index.json     # artifact id, revision, sha256, size, media type
+  artifacts/index.json     # artifact id, revision, sha256, size, media type, release_status
   withheld.json            # classes deliberately left out, with counts
 ```
 
@@ -171,10 +201,12 @@ The bundle therefore separates **private/restricted ledger records** from
 - **Restricted channels and private records** (`agent.message.*`,
   `agent.mailbox.*`, `agent.lifecycle.handoff`, `agent.lifecycle.handoff_hook`,
   `agent.conversation.handoff`, `private.*`, `*.private.*`, explicit private
-  markers, and — in `org`-class exports — cross-organization `ORG-EVENT-DEFAULT`
-  approval rows) are exported in `ledger/events.jsonl` as **hash-only stubs**:
-  `redacted: true`, `redacted_class` set to the withheld class
-  (`private_message_bodies`, `private_records`, or `cross_org_events`),
+  markers, payloads the scanner cannot walk completely, and — in
+  default-organization `org` exports only — other organizations'
+  `ORG-EVENT-DEFAULT` approval rows) are exported in `ledger/events.jsonl` as
+  **hash-only stubs**: `redacted: true`, `redacted_class` set to the withheld
+  class (`private_message_bodies`, `private_records`, `unparseable_payload`, or
+  `cross_org_events`),
   `channel: "[redacted]"`, `payload: ""`, and `originator`, `episode_id`,
   `causal_parent_id`, and `dedupe_key` set to `null`. Only the chain-linking
   fields (`seq` or `org_seq`, `ulid`, `created_at`, `prev_hash`, `entry_hash`,
@@ -190,13 +222,64 @@ The bundle therefore separates **private/restricted ledger records** from
   payload-hash-verified under hash_v; K redacted hash-only row(s) chain-linked
   only"*). An unredacted row on any restricted channel is refused outright
   (`exit 1`, `forbidden_private_content`).
-- **Secret and credential leaks** (secret/token/password/authorization/API-key/
-  private-key fields regardless of casing or separators, string or non-string
-  values, JSON nested inside strings, `uas_…`, `ghp_…`/`github_pat_…`/provider
-  token prefixes, `Bearer …`, JWTs, and PEM private-key blocks) on non-private
-  records are **never** silently stubbed: export refuses outright without
-  writing bundle files, and the verifier refuses (`exit 1`) any bundle carrying
-  them.
+- **A stub is the exporter's assertion.** The current hash form commits to the
+  payload and the channel together, so a stub cannot show the verifier which
+  channel it hid or that the row was private; an exporter could stub any row.
+  The verifier therefore bounds what a stub may claim and says what it cannot
+  check:
+  - every stub must be counted in `withheld.json` under its class (a class
+    count below its stub count refuses, `withheld_count_mismatch`);
+  - `cross_org_events` stubs appear only in a default-organization `org`
+    bundle (`invalid_redacted_event` elsewhere);
+  - with `--hub-bundle`, a stub whose row the verified hub bundle carries
+    unredacted on a non-restricted channel is refused
+    (`unjustified_redaction`), except a `cross_org_events` stub of an
+    `agent.approval.*` row;
+  - whenever `redacted_events > 0`, the verdict's `warnings`, `completeness`,
+    `approvals` and `separation_of_duties` say that receipts, cross-links and
+    separation of duties cover unredacted rows only. A stubbed approval row and
+    its dropped receipt are not detectable from the bundle alone.
+  A later hash form that commits to `H(payload)` separately would let a stub
+  keep its channel in clear and close this gap.
+- **Secret and credential leaks** on non-private records are **never**
+  silently stubbed: export refuses outright without writing bundle files, and
+  the verifier refuses (`exit 1`) any bundle carrying them. The scanner covers:
+  - keys, matched on a skeleton (NFKC, zero-width and combining characters
+    dropped, common Cyrillic/Greek/Latin look-alikes folded to ASCII, split on
+    separators and camelCase): any key containing `token`, `secret`,
+    `password`, `passwd`, `passphrase`, `passkey`, `authorization`,
+    `credential`, `apikey`, `privatekey`, `signingseed`, `cookie`, `mnemonic`,
+    `sessionkey` or `bearer`, and the words `pwd`, `pw`, `pass`, `auth`, `seed`
+    at the end of a key or before `key`/`value`/`secret`/`word`/`phrase`/
+    `code`/`header`/... (`session` only before such a word);
+  - values under those keys: `null`, placeholders (`""`, `[redacted]`), empty
+    containers and booleans are metadata; integers and integer arrays are
+    metadata only under an id- or count-shaped key (`token_id: 7`,
+    `token_ids: [7, 8]`, `revoked_tokens: 4`, `input_tokens: 1200`); an
+    opaque string is metadata only under a weak id-shaped key
+    (`session_id: "…"`); anything else (a string under `credential_id`, a
+    number under `password`) is material;
+  - private markers: any key whose skeleton contains `private` (not
+    `private_key`) with a truthy value (`true`, `"true"`, `" TRUE "`, `1`),
+    `visibility`/`sensitivity`/`classification`/`privacy` equal to
+    `private` after trimming and case-folding, and `labels`/`tags` holding
+    `private`;
+  - value patterns, in each string and in its percent-decoded form: `uas_…`,
+    PEM private keys, `Bearer` and `Basic` credentials after any whitespace,
+    `+` or percent-encoded whitespace, URL userinfo
+    (`scheme://user:password@host`), Slack webhooks, GitHub/GitLab/Slack/npm/
+    PyPI/Hugging Face/`ya29.`/Anthropic/OpenAI/Stripe/`AIza` tokens, AWS
+    access keys and secret keys, and JWTs;
+  - JSON nested in strings at any depth (past 16 levels the scan fails closed),
+    and `"key": value` pairs embedded anywhere in free text (JSON that starts
+    mid-string, escaped JSON).
+
+  The scanner fails closed and runs in linear time. A ledger payload that is
+  not strict JSON (`NaN`/`Infinity`, trailing text, duplicate keys, nesting
+  past 128 levels) or that holds a string longer than 1 MiB is exported only as
+  an `unparseable_payload` stub, and the verifier refuses any unredacted
+  payload it cannot walk completely. Every bundle file is parsed strictly the
+  same way.
 
 ## What is hashed, and under which version
 
@@ -238,6 +321,7 @@ without replaying the whole hub.
 | `policy_revision`, `policy_digest` | The policy in force when it was decided |
 | `requester` | Identity label, kind (`human`/`agent`/`service`) |
 | `resolver` | Identity label, kind, and transport (`ui`, `http`, `mcp`, `cli`, `slack`) |
+| `resolver_is_requester` | Whether the resolver is the requester (recomputed from clear labels; the exporter's word for placeholder labels) |
 | `decision`, `reason` | `approved` or `denied`, with the recorded reason |
 | `decided_at`, `expires_at` | Decision time and any one-time window |
 | `ledger` | `{seq, hash}` (class `hub`) or `{org_seq, hash}` (class `org`) of the event that recorded the decision |
@@ -250,13 +334,30 @@ the signer's attestation of the bundle, not a separate per-receipt key.
 
 Binding rules the verifier enforces:
 
-- The `action_digest` must match the payload in the event. A changed payload
-  needs a new approval; a receipt for a different payload is a refusal, not a
-  warning.
+- The receipt is bound to the hash-verified `agent.approval.resolved` event it
+  points at. `action_digest`, `tool`, the normalized `decision`,
+  `resolver.transport` and `expires_at` must equal the event's;
+  `resolver.label` must equal the event's `resolved_by`; `decided_at` must not
+  be after the event's `created_at`. Where the bundle also holds the
+  `agent.approval.requested` event, `requester.label` must equal its
+  `requested_by`. A changed payload needs a new approval; a receipt for a
+  different payload is a refusal, not a warning.
+- The verifier picks the policy revision in force itself: the latest
+  `kind = "policy"` revision whose `created_at` is at or before `decided_at`.
+  A receipt citing another revision, or none when one exists, is refused. A
+  cited revision's `document_sha256` must equal the one its
+  `agent.config.revision` event records when that event is in the bundle.
 - A one-time approval names the revisions it covers. A release at a different
   revision is refused even if the approval is still live.
-- `resolver` must be a verified human and must differ from `requester` where
-  separation of duties applies. A receipt that cannot show this fails.
+- `resolver` must be a verified human, and an approved receipt whose resolver
+  is its requester is refused whatever the policy says: that is the hub's own
+  invariant (`approval_resolve` refuses self-approval). A policy rule that
+  names the tool is reported as an extra, never required.
+- In a `hub` bundle another organization's requester and resolver labels are
+  the fixed placeholder `[redacted-label]` (the ledger records `null` for
+  them) with `resolver_is_requester` carrying the separation-of-duties fact,
+  and that organization's free-text `reason` is omitted. Those resolvers are
+  reported as hub-asserted.
 
 ## What `ua evidence verify` checks
 
@@ -264,10 +365,15 @@ Exit codes: `0` verified, `1` refused (with a machine-readable reason and the
 offending sequence or field), `2` cannot verify (missing input, unknown key,
 unsupported version). A refusal is never downgraded to a warning.
 
-1. **Format and filesystem safety.** Version known; every file in the manifest
-   present; no extra files counted as evidence; symlinks anywhere in the bundle
-   directory and non-regular files are refused (`exit 1`); per-file and total
-   read sizes are capped before loading into memory.
+1. **Format and filesystem safety.** Version known; `manifest.files` lists
+   exactly the required files plus `approvals/<id>.json` with a positive
+   canonical decimal id (`approvals/010.json`, `approvals/+10.json` and any
+   other path refuse, `unexpected_bundle_file`); every listed file is present
+   and parses strictly to its schema; unlisted files on disk are reported and
+   never counted as evidence; symlinks anywhere in the bundle directory and
+   non-regular files are refused (`exit 1`); per-file and total read sizes are
+   capped before loading into memory. `manifest.window` must equal the first
+   and last event times (`hub`) or the checkpoint's window (`org`).
 2. **Manifest digest and per-file digests.**
 3. **Checkpoint signature** against the pinned anchor. An unknown key id is `2`,
    never a pass; a key read from the same database is reported as
@@ -289,26 +395,37 @@ unsupported version). A refusal is never downgraded to a warning.
    reporting completeness as `unverified`, never as a pass; an incremental `org`
    bundle without a pinned checkpoint exits `2`.
 6. **Downgrade refusal** — a `hash_v = 1` row after the first `hash_v = 2` row.
-7. **Receipts** — digest matches the manifest, `action_digest` matches the event
-   payload, resolver is a verified human, separation of duties holds, `covers`
-   matches the artifact index. Policy revisions are matched on `(kind, revision)`
-   (`kind = "policy"`), each revision's `document` is re-hashed against
-   `document_sha256`, and separation of duties is derived independently by the
-   verifier from that hashed policy document rather than trusted from an
-   exporter-stamped list. Where the policy document has no separation-of-duties
-   clause for the tool, the claim is reported as `not-applicable`, never as a
-   pass. In `hub` bundles, non-default organization approval receipts keep
-   `ledger_label` redaction (pseudonymized requester/resolver labels preserving
-   distinctness, and omitted free-text reason).
+7. **Receipts** — digest matches the manifest, every field the resolved event
+   records matches it (The approval receipt), resolver is a verified human,
+   resolver differs from requester, the policy cited is the one in force,
+   `covers` matches the artifact index. Policy revisions are matched on
+   `(kind, revision)` (`kind = "policy"`); in `hub` bundles each revision's
+   `document` is re-hashed against `document_sha256` and its `sod_tools` derived
+   from it, and a `sod_tools` list without its document is refused. The
+   `separation_of_duties` claim is `verified` only when every approved
+   receipt's resolver and requester labels and the policy in force are bound to
+   hash-verified events in the bundle; otherwise it is `hub-asserted`, with the
+   basis naming what is not bound. The `approvals` claim reports the receipts
+   bound to their events, `hub-asserted` resolvers, or, for a non-default
+   organization's `org` bundle, that approvals are not covered.
 8. **Cross-links** — every unredacted approval event has a receipt and every
    receipt has an event; `ledger.seq`/`ledger.org_seq` and `ledger.hash` in the
    receipt resolve.
-9. **Trace** — for each released artifact: artifact → task → run/attempt →
-   policy revision (`kind = "policy"`) → approval → `receipt.covers`. A missing
-   link on a released artifact is a refusal, not a blank field. Unreleased
-   deliverable revisions recorded inside the bundle window carry `released: false`
-   with task linkage (and optional run/policy linkage when present) without
-   requiring a release approval.
+9. **Trace** — for each artifact with `release_status: "released"`: artifact →
+   task → run/attempt → policy revision → approval → `receipt.covers`. A
+   missing link on a released artifact is a refusal, not a blank field. Every
+   artifact's `policy_revision` must be the revision in force at `recorded_at`,
+   or absent when none was (a hub with no policy revision exports and
+   verifies). `unreleased` and `release_not_in_bundle` (a live release whose
+   approval falls outside the window) carry no approval id;
+   `not_provable_in_org_bundle` is valid only in a non-default organization's
+   `org` bundle. The `artifacts` claim is `verified` when every entry is bound
+   to a hash-verified `agent.deliverable.revised` event (revision and sha256)
+   and `hub-asserted` otherwise. `evidence/rows.jsonl` is rebuilt from the
+   unredacted evidence-channel events (`evidence.*`, `agent.approval.*`,
+   `agent.deliverable.*`, `sdk.*`); an extra, missing or altered row refuses
+   (`evidence_row_mismatch`). In an `org` bundle a row's task ordinal is
+   checked only for presence.
 10. **Private and secret content** — a bundle containing an unredacted
     restricted channel, a record marked private, a secret/token/credential
     key or value pattern (including non-string values and nested JSON strings),
@@ -316,13 +433,34 @@ unsupported version). A refusal is never downgraded to a warning.
 11. **Unhashed or legacy rows** — reported explicitly with their count and
     sequence range; never silently accepted as verified.
 12. **Withheld classes** — `withheld.json` is scoped strictly to the
-    checkpoint's window and organization class (so re-exporting a checkpoint
-    after later writes stays deterministic) and is reported as part of the
-    verdict, so a reader knows what the bundle deliberately does not contain.
+    checkpoint's window and organization class, read from the checkpoint's
+    export snapshot (Determinism), must count every stub under its class, and
+    is reported as part of the verdict, so a reader knows what the bundle
+    deliberately does not contain. The table counts themselves are the hub's
+    word.
 
-The verifier also prints the three claims separately (`integrity`, `authorship`,
-`completeness`) with the basis for each, so a reader cannot mistake "hashes
-match" for "the hub is honest".
+The verdict reports `integrity`, `authorship`, `completeness`,
+`separation_of_duties`, `approvals` and `artifacts`, each with a status
+(`verified`, `refused`, `unverified`, `not-applicable`, or `hub-asserted` for a
+claim the bundle carries only on the exporting hub's word) and its basis, so a
+reader cannot mistake "hashes match" for "the hub is honest".
+
+`ua evidence sign --bundle` runs every one of these checks except authorship
+before it signs, and refuses to sign a bundle the verifier would refuse.
+
+## Determinism
+
+Re-exporting a checkpoint gives the same bytes. The ledger rows are immutable,
+but `withheld.json` counts and `org` ordinals come from tables that later
+deletes change (an expired-session purge, a deleted task). So the hub freezes
+an export snapshot when it writes the checkpoint (`ua evidence checkpoint`), in
+the append-only `evidence_export_snapshot` table: the timestamps of the
+withheld tables' rows at or before the checkpoint's cutoff, the
+`message_index` rows, and for an `org` checkpoint the organization's task,
+approval and deliverable ids. Every export of that checkpoint counts and maps
+from the snapshot. A checkpoint written before snapshots existed freezes its
+snapshot on its first export. Ordinals are stable per checkpoint; two
+checkpoints taken around a delete can give one task different ordinals.
 
 ## Keys
 

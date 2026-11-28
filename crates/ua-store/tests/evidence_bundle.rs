@@ -15,10 +15,12 @@ use ua_store::evidence::{
 };
 use ua_store::evidence_bundle::{
     ApprovalReceipt, ArtifactIndexEntry, BundleCheckpointFile, BundleLedgerEvent, BundleManifest,
-    BundleVerifyTrust, CLASS_CROSS_ORG_EVENTS, CLASS_PRIVATE_MESSAGES, CLASS_PRIVATE_RECORDS, ClaimStatus,
-    ExportBundleOptions, PinnedHubHead, PinnedOrgHead, PolicyRevisionRecord, ProducerInfo, REDACTED_CHANNEL,
-    compute_org_window_checkpoint, export_bundle, load_verified_hub_cross_check, org_chain_fold, sha256_hex,
-    to_canonical_bytes, verify_bundle_dir, verify_bundle_dir_with_limits,
+    BundleVerifyTrust, CLASS_APPROVALS_IN_DEFAULT_LEDGER, CLASS_CROSS_ORG_EVENTS, CLASS_PRIVATE_MESSAGES,
+    CLASS_PRIVATE_RECORDS, CLASS_UNPARSEABLE_PAYLOAD, ClaimStatus, EXPORT_SNAPSHOT_PART, EvidenceRow,
+    ExportBundleOptions, LABEL_PLACEHOLDER, PinnedHubHead, PinnedOrgHead, PolicyRevisionRecord, ProducerInfo,
+    REDACTED_CHANNEL, WithheldReport, compute_org_window_checkpoint, export_bundle,
+    load_verified_hub_cross_check, org_chain_fold, sha256_hex, snapshot_checkpoint, to_canonical_bytes,
+    verify_bundle_dir, verify_bundle_dir_with_limits,
 };
 use ua_store::ledger::{
     self, EventInput, GENESIS_HASH, HASH_V1, HASH_V2, compute_entry_hash, compute_entry_hash_v2,
@@ -121,6 +123,18 @@ fn remanifest_and_resign(bundle_dir: &Path, sk: &SigningKey, resign_checkpoint: 
     manifest.digest = manifest.recompute_digest().unwrap();
     std::fs::write(&manifest_path, to_canonical_bytes(&manifest).unwrap()).unwrap();
     sign_bundle_offline(bundle_dir, sk);
+}
+
+/// Rewrite every line of a JSONL bundle file through `f`.
+fn rewrite_jsonl<T: serde::de::DeserializeOwned + serde::Serialize>(path: &Path, mut f: impl FnMut(&mut T)) {
+    let mut out = Vec::new();
+    for line in std::fs::read_to_string(path).unwrap().lines().filter(|l| !l.trim().is_empty()) {
+        let mut item: T = serde_json::from_str(line).unwrap();
+        f(&mut item);
+        out.extend_from_slice(&to_canonical_bytes(&item).unwrap());
+        out.push(b'\n');
+    }
+    std::fs::write(path, out).unwrap();
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
@@ -248,12 +262,14 @@ CREATE TABLE IF NOT EXISTS session_credentials (
     issued_at TEXT NOT NULL DEFAULT '2026-11-20T00:00:00Z'
 );
 CREATE TABLE IF NOT EXISTS message_index (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    org_id TEXT NOT NULL,
-    event_ulid TEXT,
-    event_seq INTEGER,
-    body TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT '2026-11-20T00:00:00Z'
+    message_id TEXT PRIMARY KEY,
+    recipient TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    act TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    event_ulid TEXT NOT NULL UNIQUE,
+    event_seq INTEGER NOT NULL,
+    created_at TEXT NOT NULL
 );
 ",
     };
@@ -262,6 +278,7 @@ CREATE TABLE IF NOT EXISTS message_index (
         ua_store::org::STORE_PART.into(),
         KEY_STORE_PART.into(),
         CHECKPOINT_CHECKS_PART.into(),
+        EXPORT_SNAPSHOT_PART.into(),
         extra.into(),
     ];
     let db = Db::open(&dir.path().join("hub.db"), &parts).unwrap();
@@ -286,7 +303,7 @@ fn populate_sample_db(db: &Db, sk: &SigningKey, key_id: &str) -> (String, String
     let (hub_cp_id, org_cp_id) = db
         .write(|tx| {
             tx.execute(
-                "INSERT INTO orgs (id, slug, display_name, created_at) VALUES ('acme', 'acme', 'Acme Org', '2026-11-20T00:00:00Z')",
+                "INSERT OR IGNORE INTO orgs (id, slug, display_name, created_at) VALUES ('acme', 'acme', 'Acme Org', '2026-11-20T00:00:00Z')",
                 [],
             )?;
             key_add(tx, key_id, &pk, "2026-11-20T00:00:00Z", Some("fixture key"))?;
@@ -305,7 +322,8 @@ fn populate_sample_db(db: &Db, sk: &SigningKey, key_id: &str) -> (String, String
                 [],
             )?;
             tx.execute(
-                "INSERT INTO message_index (org_id, body) VALUES ('default', 'private dm body')",
+                "INSERT INTO message_index (message_id, recipient, sender, act, conversation_id, event_ulid, event_seq, created_at) \
+                 VALUES ('m-1', 'builder-2', 'builder-1', 'inform', 'c-1', '01MSG00000000000000000000A', 1, '2026-11-20T00:00:00Z')",
                 [],
             )?;
 
@@ -381,8 +399,45 @@ fn populate_sample_db(db: &Db, sk: &SigningKey, key_id: &str) -> (String, String
             // Ledger events across both default and acme orgs (all hash_v = 2).
             ledger::append(
                 tx,
+                EventInput::new(
+                    "default",
+                    "agent.config.revision",
+                    json!({
+                        "schema": 1, "kind": "policy", "revision": 1, "action": "commit", "actor": "operator",
+                        "parent_revision": null, "restores_revision": null, "document_sha256": policy_doc_sha,
+                        "raw_sha256": policy_doc_sha, "approval_id": null, "diff": ""
+                    }),
+                )
+                .by("operator"),
+            )?;
+            ledger::append(
+                tx,
                 EventInput::new("default", "agent.task.created", json!({ "task_id": 42, "title": "Audit report" }))
                     .by("builder-1"),
+            )?;
+            ledger::append(
+                tx,
+                EventInput::new(
+                    "default",
+                    "agent.deliverable.revised",
+                    json!({
+                        "org_id": "default", "task_id": 42, "deliverable_id": 1, "kind": "file", "revision_id": 1,
+                        "rev_no": 1, "identity": artifact_sha, "size_bytes": 4096
+                    }),
+                )
+                .by("builder-1"),
+            )?;
+            ledger::append(
+                tx,
+                EventInput::new(
+                    "default",
+                    "agent.approval.requested",
+                    json!({
+                        "approval_id": 10, "tool": "deliverable_release", "requested_by": "builder-1",
+                        "payload_sha256": action_digest
+                    }),
+                )
+                .by("builder-1"),
             )?;
             ledger::append(
                 tx,
@@ -844,22 +899,26 @@ fn receipts_sod_cross_links_and_artifact_trace_mutations() {
         assert_eq!(v.reason.as_deref(), Some("receipt_resolver_not_human"));
     }
 
-    // 2. SoD violation (resolver == requester on deliverable_release) -> exit 1.
+    // 2. A receipt whose resolver label is rewritten to the requester's is
+    //    refused against the hash-verified event's `resolved_by` (B-B1).
     {
         let tmp = tempdir().unwrap();
         copy_dir_recursive(&fixtures_root().join("good_hub"), tmp.path());
         let p = tmp.path().join("approvals/10.json");
         let mut r: ApprovalReceipt = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         r.resolver.label = r.requester.label.clone();
+        r.resolver_is_requester = true;
         r.receipt_id = r.compute_receipt_id().unwrap();
         std::fs::write(&p, to_canonical_bytes(&r).unwrap()).unwrap();
         remanifest_and_resign(tmp.path(), &sk, false);
         let v = verify_bundle_dir(tmp.path(), &trust).unwrap();
         assert_eq!(v.exit_code, 1);
-        assert_eq!(v.reason.as_deref(), Some("receipt_sod_violation"));
+        assert_eq!(v.reason.as_deref(), Some("receipt_event_mismatch"));
     }
 
-    // 3. Non-SoD rule reports separation_of_duties = not-applicable (never verified).
+    // 3. Rewriting the policy document (and its digest) to drop the SoD rule
+    //    is refused against the hash-verified agent.config.revision event
+    //    (review B-S2).
     {
         let tmp = tempdir().unwrap();
         copy_dir_recursive(&fixtures_root().join("good_hub"), tmp.path());
@@ -896,8 +955,8 @@ fn receipts_sod_cross_links_and_artifact_trace_mutations() {
 
         remanifest_and_resign(tmp.path(), &sk, false);
         let v = verify_bundle_dir(tmp.path(), &trust).unwrap();
-        assert!(v.ok, "non-SoD rule should verify cleanly: {v:?}");
-        assert_eq!(v.separation_of_duties.status, ClaimStatus::NotApplicable);
+        assert_eq!(v.exit_code, 1, "{v:?}");
+        assert_eq!(v.reason.as_deref(), Some("policy_ledger_mismatch"));
     }
 
     // 4. Missing receipt for approval event -> exit 1 (cross_link_missing_receipt).
@@ -1710,15 +1769,19 @@ fn real_hub_org_event_default_unhashed_org_and_unreleased_deliverables() {
 
     let v_hub = verify_bundle_dir(&hub_dir, &trust).unwrap();
     assert!(v_hub.ok, "hub bundle with acme approval + unreleased deliverable failed: {v_hub:?}");
-    assert_eq!(v_hub.separation_of_duties.status, ClaimStatus::Verified);
+    // Acme's resolver is `null` in the ledger (ORG-EVENT-DEFAULT): the resolver
+    // and separation of duties are the hub's word, never "verified".
+    assert_eq!(v_hub.separation_of_duties.status, ClaimStatus::HubAsserted);
+    assert_eq!(v_hub.approvals.status, ClaimStatus::HubAsserted);
     let receipt_raw = std::fs::read_to_string(hub_dir.join("approvals/55.json")).unwrap();
     assert!(!receipt_raw.contains("acme-secret-bot"), "requester label bypassed ledger_label redaction");
     assert!(!receipt_raw.contains("acme-secret-human"), "resolver label bypassed ledger_label redaction");
     assert!(!receipt_raw.contains("acme-confidential-reason"), "tenant reason leaked");
     let rec: ApprovalReceipt = serde_json::from_str(&receipt_raw).unwrap();
-    assert!(rec.requester.label.starts_with("redacted:"));
-    assert!(rec.resolver.label.starts_with("redacted:"));
-    assert_ne!(rec.requester.label, rec.resolver.label);
+    // A fixed placeholder, not a guessable hash of the label (A-S-NEW-6).
+    assert_eq!(rec.requester.label, LABEL_PLACEHOLDER);
+    assert_eq!(rec.resolver.label, LABEL_PLACEHOLDER);
+    assert!(!rec.resolver_is_requester);
     assert_eq!(rec.reason, None);
 }
 
@@ -1739,10 +1802,13 @@ fn policy_kind_revision_collision_and_document_derived_sod_verification() {
         revs.retain(|r| r.kind != "policy");
         assert!(revs.iter().any(|r| r.kind == "profile" && r.revision == 1));
         std::fs::write(&p, to_canonical_bytes(&revs).unwrap()).unwrap();
+        // Keep the evidence rows consistent with the shrunken policy list so
+        // the receipt check is what refuses.
+        rewrite_jsonl::<EvidenceRow>(&tmp.path().join("evidence/rows.jsonl"), |r| r.policy_revision = None);
         remanifest_and_resign(tmp.path(), &sk, false);
         let v = verify_bundle_dir(tmp.path(), &trust).unwrap();
         assert_eq!(v.exit_code, 1);
-        assert_eq!(v.reason.as_deref(), Some("receipt_policy_missing"));
+        assert_eq!(v.reason.as_deref(), Some("receipt_policy_mismatch"));
     }
 
     // 2. Claiming extra `sod_tools` not backed by `document` -> MUST REFUSE (`policy_sod_mismatch`).
@@ -1813,7 +1879,8 @@ fn reexport_determinism_after_later_writes_and_timestamp_normalization() {
             [later],
         )?;
         tx.execute(
-            "INSERT INTO message_index (org_id, body, created_at) VALUES ('default', 'late msg', ?1)",
+            "INSERT INTO message_index (message_id, recipient, sender, act, conversation_id, event_ulid, event_seq, created_at) \
+             VALUES ('m-late', 'builder-2', 'builder-1', 'inform', 'c-1', '01MSGLATE0000000000000000A', 9999, ?1)",
             [later],
         )?;
         tx.execute(
@@ -2132,4 +2199,937 @@ fn mutations_v11_v12_v16_v18_are_all_refused() {
         assert_eq!(v.exit_code, 1, "V18 path traversal must refuse: {v:?}");
         assert_eq!(v.reason.as_deref(), Some("invalid_manifest_path"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fix round on #2716 S3b+S3c (reviews A and B at 1177b19d)
+// ---------------------------------------------------------------------------
+
+fn read_events(dir: &Path) -> Vec<BundleLedgerEvent> {
+    std::fs::read_to_string(dir.join("ledger/events.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn write_events(dir: &Path, evs: &[BundleLedgerEvent]) {
+    let mut out = Vec::new();
+    for ev in evs {
+        out.extend_from_slice(&to_canonical_bytes(ev).unwrap());
+        out.push(b'\n');
+    }
+    std::fs::write(dir.join("ledger/events.jsonl"), out).unwrap();
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> T {
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+fn write_json<T: serde::Serialize>(path: &Path, v: &T) {
+    std::fs::write(path, to_canonical_bytes(v).unwrap()).unwrap();
+}
+
+fn make_stub(ev: &mut BundleLedgerEvent, class: &str) {
+    ev.channel = REDACTED_CHANNEL.into();
+    ev.payload = String::new();
+    ev.originator = None;
+    ev.episode_id = None;
+    ev.causal_parent_id = None;
+    ev.dedupe_key = None;
+    ev.redacted = true;
+    ev.redacted_class = Some(class.into());
+}
+
+/// Add `n` to `withheld.json` class `class` and the manifest's
+/// `withheld_total` (the caller re-manifests afterwards).
+fn bump_withheld(dir: &Path, class: &str, n: u64) {
+    let wp = dir.join("withheld.json");
+    let mut w: WithheldReport = read_json(&wp);
+    w.record(class, n);
+    write_json(&wp, &w);
+    let mp = dir.join("manifest.json");
+    let mut m: BundleManifest = read_json(&mp);
+    m.counts.withheld_total = w.total;
+    write_json(&mp, &m);
+}
+
+/// Edit `manifest.json` in place, recompute its digest and re-sign.
+fn edit_manifest(dir: &Path, sk: &SigningKey, f: impl FnOnce(&mut BundleManifest)) {
+    let mp = dir.join("manifest.json");
+    let mut m: BundleManifest = read_json(&mp);
+    f(&mut m);
+    m.digest = m.recompute_digest().unwrap();
+    write_json(&mp, &m);
+    sign_bundle_offline(dir, sk);
+}
+
+fn edit_receipt(dir: &Path, id: i64, f: impl FnOnce(&mut ApprovalReceipt)) {
+    let p = dir.join(format!("approvals/{id}.json"));
+    let mut r: ApprovalReceipt = read_json(&p);
+    f(&mut r);
+    r.receipt_id = r.compute_receipt_id().unwrap();
+    write_json(&p, &r);
+}
+
+fn good_copy(name: &str) -> tempfile::TempDir {
+    let tmp = tempdir().unwrap();
+    copy_dir_recursive(&fixtures_root().join(name), tmp.path());
+    tmp
+}
+
+fn export_signed(db: &Db, cp: &str, dir: &Path, sk: &SigningKey) {
+    db.read(|c| export_bundle(c, dir, &export_opts(cp))).unwrap();
+    sign_bundle_offline(dir, sk);
+}
+
+fn assert_refused(v: &ua_store::evidence_bundle::BundleVerdict, reason: &str) {
+    assert_eq!(v.exit_code, 1, "expected refusal {reason}, got {v:?}");
+    assert_eq!(v.reason.as_deref(), Some(reason), "{v:?}");
+}
+
+/// Blocker 2 (A-B2, B-S1): a redaction stub is the exporter's assertion.
+/// It must be counted in withheld.json under its class, `cross_org_events`
+/// exists only in default-organization org bundles, a stub of a row the hub
+/// bundle shows in clear is refused, and the verdict says receipts,
+/// cross-links and SoD cover unredacted rows only. Pins mutations N09-N13.
+#[test]
+fn redaction_stubs_are_counted_scoped_cross_checked_and_reported() {
+    let trust = fixture_trust();
+    let (sk, _) = signing_key(FIXTURE_KEY_SEED);
+    let note = "covers unredacted ledger rows only";
+    let idx_of = |evs: &[BundleLedgerEvent], ch: &str| evs.iter().position(|e| e.channel == ch).unwrap();
+
+    // S1: an ordinary row stubbed as private_records without a withheld count refuses.
+    let tmp = good_copy("good_hub");
+    let mut evs = read_events(tmp.path());
+    let i = idx_of(&evs, "agent.task.created");
+    make_stub(&mut evs[i], CLASS_PRIVATE_RECORDS);
+    write_events(tmp.path(), &evs);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "withheld_count_mismatch");
+    // Counted, it verifies, but the verdict says what a stub cannot prove.
+    bump_withheld(tmp.path(), CLASS_PRIVATE_RECORDS, 1);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    let v = verify_bundle_dir(tmp.path(), &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    assert!(v.warnings.iter().any(|w| w.contains(note)), "{:?}", v.warnings);
+    assert!(v.completeness.basis.contains(note));
+    assert!(v.separation_of_duties.basis.contains(note));
+    assert!(v.approvals.basis.contains(note));
+
+    // S2: cross_org_events in a hub bundle refuses, even when counted.
+    let tmp = good_copy("good_hub");
+    let mut evs = read_events(tmp.path());
+    let i = idx_of(&evs, "agent.task.created");
+    make_stub(&mut evs[i], CLASS_CROSS_ORG_EVENTS);
+    write_events(tmp.path(), &evs);
+    bump_withheld(tmp.path(), CLASS_CROSS_ORG_EVENTS, 1);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "invalid_redacted_event");
+
+    // S3: an evidence row whose event is stubbed no longer matches the rebuilt rows.
+    let tmp = good_copy("good_hub");
+    let mut evs = read_events(tmp.path());
+    let i = idx_of(&evs, "evidence.attestation");
+    make_stub(&mut evs[i], CLASS_PRIVATE_MESSAGES);
+    write_events(tmp.path(), &evs);
+    bump_withheld(tmp.path(), CLASS_PRIVATE_MESSAGES, 1);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "evidence_row_mismatch");
+
+    // S4: stubbing the approval and dropping its receipt is the documented
+    // limit of the stub form: it verifies, and the verdict says the approval
+    // claims cover unredacted rows only (follow-up: commit H(payload)).
+    let tmp = good_copy("good_hub");
+    let mut evs = read_events(tmp.path());
+    let i = idx_of(&evs, "agent.approval.resolved");
+    let ulid = evs[i].ulid.clone();
+    make_stub(&mut evs[i], CLASS_PRIVATE_RECORDS);
+    write_events(tmp.path(), &evs);
+    std::fs::remove_file(tmp.path().join("approvals/10.json")).unwrap();
+    let ap = tmp.path().join("artifacts/index.json");
+    let mut arts: Vec<ArtifactIndexEntry> = read_json(&ap);
+    arts[0].release_status = "unreleased".into();
+    arts[0].approval_id = None;
+    write_json(&ap, &arts);
+    let rows_path = tmp.path().join("evidence/rows.jsonl");
+    let kept: Vec<String> = std::fs::read_to_string(&rows_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.contains(&ulid))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&rows_path, kept.concat()).unwrap();
+    {
+        let mut m: BundleManifest = read_json(&tmp.path().join("manifest.json"));
+        m.files.remove("approvals/10.json");
+        write_json(&tmp.path().join("manifest.json"), &m);
+    }
+    bump_withheld(tmp.path(), CLASS_PRIVATE_RECORDS, 1);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    let v = verify_bundle_dir(tmp.path(), &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    assert_eq!(v.redacted_events.count, 1);
+    assert!(v.approvals.basis.contains(note), "{:?}", v.approvals);
+    assert!(v.warnings.iter().any(|w| w.contains(note)));
+
+    // N09: a stub that keeps its payload refuses.
+    let tmp = good_copy("good_hub");
+    let mut evs = read_events(tmp.path());
+    let i = idx_of(&evs, "agent.task.created");
+    make_stub(&mut evs[i], CLASS_PRIVATE_RECORDS);
+    evs[i].payload = "{\"kept\":true}".into();
+    write_events(tmp.path(), &evs);
+    bump_withheld(tmp.path(), CLASS_PRIVATE_RECORDS, 1);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "invalid_redacted_event");
+
+    // N10: an unknown redacted_class refuses.
+    let tmp = good_copy("good_hub");
+    let mut evs = read_events(tmp.path());
+    let i = idx_of(&evs, "agent.task.created");
+    make_stub(&mut evs[i], "bogus_class");
+    write_events(tmp.path(), &evs);
+    bump_withheld(tmp.path(), "bogus_class", 1);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "invalid_redacted_event");
+
+    // N11: manifest counts.redacted_events must equal the stubs.
+    let tmp = good_copy("good_org");
+    edit_manifest(tmp.path(), &sk, |m| m.counts.redacted_events += 1);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "count_mismatch");
+
+    // N12: an unredacted row must not carry redacted_class.
+    let tmp = good_copy("good_hub");
+    let mut evs = read_events(tmp.path());
+    evs[0].redacted_class = Some(CLASS_PRIVATE_RECORDS.into());
+    write_events(tmp.path(), &evs);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "invalid_redacted_event");
+
+    // N13: a stub's entry_hash must be 64 hex characters.
+    let tmp = good_copy("good_org");
+    let mut evs = read_events(tmp.path());
+    make_stub(&mut evs[0], CLASS_PRIVATE_RECORDS);
+    evs[0].entry_hash = Some("zz".into());
+    write_events(tmp.path(), &evs);
+    bump_withheld(tmp.path(), CLASS_PRIVATE_RECORDS, 1);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "invalid_redacted_event");
+
+    // B-S1: an org bundle stub of a row the verified hub bundle shows in clear
+    // on a non-restricted channel is refused under --hub-bundle.
+    let tmp = good_copy("good_org");
+    let mut evs = read_events(tmp.path());
+    let i = idx_of(&evs, "agent.task.completed");
+    make_stub(&mut evs[i], CLASS_PRIVATE_RECORDS);
+    write_events(tmp.path(), &evs);
+    bump_withheld(tmp.path(), CLASS_PRIVATE_RECORDS, 1);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    let alone = verify_bundle_dir(tmp.path(), &trust).unwrap();
+    assert!(alone.ok, "{alone:?}");
+    assert!(alone.warnings.iter().any(|w| w.contains(note)));
+    let hub_cc = load_verified_hub_cross_check(&fixtures_root().join("good_hub"), &trust).unwrap().unwrap();
+    let mut cc_trust = trust.clone();
+    cc_trust.hub_cross_check = Some(hub_cc);
+    assert_refused(&verify_bundle_dir(tmp.path(), &cc_trust).unwrap(), "unjustified_redaction");
+}
+
+/// Blocker 3 (B-B1): every field the hash-verified `agent.approval.resolved`
+/// event records binds the receipt, and the verifier picks the policy in force.
+#[test]
+fn receipts_bind_every_field_to_the_hash_verified_approval_event() {
+    let trust = fixture_trust();
+    let (sk, _) = signing_key(FIXTURE_KEY_SEED);
+    let base = verify_bundle_dir(&fixtures_root().join("good_hub"), &trust).unwrap();
+    assert!(base.ok);
+    assert_eq!(base.approvals.status, ClaimStatus::Verified);
+    assert_eq!(base.separation_of_duties.status, ClaimStatus::Verified);
+
+    type Mutation = (&'static str, Box<dyn Fn(&mut ApprovalReceipt)>);
+    let cases: Vec<(Mutation, &str)> = vec![
+        (("tool", Box::new(|r| r.tool = "harmless_tool".into())), "receipt_event_mismatch"),
+        (("decision", Box::new(|r| r.decision = "denied".into())), "receipt_event_mismatch"),
+        (
+            ("resolver label", Box::new(|r| r.resolver.label = "forged-resolver".into())),
+            "receipt_event_mismatch",
+        ),
+        (("transport", Box::new(|r| r.resolver.transport = Some("slack".into()))), "receipt_event_mismatch"),
+        (
+            ("expires_at", Box::new(|r| r.expires_at = Some("2030-01-01T00:00:00Z".into()))),
+            "receipt_event_mismatch",
+        ),
+        (
+            ("requester label", Box::new(|r| r.requester.label = "someone-else".into())),
+            "receipt_event_mismatch",
+        ),
+        (("resolver_is_requester", Box::new(|r| r.resolver_is_requester = true)), "receipt_event_mismatch"),
+        (
+            ("decided_at", Box::new(|r| r.decided_at = "2099-01-01T00:00:00Z".into())),
+            "receipt_decided_after_event",
+        ),
+        (
+            (
+                "no policy cited",
+                Box::new(|r| {
+                    r.policy_revision = None;
+                    r.policy_digest = None;
+                }),
+            ),
+            "receipt_policy_mismatch",
+        ),
+        (("other policy cited", Box::new(|r| r.policy_revision = Some(2))), "receipt_policy_mismatch"),
+    ];
+    for ((name, f), reason) in cases {
+        let tmp = good_copy("good_hub");
+        edit_receipt(tmp.path(), 10, |r| f(r));
+        remanifest_and_resign(tmp.path(), &sk, false);
+        let v = verify_bundle_dir(tmp.path(), &trust).unwrap();
+        assert_eq!(v.exit_code, 1, "{name}: {v:?}");
+        assert_eq!(v.reason.as_deref(), Some(reason), "{name}: {v:?}");
+    }
+}
+
+/// A minimal default-organization release: task 42, deliverable 1 rev 1,
+/// approval 10 (requested by `requester`, resolved by `resolver`), its
+/// requested/resolved events, and a signed hub checkpoint at the head.
+struct ReleaseSeed {
+    policy: Option<Value>,
+    config_event: bool,
+    requester: &'static str,
+    resolver: &'static str,
+}
+
+fn seed_release_hub(db: &Db, sk: &SigningKey, pk: &str, seed: &ReleaseSeed) -> String {
+    let payload_obj = json!({ "deliverable_id": 1, "revision": 1, "destination": "release/report.md" });
+    let canon = ua_core::canonical::to_string(&payload_obj);
+    let digest = sha256_hex(canon.as_bytes());
+    let artifact_sha = "e".repeat(64);
+    db.write(|tx| {
+        key_add(tx, FIXTURE_KEY_ID, pk, "2026-11-20T00:00:00Z", None)?;
+        if let Some(doc) = &seed.policy {
+            let doc_canon = ua_core::canonical::to_string(doc);
+            let doc_sha = sha256_hex(doc_canon.as_bytes());
+            tx.execute(
+                "INSERT INTO config_revisions (kind, revision, action, actor, document, document_sha256, raw_sha256, created_at) \
+                 VALUES ('policy', 1, 'commit', 'operator', ?1, ?2, ?2, '2026-11-20T00:01:00Z')",
+                params![doc_canon, doc_sha],
+            )?;
+            if seed.config_event {
+                ledger::append(
+                    tx,
+                    EventInput::new(
+                        "default",
+                        "agent.config.revision",
+                        json!({ "schema": 1, "kind": "policy", "revision": 1, "action": "commit",
+                                "actor": "operator", "document_sha256": doc_sha, "raw_sha256": doc_sha,
+                                "approval_id": null, "diff": "" }),
+                    )
+                    .by("operator"),
+                )?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO tasks (id, org_id, title, created_at) VALUES (42, 'default', 'Report', '2026-11-20T00:02:00Z')",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO dispatch_runs (run_id, task_id, attempt, created_at) VALUES ('run-9', 42, 1, '2026-11-20T00:02:00Z')",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO deliverables (id, org_id, task_id, kind, title, created_by, created_at) \
+             VALUES (1, 'default', 42, 'file', 'Report', 'builder-1', '2026-11-20T00:03:00Z')",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO deliverable_revisions (id, org_id, deliverable_id, rev_no, identity, producer, recorded_at) \
+             VALUES (1, 'default', 1, 1, ?1, 'builder-1', '2026-11-20T00:03:00Z')",
+            [&artifact_sha],
+        )?;
+        tx.execute(
+            "INSERT INTO approvals (id, org_id, tool, payload, requested_by, status, resolved_by, resolved_transport, created_at, updated_at, resolved_at, run_id) \
+             VALUES (10, 'default', 'deliverable_release', ?1, ?2, 'approved', ?3, 'ui', '2026-11-20T00:04:00Z', '2026-11-20T00:05:00Z', '2026-11-20T00:05:00Z', 'run-9')",
+            params![canon, seed.requester, seed.resolver],
+        )?;
+        tx.execute(
+            "INSERT INTO deliverable_releases (approval_id, revision_id, org_id, requester, approver, destination, root_identity, staging_id, workflow_revision, ownership_generation) \
+             VALUES (10, 1, 'default', ?1, ?2, 'release/report.md', 'root', 'stage', 1, 1)",
+            params![seed.requester, seed.resolver],
+        )?;
+        ledger::append(
+            tx,
+            EventInput::new(
+                "default",
+                "agent.approval.requested",
+                json!({ "approval_id": 10, "tool": "deliverable_release", "requested_by": seed.requester,
+                        "payload_sha256": digest }),
+            )
+            .by(seed.requester),
+        )?;
+        ledger::append(
+            tx,
+            EventInput::new(
+                "default",
+                "agent.approval.resolved",
+                json!({ "approval_id": 10, "tool": "deliverable_release", "decision": "approve",
+                        "resolved_by": seed.resolver, "transport": "ui", "payload_sha256": digest,
+                        "expires_at": "2026-11-21T00:05:00Z" }),
+            )
+            .by(seed.resolver),
+        )?;
+        write_hub_cp_at_head(tx, "cp-release", sk, FIXTURE_KEY_ID)
+    })
+    .unwrap()
+}
+
+/// S-NEW-1 and B-S8: self-approval is refused whatever the policy says (a
+/// real-format policy has no SoD key); SoD is hub-asserted when the policy is
+/// not bound to its ledger event; a hub with no policy revision exports and
+/// verifies with the link reported as absent; N16 is pinned.
+#[test]
+fn self_approval_is_refused_whatever_the_policy_says() {
+    let (sk, pk) = signing_key(FIXTURE_KEY_SEED);
+    let trust =
+        BundleVerifyTrust::from_anchor(TrustAnchor { key_id: FIXTURE_KEY_ID.into(), public_key: pk.clone() });
+    let real_policy =
+        json!({ "version": 1, "rules": [{ "tool": "deliverable_release", "action": "require_approval" }] });
+
+    // Self-approval under the hub's own policy format -> refused.
+    let (_d, db) = open_test_db();
+    let cp = seed_release_hub(
+        &db,
+        &sk,
+        &pk,
+        &ReleaseSeed {
+            policy: Some(real_policy.clone()),
+            config_event: true,
+            requester: "operator",
+            resolver: "operator",
+        },
+    );
+    let out = tempdir().unwrap();
+    export_signed(&db, &cp, &out.path().join("b"), &sk);
+    let v = verify_bundle_dir(&out.path().join("b"), &trust).unwrap();
+    assert_refused(&v, "receipt_sod_violation");
+    assert_eq!(v.separation_of_duties.status, ClaimStatus::Refused);
+
+    // Honest approval, policy bound -> SoD verified; artifact bound -> verified.
+    let (_d, db) = open_test_db();
+    let cp = seed_release_hub(
+        &db,
+        &sk,
+        &pk,
+        &ReleaseSeed {
+            policy: Some(real_policy.clone()),
+            config_event: true,
+            requester: "builder-1",
+            resolver: "operator",
+        },
+    );
+    export_signed(&db, &cp, &out.path().join("c"), &sk);
+    let v = verify_bundle_dir(&out.path().join("c"), &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    assert_eq!(v.separation_of_duties.status, ClaimStatus::Verified, "{v:?}");
+
+    // Honest approval, policy not bound to an agent.config.revision event ->
+    // SoD hub-asserted, never verified.
+    let (_d, db) = open_test_db();
+    let cp = seed_release_hub(
+        &db,
+        &sk,
+        &pk,
+        &ReleaseSeed {
+            policy: Some(real_policy),
+            config_event: false,
+            requester: "builder-1",
+            resolver: "operator",
+        },
+    );
+    export_signed(&db, &cp, &out.path().join("d"), &sk);
+    let v = verify_bundle_dir(&out.path().join("d"), &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    assert_eq!(v.separation_of_duties.status, ClaimStatus::HubAsserted, "{v:?}");
+    assert!(v.separation_of_duties.basis.contains("agent.config.revision"));
+
+    // B-S8: no policy revision at all -> exports and verifies; the receipt and
+    // artifact carry no policy link, which the verifier accepts because none
+    // was in force.
+    let (_d, db) = open_test_db();
+    let cp = seed_release_hub(
+        &db,
+        &sk,
+        &pk,
+        &ReleaseSeed { policy: None, config_event: false, requester: "builder-1", resolver: "operator" },
+    );
+    let dir = out.path().join("e");
+    export_signed(&db, &cp, &dir, &sk);
+    let v = verify_bundle_dir(&dir, &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    let arts: Vec<ArtifactIndexEntry> = read_json(&dir.join("artifacts/index.json"));
+    assert_eq!(arts[0].release_status, "released");
+    assert_eq!(arts[0].policy_revision, None);
+    let rec: ApprovalReceipt = read_json(&dir.join("approvals/10.json"));
+    assert_eq!(rec.policy_revision, None);
+
+    // N16: sod_tools claimed without its document refuses.
+    let tmp = good_copy("good_hub");
+    let pp = tmp.path().join("policy/revisions.json");
+    let mut revs: Vec<PolicyRevisionRecord> = read_json(&pp);
+    let pol = revs.iter_mut().find(|r| r.kind == "policy").unwrap();
+    assert!(!pol.sod_tools.is_empty());
+    pol.document = None;
+    write_json(&pp, &revs);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &fixture_trust()).unwrap(), "policy_sod_unverifiable");
+}
+
+/// Insert a raw `event_log` row (hash_v 2) chained to the current head.
+fn insert_raw_event(tx: &mut ua_store::WriteTx<'_>, ulid: &str, channel: &str, payload: &str) {
+    let prev: String =
+        tx.query_row("SELECT entry_hash FROM event_log ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    let ts = "2026-11-21T00:00:00Z";
+    let eh = compute_entry_hash_v2(
+        Some(&prev),
+        ulid,
+        channel,
+        payload,
+        Some("sys"),
+        None,
+        None,
+        ts,
+        None,
+        "default",
+    );
+    tx.execute(
+        "INSERT INTO event_log (ulid, channel, payload, originator, created_at, prev_hash, entry_hash, org_id, hash_v) \
+         VALUES (?1, ?2, ?3, 'sys', ?4, ?5, ?6, 'default', 2)",
+        params![ulid, channel, payload, ts, prev, eh],
+    )
+    .unwrap();
+}
+
+/// Blocker 4 (B-B2): payloads that are not strict JSON are exported only as
+/// `unparseable_payload` stubs, and the verifier refuses one in clear.
+#[test]
+fn non_strict_json_payloads_are_stubbed_at_export_and_refused_at_verify() {
+    let (sk, pk) = signing_key(FIXTURE_KEY_SEED);
+    let trust =
+        BundleVerifyTrust::from_anchor(TrustAnchor { key_id: FIXTURE_KEY_ID.into(), public_key: pk.clone() });
+    let mut deep = json!({ "password": "PLANT14-deep" });
+    for _ in 0..130 {
+        deep = json!([deep]);
+    }
+    let (_d, db) = open_test_db();
+    let cp = db
+        .write(|tx| {
+            key_add(tx, FIXTURE_KEY_ID, &pk, "2026-11-20T00:00:00Z", None)?;
+            insert_raw_event(
+                tx,
+                "01NAN0000000000000000000001",
+                "agent.log",
+                r#"{"password":"PLANT24-nan","score":NaN}"#,
+            );
+            insert_raw_event(
+                tx,
+                "01TRL0000000000000000000002",
+                "agent.log",
+                r#"{"password":"PLANT25-trail"} trailing"#,
+            );
+            insert_raw_event(
+                tx,
+                "01DUP0000000000000000000003",
+                "agent.log",
+                r#"{"password":"PLANT26-dup","password":null}"#,
+            );
+            ledger::append(tx, EventInput::new("default", "agent.log", json!({ "d": deep })))?;
+            ledger::append(tx, EventInput::new("default", "agent.task.created", json!({ "task_id": 1 })))?;
+            write_hub_cp_at_head(tx, "cp-nonstrict", &sk, FIXTURE_KEY_ID)
+        })
+        .unwrap();
+    let out = tempdir().unwrap();
+    let dir = out.path().join("b");
+    export_signed(&db, &cp, &dir, &sk);
+    let text = std::fs::read_to_string(dir.join("ledger/events.jsonl")).unwrap();
+    for plant in ["PLANT24", "PLANT25", "PLANT26", "PLANT14"] {
+        assert!(!text.contains(plant), "{plant} leaked into the bundle");
+    }
+    let withheld: WithheldReport = read_json(&dir.join("withheld.json"));
+    assert_eq!(withheld.classes.get(CLASS_UNPARSEABLE_PAYLOAD), Some(&4));
+    let v = verify_bundle_dir(&dir, &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    assert_eq!(v.redacted_events.count, 4);
+
+    // Put one payload back in clear (its row hash still verifies): refused.
+    let raw: (String, String, Option<String>) = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT channel, payload, originator FROM event_log WHERE ulid = '01DUP0000000000000000000003'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .unwrap();
+    let mut evs = read_events(&dir);
+    let ev = evs.iter_mut().find(|e| e.ulid == "01DUP0000000000000000000003").unwrap();
+    ev.channel = raw.0;
+    ev.payload = raw.1;
+    ev.originator = raw.2;
+    ev.redacted = false;
+    ev.redacted_class = None;
+    write_events(&dir, &evs);
+    remanifest_and_resign(&dir, &sk, false);
+    let v = verify_bundle_dir(&dir, &trust).unwrap();
+    assert_refused(&v, "forbidden_private_content");
+    assert_eq!(v.offending.as_ref().unwrap()["class"], CLASS_UNPARSEABLE_PAYLOAD);
+}
+
+/// Blocker 5 (B-B3): manifest.files holds exactly the required files plus
+/// `approvals/<id>.json` with a canonical decimal id, and every file parses
+/// strictly to its schema.
+#[test]
+fn manifest_lists_exactly_the_bundle_files() {
+    let trust = fixture_trust();
+    let (sk, _) = signing_key(FIXTURE_KEY_SEED);
+
+    for extra in [
+        "notes/ops.txt",
+        "notes/deep.json",
+        "approvals/010.json",
+        "approvals/+10.json",
+        "Approvals/10.json",
+        "approvals/0.json",
+    ] {
+        let tmp = good_copy("good_hub");
+        let target = tmp.path().join(extra);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(tmp.path().join("approvals/10.json"), &target).unwrap();
+        let sha = sha256_hex(&std::fs::read(&target).unwrap());
+        edit_manifest(tmp.path(), &sk, |m| {
+            m.files.insert(extra.to_string(), sha);
+        });
+        assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "unexpected_bundle_file");
+    }
+
+    // A listed file with a duplicate key refuses (strict parse).
+    let tmp = good_copy("good_hub");
+    std::fs::write(tmp.path().join("withheld.json"), br#"{"classes":{},"total":0,"total":5}"#).unwrap();
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "invalid_withheld");
+}
+
+/// Blocker 6 (B-B4): a non-default organization's approvals sit in the
+/// default ledger, so its org bundle reports the release as not provable,
+/// counts the omitted approvals, and says approvals are not covered.
+#[test]
+fn org_bundle_reports_releases_and_approvals_as_not_covered() {
+    let (sk, pk) = signing_key(FIXTURE_KEY_SEED);
+    let trust =
+        BundleVerifyTrust::from_anchor(TrustAnchor { key_id: FIXTURE_KEY_ID.into(), public_key: pk.clone() });
+    let (_d, db) = open_test_db();
+    let canon = ua_core::canonical::to_string(&json!({ "deliverable_id": 3 }));
+    let digest = sha256_hex(canon.as_bytes());
+    let (org_cp, hub_cp) = db
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, created_at) VALUES ('acme', 'acme', 'Acme', '2026-11-20T00:00:00Z')",
+                [],
+            )?;
+            key_add(tx, FIXTURE_KEY_ID, &pk, "2026-11-20T00:00:00Z", None)?;
+            tx.execute(
+                "INSERT INTO tasks (id, org_id, title, created_at) VALUES (101, 'acme', 't', '2026-11-20T00:02:00Z')",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO dispatch_runs (run_id, task_id, attempt, created_at) VALUES ('run-a', 101, 1, '2026-11-20T00:02:00Z')",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO deliverables (id, org_id, task_id, kind, title, created_by, created_at) \
+                 VALUES (3, 'acme', 101, 'file', 'd', 'acme-bot', '2026-11-20T00:03:00Z')",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO deliverable_revisions (id, org_id, deliverable_id, rev_no, identity, producer, recorded_at) \
+                 VALUES (3, 'acme', 3, 1, ?1, 'acme-bot', '2026-11-20T00:03:00Z')",
+                ["f".repeat(64)],
+            )?;
+            tx.execute(
+                "INSERT INTO approvals (id, org_id, tool, payload, requested_by, status, resolved_by, resolved_transport, created_at, updated_at, resolved_at) \
+                 VALUES (20, 'acme', 'deliverable_release', ?1, 'acme-bot', 'approved', 'acme-human', 'ui', '2026-11-20T00:04:00Z', '2026-11-20T00:05:00Z', '2026-11-20T00:05:00Z')",
+                [&canon],
+            )?;
+            tx.execute(
+                "INSERT INTO deliverable_releases (approval_id, revision_id, org_id, requester, approver, destination, root_identity, staging_id, workflow_revision, ownership_generation) \
+                 VALUES (20, 3, 'acme', 'acme-bot', 'acme-human', 'out', 'root', 'stage', 1, 1)",
+                [],
+            )?;
+            ledger::append(tx, EventInput::new("acme", "evidence.attestation", json!({ "task_id": 101 })).by("acme-bot"))?;
+            ledger::append(
+                tx,
+                EventInput::new(
+                    "default",
+                    "agent.approval.resolved",
+                    json!({ "approval_id": 20, "tool": "deliverable_release", "decision": "approve",
+                            "resolved_by": null, "transport": "ui", "payload_sha256": digest }),
+                )
+                .by("system"),
+            )?;
+            let sum = compute_org_window_checkpoint(tx, "acme", "2026-11-01T00:00:00Z", "2099-12-31T23:59:59Z", None)?;
+            let cp = Checkpoint {
+                checkpoint_id: "cp-acme".into(),
+                class: CheckpointClass::Org,
+                org_id: Some("acme".into()),
+                seq: None,
+                hash: None,
+                window: Some(sum.window),
+                global_from_hash: Some(sum.global_from_hash),
+                global_head_hash: Some(sum.global_head_hash),
+                org_row_count: Some(sum.org_row_count),
+                org_chain_hash: Some(sum.org_chain_hash),
+                key_id: FIXTURE_KEY_ID.into(),
+                signed_at: "2026-11-25T12:00:00Z".into(),
+            };
+            let d = checkpoint_write(tx, &cp, "2026-11-25T12:00:00Z")?;
+            checkpoint_attach(tx, &cp.checkpoint_id, &sign_hex_digest(&sk, &d))?;
+            let hub = write_hub_cp_at_head(tx, "cp-acme-hub", &sk, FIXTURE_KEY_ID)?;
+            Ok((cp.checkpoint_id, hub))
+        })
+        .unwrap();
+    let out = tempdir().unwrap();
+    let dir = out.path().join("org");
+    export_signed(&db, &org_cp, &dir, &sk);
+    let arts: Vec<ArtifactIndexEntry> = read_json(&dir.join("artifacts/index.json"));
+    assert_eq!(arts.len(), 1);
+    assert_eq!(arts[0].release_status, "not_provable_in_org_bundle");
+    assert_eq!(arts[0].approval_id, None);
+    let withheld: WithheldReport = read_json(&dir.join("withheld.json"));
+    assert_eq!(withheld.classes.get(CLASS_APPROVALS_IN_DEFAULT_LEDGER), Some(&1));
+    let v = verify_bundle_dir(&dir, &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    assert_eq!(v.approvals.status, ClaimStatus::Unverified);
+    assert!(v.approvals.basis.contains("not covered"), "{:?}", v.approvals);
+
+    // The claim cannot be forged as `released: false`-style "unreleased" plus
+    // an approval id, nor as not_provable in a hub bundle.
+    let hub_dir = out.path().join("hub");
+    export_signed(&db, &hub_cp, &hub_dir, &sk);
+    let arts: Vec<ArtifactIndexEntry> = read_json(&hub_dir.join("artifacts/index.json"));
+    assert_eq!(arts[0].release_status, "released");
+    let ap = hub_dir.join("artifacts/index.json");
+    let mut forged = arts.clone();
+    forged[0].release_status = "not_provable_in_org_bundle".into();
+    forged[0].approval_id = None;
+    write_json(&ap, &forged);
+    edit_receipt(&hub_dir, 20, |r| r.covers.clear());
+    remanifest_and_resign(&hub_dir, &sk, false);
+    assert_refused(&verify_bundle_dir(&hub_dir, &trust).unwrap(), "broken_artifact_trace");
+}
+
+/// S-NEW-2 and N28: an org bundle carries only the policy revisions it cites,
+/// with the digest and without the document.
+#[test]
+fn org_bundles_omit_policy_documents_and_uncited_revisions() {
+    let (sk, _) = signing_key(FIXTURE_KEY_SEED);
+    let (_d, db) = open_test_db();
+    let (hub_cp, org_cp) = populate_sample_db(&db, &sk, FIXTURE_KEY_ID);
+    let out = tempdir().unwrap();
+    db.read(|c| export_bundle(c, &out.path().join("org"), &export_opts(&org_cp))).unwrap();
+    db.read(|c| export_bundle(c, &out.path().join("hub"), &export_opts(&hub_cp))).unwrap();
+    let revs: Vec<PolicyRevisionRecord> = read_json(&out.path().join("org/policy/revisions.json"));
+    assert!(!revs.is_empty());
+    for r in &revs {
+        assert_eq!(r.kind, "policy", "org bundle carries an uncited {:?} revision", r.kind);
+        assert!(r.document.is_none(), "org bundle carries a policy document");
+        assert!(r.sod_tools.is_empty());
+        assert!(r.id.is_none());
+    }
+    let org_text = std::fs::read_to_string(out.path().join("org/policy/revisions.json")).unwrap();
+    assert!(!org_text.contains("separation_of_duties"));
+    let hub: Vec<PolicyRevisionRecord> = read_json(&out.path().join("hub/policy/revisions.json"));
+    assert!(hub.iter().any(|r| r.kind == "profile"), "hub bundle keeps the window's revisions");
+    assert!(hub.iter().all(|r| r.document.is_some()));
+}
+
+/// S-NEW-3: org evidence rows map task ids through the same dense ordinals as
+/// the artifacts, never a constant.
+#[test]
+fn org_evidence_rows_use_task_ordinals() {
+    let (sk, pk) = signing_key(FIXTURE_KEY_SEED);
+    let trust =
+        BundleVerifyTrust::from_anchor(TrustAnchor { key_id: FIXTURE_KEY_ID.into(), public_key: pk.clone() });
+    let (_d, db) = open_test_db();
+    let cp = db
+        .write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, created_at) VALUES ('acme', 'acme', 'Acme', '2026-11-20T00:00:00Z')",
+                [],
+            )?;
+            key_add(tx, FIXTURE_KEY_ID, &pk, "2026-11-20T00:00:00Z", None)?;
+            for (id, org) in [(5, "acme"), (6, "default"), (7, "default"), (8, "default"), (9, "acme")] {
+                tx.execute(
+                    "INSERT INTO tasks (id, org_id, title, created_at) VALUES (?1, ?2, 't', '2026-11-20T00:02:00Z')",
+                    params![id, org],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO deliverables (id, org_id, task_id, kind, title, created_by, created_at) \
+                 VALUES (4, 'acme', 9, 'file', 'd', 'acme-bot', '2026-11-20T00:03:00Z')",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO deliverable_revisions (id, org_id, deliverable_id, rev_no, identity, producer, recorded_at) \
+                 VALUES (4, 'acme', 4, 1, ?1, 'acme-bot', '2026-11-20T00:03:00Z')",
+                ["a".repeat(64)],
+            )?;
+            ledger::append(tx, EventInput::new("acme", "evidence.attestation", json!({ "task_id": 5 })).by("acme-bot"))?;
+            ledger::append(tx, EventInput::new("acme", "evidence.attestation", json!({ "task_id": 9 })).by("acme-bot"))?;
+            let sum = compute_org_window_checkpoint(tx, "acme", "2026-11-01T00:00:00Z", "2099-12-31T23:59:59Z", None)?;
+            let cp = Checkpoint {
+                checkpoint_id: "cp-acme-ord".into(),
+                class: CheckpointClass::Org,
+                org_id: Some("acme".into()),
+                seq: None,
+                hash: None,
+                window: Some(sum.window),
+                global_from_hash: Some(sum.global_from_hash),
+                global_head_hash: Some(sum.global_head_hash),
+                org_row_count: Some(sum.org_row_count),
+                org_chain_hash: Some(sum.org_chain_hash),
+                key_id: FIXTURE_KEY_ID.into(),
+                signed_at: "2026-11-25T12:00:00Z".into(),
+            };
+            let d = checkpoint_write(tx, &cp, "2026-11-25T12:00:00Z")?;
+            checkpoint_attach(tx, &cp.checkpoint_id, &sign_hex_digest(&sk, &d))?;
+            Ok(cp.checkpoint_id)
+        })
+        .unwrap();
+    let out = tempdir().unwrap();
+    let dir = out.path().join("b");
+    export_signed(&db, &cp, &dir, &sk);
+    let rows: Vec<EvidenceRow> = std::fs::read_to_string(dir.join("evidence/rows.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.iter().map(|r| r.task_id).collect::<Vec<_>>(), vec![Some(1), Some(2)]);
+    let arts: Vec<ArtifactIndexEntry> = read_json(&dir.join("artifacts/index.json"));
+    assert_eq!(arts[0].task_id, 2, "the artifact for task 9 uses the same ordinal as its evidence row");
+    assert_eq!(arts[0].id, "deliverable:1");
+    assert!(verify_bundle_dir(&dir, &trust).unwrap().ok);
+}
+
+/// B-S3: evidence rows are rebuilt from the ledger, the manifest window is
+/// checked, and artifacts not bound to agent.deliverable.* events are
+/// reported as hub-asserted.
+#[test]
+fn evidence_rows_window_and_artifact_bindings_are_checked() {
+    let trust = fixture_trust();
+    let (sk, _) = signing_key(FIXTURE_KEY_SEED);
+    let base = verify_bundle_dir(&fixtures_root().join("good_hub"), &trust).unwrap();
+    assert_eq!(base.artifacts.status, ClaimStatus::Verified, "{:?}", base.artifacts);
+
+    // A fabricated evidence row refuses.
+    let tmp = good_copy("good_hub");
+    let rows_path = tmp.path().join("evidence/rows.jsonl");
+    let mut text = std::fs::read_to_string(&rows_path).unwrap();
+    let mut fake: EvidenceRow = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    fake.id = "01FAKE00000000000000000000".into();
+    fake.kind = "evidence.attestation".into();
+    fake.labels = vec!["tests_passed".into()];
+    text.push_str(&String::from_utf8(to_canonical_bytes(&fake).unwrap()).unwrap());
+    text.push('\n');
+    std::fs::write(&rows_path, text).unwrap();
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "evidence_row_mismatch");
+
+    // An altered row (labels) refuses.
+    let tmp = good_copy("good_hub");
+    rewrite_jsonl::<EvidenceRow>(&tmp.path().join("evidence/rows.jsonl"), |r| {
+        r.labels.push("tests_passed".into())
+    });
+    remanifest_and_resign(tmp.path(), &sk, false);
+    assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "evidence_row_mismatch");
+
+    // A widened manifest window refuses, for both classes.
+    for fixture in ["good_hub", "good_org"] {
+        let tmp = good_copy(fixture);
+        edit_manifest(tmp.path(), &sk, |m| {
+            m.window = Window { start: "2001-01-01T00:00:00Z".into(), end: "2099-01-01T00:00:00Z".into() };
+        });
+        assert_refused(&verify_bundle_dir(tmp.path(), &trust).unwrap(), "manifest_window_mismatch");
+    }
+
+    // A fabricated unreleased artifact is not bound to a deliverable event:
+    // the index is reported hub-asserted.
+    let tmp = good_copy("good_hub");
+    let ap = tmp.path().join("artifacts/index.json");
+    let mut arts: Vec<ArtifactIndexEntry> = read_json(&ap);
+    let mut fake = arts[0].clone();
+    fake.id = "deliverable:999".into();
+    fake.release_status = "unreleased".into();
+    fake.approval_id = None;
+    arts.push(fake);
+    write_json(&ap, &arts);
+    remanifest_and_resign(tmp.path(), &sk, false);
+    let v = verify_bundle_dir(tmp.path(), &trust).unwrap();
+    assert!(v.ok, "{v:?}");
+    assert_eq!(v.artifacts.status, ClaimStatus::HubAsserted);
+}
+
+/// B-S6: withheld counts and org ordinals come from the checkpoint's frozen
+/// snapshot, so a re-export after deletes is byte-identical.
+#[test]
+fn reexport_is_byte_identical_after_deletes() {
+    let (sk, _) = signing_key(FIXTURE_KEY_SEED);
+    let (_d, db) = open_test_db();
+    // An earlier acme task (100) makes task 101's ordinal 2.
+    db.write(|tx| {
+        tx.execute(
+            "INSERT INTO orgs (id, slug, display_name, created_at) VALUES ('acme', 'acme', 'Acme Org', '2026-11-20T00:00:00Z')",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO tasks (id, org_id, title, created_at) VALUES (100, 'acme', 'earlier', '2026-11-19T00:00:00Z')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let (hub_cp, org_cp) = populate_sample_db(&db, &sk, FIXTURE_KEY_ID);
+    for cp in [&hub_cp, &org_cp] {
+        let wrote = db.write(|tx| snapshot_checkpoint(tx, cp, "2026-11-25T12:06:00Z")).unwrap();
+        assert!(wrote);
+        let again = db.write(|tx| snapshot_checkpoint(tx, cp, "2026-11-25T12:07:00Z")).unwrap();
+        assert!(!again, "a snapshot is written once");
+    }
+    let out = tempdir().unwrap();
+    let r1h = db.read(|c| export_bundle(c, &out.path().join("h1"), &export_opts(&hub_cp))).unwrap();
+    let r1o = db.read(|c| export_bundle(c, &out.path().join("o1"), &export_opts(&org_cp))).unwrap();
+    assert!(r1h.withheld.classes.contains_key("session_credentials"));
+    let rows: Vec<EvidenceRow> = std::fs::read_to_string(out.path().join("o1/evidence/rows.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(rows.iter().any(|r| r.task_id == Some(2)), "task 101 is acme's second task: {rows:?}");
+
+    db.write(|tx| {
+        tx.execute("DELETE FROM session_credentials", [])?;
+        tx.execute("DELETE FROM tasks WHERE id = 100", [])?;
+        tx.execute("DELETE FROM agent_tokens", [])?;
+        Ok(())
+    })
+    .unwrap();
+    let r2h = db.read(|c| export_bundle(c, &out.path().join("h2"), &export_opts(&hub_cp))).unwrap();
+    let r2o = db.read(|c| export_bundle(c, &out.path().join("o2"), &export_opts(&org_cp))).unwrap();
+    assert_eq!(r1h.manifest, r2h.manifest, "hub bundle drifted after deletes");
+    assert_eq!(r1o.manifest, r2o.manifest, "org bundle drifted after deletes");
+    // The snapshot cannot be rewritten or removed.
+    assert!(db.write(|tx| Ok(tx.execute("DELETE FROM evidence_export_snapshot", [])?)).is_err());
+    assert!(
+        db.write(|tx| Ok(tx.execute("UPDATE evidence_export_snapshot SET snapshot = '{}'", [])?)).is_err()
+    );
 }

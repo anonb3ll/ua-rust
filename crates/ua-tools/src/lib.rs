@@ -253,6 +253,10 @@ pub fn schema_parts() -> Vec<Part> {
     // tenant-scoped) plus parent-org fences and generated org triggers.
     parts.push(families::memory::CHUNKS_SCHEMA.into());
     parts.push(families::memory::CHUNKS_TENANT_PART.into());
+    // The append-only export snapshot frozen per checkpoint (withheld counts
+    // and org ordinals), so a re-export after deletes stays byte-identical
+    // (docs/evidence-export.md, Determinism). After the checkpoint parts.
+    parts.push(ua_store::evidence_bundle::EXPORT_SNAPSHOT_PART.into());
     parts
 }
 

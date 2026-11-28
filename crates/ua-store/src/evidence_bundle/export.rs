@@ -21,12 +21,17 @@ use crate::ledger::GENESIS_HASH;
 use super::canonical::{
     empty_org_chain_hash, org_chain_fold, sha256_hex, to_canonical_bytes, to_canonical_string,
 };
-use super::egress::{CLASS_CROSS_ORG_EVENTS, EgressFilter, LedgerEgressAction};
+use super::egress::{CLASS_CROSS_ORG_EVENTS, EgressFilter, LedgerEgressAction, parse_strict_json};
+use super::snapshot::{
+    ExportSnapshot, column_exists, in_time_window, snapshot_capture, snapshot_load, table_exists,
+};
 use super::{
     ARTIFACT_CONTENT_HASH_ONLY, ApprovalReceipt, ArtifactIndexEntry, BUNDLE_FORMAT, BundleCheckpointFile,
-    BundleLedgerEvent, BundleManifest, CoveredArtifact, EvidenceRow, ManifestCounts, PolicyRevisionRecord,
-    ProducerInfo, REDACTED_CHANNEL, ReceiptActor, ReceiptLedgerRef, ReceiptResolver, WithheldReport, cmp_ts,
-    extract_sod_tools_from_doc, normalize_ts_utc,
+    BundleLedgerEvent, BundleManifest, CoveredArtifact, EvidenceRow, LABEL_PLACEHOLDER, ManifestCounts,
+    PolicyRevisionRecord, ProducerInfo, REDACTED_CHANNEL, RELEASE_NOT_IN_BUNDLE,
+    RELEASE_NOT_PROVABLE_IN_ORG_BUNDLE, RELEASE_RELEASED, RELEASE_UNRELEASED, ReceiptActor, ReceiptLedgerRef,
+    ReceiptResolver, WithheldReport, cmp_ts, derive_evidence_row, extract_sod_tools_from_doc,
+    is_evidence_channel, labels_equal, normalize_decision, normalize_ts_utc, policy_in_force,
 };
 
 /// Options for [`export_bundle`].
@@ -217,41 +222,46 @@ pub fn export_bundle(
     let ledger_data =
         collect_ledger_events(conn, &checkpoint, opts.from_seq, opts.from_org_seq, &mut filter)?;
 
-    // Count inherently withheld database tables strictly within the checkpoint's
-    // window so re-exporting an older checkpoint after later writes stays
-    // byte-identical and hub bundles never expose all-time table totals.
-    filter.count_withheld_tables(
-        conn,
-        checkpoint.org_id.as_deref(),
+    // Withheld table counts and `org` ordinals come from the checkpoint's
+    // frozen export snapshot (captured live when none was stored), so a
+    // re-export after deletes stays byte-identical. Counts are scoped to the
+    // bundle window and, for `org` bundles, to the organization.
+    let snapshot = match snapshot_load(conn, &opts.checkpoint_id)? {
+        Some(s) => s,
+        None => snapshot_capture(conn, &checkpoint)?,
+    };
+    for (class, n) in snapshot.withheld_in_window(
         ledger_data.start_excl_ts.as_deref(),
         &ledger_data.cutoff_ts,
         ledger_data.seq_bounds,
         &ledger_data.redacted_ulids,
-    )?;
+    ) {
+        filter.record_withheld(&class, n);
+    }
 
-    // Build lookup map of unredacted exported approval resolution events so
-    // receipts cross-link directly.
-    let mut approval_event_refs: BTreeMap<i64, (ReceiptLedgerRef, Value)> = BTreeMap::new();
+    // Unredacted approval resolution events, keyed by raw approval id, so
+    // receipts cross-link directly (the latest resolution per approval).
+    let mut approval_event_refs: BTreeMap<i64, ApprovalEventRef> = BTreeMap::new();
     for ev in &ledger_data.events {
         if ev.redacted {
             continue;
         }
         if ev.channel == "agent.approval.resolved"
             && let Some(eh) = ev.entry_hash.as_deref()
-            && let Ok(parsed) = serde_json::from_str::<Value>(&ev.payload)
+            && let Ok(parsed) = parse_strict_json(&ev.payload)
             && let Some(aid) = parsed.get("approval_id").and_then(Value::as_i64)
         {
             approval_event_refs.insert(
                 aid,
-                (ReceiptLedgerRef { seq: ev.seq, org_seq: ev.org_seq, hash: eh.to_string() }, parsed),
+                ApprovalEventRef {
+                    ledger: ReceiptLedgerRef { seq: ev.seq, org_seq: ev.org_seq, hash: eh.to_string() },
+                    payload: parsed,
+                },
             );
         }
     }
 
-    // Build org-local dense ID mapper for `org` bundles so hub-wide
-    // autoincrement gaps never reveal cross-org volume.
-    let id_mapper =
-        OrgIdMapper::new(conn, checkpoint.class, checkpoint.org_id.as_deref(), &ledger_data.events)?;
+    let id_mapper = IdMapper::new(checkpoint.class, checkpoint.org_id.as_deref(), &snapshot);
 
     // 2. Load policy revisions up to the checkpoint cutoff (reading the actual
     //    policy `document` and deriving `sod_tools` from it — never hard-coded).
@@ -262,6 +272,7 @@ pub fn export_bundle(
     let exported_raw_approval_ids: BTreeSet<i64> = approval_event_refs.keys().copied().collect();
     let (artifacts, covers_by_raw_approval) = collect_artifacts(
         conn,
+        checkpoint.class,
         checkpoint.org_id.as_deref(),
         ledger_data.start_excl_ts.as_deref(),
         &ledger_data.cutoff_ts,
@@ -282,6 +293,8 @@ pub fn export_bundle(
     )?;
     let evidence_rows =
         collect_evidence_rows(&ledger_data.events, &all_policy_revisions, &id_mapper, &mut filter)?;
+    // `org` bundles carry the digest of each cited policy revision without its
+    // document: policy documents name identities across the hub.
 
     // 4. Filter `policy/revisions.json` to the bundle's scope & window:
     //    - `org` class: only policy revisions actually cited by receipts,
@@ -306,6 +319,13 @@ pub fn export_bundle(
     }
     let policy_revisions: Vec<PolicyRevisionRecord> = all_policy_revisions
         .into_iter()
+        .map(|mut p| {
+            if checkpoint.class == CheckpointClass::Org {
+                p.document = None;
+                p.sod_tools = Vec::new();
+            }
+            p
+        })
         .filter(|p| {
             let cited = p.kind == "policy" && cited_policy_revs.contains(&p.revision);
             match checkpoint.class {
@@ -453,139 +473,56 @@ struct RawApprovalRow {
     transport: Option<String>,
 }
 
-/// Maps hub-wide autoincrement IDs to dense per-organization ordinals (`1, 2, ...`)
-/// when exporting an `org`-class bundle so cross-org volume gaps never leak.
-/// For `hub` bundles, returns raw IDs unchanged.
-struct OrgIdMapper {
-    org_id: Option<String>,
-    has_tasks_org: bool,
-    has_approvals_org: bool,
-    has_deliverables_org: bool,
-    fallback_task_ordinals: BTreeMap<i64, i64>,
+struct ApprovalEventRef {
+    ledger: ReceiptLedgerRef,
+    payload: Value,
 }
 
-impl OrgIdMapper {
-    fn new(
-        conn: &Connection,
-        class: CheckpointClass,
-        org_id: Option<&str>,
-        events: &[BundleLedgerEvent],
-    ) -> UaResult<Self> {
-        let Some(org) = (match class {
-            CheckpointClass::Org => org_id,
+/// Maps hub-wide autoincrement ids to dense per-organization ordinals
+/// (`1, 2, ...`) from the checkpoint's export snapshot when exporting an
+/// `org`-class bundle, so hub-wide gaps never reveal cross-org volume. `hub`
+/// bundles keep raw ids.
+struct IdMapper<'a> {
+    org: Option<String>,
+    snapshot: &'a ExportSnapshot,
+}
+
+impl<'a> IdMapper<'a> {
+    fn new(class: CheckpointClass, org_id: Option<&str>, snapshot: &'a ExportSnapshot) -> Self {
+        let org = match class {
+            CheckpointClass::Org => org_id.map(str::to_string),
             CheckpointClass::Hub => None,
-        }) else {
-            return Ok(Self {
-                org_id: None,
-                has_tasks_org: false,
-                has_approvals_org: false,
-                has_deliverables_org: false,
-                fallback_task_ordinals: BTreeMap::new(),
-            });
         };
-        let has_tasks_org = table_exists(conn, "tasks")? && column_exists(conn, "tasks", "org_id")?;
-        let has_approvals_org =
-            table_exists(conn, "approvals")? && column_exists(conn, "approvals", "org_id")?;
-        let has_deliverables_org =
-            table_exists(conn, "deliverables")? && column_exists(conn, "deliverables", "org_id")?;
+        Self { org, snapshot }
+    }
 
-        let mut fallback_task_ordinals = BTreeMap::new();
-        if !has_tasks_org {
-            let mut task_ids = BTreeSet::new();
-            if has_deliverables_org {
-                let mut stmt = conn.prepare("SELECT DISTINCT task_id FROM deliverables WHERE org_id = ?1")?;
-                for row in stmt.query_map([org], |r| r.get::<_, i64>(0))? {
-                    let tid = row?;
-                    if tid > 0 {
-                        task_ids.insert(tid);
-                    }
-                }
-            }
-            for ev in events {
-                if !ev.redacted
-                    && let Ok(v) = serde_json::from_str::<Value>(&ev.payload)
-                    && let Some(tid) = v.get("task_id").and_then(Value::as_i64)
-                    && tid > 0
-                {
-                    task_ids.insert(tid);
-                }
-            }
-            for (idx, tid) in task_ids.into_iter().enumerate() {
-                fallback_task_ordinals.insert(tid, (idx + 1) as i64);
-            }
+    fn is_org(&self) -> bool {
+        self.org.is_some()
+    }
+
+    /// The ordinal of a task in this organization, or `None` when it is not
+    /// one of the organization's tasks (another organization's event in the
+    /// default ledger, or a task deleted before the snapshot).
+    fn task_id(&self, raw: i64) -> Option<i64> {
+        if self.org.is_none() {
+            return Some(raw);
         }
-
-        Ok(Self {
-            org_id: Some(org.to_string()),
-            has_tasks_org,
-            has_approvals_org,
-            has_deliverables_org,
-            fallback_task_ordinals,
-        })
+        self.snapshot.task_ordinal(raw)
     }
 
-    fn task_id(&self, conn: &Connection, raw: i64) -> UaResult<i64> {
-        let Some(org) = self.org_id.as_deref() else {
-            return Ok(raw);
-        };
-        if self.has_tasks_org {
-            let n: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM tasks WHERE org_id = ?1 AND id <= ?2",
-                rusqlite::params![org, raw],
-                |r| r.get(0),
-            )?;
-            if n > 0 {
-                return Ok(n);
-            }
+    fn approval_id(&self, raw: i64) -> Option<i64> {
+        if self.org.is_none() {
+            return Some(raw);
         }
-        Ok(*self.fallback_task_ordinals.get(&raw).unwrap_or(&1))
+        self.snapshot.approval_ordinal(raw)
     }
 
-    fn approval_id(&self, conn: &Connection, raw: i64) -> UaResult<i64> {
-        let Some(org) = self.org_id.as_deref() else {
-            return Ok(raw);
-        };
-        if self.has_approvals_org {
-            let n: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM approvals WHERE org_id = ?1 AND id <= ?2",
-                rusqlite::params![org, raw],
-                |r| r.get(0),
-            )?;
-            if n > 0 {
-                return Ok(n);
-            }
+    fn deliverable_id(&self, raw: i64) -> Option<i64> {
+        if self.org.is_none() {
+            return Some(raw);
         }
-        Ok(raw)
+        self.snapshot.deliverable_ordinal(raw)
     }
-
-    fn deliverable_id(&self, conn: &Connection, raw: i64) -> UaResult<i64> {
-        let Some(org) = self.org_id.as_deref() else {
-            return Ok(raw);
-        };
-        if self.has_deliverables_org {
-            let n: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM deliverables WHERE org_id = ?1 AND id <= ?2",
-                rusqlite::params![org, raw],
-                |r| r.get(0),
-            )?;
-            if n > 0 {
-                return Ok(n);
-            }
-        }
-        Ok(raw)
-    }
-}
-
-fn in_time_window(ts: &str, start_excl_ts: Option<&str>, cutoff_ts: &str) -> bool {
-    if cmp_ts(ts, cutoff_ts) == Ordering::Greater {
-        return false;
-    }
-    if let Some(start) = start_excl_ts
-        && cmp_ts(ts, start) != Ordering::Greater
-    {
-        return false;
-    }
-    true
 }
 
 /// Detect whether an `agent.approval.*` event in the `default` ledger actually
@@ -603,7 +540,7 @@ fn is_foreign_org_approval_event(
     if !channel.starts_with("agent.approval.") {
         return Ok(false);
     }
-    let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
+    let Ok(parsed) = parse_strict_json(payload) else {
         return Ok(false);
     };
     if has_approvals
@@ -967,22 +904,6 @@ fn collect_ledger_events(
     }
 }
 
-fn table_exists(conn: &Connection, table: &str) -> UaResult<bool> {
-    Ok(conn
-        .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [table], |_| Ok(true))
-        .optional()?
-        .unwrap_or(false))
-}
-
-fn column_exists(conn: &Connection, table: &str, col: &str) -> UaResult<bool> {
-    Ok(conn
-        .query_row(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"), [col], |_| {
-            Ok(true)
-        })
-        .optional()?
-        .unwrap_or(false))
-}
-
 fn load_policy_revisions_up_to(
     conn: &Connection,
     cutoff_ts: &str,
@@ -1078,12 +999,13 @@ struct RawArtifactRevision {
 #[allow(clippy::too_many_arguments)]
 fn collect_artifacts(
     conn: &Connection,
+    class: CheckpointClass,
     org_id: Option<&str>,
     start_excl_ts: Option<&str>,
     cutoff_ts: &str,
     exported_raw_approval_ids: &BTreeSet<i64>,
     policy_revisions: &[PolicyRevisionRecord],
-    id_mapper: &OrgIdMapper,
+    id_mapper: &IdMapper<'_>,
     filter: &mut EgressFilter,
 ) -> UaResult<ArtifactCollection> {
     if !table_exists(conn, "deliverables")? || !table_exists(conn, "deliverable_revisions")? {
@@ -1094,6 +1016,10 @@ fn collect_artifacts(
     let has_cancelled_at = has_releases && column_exists(conn, "deliverable_releases", "cancelled_at")?;
     let has_dispatch_runs = table_exists(conn, "dispatch_runs")?;
     let has_dispatch_runs_org = has_dispatch_runs && column_exists(conn, "dispatch_runs", "org_id")?;
+    // A non-default organization's approval events sit in the default ledger
+    // (ORG-EVENT-DEFAULT), so its `org` bundle can never prove a release.
+    let org_bundle_without_approvals =
+        class == CheckpointClass::Org && org_id.is_some_and(|o| o != DEFAULT_ORG);
 
     let sql = match org_id {
         Some(_) => {
@@ -1141,8 +1067,9 @@ fn collect_artifacts(
         row_org,
     } in raw_rows
     {
-        // Check whether this revision is released by an approval inside this bundle.
-        let raw_approval_id: Option<i64> = if has_releases {
+        // Live releases of this revision, and the one (if any) whose approval
+        // event is exported in this bundle.
+        let release_ids: Vec<i64> = if has_releases {
             let rel_sql = if has_cancelled_at {
                 "SELECT approval_id FROM deliverable_releases \
                  WHERE revision_id = ?1 AND cancelled_at IS NULL ORDER BY approval_id ASC"
@@ -1151,11 +1078,11 @@ fn collect_artifacts(
                  WHERE revision_id = ?1 ORDER BY approval_id ASC"
             };
             let mut rstmt = conn.prepare(rel_sql)?;
-            let ids: Vec<i64> = rstmt.query_map([rev_row_id], |r| r.get(0))?.collect::<Result<_, _>>()?;
-            ids.into_iter().find(|aid| exported_raw_approval_ids.contains(aid))
+            rstmt.query_map([rev_row_id], |r| r.get(0))?.collect::<Result<_, _>>()?
         } else {
-            None
+            Vec::new()
         };
+        let raw_approval_id = release_ids.iter().copied().find(|aid| exported_raw_approval_ids.contains(aid));
 
         // Include revisions recorded inside the bundle window, plus any earlier
         // revision (<= cutoff) covered by a release approval resolved in this window.
@@ -1211,25 +1138,44 @@ fn collect_artifacts(
             (None, None)
         };
 
-        let policy_revision = policy_revisions
-            .iter()
-            .rev()
-            .find(|p| p.kind == "policy" && cmp_ts(&p.created_at, &recorded_at) != Ordering::Greater)
-            .map(|p| p.revision);
+        let policy_revision = policy_in_force(policy_revisions, &recorded_at).map(|p| p.revision);
         let media_type = if kind == "commit" {
             "application/vnd.ua.git-commit".to_string()
         } else {
             "application/octet-stream".to_string()
         };
 
-        let mapped_deliv_id = id_mapper.deliverable_id(conn, deliverable_id)?;
-        let mapped_task_id = id_mapper.task_id(conn, raw_task_id)?;
+        let mapped_deliv_id = id_mapper.deliverable_id(deliverable_id).ok_or_else(|| {
+            UaError::conflict(format!(
+                "deliverable {deliverable_id} is missing from the checkpoint's export snapshot; cannot map it to an \
+                 organization-local id"
+            ))
+        })?;
+        let mapped_task_id = id_mapper.task_id(raw_task_id).ok_or_else(|| {
+            UaError::conflict(format!(
+                "task {raw_task_id} of deliverable {deliverable_id} is missing from the checkpoint's export \
+                 snapshot; cannot map it to an organization-local id"
+            ))
+        })?;
         let mapped_approval_id = match raw_approval_id {
-            Some(aid) => Some(id_mapper.approval_id(conn, aid)?),
+            Some(aid) => Some(id_mapper.approval_id(aid).ok_or_else(|| {
+                UaError::conflict(format!(
+                    "approval {aid} is missing from the checkpoint's export snapshot; cannot map it to an \
+                     organization-local id"
+                ))
+            })?),
             None => None,
         };
+        let release_status = if mapped_approval_id.is_some() {
+            RELEASE_RELEASED
+        } else if release_ids.is_empty() {
+            RELEASE_UNRELEASED
+        } else if org_bundle_without_approvals {
+            RELEASE_NOT_PROVABLE_IN_ORG_BUNDLE
+        } else {
+            RELEASE_NOT_IN_BUNDLE
+        };
         let artifact_id = format!("deliverable:{mapped_deliv_id}");
-        let released = mapped_approval_id.is_some();
 
         let entry = ArtifactIndexEntry {
             id: artifact_id.clone(),
@@ -1242,7 +1188,7 @@ fn collect_artifacts(
             attempt,
             policy_revision,
             approval_id: mapped_approval_id,
-            released,
+            release_status: release_status.to_string(),
             recorded_at: normalize_ts_utc(&recorded_at),
         };
         let val = serde_json::to_value(&entry).map_err(|e| UaError::internal(e.to_string()))?;
@@ -1259,27 +1205,15 @@ fn collect_artifacts(
     Ok((out, covers_by_raw_approval))
 }
 
-/// Deterministic, non-reversible label pseudonymization for non-default org
-/// approval actors inside a `hub` bundle, matching `approvals::ledger_label`
-/// policy while preserving `resolver != requester` for separation-of-duties
-/// verification.
-fn redact_tenant_label(org: &str, label: &str) -> String {
-    if label.trim().is_empty() {
-        return String::new();
-    }
-    let digest = sha256_hex(format!("ua.label.v1\0{org}\0{label}").as_bytes());
-    format!("redacted:{}", &digest[..16])
-}
-
 #[allow(clippy::too_many_arguments)]
 fn collect_approval_receipts(
     conn: &Connection,
     class: CheckpointClass,
     org_id: Option<&str>,
-    approval_event_refs: &BTreeMap<i64, (ReceiptLedgerRef, Value)>,
+    approval_event_refs: &BTreeMap<i64, ApprovalEventRef>,
     policy_revisions: &[PolicyRevisionRecord],
     covers_by_raw_approval: &BTreeMap<i64, Vec<CoveredArtifact>>,
-    id_mapper: &OrgIdMapper,
+    id_mapper: &IdMapper<'_>,
     filter: &mut EgressFilter,
 ) -> UaResult<Vec<ApprovalReceipt>> {
     if approval_event_refs.is_empty() || !table_exists(conn, "approvals")? {
@@ -1291,7 +1225,8 @@ fn collect_approval_receipts(
     let transport_col = if has_transport { "resolved_transport" } else { "NULL" };
 
     let mut out = Vec::new();
-    for (&raw_aid, (ledger_ref, ev_payload)) in approval_event_refs {
+    for (&raw_aid, ev_ref) in approval_event_refs {
+        let ev_payload = &ev_ref.payload;
         let row: Option<RawApprovalRow> = conn
             .query_row(
                 &format!(
@@ -1318,7 +1253,7 @@ fn collect_approval_receipts(
             .optional()?;
         let Some(RawApprovalRow {
             org_id: row_org,
-            tool,
+            tool: row_tool,
             payload_raw,
             requested_by,
             status,
@@ -1336,14 +1271,12 @@ fn collect_approval_receipts(
         {
             continue;
         }
-        let raw_decision = ev_payload.get("decision").and_then(Value::as_str).unwrap_or(status.as_str());
-        let decision = match raw_decision {
-            "approve" | "approved" => "approved",
-            "deny" | "denied" => "denied",
-            "revoke" | "revoked" => "revoked",
-            other => other,
-        }
-        .to_string();
+        // The hash-verified event is the source of truth for every field it
+        // records; the approvals row fills in only what the event omits.
+        let tool =
+            ev_payload.get("tool").and_then(Value::as_str).map(str::to_string).unwrap_or(row_tool.clone());
+        let decision =
+            normalize_decision(ev_payload.get("decision").and_then(Value::as_str).unwrap_or(status.as_str()));
         let decided_at_raw = resolved_at.unwrap_or_else(|| {
             ev_payload.get("decided_at").and_then(Value::as_str).unwrap_or("").to_string()
         });
@@ -1363,39 +1296,38 @@ fn collect_approval_receipts(
         };
 
         let raw_req_label = requested_by.unwrap_or_else(|| "unknown".to_string());
-        let raw_resolver_label = resolved_by
-            .or_else(|| ev_payload.get("resolved_by").and_then(Value::as_str).map(str::to_string))
+        let raw_resolver_label = ev_payload
+            .get("resolved_by")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or(resolved_by)
             .unwrap_or_default();
+        let resolver_is_requester = labels_equal(&raw_resolver_label, &raw_req_label);
 
-        // Respect `ledger_label` redaction: in a `hub` bundle, non-default org
-        // tenant labels are pseudonymized (preserving SoD inequality) and their
-        // free-text `reason` is omitted so tenant names/notes never bypass
-        // ledger redaction.
+        // In a `hub` bundle another organization's labels are a fixed
+        // placeholder (the ledger records `null` for them, `ledger_label`) and
+        // its free-text reason is omitted; `resolver_is_requester` keeps the
+        // separation-of-duties fact without the labels.
         let redact_for_hub = class == CheckpointClass::Hub && row_org != DEFAULT_ORG;
-        let req_label = if redact_for_hub {
-            redact_tenant_label(&row_org, &raw_req_label)
+        let (req_label, resolver_label) = if redact_for_hub {
+            (LABEL_PLACEHOLDER.to_string(), LABEL_PLACEHOLDER.to_string())
         } else {
-            raw_req_label.clone()
-        };
-        let resolver_label = if redact_for_hub {
-            redact_tenant_label(&row_org, &raw_resolver_label)
-        } else {
-            raw_resolver_label.clone()
+            (raw_req_label.clone(), raw_resolver_label.clone())
         };
         let receipt_reason = if redact_for_hub { None } else { reason };
 
         let request_val = json!({
             "payload": payload_raw,
             "requested_by": req_label,
-            "tool": tool,
+            "tool": row_tool,
         });
         let request_digest = sha256_hex(to_canonical_string(&request_val)?.as_bytes());
 
         let resolver_transport =
-            transport.or_else(|| ev_payload.get("transport").and_then(Value::as_str).map(str::to_string));
+            ev_payload.get("transport").and_then(Value::as_str).map(str::to_string).or(transport);
         let resolver_kind = if let Some(k) = ev_payload.get("resolver_kind").and_then(Value::as_str) {
             k.to_string()
-        } else if decision != "approved" && raw_resolver_label == raw_req_label {
+        } else if decision != "approved" && resolver_is_requester {
             "agent".to_string()
         } else {
             "human".to_string()
@@ -1412,12 +1344,14 @@ fn collect_approval_receipts(
             None
         };
 
-        let policy_match = policy_revisions.iter().rev().find(|p| {
-            p.kind == "policy"
-                && (decided_at.is_empty() || cmp_ts(&p.created_at, &decided_at) != Ordering::Greater)
-        });
+        let policy_match = policy_in_force(policy_revisions, &decided_at);
         let covers = covers_by_raw_approval.get(&raw_aid).cloned().unwrap_or_default();
-        let mapped_aid = id_mapper.approval_id(conn, raw_aid)?;
+        let mapped_aid = id_mapper.approval_id(raw_aid).ok_or_else(|| {
+            UaError::conflict(format!(
+                "approval {raw_aid} is missing from the checkpoint's export snapshot; cannot map it to an \
+                 organization-local id"
+            ))
+        })?;
 
         let mut receipt = ApprovalReceipt {
             receipt_id: String::new(),
@@ -1434,11 +1368,12 @@ fn collect_approval_receipts(
                 kind: resolver_kind,
                 transport: resolver_transport,
             },
+            resolver_is_requester,
             decision,
             reason: receipt_reason,
             decided_at,
             expires_at,
-            ledger: ledger_ref.clone(),
+            ledger: ev_ref.ledger.clone(),
             run_id,
             attempt,
             covers,
@@ -1455,55 +1390,23 @@ fn collect_approval_receipts(
 fn collect_evidence_rows(
     events: &[BundleLedgerEvent],
     policy_revisions: &[PolicyRevisionRecord],
-    id_mapper: &OrgIdMapper,
+    id_mapper: &IdMapper<'_>,
     filter: &mut EgressFilter,
 ) -> UaResult<Vec<EvidenceRow>> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for ev in events {
-        if ev.redacted {
+        if ev.redacted || !is_evidence_channel(&ev.channel) || !seen.insert(ev.ulid.clone()) {
             continue;
         }
-        let Ok(parsed) = serde_json::from_str::<Value>(&ev.payload) else { continue };
-        let is_evidence_event = ev.channel.starts_with("evidence.")
-            || ev.channel.starts_with("agent.approval.")
-            || ev.channel.starts_with("agent.deliverable.")
-            || ev.channel.starts_with("sdk.");
-        if !is_evidence_event || !seen.insert(ev.ulid.clone()) {
-            continue;
+        let Ok(parsed) = parse_strict_json(&ev.payload) else { continue };
+        let mut row = derive_evidence_row(ev, &parsed, policy_revisions);
+        if id_mapper.is_org() {
+            // Dense organization-local task ordinal (or none for a task that is
+            // not this organization's); the raw hub approval id is dropped.
+            row.task_id = row.task_id.and_then(|tid| id_mapper.task_id(tid));
+            row.approval_id = None;
         }
-        let raw_task_id = parsed.get("task_id").and_then(Value::as_i64);
-        let task_id = match (raw_task_id, id_mapper.org_id.as_deref()) {
-            (Some(tid), Some(_)) => Some(*id_mapper.fallback_task_ordinals.get(&tid).unwrap_or(&1)),
-            (other, _) => other,
-        };
-        let run_id = parsed.get("run_id").and_then(Value::as_str).map(str::to_string);
-        let attempt = parsed.get("attempt").and_then(Value::as_i64);
-        // For org bundles, omit raw hub approval_id on EvidenceRow if not mapped
-        // (receipts carry the dense org-local approval_id).
-        let approval_id =
-            if id_mapper.org_id.is_some() { None } else { parsed.get("approval_id").and_then(Value::as_i64) };
-        let policy_revision = policy_revisions
-            .iter()
-            .rev()
-            .find(|p| p.kind == "policy" && cmp_ts(&p.created_at, &ev.created_at) != Ordering::Greater)
-            .map(|p| p.revision);
-        let mut labels = vec![ev.channel.clone()];
-        if ev.channel.starts_with("sdk.") {
-            labels.push("client_asserted".into());
-        }
-        let row = EvidenceRow {
-            id: ev.ulid.clone(),
-            kind: ev.channel.clone(),
-            org_id: ev.org_id.clone(),
-            task_id,
-            run_id,
-            attempt,
-            policy_revision,
-            approval_id,
-            labels,
-            created_at: normalize_ts_utc(&ev.created_at),
-        };
         let val = serde_json::to_value(&row).map_err(|e| UaError::internal(e.to_string()))?;
         if filter.allow_evidence_row(&val)? {
             out.push(row);

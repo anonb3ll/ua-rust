@@ -412,3 +412,58 @@ fn end_to_end_export_offline_sign_and_verify_hub_and_org_bundles() {
     // Offline UA_HOME stayed 100% empty through all offline steps!
     assert!(std::fs::read_dir(offline_home.path()).unwrap().next().is_none());
 }
+
+/// `sign --bundle` runs the verifier's non-authorship checks first and refuses
+/// to sign a bundle the verifier would refuse (review B-B3): a private record,
+/// or an extra file listed in the manifest. A refused sign leaves the old
+/// `manifest.sig` untouched.
+#[test]
+fn sign_bundle_refuses_a_bundle_the_verifier_refuses() {
+    let empty_home = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let root = fixtures_root();
+    let key_path = work.path().join("op.key");
+    let keygen =
+        run_ua(empty_home.path(), &["evidence", "key-generate", "--out", key_path.to_str().unwrap()]);
+    assert_eq!(keygen.status.code(), Some(0));
+
+    // The checked-in private_record fixture has valid hashes but a private label.
+    let private = work.path().join("private");
+    copy_dir_recursive(&root.join("private_record"), &private);
+    let sig_before = std::fs::read(private.join("manifest.sig")).unwrap();
+    let out = run_ua(
+        empty_home.path(),
+        &[
+            "evidence",
+            "sign",
+            "--key-file",
+            key_path.to_str().unwrap(),
+            "--bundle",
+            private.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(out.status.code(), Some(0), "signing a refused bundle must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("forbidden_private_content"), "stderr: {stderr}");
+    assert_eq!(std::fs::read(private.join("manifest.sig")).unwrap(), sig_before);
+
+    // An extra file listed in the manifest with a correct hash.
+    let extra = work.path().join("extra");
+    copy_dir_recursive(&root.join("good_hub"), &extra);
+    std::fs::create_dir_all(extra.join("notes")).unwrap();
+    std::fs::write(extra.join("notes/ops.txt"), b"operator notes").unwrap();
+    let mp = extra.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
+    let sha = ua_store::evidence_bundle::sha256_hex(b"operator notes");
+    manifest["files"]["notes/ops.txt"] = Value::String(sha);
+    let m: ua_store::evidence_bundle::BundleManifest = serde_json::from_value(manifest).unwrap();
+    let mut m = m;
+    m.digest = m.recompute_digest().unwrap();
+    std::fs::write(&mp, ua_store::evidence_bundle::to_canonical_bytes(&m).unwrap()).unwrap();
+    let out = run_ua(
+        empty_home.path(),
+        &["evidence", "sign", "--key-file", key_path.to_str().unwrap(), "--bundle", extra.to_str().unwrap()],
+    );
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected_bundle_file"));
+}

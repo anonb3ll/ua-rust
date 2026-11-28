@@ -19,6 +19,7 @@
 pub mod canonical;
 pub mod egress;
 pub mod export;
+pub mod snapshot;
 pub mod verify;
 
 use std::cmp::Ordering;
@@ -34,14 +35,17 @@ pub use canonical::{
     empty_org_chain_hash, org_chain_fold, sha256_hex, to_canonical_bytes, to_canonical_string,
 };
 pub use egress::{
-    CLASS_AUTH_TOKENS, CLASS_CROSS_ORG_EVENTS, CLASS_MANAGED_SECRETS, CLASS_PASSKEYS, CLASS_PRIVATE_MESSAGES,
-    CLASS_PRIVATE_RECORDS, CLASS_PROVIDER_CREDENTIALS, CLASS_SESSION_CREDENTIALS, EgressFilter,
-    EgressViolation, WithheldReport, find_forbidden_in_ledger_event, find_forbidden_in_value,
-    is_restricted_channel, restricted_channel_class,
+    CLASS_APPROVALS_IN_DEFAULT_LEDGER, CLASS_AUTH_TOKENS, CLASS_CROSS_ORG_EVENTS, CLASS_MANAGED_SECRETS,
+    CLASS_PASSKEYS, CLASS_PRIVATE_MESSAGES, CLASS_PRIVATE_RECORDS, CLASS_PROVIDER_CREDENTIALS,
+    CLASS_SESSION_CREDENTIALS, CLASS_UNPARSEABLE_PAYLOAD, EgressFilter, EgressViolation,
+    MAX_SCANNED_STRING_BYTES, STUB_CLASSES, WithheldReport, find_forbidden_in_ledger_event,
+    find_forbidden_in_text, find_forbidden_in_value, is_restricted_channel, parse_strict_json,
+    restricted_channel_class,
 };
 pub use export::{
     ExportBundleOptions, ExportBundleResult, OrgWindowSummary, compute_org_window_checkpoint, export_bundle,
 };
+pub use snapshot::{EXPORT_SNAPSHOT_PART, ExportSnapshot, snapshot_checkpoint, snapshot_load};
 pub use verify::{
     BundleVerdict, BundleVerifyTrust, ClaimReport, ClaimStatus, HubCrossCheck, LegacyPrefixReport,
     MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_TOTAL_BYTES, PinnedHubHead, PinnedOrgHead, RedactedEventsReport,
@@ -57,6 +61,26 @@ pub const ARTIFACT_CONTENT_HASH_ONLY: &str = "hash_only";
 /// Placeholder channel written on hash-only redacted ledger stubs.
 pub const REDACTED_CHANNEL: &str = "[redacted]";
 
+/// Placeholder written for another organization's requester or resolver label
+/// in a `hub` bundle (the ledger records `null` for it, `ORG-EVENT-DEFAULT`).
+pub const LABEL_PLACEHOLDER: &str = "[redacted-label]";
+
+/// `artifacts/index.json` `release_status`: released by an approval whose
+/// receipt is in this bundle.
+pub const RELEASE_RELEASED: &str = "released";
+/// `release_status`: no live release of this revision.
+pub const RELEASE_UNRELEASED: &str = "unreleased";
+/// `release_status`: the revision has a release, but its approval event sits
+/// in the default organization's ledger (`ORG-EVENT-DEFAULT`), so this `org`
+/// bundle cannot carry or prove it.
+pub const RELEASE_NOT_PROVABLE_IN_ORG_BUNDLE: &str = "not_provable_in_org_bundle";
+/// `release_status`: the revision has a live release whose approval event
+/// falls outside this bundle's window.
+pub const RELEASE_NOT_IN_BUNDLE: &str = "release_not_in_bundle";
+
+/// Channel of the hub's policy, profile and approval-rule revision events.
+pub const CONFIG_REVISION_CHANNEL: &str = "agent.config.revision";
+
 /// Required hashed relative paths inside every bundle (in addition to any
 /// `approvals/<id>.json` files).
 pub const REQUIRED_BUNDLE_FILES: &[&str] = &[
@@ -70,6 +94,69 @@ pub const REQUIRED_BUNDLE_FILES: &[&str] = &[
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Whether two identity labels name the same identity (trimmed, ASCII
+/// case-insensitive, as the hub matches labels).
+pub fn labels_equal(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// Normalize an approval decision (`approve` / `approved` -> `approved`, ...).
+pub fn normalize_decision(raw: &str) -> String {
+    match raw.trim() {
+        "approve" | "approved" => "approved",
+        "deny" | "denied" => "denied",
+        "revoke" | "revoked" => "revoked",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Whether a ledger channel produces an `evidence/rows.jsonl` row.
+pub fn is_evidence_channel(channel: &str) -> bool {
+    channel.starts_with("evidence.")
+        || channel.starts_with("agent.approval.")
+        || channel.starts_with("agent.deliverable.")
+        || channel.starts_with("sdk.")
+}
+
+/// The policy revision in force at `ts`: the latest `kind = "policy"`
+/// revision created at or before `ts`.
+pub fn policy_in_force<'a>(
+    policy_revisions: &'a [PolicyRevisionRecord],
+    ts: &str,
+) -> Option<&'a PolicyRevisionRecord> {
+    policy_revisions
+        .iter()
+        .filter(|p| p.kind == "policy" && cmp_ts(&p.created_at, ts) != Ordering::Greater)
+        .max_by(|a, b| cmp_ts(&a.created_at, &b.created_at).then(a.revision.cmp(&b.revision)))
+}
+
+/// Derive the evidence row for an unredacted evidence-channel event from its
+/// hash-verified fields. `task_id` and `approval_id` carry the payload's raw
+/// hub ids; an `org` exporter maps them to dense ordinals (or `None`).
+pub fn derive_evidence_row(
+    ev: &BundleLedgerEvent,
+    parsed: &Value,
+    policy_revisions: &[PolicyRevisionRecord],
+) -> EvidenceRow {
+    let mut labels = vec![ev.channel.clone()];
+    if ev.channel.starts_with("sdk.") {
+        labels.push("client_asserted".into());
+    }
+    EvidenceRow {
+        id: ev.ulid.clone(),
+        kind: ev.channel.clone(),
+        org_id: ev.org_id.clone(),
+        task_id: parsed.get("task_id").and_then(Value::as_i64),
+        run_id: parsed.get("run_id").and_then(Value::as_str).map(str::to_string),
+        attempt: parsed.get("attempt").and_then(Value::as_i64),
+        policy_revision: policy_in_force(policy_revisions, &ev.created_at).map(|p| p.revision),
+        approval_id: parsed.get("approval_id").and_then(Value::as_i64),
+        labels,
+        created_at: normalize_ts_utc(&ev.created_at),
+    }
 }
 
 /// Normalize any RFC 3339 timestamp (`Z`, `+00:00`, or an arbitrary offset) to
@@ -314,6 +401,11 @@ pub struct ApprovalReceipt {
     pub policy_digest: Option<String>,
     pub requester: ReceiptActor,
     pub resolver: ReceiptResolver,
+    /// Whether the resolver is the requester. Recomputed from the labels when
+    /// both are in clear; the exporter's word when they are
+    /// [`LABEL_PLACEHOLDER`]s (another organization's labels in a `hub`
+    /// bundle).
+    pub resolver_is_requester: bool,
     /// `"approved"`, `"denied"`, or `"revoked"`.
     pub decision: String,
     pub reason: Option<String>,
@@ -342,6 +434,7 @@ struct ReceiptWithoutId<'a> {
     request_digest: &'a str,
     requester: &'a ReceiptActor,
     resolver: &'a ReceiptResolver,
+    resolver_is_requester: bool,
     run_id: &'a Option<String>,
     tool: &'a str,
 }
@@ -366,6 +459,7 @@ impl ApprovalReceipt {
             request_digest: &self.request_digest,
             requester: &self.requester,
             resolver: &self.resolver,
+            resolver_is_requester: self.resolver_is_requester,
             run_id: &self.run_id,
             tool: &self.tool,
         };
@@ -403,6 +497,8 @@ pub struct PolicyRevisionRecord {
     pub actor: String,
     /// Canonical policy document JSON string whose SHA-256 equals
     /// `document_sha256` and from which `sod_tools` is independently derived.
+    /// Present in `hub` bundles only: policy documents name identities, so an
+    /// `org` bundle carries the digest without the document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document: Option<String>,
     pub document_sha256: String,
@@ -431,8 +527,9 @@ pub struct ArtifactIndexEntry {
     pub attempt: Option<i64>,
     pub policy_revision: Option<i64>,
     pub approval_id: Option<i64>,
-    #[serde(default)]
-    pub released: bool,
+    /// [`RELEASE_RELEASED`], [`RELEASE_UNRELEASED`], or
+    /// [`RELEASE_NOT_PROVABLE_IN_ORG_BUNDLE`].
+    pub release_status: String,
     pub recorded_at: String,
 }
 
