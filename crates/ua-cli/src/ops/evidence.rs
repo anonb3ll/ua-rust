@@ -28,8 +28,9 @@ use ua_store::evidence::{
     key_revoke, latest_signed_checkpoint, verify_checkpoint_with,
 };
 use ua_store::evidence_bundle::{
-    BUNDLE_FORMAT, BundleCheckpointFile, BundleManifest, ExportBundleOptions, compute_org_window_checkpoint,
-    export_bundle, sha256_hex,
+    BUNDLE_FORMAT, BundleCheckpointFile, BundleManifest, BundleVerifyTrust, ExportBundleOptions,
+    PinnedHubHead, PinnedOrgHead, compute_org_window_checkpoint, export_bundle,
+    load_verified_hub_cross_check, sha256_hex, verify_bundle_dir,
 };
 use ua_tools::Hub;
 
@@ -128,13 +129,18 @@ pub enum EvidenceCmd {
         #[arg(long)]
         signature: String,
     },
-    /// Verify a checkpoint's signature. Pass the key you obtained out of band
-    /// (`--anchor-key` and `--anchor-key-id`, or `--trust-file`); without it
-    /// the result is only "matches the key in the same database", which is not
-    /// authorship. Exits 0 verified, 1 refused, 2 cannot verify.
+    /// Verify a checkpoint in the hub database (`--checkpoint`) or an exported
+    /// evidence bundle offline (`--bundle`). Offline `--bundle` verification
+    /// never opens or creates a hub database. Exits 0 verified, 1 refused,
+    /// 2 cannot verify.
     Verify {
-        #[arg(long)]
-        checkpoint: String,
+        /// Checkpoint id in the hub database. Mutually exclusive with `--bundle`.
+        #[arg(long, conflicts_with = "bundle", required_unless_present = "bundle")]
+        checkpoint: Option<String>,
+        /// Exported evidence bundle directory to verify completely offline.
+        /// Mutually exclusive with `--checkpoint`.
+        #[arg(long, conflicts_with = "checkpoint", required_unless_present = "checkpoint")]
+        bundle: Option<PathBuf>,
         /// Hex-encoded 32-byte Ed25519 public key the verifier pinned out of band.
         #[arg(long)]
         anchor_key: Option<String>,
@@ -150,11 +156,17 @@ pub enum EvidenceCmd {
         /// independently of the database's `revoked_at` column.
         #[arg(long = "revoked-key-id")]
         revoked_key_ids: Vec<String>,
-        /// Local copy of a previously signed hub checkpoint file (repeatable).
-        /// Each supplied record must match `event_log`, exist as a signed row
-        /// in `evidence_checkpoint`, and pass signature verification.
+        /// Local copy of a previously signed checkpoint file (repeatable).
+        /// For `--checkpoint`: out-of-band hub checkpoints checked against the
+        /// database. For `--bundle`: pins the prior checkpoint head (`hub` or
+        /// `org`) for incremental completeness verification.
         #[arg(long = "prev-checkpoint")]
         prev_checkpoints: Vec<PathBuf>,
+        /// For `--bundle` (class `org` only): path to a signed `hub` bundle
+        /// directory used to cross-check `global_from_hash` and
+        /// `global_head_hash` against the global ledger chain.
+        #[arg(long)]
+        hub_bundle: Option<PathBuf>,
     },
 }
 
@@ -379,12 +391,33 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
         }
         EvidenceCmd::Verify {
             checkpoint,
+            bundle,
             anchor_key,
             anchor_key_id,
             trust_file,
             revoked_key_ids,
             prev_checkpoints,
+            hub_bundle,
         } => {
+            if let Some(bundle_dir) = bundle {
+                return run_verify_bundle(
+                    &bundle_dir,
+                    anchor_key,
+                    anchor_key_id,
+                    trust_file.as_deref(),
+                    revoked_key_ids,
+                    prev_checkpoints,
+                    hub_bundle.as_deref(),
+                );
+            }
+            if hub_bundle.is_some() {
+                eprintln!("cannot verify: --hub-bundle is only valid with --bundle");
+                return Ok(ExitCode::from(2));
+            }
+            let Some(checkpoint) = checkpoint else {
+                eprintln!("cannot verify: either --checkpoint or --bundle is required");
+                return Ok(ExitCode::from(2));
+            };
             let trust = match build_verify_trust(
                 anchor_key,
                 anchor_key_id,
@@ -417,6 +450,118 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::from(verdict.exit_code()))
         }
     }
+}
+
+/// Verify an exported evidence bundle completely offline without opening or
+/// creating any hub database or reading `$UA_HOME`.
+pub fn run_verify_bundle(
+    bundle_dir: &Path,
+    anchor_key: Option<String>,
+    anchor_key_id: Option<String>,
+    trust_file: Option<&Path>,
+    revoked_key_ids: Vec<String>,
+    prev_checkpoints: Vec<PathBuf>,
+    hub_bundle: Option<&Path>,
+) -> anyhow::Result<ExitCode> {
+    let base_trust =
+        match build_verify_trust(anchor_key, anchor_key_id, trust_file, revoked_key_ids, Vec::new()) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("cannot verify: {e:#}");
+                return Ok(ExitCode::from(2));
+            }
+        };
+
+    let mut pinned_hub: Option<PinnedHubHead> = base_trust
+        .signed_checkpoints
+        .iter()
+        .max_by_key(|p| p.seq)
+        .map(|p| PinnedHubHead { seq: p.seq, hash: p.hash.clone() });
+    let mut pinned_org: Option<PinnedOrgHead> = None;
+
+    for path in prev_checkpoints {
+        let parsed = match load_checkpoint_file(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot verify: {e:#}");
+                return Ok(ExitCode::from(2));
+            }
+        };
+        if let Err(e) = parsed.checkpoint.validate_fields() {
+            eprintln!("cannot verify: invalid --prev-checkpoint {}: {e}", path.display());
+            return Ok(ExitCode::from(2));
+        }
+        let recomputed = parsed.checkpoint.digest();
+        if let Some(claimed) = parsed.digest.as_deref()
+            && !claimed.trim().eq_ignore_ascii_case(&recomputed)
+        {
+            eprintln!(
+                "cannot verify: digest mismatch in --prev-checkpoint {} (claims {claimed}, recomputed {recomputed})",
+                path.display()
+            );
+            return Ok(ExitCode::from(2));
+        }
+        match parsed.checkpoint.class {
+            CheckpointClass::Hub => {
+                let seq = parsed.checkpoint.seq.expect("validated hub");
+                let hash = parsed.checkpoint.hash.expect("validated hub");
+                if pinned_hub.as_ref().is_none_or(|cur| seq > cur.seq) {
+                    pinned_hub = Some(PinnedHubHead { seq, hash });
+                }
+            }
+            CheckpointClass::Org => {
+                let org_id = parsed.checkpoint.org_id.expect("validated org");
+                let global_head_hash = parsed.checkpoint.global_head_hash.expect("validated org");
+                let org_row_count = parsed.checkpoint.org_row_count.expect("validated org");
+                let org_chain_hash = parsed.checkpoint.org_chain_hash.expect("validated org");
+                if pinned_org.as_ref().is_none_or(|cur| org_row_count > cur.org_row_count) {
+                    pinned_org =
+                        Some(PinnedOrgHead { org_id, global_head_hash, org_row_count, org_chain_hash });
+                }
+            }
+        }
+    }
+
+    let mut bundle_trust = BundleVerifyTrust {
+        anchor: base_trust.anchor,
+        trust_keys: base_trust.trust_keys,
+        revoked_key_ids: base_trust.revoked_key_ids,
+        pinned_hub,
+        pinned_org,
+        hub_cross_check: None,
+    };
+
+    if let Some(hub_dir) = hub_bundle {
+        match load_verified_hub_cross_check(hub_dir, &bundle_trust) {
+            Ok(Ok(cc)) => bundle_trust.hub_cross_check = Some(cc),
+            Ok(Err(failed_hub_verdict)) => {
+                println!("{}", serde_json::to_string_pretty(&failed_hub_verdict)?);
+                eprintln!(
+                    "cannot verify: --hub-bundle {} failed verification (exit {})",
+                    hub_dir.display(),
+                    failed_hub_verdict.exit_code
+                );
+                return Ok(ExitCode::from(failed_hub_verdict.exit_code));
+            }
+            Err(e) => {
+                eprintln!("cannot verify: loading --hub-bundle {}: {e}", hub_dir.display());
+                return Ok(ExitCode::from(2));
+            }
+        }
+    }
+
+    let verdict = match verify_bundle_dir(bundle_dir, &bundle_trust) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("cannot verify: {e}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&verdict)?);
+    for w in &verdict.warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok(ExitCode::from(verdict.exit_code))
 }
 
 /// Generate a key file without opening the hub. This command is offline: it

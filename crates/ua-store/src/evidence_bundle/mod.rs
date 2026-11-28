@@ -19,6 +19,7 @@
 pub mod canonical;
 pub mod egress;
 pub mod export;
+pub mod verify;
 
 use std::collections::BTreeMap;
 
@@ -33,6 +34,10 @@ pub use canonical::{
 pub use egress::{EgressFilter, WithheldReport, find_forbidden_in_ledger_event, find_forbidden_in_value};
 pub use export::{
     ExportBundleOptions, ExportBundleResult, OrgWindowSummary, compute_org_window_checkpoint, export_bundle,
+};
+pub use verify::{
+    BundleVerdict, BundleVerifyTrust, ClaimReport, ClaimStatus, HubCrossCheck, LegacyPrefixReport,
+    PinnedHubHead, PinnedOrgHead, load_verified_hub_cross_check, verify_bundle_dir,
 };
 
 /// Current bundle manifest format version.

@@ -487,6 +487,27 @@ async fn run_cmd(cli: Cli, held: &mut Held) -> anyhow::Result<ExitCode> {
             )?;
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Evidence(ops::evidence::EvidenceArgs {
+            cmd:
+                ops::evidence::EvidenceCmd::Verify {
+                    checkpoint: None,
+                    bundle: Some(bundle),
+                    anchor_key,
+                    anchor_key_id,
+                    trust_file,
+                    revoked_key_ids,
+                    prev_checkpoints,
+                    hub_bundle,
+                },
+        }) => ops::evidence::run_verify_bundle(
+            &bundle,
+            anchor_key,
+            anchor_key_id,
+            trust_file.as_deref(),
+            revoked_key_ids,
+            prev_checkpoints,
+            hub_bundle.as_deref(),
+        ),
         cmd => {
             let cfg = load_config(explicit_config.as_deref())?;
 
