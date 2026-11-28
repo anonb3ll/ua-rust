@@ -2296,4 +2296,56 @@ mod tests {
         bad_err["event_log"]["chain_error"] = json!(42);
         assert!(event_log_of("right", &bad_err).unwrap_err().to_string().contains("chain_error"));
     }
+
+    #[test]
+    fn v2_rows_verify_and_tampered_org_id_counts_as_mismatch() {
+        let store = ua_store::Db::open_in_memory(&[
+            ua_store::Part::from(ledger::SCHEMA),
+            ua_store::Part::from(ledger::META_SCHEMA),
+            ua_store::Part::from(ua_store::org::STORE_PART),
+        ])
+        .unwrap();
+        let ev1 = store
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
+                     VALUES ('org-b', 'org-b', 'Org B', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                ledger::append(
+                    tx,
+                    ua_store::EventInput::new(ua_core::DEFAULT_ORG, "agent.x", json!({ "n": 1 })),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let ev2 = store
+            .write(|tx| ledger::append(tx, ua_store::EventInput::new("org-b", "agent.y", json!({ "n": 2 }))))
+            .unwrap()
+            .unwrap();
+
+        let before = store.read(event_log_summary).unwrap();
+        assert_eq!(before["chain_ok"], true, "{before:?}");
+        assert_eq!(before["entry_hash_mismatches"], 0, "{before:?}");
+        assert_eq!(before["count"], 2);
+        let expected_rolling = hex::encode(Sha256::digest(
+            format!("{}\n{}\n", ev1.entry_hash.as_deref().unwrap(), ev2.entry_hash.as_deref().unwrap())
+                .as_bytes(),
+        ));
+        assert_eq!(before["rolling_hash"], expected_rolling);
+
+        // Tamper org_id on a hash_v = 2 row in place: must fail chain_ok and count as a mismatch.
+        store
+            .write(|tx| {
+                tx.execute_batch("DROP TRIGGER event_log_no_update;")?;
+                tx.execute("UPDATE event_log SET org_id = 'org-b' WHERE seq = ?1", [ev1.seq])?;
+                Ok(())
+            })
+            .unwrap();
+        let after = store.read(event_log_summary).unwrap();
+        assert_eq!(after["chain_ok"], false, "{after:?}");
+        assert_eq!(after["entry_hash_mismatches"], 1, "{after:?}");
+        assert_eq!(after["first_bad_seq"], ev1.seq);
+        assert_ne!(after["rolling_hash"], before["rolling_hash"]);
+    }
 }

@@ -1023,6 +1023,48 @@ mod tests {
         assert_eq!(report.reason.as_deref(), Some("entry_hash does not match the row contents"));
     }
 
+    #[test]
+    fn v2_empty_org_id_with_recomputed_hash_fails_verify() {
+        let db = Db::open_in_memory(&[
+            crate::Part::from(SCHEMA),
+            crate::Part::from(META_SCHEMA),
+            crate::Part::from(crate::org::STORE_PART),
+        ])
+        .unwrap();
+        let ev = db
+            .write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": 1 }))))
+            .unwrap()
+            .unwrap();
+        assert!(db.read(verify).unwrap().ok);
+        db.write(|tx| Ok(tx.execute_batch("DROP TRIGGER event_log_no_update;")?)).unwrap();
+        for bad_org in ["", "   "] {
+            let recomputed = compute_entry_hash_v2(
+                ev.prev_hash.as_deref(),
+                &ev.ulid,
+                &ev.channel,
+                &serde_json::to_string(&ev.payload).unwrap(),
+                ev.originator.as_deref(),
+                ev.episode_id.as_deref(),
+                ev.causal_parent_id.as_deref(),
+                &ev.created_at,
+                ev.dedupe_key.as_deref(),
+                bad_org,
+            );
+            db.write(|tx| {
+                tx.execute(
+                    "UPDATE event_log SET org_id = ?1, entry_hash = ?2 WHERE seq = ?3",
+                    params![bad_org, recomputed, ev.seq],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            let report = db.read(verify).unwrap();
+            assert!(!report.ok, "bad_org={bad_org:?}: {report:?}");
+            assert_eq!(report.first_bad_seq, Some(ev.seq));
+            assert_eq!(report.reason.as_deref(), Some("hash_v = 2 row has missing or invalid org_id"));
+        }
+    }
+
     /// An upgraded store with an existing `hash_v = 1` chain opens cleanly on
     /// new code, appends a `hash_v = 2` row whose `prev_hash` links to the
     /// last `hash_v = 1` hash, and passes `verify()`.

@@ -312,11 +312,11 @@ pattern as `ua-deliverables` (`crates/ua-deliverables/src/schema.rs`) and
    `crates/ua-tools/tests/org_classification.rs` in the same PR that introduces
    `graph.v1` (never to `TENANT_MISSING_ORG_ID`), so the CI insert guard
    verifies every non-test `INSERT` names `org_id`.
-6. **Organization-level ledger redaction.** Until per-organization ledger
-   events (`hash_v = 2`) switch over, `ORG-EVENT-DEFAULT` sites for non-default
-   organizations write only neutral IDs and edge/node kinds (never display
-   labels, `external_id` text, or `meta_json`) with originator `'system'`,
-   matching [organization.md](organization.md).
+6. **Organization-level ledger redaction.** Until memberships and
+   per-organization ledger visibility rules switch over, `ORG-EVENT-DEFAULT`
+   sites for non-default organizations write only neutral IDs and edge/node
+   kinds (never display labels, `external_id` text, or `meta_json`) with
+   originator `'system'`, matching [organization.md](organization.md).
 
 ## Query shapes and hard bounds
 
