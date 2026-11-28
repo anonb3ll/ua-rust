@@ -137,8 +137,9 @@ the denylist is the only secret within its reach.
 This repository is public. No personal names, e-mail addresses, home
 directory paths, host names or real tokens in tracked files (code, tests,
 docs) or in commit messages. Use placeholders such as `builder-1`, `operator`,
-`~/projects`, `example.com`. `scripts/vocab-check.sh` (run in CI) enforces
-this; list an intended exception in `scripts/vocab-allowlist.txt`. An allowlist
+`~/projects`, `example.com`. `scripts/vocab-check.sh` (run in CI) enforces the
+tracked-file part of this and never reads commit messages; list an intended
+exception in `scripts/vocab-allowlist.txt`. An allowlist
 entry can be scoped to one pattern class — `vocab` for the legacy role names,
 `private` for addresses, home paths and tailnet names — and a scoped entry never
 silences the other class on the same line. `scripts/vocab-check-selftest.sh`
