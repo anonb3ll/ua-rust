@@ -4,11 +4,13 @@
 //! is an authored utterance, optionally threaded, with mentions and
 //! references. There is no update or delete.
 
-use rusqlite::{Connection, OptionalExtension, params};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{UaError, UaResult};
+use ua_store::task_comments::{
+    NewTaskComment, SqliteTaskComments, TaskCommentRow, TaskCommentsRead, TaskCommentsWrite,
+};
 
 use super::*;
 use crate::registry::{Registry, ToolCtx, tool};
@@ -85,7 +87,8 @@ async fn comment(ctx: ToolCtx, a: CommentArgs) -> UaResult<Value> {
             ctx.hub
                 .db()
                 .read_async(move |c| {
-                    let row = get(c, &org, p.comment_id)?
+                    let mut repo = SqliteTaskComments::new(c);
+                    let row = get(&mut repo, &org, p.comment_id)?
                         .ok_or_else(|| UaError::not_found(format!("unknown comment: {}", p.comment_id)))?;
                     Ok(json!({ "comment": row }))
                 })
@@ -121,10 +124,27 @@ fn redact_credentials(text: &str) -> (String, bool) {
     (out, found)
 }
 
+/// Base 10-field JSON map matching the pre-migration `SELECT *` row shape of
+/// `task_comments` (without `org_id`), leaving `mentions` and `refs` as raw
+/// text so each caller can apply its own JSON decoding rules.
+pub(crate) fn base_json_map(row: &TaskCommentRow) -> Map<String, Value> {
+    let mut obj = Map::new();
+    obj.insert("id".into(), json!(row.id));
+    obj.insert("task_id".into(), json!(row.task_id));
+    obj.insert("parent_comment_id".into(), json!(row.parent_comment_id));
+    obj.insert("author".into(), json!(row.author));
+    obj.insert("body".into(), json!(row.body));
+    obj.insert("mentions".into(), Value::String(row.mentions_json.clone()));
+    obj.insert("refs".into(), Value::String(row.refs_json.clone()));
+    obj.insert("idempotency_key".into(), json!(row.idempotency_key));
+    obj.insert("thread_revision".into(), json!(row.thread_revision));
+    obj.insert("created_at".into(), json!(row.created_at));
+    obj
+}
+
 /// A comment reply, without its `org_id` (the caller's own).
-fn public(row: &rusqlite::Row<'_>) -> rusqlite::Result<Map<String, Value>> {
-    let mut obj = row_object(row)?;
-    obj.remove("org_id");
+fn public(row: &TaskCommentRow) -> Map<String, Value> {
+    let mut obj = base_json_map(row);
     for (key, empty) in [("mentions", json!([])), ("refs", json!({}))] {
         let parsed =
             obj.get(key).and_then(Value::as_str).and_then(|s| serde_json::from_str(s).ok()).unwrap_or(empty);
@@ -133,36 +153,27 @@ fn public(row: &rusqlite::Row<'_>) -> rusqlite::Result<Map<String, Value>> {
     let mut participants = vec![obj.get("author").cloned().unwrap_or(Value::Null)];
     participants.extend(obj.get("mentions").and_then(Value::as_array).cloned().unwrap_or_default());
     obj.insert("participants".into(), Value::Array(participants));
-    Ok(obj)
+    obj
 }
 
 /// Comment `id` of organization `org`; another organization's comment
 /// answers as a missing one.
-fn get(conn: &Connection, org: &str, id: i64) -> UaResult<Option<Map<String, Value>>> {
-    Ok(conn
-        .query_row("SELECT * FROM task_comments WHERE org_id = ?1 AND id = ?2", params![org, id], public)
-        .optional()?)
+fn get(repo: &mut impl TaskCommentsRead, org: &str, id: i64) -> UaResult<Option<Map<String, Value>>> {
+    Ok(repo.get_task_comment(org, id)?.as_ref().map(public))
 }
 
 fn list(conn: &Connection, org: &str, task_id: i64) -> UaResult<Value> {
     if task_object(conn, org, task_id)?.is_none() {
         return Err(UaError::not_found(format!("unknown task: {task_id}")));
     }
-    let mut stmt =
-        conn.prepare("SELECT * FROM task_comments WHERE org_id = ?1 AND task_id = ?2 ORDER BY id")?;
+    let mut repo = SqliteTaskComments::new(conn);
     let comments: Vec<Map<String, Value>> =
-        stmt.query_map(params![org, task_id], public)?.collect::<Result<_, _>>()?;
-    let snap: Option<(i64, String)> = conn
-        .query_row(
-            "SELECT revision, updated_at FROM task_comment_threads WHERE org_id = ?1 AND task_id = ?2",
-            params![org, task_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
+        repo.list_task_comments(org, task_id)?.iter().map(public).collect();
+    let snap = repo.get_task_comment_thread(org, task_id)?;
     Ok(json!({
         "task_id": task_id,
-        "revision": snap.as_ref().map(|s| s.0).unwrap_or(0),
-        "updated_at": snap.map(|s| s.1),
+        "revision": snap.as_ref().map(|s| s.revision).unwrap_or(0),
+        "updated_at": snap.map(|s| s.updated_at),
         "comments": comments,
         "notes_are_spec": true,
     }))
@@ -244,6 +255,7 @@ async fn append(ctx: ToolCtx, p: AppendParams) -> UaResult<Value> {
     let task_id = p.task_id;
     let parent = p.parent_comment_id;
     let org = ctx.caller.org_id.clone();
+    let clock = ctx.hub.cfg().clock;
 
     ctx.hub
         .db()
@@ -253,59 +265,31 @@ async fn append(ctx: ToolCtx, p: AppendParams) -> UaResult<Value> {
                 return Err(UaError::not_found(format!("unknown task: {task_id}")));
             }
             if let Some(k) = &key {
-                let prior = tx
-                    .query_row(
-                        "SELECT * FROM task_comments WHERE org_id = ?4 AND task_id = ?1 AND author = ?2 \
-                         AND idempotency_key = ?3",
-                        params![task_id, author, k, org],
-                        public,
-                    )
-                    .optional()?;
+                let prior = tx.find_task_comment_by_idempotency_key(&org, task_id, &author, k)?;
                 if let Some(prior) = prior {
-                    return Ok(json!({ "comment": prior, "idempotent_replay": true }));
+                    return Ok(json!({ "comment": public(&prior), "idempotent_replay": true }));
                 }
             }
             if let Some(pid) = parent {
-                let on: Option<i64> = tx
-                    .query_row(
-                        "SELECT task_id FROM task_comments WHERE org_id = ?1 AND id = ?2",
-                        params![org, pid],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
+                let on = tx.get_task_comment(&org, pid)?.map(|c| c.task_id);
                 if on != Some(task_id) {
                     return Err(UaError::invalid("parent comment is not on this task"));
                 }
             }
-            let ts = now();
-            tx.execute(
-                "INSERT INTO task_comment_threads (org_id, task_id, revision, updated_at) VALUES (?3, ?1, 1, ?2) \
-                 ON CONFLICT(task_id) DO UPDATE SET revision = revision + 1, updated_at = excluded.updated_at \
-                 WHERE org_id = excluded.org_id",
-                params![task_id, ts, org],
-            )?;
-            let revision: i64 = tx.query_row(
-                "SELECT revision FROM task_comment_threads WHERE org_id = ?1 AND task_id = ?2",
-                params![org, task_id],
-                |r| r.get(0),
-            )?;
-            tx.execute(
-                "INSERT INTO task_comments (org_id, task_id, parent_comment_id, author, body, mentions, refs, \
-                 idempotency_key, thread_revision, created_at) VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    task_id,
-                    parent,
-                    author,
-                    body,
-                    Value::from(mentions.clone()).to_string(),
-                    Value::Object(refs).to_string(),
-                    key,
-                    revision,
-                    ts,
-                    org
-                ],
-            )?;
-            let comment_id = tx.last_insert_rowid();
+            let ts = clock.now();
+            let revision = tx.bump_task_comment_thread(&org, task_id, &ts)?;
+            let comment_id = tx.insert_task_comment(&NewTaskComment {
+                org_id: org.clone(),
+                task_id,
+                parent_comment_id: parent,
+                author: author.clone(),
+                body,
+                mentions_json: Value::from(mentions.clone()).to_string(),
+                refs_json: Value::Object(refs).to_string(),
+                idempotency_key: key,
+                thread_revision: revision,
+                created_at: ts,
+            })?;
             let mentions = if org == ua_core::DEFAULT_ORG { json!(mentions) } else { Value::Null };
             emit(
                 tx,

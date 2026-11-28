@@ -31,6 +31,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ua_core::{Caller, UaError, UaResult};
+use ua_store::task_comments::{SqliteTaskComments, TaskCommentsRead};
 
 use super::events::{EventReader, VISIBLE_EVENT};
 use super::evidence::{CLIENT_EVIDENCE_SOURCE, is_client_channel};
@@ -741,11 +742,14 @@ fn read(hub: &Hub, caller: &Caller, c: &Connection, kind: &str, id: &str) -> UaR
         "goal" => {
             org_row(c, "SELECT * FROM goals WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?.map(Value::Object)
         }
-        "comment" => org_row(c, "SELECT * FROM task_comments WHERE id = ?1 AND org_id = ?2", id, &caller.org_id)?
-            .map(|mut m| {
-            decode(&mut m, &["mentions", "refs"]);
-            Value::Object(m)
-        }),
+        "comment" => {
+            let Ok(comment_id) = id.parse::<i64>() else { return Ok(None) };
+            SqliteTaskComments::new(c).get_task_comment(&caller.org_id, comment_id)?.map(|row| {
+                let mut m = crate::families::tasks::comments::base_json_map(&row);
+                decode(&mut m, &["mentions", "refs"]);
+                Value::Object(m)
+            })
+        }
         _ => None,
     };
     Ok(obj)

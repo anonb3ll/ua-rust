@@ -8,7 +8,7 @@
 //! `core_schema.rs`. This family owns the full-text index over tasks, the
 //! comment thread tables and the goal tables.
 
-mod comments;
+pub(crate) mod comments;
 pub mod goal_links;
 mod goals;
 mod graph;
