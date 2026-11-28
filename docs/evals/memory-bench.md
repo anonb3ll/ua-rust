@@ -418,7 +418,11 @@ options (none measured or recommended here):
 
 The decision on 2026-11-28 was tuning first, levers **B then A**, measured on
 both corpora. This section records the fixture half; the LongMemEval-S
-470-question run follows once it completes.
+120-question stratified set (`longmemeval-strat120-seed2145.txt`, the same set
+the table above measures) follows once it completes. The 470-question set is
+not used here: on this 4-core desktop a hybrid pass costs roughly three minutes
+per question, so a full 470 run would take about 22 hours and the 120-question
+set already carries the comparison baselines.
 
 **Changes.** In `crates/ua-memory/src/search.rs`:
 
@@ -456,8 +460,8 @@ covers it.
 **Risk stated.** The guard drops semantic-only candidates only when the query
 is one token and FTS5 found the token. A single-word paraphrase whose token
 does not occur in the target note still falls through to the semantic leg; the
-LongMemEval-S 470 run checks that the guard does not cost paraphrase recall at
-scale.
+LongMemEval-S 120-question hybrid run checks that the guard does not cost
+paraphrase recall at scale.
 
 ##### Reproducing the `--features embeddings` run
 
