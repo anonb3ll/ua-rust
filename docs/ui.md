@@ -139,7 +139,7 @@ path (discovered native sessions), the provenance graph and other
 `/api/platform/*` paths outside the manifest and objects, and the evidence
 export answer `501` with `{"error": "not_implemented", "capability": "..."}`
 until they are built. `/api/work-products*` answers `501` too: work
-products are not ported pending an explicit product decision.
+products are being redesigned as generic deliverables ([parity.md](parity.md)).
 
 ## Third-party files
 
