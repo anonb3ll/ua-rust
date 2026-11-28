@@ -2133,13 +2133,15 @@ mod tests {
             causal_parent_id: Option<String>,
             created_at: String,
             dedupe_key: Option<String>,
+            org_id: String,
+            hash_v: i64,
         }
         db.write(|tx| {
             tx.execute("DROP TRIGGER IF EXISTS event_log_no_update", [])?;
             let rows: Vec<EventRow> = {
                 let mut stmt = tx.prepare(
                     "SELECT seq, ulid, channel, payload, originator, episode_id, \
-                            causal_parent_id, created_at, dedupe_key \
+                            causal_parent_id, created_at, dedupe_key, org_id, hash_v \
                      FROM event_log ORDER BY seq ASC",
                 )?;
                 stmt.query_map([], |r| {
@@ -2153,6 +2155,8 @@ mod tests {
                         causal_parent_id: r.get(6)?,
                         created_at: r.get(7)?,
                         dedupe_key: r.get(8)?,
+                        org_id: r.get(9)?,
+                        hash_v: r.get(10)?,
                     })
                 })?
                 .collect::<Result<_, _>>()?
@@ -2165,7 +2169,8 @@ mod tests {
                     row.payload = r#"{"rewritten":true}"#.to_string();
                 }
                 let prev_val = prev.as_deref().unwrap_or(crate::ledger::GENESIS_HASH);
-                let entry_hash = crate::ledger::compute_entry_hash(
+                let entry_hash = crate::ledger::compute_entry_hash_for_version(
+                    row.hash_v,
                     Some(prev_val),
                     &row.ulid,
                     &row.channel,
@@ -2175,7 +2180,9 @@ mod tests {
                     row.causal_parent_id.as_deref(),
                     &row.created_at,
                     row.dedupe_key.as_deref(),
-                );
+                    Some(&row.org_id),
+                )
+                .expect("valid hash_v");
                 tx.execute(
                     "UPDATE event_log SET payload = ?1, prev_hash = ?2, entry_hash = ?3 WHERE seq = ?4",
                     params![row.payload, prev_val, entry_hash, row.seq],

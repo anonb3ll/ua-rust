@@ -848,16 +848,29 @@ fn check_source_bindings_overlap(src: &Connection, db: &Db, map: &TableMap, last
     Ok(())
 }
 
-/// The target ledger must hold exactly the rows this importer wrote so far.
+/// The target ledger must hold exactly the rows this importer wrote so far,
+/// and must not hold any `hash_v >= 2` rows (appending `hash_v = 1` imported
+/// rows after `hash_v = 2` rows would downgrade the hash chain).
 fn check_ledger_target(src: &Connection, db: &Db, last: i64) -> anyhow::Result<()> {
-    let target_max: Option<i64> =
-        db.read(|c| Ok(c.query_row("SELECT MAX(seq) FROM event_log", [], |r| r.get(0))?))?;
+    let (target_max, has_v2): (Option<i64>, bool) = db.read(|c| {
+        let max = c.query_row("SELECT MAX(seq) FROM event_log", [], |r| r.get(0))?;
+        let v2 = ledger::has_hash_v_above(c, ledger::HASH_V1)?;
+        Ok((max, v2))
+    })?;
     if target_max.unwrap_or(0) > last {
+        let extra =
+            if has_v2 { " and downgrade the hash chain (target already holds hash_v >= 2 rows)" } else { "" };
         bail!(
             "target ledger already holds events this import did not write (max seq {} > imported {last}); \
-             importing the Python ledger would interleave two histories. Import into a fresh database. \
+             importing the Python ledger would interleave two histories{extra}. Import into a fresh database. \
              Catch-up imports only work before the Rust hub writes its own events (nothing was written)",
             target_max.unwrap_or(0)
+        );
+    }
+    if has_v2 {
+        bail!(
+            "target ledger already holds hash_v >= 2 rows; importing hash_v = 1 rows would downgrade the \
+             hash chain. Catch-up imports only work before the Rust hub writes its own events (nothing was written)"
         );
     }
     if last > 0 {
@@ -1611,8 +1624,15 @@ fn copy_ledger(
         let copied = db
             .write(|tx| {
                 // Re-check inside the write transaction: the target ledger must
-                // still end exactly where this import left it. Another writer
-                // appending in between would interleave two histories.
+                // still hold no `hash_v >= 2` rows and end exactly where this
+                // import left it. Another writer appending in between would
+                // interleave two histories or downgrade the hash chain.
+                if ledger::has_hash_v_above(tx, ledger::HASH_V1)? {
+                    return Err(UaError::conflict(
+                        "target ledger holds hash_v >= 2 rows; importing hash_v = 1 rows would downgrade \
+                         the hash chain",
+                    ));
+                }
                 let target_max: Option<i64> =
                     tx.query_row("SELECT MAX(seq) FROM event_log", [], |r| r.get(0))?;
                 let expected = (cursor > 0).then_some(cursor);

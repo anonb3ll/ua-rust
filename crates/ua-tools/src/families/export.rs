@@ -806,7 +806,7 @@ fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
     let ledger_ok = ledger_report.as_ref().is_none_or(|r| r.ok);
     if has_log {
         let mut want: Vec<&str> = ROLLING_ROW_COLUMNS.to_vec();
-        want.extend(["dedupe_key", "prev_hash", "entry_hash"]);
+        want.extend(["dedupe_key", "prev_hash", "entry_hash", "org_id", "hash_v"]);
         // Separate from ledger::verify (seq order): rolling_hash and ulid bounds follow ulid order, which can differ in imported logs.
         for_each_row(c, "event_log", &want, "ulid", None, |mut row| {
             let ulid = row.get("ulid").cloned().unwrap_or(Value::Null);
@@ -818,24 +818,43 @@ fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
             let stored = row.remove("entry_hash");
             let dedupe_key = row.remove("dedupe_key");
             let prev_hash = row.remove("prev_hash");
+            let org_id = row.remove("org_id");
+            let hash_v = row.remove("hash_v");
             match stored {
                 Some(Value::String(h)) if !h.is_empty() => {
                     let text = |k: &str| row.get(k).and_then(Value::as_str);
-                    let recomputed = ledger::compute_entry_hash(
-                        prev_hash.as_ref().and_then(Value::as_str),
-                        text("ulid").unwrap_or_default(),
-                        text("channel").unwrap_or_default(),
-                        text("payload").unwrap_or_default(),
-                        text("originator"),
-                        text("episode_id"),
-                        text("causal_parent_id"),
-                        text("created_at").unwrap_or_default(),
-                        dedupe_key.as_ref().and_then(Value::as_str),
-                    );
-                    if recomputed != h {
-                        mismatches += 1;
+                    let form = match &hash_v {
+                        None => Some(ledger::HASH_V1),
+                        Some(Value::Number(n)) => n.as_i64(),
+                        Some(_) => None,
+                    };
+                    let recomputed = form.and_then(|v| {
+                        ledger::compute_entry_hash_for_version(
+                            v,
+                            prev_hash.as_ref().and_then(Value::as_str),
+                            text("ulid").unwrap_or_default(),
+                            text("channel").unwrap_or_default(),
+                            text("payload").unwrap_or_default(),
+                            text("originator"),
+                            text("episode_id"),
+                            text("causal_parent_id"),
+                            text("created_at").unwrap_or_default(),
+                            dedupe_key.as_ref().and_then(Value::as_str),
+                            org_id.as_ref().and_then(Value::as_str),
+                        )
+                    });
+                    match recomputed {
+                        Some(r) => {
+                            if r != h {
+                                mismatches += 1;
+                            }
+                            hasher.update(r.as_bytes());
+                        }
+                        None => {
+                            mismatches += 1;
+                            hasher.update(py_dumps(&Value::Object(row), None).as_bytes());
+                        }
                     }
-                    hasher.update(recomputed.as_bytes());
                 }
                 Some(Value::String(_)) => {
                     // Blank `""` entry_hash is not a NULL legacy prefix row: count it as a
@@ -2276,5 +2295,57 @@ mod tests {
         let mut bad_err = base;
         bad_err["event_log"]["chain_error"] = json!(42);
         assert!(event_log_of("right", &bad_err).unwrap_err().to_string().contains("chain_error"));
+    }
+
+    #[test]
+    fn v2_rows_verify_and_tampered_org_id_counts_as_mismatch() {
+        let store = ua_store::Db::open_in_memory(&[
+            ua_store::Part::from(ledger::SCHEMA),
+            ua_store::Part::from(ledger::META_SCHEMA),
+            ua_store::Part::from(ua_store::org::STORE_PART),
+        ])
+        .unwrap();
+        let ev1 = store
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
+                     VALUES ('org-b', 'org-b', 'Org B', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                    [],
+                )?;
+                ledger::append(
+                    tx,
+                    ua_store::EventInput::new(ua_core::DEFAULT_ORG, "agent.x", json!({ "n": 1 })),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let ev2 = store
+            .write(|tx| ledger::append(tx, ua_store::EventInput::new("org-b", "agent.y", json!({ "n": 2 }))))
+            .unwrap()
+            .unwrap();
+
+        let before = store.read(event_log_summary).unwrap();
+        assert_eq!(before["chain_ok"], true, "{before:?}");
+        assert_eq!(before["entry_hash_mismatches"], 0, "{before:?}");
+        assert_eq!(before["count"], 2);
+        let expected_rolling = hex::encode(Sha256::digest(
+            format!("{}\n{}\n", ev1.entry_hash.as_deref().unwrap(), ev2.entry_hash.as_deref().unwrap())
+                .as_bytes(),
+        ));
+        assert_eq!(before["rolling_hash"], expected_rolling);
+
+        // Tamper org_id on a hash_v = 2 row in place: must fail chain_ok and count as a mismatch.
+        store
+            .write(|tx| {
+                tx.execute_batch("DROP TRIGGER event_log_no_update;")?;
+                tx.execute("UPDATE event_log SET org_id = 'org-b' WHERE seq = ?1", [ev1.seq])?;
+                Ok(())
+            })
+            .unwrap();
+        let after = store.read(event_log_summary).unwrap();
+        assert_eq!(after["chain_ok"], false, "{after:?}");
+        assert_eq!(after["entry_hash_mismatches"], 1, "{after:?}");
+        assert_eq!(after["first_bad_seq"], ev1.seq);
+        assert_ne!(after["rolling_hash"], before["rolling_hash"]);
     }
 }

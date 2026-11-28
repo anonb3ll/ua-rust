@@ -152,11 +152,13 @@ Key restore safeguards:
    `organization.v1.store`) still starts and serves: it ignores parts it
    does not know, and the new `event_log` columns have defaults, so its
    writes succeed, while `ua doctor` and `system_doctor` report the schema
-   as degraded. Do not do that; restore a backup taken before the upgrade
-   instead (losing the writes made since). A build that has
-   `organization.v1.store` also refuses to open, or to append to, a ledger
-   whose newest row has a newer `hash_v` than it writes, with an error
-   naming both forms; run the later build instead.
+   as degraded. If the database already holds `hash_v = 2` rows, an earlier
+   build from before the fence appending `hash_v = 1` rows after them triggers
+   the downgrade refusal and breaks `verify()` permanently. Do not do that;
+   restore a backup taken before the upgrade instead (losing the writes made
+   since). A build that has `organization.v1.store` also refuses to open, or
+   to append to, a ledger whose newest row has a newer `hash_v` than it
+   writes, with an error naming both forms; run the later build instead.
 3. **Safety backup preserving WAL/SHM/journal:** Unless `--no-safety-backup` is
    passed, an existing DB is backed up to `<db>.pre-restore-<UTC>.bak` (falling
    back to raw `0600` copies of main + `-wal`/`-shm`/`-journal` sidecars when

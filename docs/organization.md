@@ -555,10 +555,17 @@ token issuance off until these proofs pass.
   the objects they had.
 - `organization.v1.store`: `orgs` (created without `IF NOT EXISTS`, so a
   database holding another `orgs` table refuses the part), the seed, and
-  `event_log.org_id` and `event_log.hash_v`. Every row is written with
-  `hash_v = 1`, the nine-field form, which does **not** cover `org_id`: until
-  rows are written with `hash_v = 2`, a row's `org_id` can be changed without
-  `verify()` noticing. `verify()` refuses any `hash_v` other than 1.
+  `event_log.org_id` and `event_log.hash_v`. Pre-migration and imported rows
+  keep `hash_v = 1` (the nine-field Python-compatible form, which does not
+  cover `org_id`). New rows appended once `organization.v1.store` has applied
+  are written with `hash_v = 2`, which adds `org_id` in sorted key position so
+  editing a row's `org_id` in place breaks `verify()`. `verify()` checks both
+  forms per row, refuses any other `hash_v`, and refuses any `hash_v = 1` row
+  after the first `hash_v = 2` row (downgrade refusal, also enforced by
+  `ua-import` on catch-up runs). A full rewrite of the chain — including
+  rewriting the tail as `hash_v = 1` — is caught only by a signed or pinned
+  checkpoint; nothing in `event_log` itself anchors the `hash_v = 1` /
+  `hash_v = 2` boundary.
 - `ua_store::org::tenant_part`. It takes the full part name
   (`organization.v1.<crate>.<family>`, or `organization.v1.<crate>` for a
   crate that is one family) rather than the owner alone, so the part stays a
@@ -623,11 +630,15 @@ token issuance off until these proofs pass.
 - `EventInput::new(org_id, …)` with `Default` removed, so every event names
   its organization; every site passes `ua_core::DEFAULT_ORG`, the
   organization of the affected row, never the caller's. `append` writes
-  `org_id` and `hash_v` explicitly, and refuses an organization `orgs` does
-  not hold. On a ledger from before
+  `org_id` and `hash_v = 2` explicitly (covering `org_id` in `entry_hash`),
+  and refuses an organization `orgs` does not hold. On a ledger from before
   `organization.v1.store` (an older backup just restored) it writes the old
-  row shape, and refuses any organization other than the default rather than
-  drop it. `org_id` is still not covered by the hash.
+  `hash_v = 1` row shape, and refuses any organization other than the default
+  rather than drop it. Switching to `hash_v = 2` binds `org_id` into the hash
+  chain but does **not** relax `org_guard.rs`, `ORG-EVENT-DEFAULT`, or the
+  non-default-organization payload redaction rules (`ledger_text`, neutralized
+  originators): events stay in the default organization's ledger with tenant
+  text redacted until memberships exist (`#2791` / `#2800`).
 
 - The `ua-org` crate, holding only `authz` for now. Departure from the
   [Authority checks](#authority-checks) API: until users and memberships
@@ -2050,8 +2061,8 @@ token issuance off until these proofs pass.
   is excused by its exact text (today only `memory_versions.v1`); the live
   trigger is still checked.
 
-Not yet: the tenant parts for the other families, the label index,
-`hash_v = 2`, and everything after `organization.v1`.
+Not yet: the tenant parts for the other families, the label index, and
+everything after `organization.v1`.
 
 ## Decision
 
@@ -3516,27 +3527,29 @@ CREATE TABLE IF NOT EXISTS import_finalized (
 - Each run records its mapping in `import_org_map`; a later run with a
   different mapping for the same source is refused.
 - Ordinary and catch-up runs write **no** `hash_v = 2` row. They are refused if
-  the target holds any `hash_v = 2` row.
-- `ua import python-hub --finalize` is the explicit last run: it imports any
-  remaining rows, appends the completion event — which records the full mapping
-  — as the first `hash_v = 2` row, and writes `import_finalized`.
-- Finalization is **target-wide**: `--finalize` finalizes every source
-  imported into that target at once, so a hub built from two sources imports
-  both, then finalizes once. After finalization every further import into that
-  target is refused.
-- `ua serve` refuses to start on a store with an import recorded but not
-  finalized, so the hub cannot append `hash_v = 2` rows ahead of a catch-up.
-- **Stores imported before this design** already hold `import_runs` rows and
-  hub-written events. `import_finalized` and `import_org_map` are created by a
-  `ua-store` procedure part, `organization.v1.import-marker`, ordered after
-  `organization.v1.store` (`import_org_map` references `orgs`), which both
-  `ua serve` (`Hub::open`) and `ua import` apply, so the check `ua serve` makes
-  never depends on a part only the importer applies. When `import_runs` exists,
-  that part backfills a legacy marker (`event_ulid` NULL) for every
-  `source_hash` already recorded, so those hubs keep starting and are treated
-  as finalized; their chain is already `hash_v = 1` throughout and verifies as
-  today. On a store never imported, `import_runs` does not exist and nothing is
-  checked.
+  the target holds any `hash_v = 2` row (enforced today in `ua-import`).
+- *(Later slice — not yet implemented.)* `ua import python-hub --finalize` is
+  the planned explicit last run: it imports any remaining rows, appends the
+  completion event — which records the full mapping — as the first `hash_v = 2`
+  row, and writes `import_finalized`.
+- *(Later slice.)* Finalization is **target-wide**: `--finalize` finalizes
+  every source imported into that target at once, so a hub built from two
+  sources imports both, then finalizes once. After finalization every further
+  import into that target is refused.
+- *(Later slice.)* `ua serve` refuses to start on a store with an import
+  recorded but not finalized, so the hub cannot append `hash_v = 2` rows ahead
+  of a catch-up.
+- *(Later slice.)* **Stores imported before this design** already hold
+  `import_runs` rows and hub-written events. `import_finalized` and
+  `import_org_map` will be created by a `ua-store` procedure part,
+  `organization.v1.import-marker`, ordered after `organization.v1.store`
+  (`import_org_map` references `orgs`), which both `ua serve` (`Hub::open`) and
+  `ua import` apply, so the check `ua serve` makes never depends on a part only
+  the importer applies. When `import_runs` exists, that part backfills a legacy
+  marker (`event_ulid` NULL) for every `source_hash` already recorded, so those
+  hubs keep starting and are treated as finalized; their chain is already
+  `hash_v = 1` throughout and verifies as today. On a store never imported,
+  `import_runs` does not exist and nothing is checked.
 
 `verify()` therefore always sees the order it requires. The migration manifest
 compare records the mapping in its fingerprint.
