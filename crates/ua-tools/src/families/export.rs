@@ -806,7 +806,7 @@ fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
     let ledger_ok = ledger_report.as_ref().is_none_or(|r| r.ok);
     if has_log {
         let mut want: Vec<&str> = ROLLING_ROW_COLUMNS.to_vec();
-        want.extend(["dedupe_key", "prev_hash", "entry_hash"]);
+        want.extend(["dedupe_key", "prev_hash", "entry_hash", "org_id", "hash_v"]);
         // Separate from ledger::verify (seq order): rolling_hash and ulid bounds follow ulid order, which can differ in imported logs.
         for_each_row(c, "event_log", &want, "ulid", None, |mut row| {
             let ulid = row.get("ulid").cloned().unwrap_or(Value::Null);
@@ -818,24 +818,43 @@ fn event_log_summary(c: &Connection) -> UaResult<Map<String, Value>> {
             let stored = row.remove("entry_hash");
             let dedupe_key = row.remove("dedupe_key");
             let prev_hash = row.remove("prev_hash");
+            let org_id = row.remove("org_id");
+            let hash_v = row.remove("hash_v");
             match stored {
                 Some(Value::String(h)) if !h.is_empty() => {
                     let text = |k: &str| row.get(k).and_then(Value::as_str);
-                    let recomputed = ledger::compute_entry_hash(
-                        prev_hash.as_ref().and_then(Value::as_str),
-                        text("ulid").unwrap_or_default(),
-                        text("channel").unwrap_or_default(),
-                        text("payload").unwrap_or_default(),
-                        text("originator"),
-                        text("episode_id"),
-                        text("causal_parent_id"),
-                        text("created_at").unwrap_or_default(),
-                        dedupe_key.as_ref().and_then(Value::as_str),
-                    );
-                    if recomputed != h {
-                        mismatches += 1;
+                    let form = match &hash_v {
+                        None => Some(ledger::HASH_V1),
+                        Some(Value::Number(n)) => n.as_i64(),
+                        Some(_) => None,
+                    };
+                    let recomputed = form.and_then(|v| {
+                        ledger::compute_entry_hash_for_version(
+                            v,
+                            prev_hash.as_ref().and_then(Value::as_str),
+                            text("ulid").unwrap_or_default(),
+                            text("channel").unwrap_or_default(),
+                            text("payload").unwrap_or_default(),
+                            text("originator"),
+                            text("episode_id"),
+                            text("causal_parent_id"),
+                            text("created_at").unwrap_or_default(),
+                            dedupe_key.as_ref().and_then(Value::as_str),
+                            org_id.as_ref().and_then(Value::as_str),
+                        )
+                    });
+                    match recomputed {
+                        Some(r) => {
+                            if r != h {
+                                mismatches += 1;
+                            }
+                            hasher.update(r.as_bytes());
+                        }
+                        None => {
+                            mismatches += 1;
+                            hasher.update(py_dumps(&Value::Object(row), None).as_bytes());
+                        }
                     }
-                    hasher.update(recomputed.as_bytes());
                 }
                 Some(Value::String(_)) => {
                     // Blank `""` entry_hash is not a NULL legacy prefix row: count it as a

@@ -555,10 +555,14 @@ token issuance off until these proofs pass.
   the objects they had.
 - `organization.v1.store`: `orgs` (created without `IF NOT EXISTS`, so a
   database holding another `orgs` table refuses the part), the seed, and
-  `event_log.org_id` and `event_log.hash_v`. Every row is written with
-  `hash_v = 1`, the nine-field form, which does **not** cover `org_id`: until
-  rows are written with `hash_v = 2`, a row's `org_id` can be changed without
-  `verify()` noticing. `verify()` refuses any `hash_v` other than 1.
+  `event_log.org_id` and `event_log.hash_v`. Pre-migration and imported rows
+  keep `hash_v = 1` (the nine-field Python-compatible form, which does not
+  cover `org_id`). New rows appended once `organization.v1.store` has applied
+  are written with `hash_v = 2`, which adds `org_id` in sorted key position so
+  editing a row's `org_id` breaks `verify()`. `verify()` checks both forms per
+  row, refuses any other `hash_v`, and refuses any `hash_v = 1` row after the
+  first `hash_v = 2` row (downgrade refusal, also enforced by `ua-import` on
+  catch-up runs).
 - `ua_store::org::tenant_part`. It takes the full part name
   (`organization.v1.<crate>.<family>`, or `organization.v1.<crate>` for a
   crate that is one family) rather than the owner alone, so the part stays a
@@ -623,11 +627,15 @@ token issuance off until these proofs pass.
 - `EventInput::new(org_id, …)` with `Default` removed, so every event names
   its organization; every site passes `ua_core::DEFAULT_ORG`, the
   organization of the affected row, never the caller's. `append` writes
-  `org_id` and `hash_v` explicitly, and refuses an organization `orgs` does
-  not hold. On a ledger from before
+  `org_id` and `hash_v = 2` explicitly (covering `org_id` in `entry_hash`),
+  and refuses an organization `orgs` does not hold. On a ledger from before
   `organization.v1.store` (an older backup just restored) it writes the old
-  row shape, and refuses any organization other than the default rather than
-  drop it. `org_id` is still not covered by the hash.
+  `hash_v = 1` row shape, and refuses any organization other than the default
+  rather than drop it. Switching to `hash_v = 2` binds `org_id` into the hash
+  chain but does **not** relax `org_guard.rs`, `ORG-EVENT-DEFAULT`, or the
+  non-default-organization payload redaction rules (`ledger_text`, neutralized
+  originators): events stay in the default organization's ledger with tenant
+  text redacted until memberships exist (`#2791` / `#2800`).
 
 - The `ua-org` crate, holding only `authz` for now. Departure from the
   [Authority checks](#authority-checks) API: until users and memberships

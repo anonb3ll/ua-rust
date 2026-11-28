@@ -2177,8 +2177,43 @@ mod tests {
         assert!(hash_forms >= 3, "every restored row is backfilled ({hash_forms})");
         db.write(|tx| ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "after.upgrade", json!({}))))
             .unwrap();
+        let latest_hash_v: i64 = db
+            .read(|c| {
+                Ok(c.query_row("SELECT hash_v FROM event_log ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(latest_hash_v, ledger::HASH_V2);
         let report = db.read(ledger::verify).unwrap();
         assert!(report.ok, "{report:?}");
+
+        // Back up and restore the now-mixed v1/v2 store; verify both forms
+        // survive intact and the restored store continues in hash_v = 2.
+        let mixed_bak = dir.path().join("mixed.bak.db");
+        let mixed_rep = backup_database(&dest, &mixed_bak, false).unwrap();
+        let mixed_dest = dir.path().join("mixed_restored.db");
+        restore_database(
+            &mixed_bak,
+            &mixed_dest,
+            RestoreOptions {
+                expected_sha256: Some(mixed_rep.sha256),
+                expected_schema: Some((full.clone(), Vec::new())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let restored_db = Db::open(&mixed_dest, &full).unwrap();
+        let (v1_count, v2_count): (i64, i64) = restored_db
+            .read(|c| {
+                Ok((
+                    c.query_row("SELECT COUNT(*) FROM event_log WHERE hash_v = 1", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(*) FROM event_log WHERE hash_v = 2", [], |r| r.get(0))?,
+                ))
+            })
+            .unwrap();
+        assert!(v1_count >= 3, "pre-upgrade v1 rows preserved ({v1_count})");
+        assert!(v2_count >= 2, "post-upgrade v2 + ops.restored rows preserved ({v2_count})");
+        let report = restored_db.read(ledger::verify).unwrap();
+        assert!(report.ok, "mixed v1/v2 restored store must verify: {report:?}");
     }
 
     #[test]

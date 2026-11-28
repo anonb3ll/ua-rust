@@ -1011,6 +1011,79 @@ fn a_source_ledger_org_id_is_refused_and_never_copied() {
     assert!(n(&db, "SELECT COUNT(*) FROM event_log") > 0);
 }
 
+/// Imported ledger rows stay `hash_v = 1`. Once the Rust hub appends a
+/// `hash_v = 2` row, the mixed `v1 -> v2` chain verifies cleanly, and a
+/// subsequent catch-up import is refused so `hash_v = 1` rows cannot be
+/// appended after `hash_v = 2` rows.
+#[test]
+fn catch_up_import_refuses_target_with_hash_v_2_rows() {
+    let f = fixture();
+    let db = target();
+    ua_import::import(&db, &f.path, &opts()).unwrap();
+    let imported_count = n(&db, "SELECT COUNT(*) FROM event_log");
+    assert!(imported_count > 0);
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM event_log WHERE hash_v <> 1"), 0);
+
+    // Rust hub appends a hash_v = 2 row after the imported hash_v = 1 chain.
+    db.write(|tx| {
+        ua_store::ledger::append(
+            tx,
+            ua_store::EventInput::new(ua_core::DEFAULT_ORG, "hub.after_import", json!({ "ok": true })),
+        )
+    })
+    .unwrap();
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM event_log WHERE hash_v = 2"), 1);
+    let report = db.read(ua_store::ledger::verify).unwrap();
+    assert!(report.ok, "mixed imported v1 + hub v2 chain must verify: {report:?}");
+
+    // Add a new v1 row to the Python source DB and attempt a catch-up import.
+    let c = Connection::open(&f.path).unwrap();
+    let last_hash: String = c
+        .query_row("SELECT entry_hash FROM event_log ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let next_ulid = "01JZZZZZZZZZZZZZZZZZZZZZZ1";
+    let next_ts = "2026-07-02T00:00:00+00:00";
+    let next_hash = ua_store::ledger::compute_entry_hash(
+        Some(&last_hash),
+        next_ulid,
+        "agent.task.updated",
+        "{}",
+        Some("builder-1"),
+        None,
+        None,
+        next_ts,
+        None,
+    );
+    c.execute(
+        "INSERT INTO event_log (ulid, channel, payload, originator, created_at, prev_hash, entry_hash) \
+         VALUES (?1, 'agent.task.updated', '{}', 'builder-1', ?2, ?3, ?4)",
+        rusqlite::params![next_ulid, next_ts, last_hash, next_hash],
+    )
+    .unwrap();
+    drop(c);
+
+    let err = ua_import::import(&db, &f.path, &opts()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("hash_v >= 2") && msg.contains("downgrade"), "{msg}");
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM event_log"), imported_count + 1);
+    assert!(db.read(ua_store::ledger::verify).unwrap().ok);
+
+    // Even when `import_runs.last_key` equals `MAX(seq)`, the `hash_v >= 2`
+    // guard refuses independently of the `target_max > last` check.
+    let max_seq: i64 =
+        db.read(|c| Ok(c.query_row("SELECT MAX(seq) FROM event_log", [], |r| r.get(0))?)).unwrap();
+    db.write(|tx| {
+        tx.execute("UPDATE import_runs SET last_key = ?1 WHERE table_name = 'event_log'", [max_seq])?;
+        Ok(())
+    })
+    .unwrap();
+    let err2 = ua_import::import(&db, &f.path, &opts()).unwrap_err();
+    let msg2 = format!("{err2:#}");
+    assert!(msg2.contains("hash_v >= 2") && msg2.contains("downgrade"), "{msg2}");
+    assert_eq!(n(&db, "SELECT COUNT(*) FROM event_log"), imported_count + 1);
+    assert!(db.read(ua_store::ledger::verify).unwrap().ok);
+}
+
 #[test]
 fn the_dry_run_reports_org_scope_either_way() {
     let f = fixture();

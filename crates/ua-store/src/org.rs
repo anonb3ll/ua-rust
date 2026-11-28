@@ -25,10 +25,10 @@ use crate::schema::Procedure;
 /// `created_at` bound from `ua_core::time::now()`), and the `event_log`
 /// columns `org_id` and `hash_v`. Apply it after `ledger.v1`.
 ///
-/// `event_log.hash_v` is 1 on every row this build writes: the existing
-/// nine-field hash form. `org_id` is stored but not covered by that hash, so
-/// until rows are written with `hash_v = 2` a row's `org_id` can be edited
-/// (around the append-only triggers) without `verify()` noticing.
+/// `event_log.hash_v` defaults to `1` so pre-migration rows keep the existing
+/// nine-field hash form; new rows appended once this part applies are written
+/// with `hash_v = 2`, which covers `org_id` in the entry hash
+/// (`docs/organization.md`, The ledger).
 pub const STORE_PART: Procedure =
     Procedure { name: "organization.v1.store", version: 1, standalone: false, run: store, args: &[] };
 
@@ -569,14 +569,13 @@ mod tests {
     }
 
     #[test]
-    fn events_carry_the_default_organization_and_hash_form_1() {
+    fn events_carry_the_default_organization_and_hash_form_2() {
         let db = Db::open_in_memory(&[
             Part::from(ledger::SCHEMA),
             Part::from(ledger::META_SCHEMA),
             Part::from(STORE_PART),
         ])
         .unwrap();
-        // `append` names neither column; both take their defaults.
         db.write(|tx| {
             ledger::append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": 1 })))
         })
@@ -586,7 +585,7 @@ mod tests {
                 Ok(c.query_row("SELECT org_id, hash_v FROM event_log", [], |r| Ok((r.get(0)?, r.get(1)?)))?)
             })
             .unwrap();
-        assert_eq!((org.as_str(), hash_v), (DEFAULT_ORG, 1));
+        assert_eq!((org.as_str(), hash_v), (DEFAULT_ORG, 2));
         assert!(db.read(ledger::verify).unwrap().ok);
     }
 

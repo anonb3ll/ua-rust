@@ -10,11 +10,12 @@
 //! current maximum, so id order equals commit order.
 //!
 //! Once `organization.v1.store` has applied, every row also carries `org_id`
-//! and `hash_v`. This build writes and verifies only `hash_v = 1`, the
-//! nine-field form above, which does **not** cover `org_id`: a row's
-//! `org_id` is recorded but not tamper-evident until rows are written with
-//! `hash_v = 2` (see `docs/organization.md`, The ledger). [`verify`] refuses
-//! any other `hash_v`.
+//! and `hash_v`. New rows are written with `hash_v = 2`, which covers the nine
+//! fields above plus `org_id` in sorted key position so tampering with a row's
+//! organization breaks verification (`docs/organization.md`, The ledger).
+//! Pre-migration and imported rows keep `hash_v = 1` (the nine-field Python-
+//! compatible form). [`verify`] checks both forms per row, refuses any other
+//! `hash_v`, and refuses any `hash_v = 1` row after the first `hash_v = 2` row.
 
 use std::fmt::Write as _;
 
@@ -29,14 +30,21 @@ use crate::schema::SchemaPart;
 
 pub const GENESIS_HASH: &str = "GENESIS";
 
-/// The only hash form this build writes and verifies.
-pub const HASH_V: i64 = 1;
+/// Legacy nine-field hash form (Python-compatible; does not cover `org_id`).
+pub const HASH_V1: i64 = 1;
+
+/// Current ten-field hash form (nine legacy fields plus `org_id`).
+pub const HASH_V2: i64 = 2;
+
+/// The hash form this build writes for every new row once
+/// `organization.v1.store` has applied.
+pub const HASH_V: i64 = HASH_V2;
 
 /// Refuse a ledger whose newest row uses a hash form newer than [`HASH_V`].
 ///
-/// This is the rollback fence: a hub rolled back from a build that writes
-/// `hash_v = 2` must not append `hash_v = 1` rows after those, which no
-/// later `verify` accepts. [`crate::Db`] runs it at open and [`append`] before
+/// This is the rollback fence: a hub rolled back from a newer build must not
+/// append lower-version rows after higher-version ones, which no later
+/// `verify` accepts. [`crate::Db`] runs it at open and [`append`] before
 /// every write.
 ///
 /// It reads only the newest row (by `seq`, the primary key, so a single
@@ -49,6 +57,25 @@ pub const HASH_V: i64 = 1;
 /// (`organization.v1.store` not applied) pass.
 pub fn check_hash_form(conn: &Connection) -> UaResult<()> {
     if has_org_columns(conn)? { refuse_newer_hash_form(conn) } else { Ok(()) }
+}
+
+/// Whether `event_log` holds any row whose `hash_v` exceeds `max_v` (or is
+/// non-integer). Returns `false` when `organization.v1.store` has not applied.
+///
+/// Used by `ua-import` to refuse catch-up imports of `hash_v = 1` rows once a
+/// target ledger has switched to `hash_v = 2`.
+pub fn has_hash_v_above(conn: &Connection, max_v: i64) -> UaResult<bool> {
+    if !has_org_columns(conn)? {
+        return Ok(false);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM event_log WHERE typeof(hash_v) != 'integer' OR hash_v > ?1 LIMIT 1",
+            [max_v],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// Whether `event_log` has the `org_id` and `hash_v` columns
@@ -67,10 +94,11 @@ fn refuse_newer_hash_form(conn: &Connection) -> UaResult<()> {
         .query_row("SELECT hash_v FROM event_log ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
         .optional()?;
     match newest {
-        None | Some(rusqlite::types::Value::Integer(HASH_V)) => Ok(()),
-        Some(rusqlite::types::Value::Integer(v)) if v > HASH_V => Err(UaError::conflict(format!(
-            "event_log holds rows with hash_v {v}, written by a newer build; this build writes and verifies \
-             only hash_v {HASH_V}, so it refuses to append to this ledger. Run a build that supports hash_v {v}"
+        None => Ok(()),
+        Some(rusqlite::types::Value::Integer(v)) if v <= HASH_V => Ok(()),
+        Some(rusqlite::types::Value::Integer(v)) => Err(UaError::conflict(format!(
+            "event_log holds rows with hash_v {v}, written by a newer build; this build supports up to \
+             hash_v {HASH_V}, so it refuses to append to this ledger. Run a build that supports hash_v {v}"
         ))),
         // Anything else is not a form any build writes; `verify` reports it.
         Some(_) => Ok(()),
@@ -161,8 +189,8 @@ fn recorded_legacy_prefix(conn: &Connection) -> UaResult<u64> {
 /// [`ua_core::DEFAULT_ORG`].
 #[derive(Debug, Clone)]
 pub struct EventInput {
-    /// The organization of the affected row. Recorded in `event_log.org_id`,
-    /// which `hash_v = 1` does not cover.
+    /// The organization of the affected row. Recorded in `event_log.org_id`
+    /// and covered by `entry_hash` under `hash_v = 2`.
     pub org_id: String,
     pub channel: String,
     pub payload: Value,
@@ -257,7 +285,25 @@ pub(crate) fn py_json_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// The canonical hash of one entry.
+fn hash_canonical_fields(fields: &[(&str, Option<&str>)], capacity_hint: usize) -> String {
+    let mut out = String::with_capacity(capacity_hint);
+    out.push('{');
+    for (i, (k, v)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        py_json_str(&mut out, k);
+        out.push(':');
+        match v {
+            Some(v) => py_json_str(&mut out, v),
+            None => out.push_str("null"),
+        }
+    }
+    out.push('}');
+    hex::encode(Sha256::digest(out.as_bytes()))
+}
+
+/// The canonical `hash_v = 1` hash of one entry (nine fields, Python-compatible).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_entry_hash(
     prev_hash: Option<&str>,
@@ -282,21 +328,85 @@ pub fn compute_entry_hash(
         ("prev_hash", Some(prev_hash.unwrap_or(GENESIS_HASH))),
         ("ulid", Some(ulid)),
     ];
-    let mut out = String::with_capacity(256 + payload_str.len());
-    out.push('{');
-    for (i, (k, v)) in fields.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
+    hash_canonical_fields(&fields, 256 + payload_str.len())
+}
+
+/// The canonical `hash_v = 2` hash of one entry: the nine `hash_v = 1` fields
+/// plus `org_id` in sorted key position.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_entry_hash_v2(
+    prev_hash: Option<&str>,
+    ulid: &str,
+    channel: &str,
+    payload_str: &str,
+    originator: Option<&str>,
+    episode_id: Option<&str>,
+    causal_parent_id: Option<&str>,
+    created_at: &str,
+    dedupe_key: Option<&str>,
+    org_id: &str,
+) -> String {
+    let fields: [(&str, Option<&str>); 10] = [
+        ("causal_parent_id", causal_parent_id),
+        ("channel", Some(channel)),
+        ("created_at", Some(created_at)),
+        ("dedupe_key", dedupe_key),
+        ("episode_id", episode_id),
+        ("org_id", Some(org_id)),
+        ("originator", originator),
+        ("payload", Some(payload_str)),
+        ("prev_hash", Some(prev_hash.unwrap_or(GENESIS_HASH))),
+        ("ulid", Some(ulid)),
+    ];
+    hash_canonical_fields(&fields, 288 + payload_str.len())
+}
+
+/// Recompute an entry's hash according to its declared `hash_v` (`1` or `2`).
+/// Returns `None` for any unknown `hash_v` or a `hash_v = 2` row lacking a
+/// non-empty `org_id`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_entry_hash_for_version(
+    hash_v: i64,
+    prev_hash: Option<&str>,
+    ulid: &str,
+    channel: &str,
+    payload_str: &str,
+    originator: Option<&str>,
+    episode_id: Option<&str>,
+    causal_parent_id: Option<&str>,
+    created_at: &str,
+    dedupe_key: Option<&str>,
+    org_id: Option<&str>,
+) -> Option<String> {
+    match hash_v {
+        HASH_V1 => Some(compute_entry_hash(
+            prev_hash,
+            ulid,
+            channel,
+            payload_str,
+            originator,
+            episode_id,
+            causal_parent_id,
+            created_at,
+            dedupe_key,
+        )),
+        HASH_V2 => {
+            let org_id = org_id.filter(|o| !o.trim().is_empty())?;
+            Some(compute_entry_hash_v2(
+                prev_hash,
+                ulid,
+                channel,
+                payload_str,
+                originator,
+                episode_id,
+                causal_parent_id,
+                created_at,
+                dedupe_key,
+                org_id,
+            ))
         }
-        py_json_str(&mut out, k);
-        out.push(':');
-        match v {
-            Some(v) => py_json_str(&mut out, v),
-            None => out.push_str("null"),
-        }
+        _ => None,
     }
-    out.push('}');
-    hex::encode(Sha256::digest(out.as_bytes()))
 }
 
 fn mint_ulid(conn: &Connection) -> UaResult<String> {
@@ -364,17 +474,32 @@ pub fn append(tx: &mut WriteTx<'_>, input: EventInput) -> UaResult<Option<Event>
         )
         .optional()?;
     let prev_hash = prev.unwrap_or_else(|| GENESIS_HASH.to_string());
-    let entry_hash = compute_entry_hash(
-        Some(&prev_hash),
-        &ulid,
-        &input.channel,
-        &payload_str,
-        input.originator.as_deref(),
-        input.episode_id.as_deref(),
-        input.causal_parent_id.as_deref(),
-        &created_at,
-        input.dedupe_key.as_deref(),
-    );
+    let entry_hash = if org_columns {
+        compute_entry_hash_v2(
+            Some(&prev_hash),
+            &ulid,
+            &input.channel,
+            &payload_str,
+            input.originator.as_deref(),
+            input.episode_id.as_deref(),
+            input.causal_parent_id.as_deref(),
+            &created_at,
+            input.dedupe_key.as_deref(),
+            &input.org_id,
+        )
+    } else {
+        compute_entry_hash(
+            Some(&prev_hash),
+            &ulid,
+            &input.channel,
+            &payload_str,
+            input.originator.as_deref(),
+            input.episode_id.as_deref(),
+            input.causal_parent_id.as_deref(),
+            &created_at,
+            input.dedupe_key.as_deref(),
+        )
+    };
     if org_columns {
         tx.execute(
             "INSERT INTO event_log (ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, \
@@ -539,8 +664,8 @@ pub struct VerifyReport {
 /// hash, so such a row was written around the ledger.
 ///
 /// Every row's `hash_v` (when the column exists, after
-/// `organization.v1.store`) must be [`HASH_V`]; any other value fails, so a
-/// row cannot claim a hash form this build does not check.
+/// `organization.v1.store`) must be `1` or `2`, and once any `hash_v = 2` row
+/// appears, no subsequent row may carry `hash_v = 1` (downgrade refusal).
 pub fn verify(conn: &Connection) -> UaResult<VerifyReport> {
     verify_through(conn, i64::MAX)
 }
@@ -550,20 +675,18 @@ pub fn verify(conn: &Connection) -> UaResult<VerifyReport> {
 /// written after it. The report is the same as [`verify`].
 pub fn verify_through(conn: &Connection, through_seq: i64) -> UaResult<VerifyReport> {
     let expected_prefix = recorded_legacy_prefix(conn)?;
-    let has_hash_v: bool = conn
-        .query_row("SELECT 1 FROM pragma_table_info('event_log') WHERE name = 'hash_v'", [], |_| Ok(true))
-        .optional()?
-        .unwrap_or(false);
-    let hash_v = if has_hash_v { "hash_v" } else { "1" };
+    let has_org_cols = has_org_columns(conn)?;
+    let (hash_v_col, org_id_col) = if has_org_cols { ("hash_v", "org_id") } else { ("1", "'default'") };
     let mut stmt = conn.prepare(&format!(
         "SELECT seq, ulid, channel, payload, originator, episode_id, causal_parent_id, created_at, dedupe_key, \
-         prev_hash, entry_hash, {hash_v} FROM event_log WHERE seq <= ?1 ORDER BY seq ASC"
+         prev_hash, entry_hash, {hash_v_col}, {org_id_col} FROM event_log WHERE seq <= ?1 ORDER BY seq ASC"
     ))?;
     let mut rows = stmt.query([through_seq])?;
     let mut expected_prev = GENESIS_HASH.to_string();
     let mut report =
         VerifyReport { ok: true, checked: 0, unhashed_legacy_prefix: 0, first_bad_seq: None, reason: None };
     let mut first_unhashed: Option<i64> = None;
+    let mut seen_v2 = false;
     while let Some(r) = rows.next()? {
         let seq: i64 = r.get(0)?;
         let fail = |reason: &str| VerifyReport {
@@ -575,16 +698,28 @@ pub fn verify_through(conn: &Connection, through_seq: i64) -> UaResult<VerifyRep
         };
         // Read untyped, so a tampered non-integer value is reported, not an error.
         let form: rusqlite::types::Value = r.get(11)?;
-        if form != rusqlite::types::Value::Integer(HASH_V) {
-            let shown = match form {
-                rusqlite::types::Value::Null => "NULL".to_string(),
-                rusqlite::types::Value::Integer(v) => v.to_string(),
-                rusqlite::types::Value::Real(v) => v.to_string(),
-                rusqlite::types::Value::Text(v) => format!("{v:?}"),
-                rusqlite::types::Value::Blob(_) => "a blob".to_string(),
-            };
-            return Ok(fail(&format!("unknown hash_v {shown}; this build verifies only hash_v = {HASH_V}")));
-        }
+        let hash_v = match form {
+            rusqlite::types::Value::Integer(HASH_V1) => {
+                if seen_v2 {
+                    return Ok(fail("hash_v downgrade: hash_v = 1 row after hash_v = 2"));
+                }
+                HASH_V1
+            }
+            rusqlite::types::Value::Integer(HASH_V2) => {
+                seen_v2 = true;
+                HASH_V2
+            }
+            other => {
+                let shown = match other {
+                    rusqlite::types::Value::Null => "NULL".to_string(),
+                    rusqlite::types::Value::Integer(v) => v.to_string(),
+                    rusqlite::types::Value::Real(v) => v.to_string(),
+                    rusqlite::types::Value::Text(v) => format!("{v:?}"),
+                    rusqlite::types::Value::Blob(_) => "a blob".to_string(),
+                };
+                return Ok(fail(&format!("unknown hash_v {shown}; this build verifies only hash_v 1 and 2")));
+            }
+        };
         let entry: Option<String> = r.get(10)?;
         let Some(entry) = entry else {
             if report.checked > 0 {
@@ -599,7 +734,12 @@ pub fn verify_through(conn: &Connection, through_seq: i64) -> UaResult<VerifyRep
             return Ok(fail("prev_hash does not link to the previous entry"));
         }
         let get = |i: usize| -> rusqlite::Result<Option<String>> { r.get(i) };
-        let recomputed = compute_entry_hash(
+        let org_id = match r.get::<_, rusqlite::types::Value>(12)? {
+            rusqlite::types::Value::Text(s) => Some(s),
+            _ => None,
+        };
+        let Some(recomputed) = compute_entry_hash_for_version(
+            hash_v,
             prev.as_deref(),
             &r.get::<_, String>(1)?,
             &r.get::<_, String>(2)?,
@@ -609,7 +749,10 @@ pub fn verify_through(conn: &Connection, through_seq: i64) -> UaResult<VerifyRep
             get(6)?.as_deref(),
             &r.get::<_, String>(7)?,
             get(8)?.as_deref(),
-        );
+            org_id.as_deref(),
+        ) else {
+            return Ok(fail("hash_v = 2 row has missing or invalid org_id"));
+        };
         if recomputed != entry {
             return Ok(fail("entry_hash does not match the row contents"));
         }
@@ -643,7 +786,7 @@ mod tests {
 
     #[test]
     fn python_compatible_hash() {
-        // Reference value computed with the original implementation:
+        // Reference value computed with the original implementation (hash_v = 1):
         // compute_entry_hash(None, "01J0000000000000000000000", "agent.task.updated",
         //   '{"id": 1, "t": "café"}', "builder-1", None, None, "2026-01-01T00:00:00+00:00")
         let h = compute_entry_hash(
@@ -658,6 +801,40 @@ mod tests {
             None,
         );
         assert_eq!(h, include_str!("../tests/fixtures/py_hash.txt").trim());
+    }
+
+    #[test]
+    fn hash_v2_golden_vector() {
+        // Reference value independently computed with Python `json.dumps(sort_keys=True,
+        // separators=(",", ":"), ensure_ascii=True)` over the ten v2 fields (with org_id="default").
+        let h = compute_entry_hash_v2(
+            None,
+            "01J0000000000000000000000",
+            "agent.task.updated",
+            "{\"id\": 1, \"t\": \"café\"}",
+            Some("builder-1"),
+            None,
+            None,
+            "2026-01-01T00:00:00+00:00",
+            None,
+            ua_core::DEFAULT_ORG,
+        );
+        assert_eq!(h, include_str!("../tests/fixtures/hash_v2.txt").trim());
+        assert_ne!(h, include_str!("../tests/fixtures/py_hash.txt").trim());
+        // Changing org_id changes the v2 hash.
+        let h_other = compute_entry_hash_v2(
+            None,
+            "01J0000000000000000000000",
+            "agent.task.updated",
+            "{\"id\": 1, \"t\": \"café\"}",
+            Some("builder-1"),
+            None,
+            None,
+            "2026-01-01T00:00:00+00:00",
+            None,
+            "org-b",
+        );
+        assert_ne!(h, h_other);
     }
 
     fn channels(db: &Db) -> Vec<String> {
@@ -798,7 +975,7 @@ mod tests {
         db.write(|tx| Ok(tx.execute_batch("DROP TRIGGER event_log_no_update;")?)).unwrap();
         // A text value keeps TEXT storage in an INTEGER column only when it does
         // not look like a number.
-        for (value, shown) in [("2", "2"), ("'v1'", "\"v1\"")] {
+        for (value, shown) in [("0", "0"), ("3", "3"), ("'v2'", "\"v2\"")] {
             db.write(|tx| {
                 Ok(tx.execute(&format!("UPDATE event_log SET hash_v = {value} WHERE seq = 2"), [])?)
             })
@@ -808,16 +985,140 @@ mod tests {
             assert_eq!(report.first_bad_seq, Some(2), "{value}");
             assert_eq!(
                 report.reason.as_deref(),
-                Some(format!("unknown hash_v {shown}; this build verifies only hash_v = 1").as_str()),
+                Some(format!("unknown hash_v {shown}; this build verifies only hash_v 1 and 2").as_str()),
                 "{value}"
             );
         }
     }
 
+    #[test]
+    fn v2_tampering_org_id_breaks_verify() {
+        let db = Db::open_in_memory(&[
+            crate::Part::from(SCHEMA),
+            crate::Part::from(META_SCHEMA),
+            crate::Part::from(crate::org::STORE_PART),
+        ])
+        .unwrap();
+        db.write(|tx| {
+            tx.execute(
+                "INSERT INTO orgs (id, slug, display_name, allowed_profiles, created_at) \
+                 VALUES ('org-b', 'org-b', 'Org B', '[\"developer\"]', '2026-01-01T00:00:00+00:00')",
+                [],
+            )?;
+            append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": 1 })))?;
+            append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": 2 })))?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(db.read(verify).unwrap().ok);
+        db.write(|tx| {
+            tx.execute_batch("DROP TRIGGER event_log_no_update;")?;
+            tx.execute("UPDATE event_log SET org_id = 'org-b' WHERE seq = 2", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let report = db.read(verify).unwrap();
+        assert!(!report.ok, "{report:?}");
+        assert_eq!(report.first_bad_seq, Some(2));
+        assert_eq!(report.reason.as_deref(), Some("entry_hash does not match the row contents"));
+    }
+
+    /// An upgraded store with an existing `hash_v = 1` chain opens cleanly on
+    /// new code, appends a `hash_v = 2` row whose `prev_hash` links to the
+    /// last `hash_v = 1` hash, and passes `verify()`.
+    #[test]
+    fn upgraded_store_switches_from_v1_to_v2_and_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgraded.db");
+        let parts = [
+            crate::Part::from(SCHEMA),
+            crate::Part::from(META_SCHEMA),
+            crate::Part::from(crate::org::STORE_PART),
+        ];
+        // Populate a valid v1 chain directly (standing in for a pre-v2 store).
+        let db = Db::open(&path, &parts).unwrap();
+        let mut prev = GENESIS_HASH.to_string();
+        for i in 1..=3i64 {
+            let ulid = format!("01J0000000000000000000000{i}");
+            let payload = format!("{{\"i\":{i}}}");
+            let ts = format!("2026-01-01T00:00:0{i}+00:00");
+            let entry_hash =
+                compute_entry_hash(Some(&prev), &ulid, "legacy.v1", &payload, None, None, None, &ts, None);
+            db.write(|tx| {
+                tx.execute(
+                    "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash, org_id, hash_v) \
+                     VALUES (?1, 'legacy.v1', ?2, ?3, ?4, ?5, 'default', 1)",
+                    params![ulid, payload, ts, prev, entry_hash],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            prev = entry_hash;
+        }
+        let last_v1_hash = prev;
+        drop(db);
+
+        // Reopen on the current build and append: switches cleanly to hash_v = 2.
+        let db = Db::open(&path, &parts).unwrap();
+        let appended = db
+            .write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "after.v2", json!({ "i": 4 }))))
+            .unwrap()
+            .unwrap();
+        assert_eq!(appended.seq, 4);
+        assert_eq!(appended.prev_hash.as_deref(), Some(last_v1_hash.as_str()));
+
+        let versions: Vec<(i64, i64)> = db
+            .read(|c| {
+                let mut stmt = c.prepare("SELECT seq, hash_v FROM event_log ORDER BY seq")?;
+                Ok(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(versions, vec![(1, 1), (2, 1), (3, 1), (4, 2)]);
+
+        let report = db.read(verify).unwrap();
+        assert!(report.ok, "{report:?}");
+        assert_eq!(report.checked, 4);
+    }
+
+    /// Downgrade refusal: a `hash_v = 1` row appearing after the first
+    /// `hash_v = 2` row fails verification even if its v1 hash and `prev_hash`
+    /// are cryptographically valid.
+    #[test]
+    fn verify_refuses_v1_after_v2_downgrade() {
+        let db = Db::open_in_memory(&[
+            crate::Part::from(SCHEMA),
+            crate::Part::from(META_SCHEMA),
+            crate::Part::from(crate::org::STORE_PART),
+        ])
+        .unwrap();
+        let v2_ev = db
+            .write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "first.v2", json!({ "i": 1 }))))
+            .unwrap()
+            .unwrap();
+        let prev = v2_ev.entry_hash.unwrap();
+        let ulid = "01J99999999999999999999999";
+        let ts = "2026-01-02T00:00:00+00:00";
+        let v1_hash =
+            compute_entry_hash(Some(&prev), ulid, "downgraded.v1", "{}", None, None, None, ts, None);
+        db.write(|tx| {
+            tx.execute(
+                "INSERT INTO event_log (ulid, channel, payload, created_at, prev_hash, entry_hash, org_id, hash_v) \
+                 VALUES (?1, 'downgraded.v1', '{}', ?2, ?3, ?4, 'default', 1)",
+                params![ulid, ts, prev, v1_hash],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let report = db.read(verify).unwrap();
+        assert!(!report.ok, "{report:?}");
+        assert_eq!(report.first_bad_seq, Some(2));
+        assert!(report.reason.as_deref().unwrap_or("").contains("downgrade"), "{report:?}");
+    }
+
     /// The rollback fence: a ledger whose newest row has a newer hash form
     /// (as a later build will write) refuses both `append` and `Db::open`,
-    /// naming both forms, so a rolled-back build never writes `hash_v = 1`
-    /// rows after `hash_v = 2` ones.
+    /// naming both forms, so a rolled-back build never writes `hash_v = 2`
+    /// rows after `hash_v = 3` ones.
     #[test]
     fn a_ledger_with_a_newer_hash_form_refuses_append_and_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -832,10 +1133,10 @@ mod tests {
             db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({ "i": i }))))
                 .unwrap();
         }
-        // Stand in for a newer build's row: the newest row claims hash_v 2.
+        // Stand in for a newer build's row: the newest row claims hash_v 3.
         db.write(|tx| {
             tx.execute_batch("DROP TRIGGER event_log_no_update;")?;
-            tx.execute("UPDATE event_log SET hash_v = 2 WHERE seq = (SELECT MAX(seq) FROM event_log)", [])?;
+            tx.execute("UPDATE event_log SET hash_v = 3 WHERE seq = (SELECT MAX(seq) FROM event_log)", [])?;
             Ok(())
         })
         .unwrap();
@@ -845,16 +1146,16 @@ mod tests {
             .write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({}))))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("hash_v 2") && err.contains("only hash_v 1"), "{err}");
+        assert!(err.contains("hash_v 3") && err.contains("hash_v 2"), "{err}");
         let after: i64 =
             db.read(|c| Ok(c.query_row("SELECT COUNT(*) FROM event_log", [], |r| r.get(0))?)).unwrap();
         assert_eq!(before, after, "nothing was appended");
         drop(db);
 
         let err = Db::open(&path, &parts).err().expect("open must refuse").to_string();
-        assert!(err.contains("hash_v 2") && err.contains("only hash_v 1"), "{err}");
+        assert!(err.contains("hash_v 3") && err.contains("hash_v 2"), "{err}");
 
-        // A ledger whose rows are all hash_v 1 opens and appends as before.
+        // A ledger whose rows are hash_v 2 opens and appends cleanly.
         let fresh = dir.path().join("fresh.db");
         let db = Db::open(&fresh, &parts).unwrap();
         db.write(|tx| append(tx, EventInput::new(ua_core::DEFAULT_ORG, "test.event", json!({})))).unwrap();
