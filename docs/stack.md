@@ -56,7 +56,7 @@ workspace crate today. Treat each as a candidate, not a decision.
 
 | Area | Candidate | Note |
 |---|---|---|
-| Storage backends | Repository traits over SQLite | The tool families call `rusqlite` directly. There are no repository traits, so a second backend would need that layer first. |
+| Storage backends | Repository traits over SQLite | `OrgRead`/`OrgWrite` and `GraphRead`/`GraphRepo` live in `ua-store`, while most tool families still call `rusqlite` directly. See [store.md](store.md) for the per-aggregate trait boundary and raw-SQL ratchet. |
 | Ledger signing | ed25519-dalek (`verify_strict`) | Signed producer events. |
 | Timestamp anchors | sigstore-tsa (RFC 3161) | Optional anchor backend. |
 | JWT | jsonwebtoken | Bearer tokens are opaque and stored hashed; add it only where a spec needs one. |

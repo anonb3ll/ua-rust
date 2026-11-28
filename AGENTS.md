@@ -57,7 +57,15 @@ touched; CI runs the whole workspace (`cargo nextest run --workspace`).
 
 This repository is public. No personal names, e-mail addresses, home
 directory paths, host names, private-network addresses or real tokens in
-code, tests, docs or commits, and no team- or organization-specific roles or
-vocabulary. Use placeholders such as `builder-1`, `operator`, `~/projects`,
-`example.com`. `scripts/vocab-check.sh` runs in CI; an intended exception
-goes in `scripts/vocab-allowlist.txt` with a reason.
+tracked files (code, tests, docs) or in commit messages, and no team- or
+organization-specific roles or vocabulary. Use placeholders such as
+`builder-1`, `operator`, `~/projects`, `example.com`.
+`scripts/vocab-check.sh` runs in CI; an intended exception goes in
+`scripts/vocab-allowlist.txt` with a reason.
+
+One exception, and it is only about commit metadata: the operator's own address
+is accepted in the **author and committer fields of commits** (2026-11-27),
+because a merge commit GitHub creates carries the merging account's identity.
+Do not rewrite such a commit to scrub it and do not report it as a privacy
+finding. Commit messages, PR text, and everything else in tracked content stay
+under the rule above.

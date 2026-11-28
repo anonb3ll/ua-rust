@@ -27,6 +27,12 @@ use ua_store::evidence::{
     TrustFile, VerifyTrust, Window, checkpoint_attach, checkpoint_write, key_add, key_list, key_retire,
     key_revoke, latest_signed_checkpoint, verify_checkpoint_with,
 };
+use ua_store::evidence_bundle::{
+    BUNDLE_FORMAT, BundleCheckpointFile, BundleManifest, BundleVerifyTrust, ExportBundleOptions,
+    MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_TOTAL_BYTES, PinnedHubHead, PinnedOrgHead,
+    compute_org_window_checkpoint, export_bundle, load_verified_hub_cross_check, sha256_hex,
+    snapshot_checkpoint, snapshot_load, verify_bundle_dir,
+};
 use ua_tools::Hub;
 
 use super::{reject_if_symlink, set_owner_only_file, write_atomic_file};
@@ -72,23 +78,46 @@ pub enum EvidenceCmd {
     /// Write a checkpoint row, print its fields and digest, and optionally
     /// write a checkpoint JSON file for offline signing.
     Checkpoint(CheckpointArgs),
-    /// Sign a checkpoint file offline with a key file. Recomputes the digest
-    /// locally from the checkpoint's fields and displays the fields (plus the
-    /// previous signed checkpoint's head) before signing.
+    /// Export a canonical, hash-manifested evidence bundle for a checkpoint.
+    /// Never holds a signing key and never writes `manifest.sig`; sign the
+    /// exported bundle offline with `ua evidence sign --bundle`.
+    Export {
+        /// Checkpoint id in `evidence_checkpoint` whose range to export.
+        #[arg(long)]
+        checkpoint: String,
+        /// Output directory for the bundle (must not exist or must be empty).
+        #[arg(long)]
+        out: PathBuf,
+        /// Optional exclusive start global `seq` for incremental `hub` exports.
+        #[arg(long)]
+        from_seq: Option<i64>,
+        /// Optional exclusive start `org_seq` for incremental `org` exports.
+        #[arg(long)]
+        from_org_seq: Option<i64>,
+    },
+    /// Sign a checkpoint file or exported evidence bundle offline with a key
+    /// file. Recomputes the digest locally and displays its fields before
+    /// signing. Never opens or creates a hub database.
     Sign {
         /// Key file: 64 hex characters (a 32-byte Ed25519 seed).
         #[arg(long)]
         key_file: PathBuf,
         /// Checkpoint JSON file written by `ua evidence checkpoint --out` (or
-        /// a bare checkpoint JSON object). The digest is recomputed locally;
-        /// an operator never signs an opaque digest handed over by a hub.
-        #[arg(long)]
-        checkpoint_file: PathBuf,
+        /// a bare checkpoint JSON object). Mutually exclusive with `--bundle`.
+        #[arg(long, conflicts_with = "bundle", required_unless_present = "bundle")]
+        checkpoint_file: Option<PathBuf>,
+        /// Exported evidence bundle directory to sign offline. Recomputes
+        /// `manifest.json`'s digest and verifies every file hash before
+        /// writing `manifest.sig` (or `--out`). Mutually exclusive with
+        /// `--checkpoint-file`.
+        #[arg(long, conflicts_with = "checkpoint_file", required_unless_present = "checkpoint_file")]
+        bundle: Option<PathBuf>,
         /// Optional local copy of the previous checkpoint file you signed, to
         /// display its head and verify continuity before signing the new one.
         #[arg(long)]
         prev_checkpoint: Option<PathBuf>,
-        /// Write the signature hex to this file instead of stdout.
+        /// Write the signature hex to this file (for `--checkpoint-file`,
+        /// defaults to stdout; for `--bundle`, defaults to `<bundle>/manifest.sig`).
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -101,13 +130,18 @@ pub enum EvidenceCmd {
         #[arg(long)]
         signature: String,
     },
-    /// Verify a checkpoint's signature. Pass the key you obtained out of band
-    /// (`--anchor-key` and `--anchor-key-id`, or `--trust-file`); without it
-    /// the result is only "matches the key in the same database", which is not
-    /// authorship. Exits 0 verified, 1 refused, 2 cannot verify.
+    /// Verify a checkpoint in the hub database (`--checkpoint`) or an exported
+    /// evidence bundle offline (`--bundle`). Offline `--bundle` verification
+    /// never opens or creates a hub database. Exits 0 verified, 1 refused,
+    /// 2 cannot verify.
     Verify {
-        #[arg(long)]
-        checkpoint: String,
+        /// Checkpoint id in the hub database. Mutually exclusive with `--bundle`.
+        #[arg(long, conflicts_with = "bundle", required_unless_present = "bundle")]
+        checkpoint: Option<String>,
+        /// Exported evidence bundle directory to verify completely offline.
+        /// Mutually exclusive with `--checkpoint`.
+        #[arg(long, conflicts_with = "checkpoint", required_unless_present = "checkpoint")]
+        bundle: Option<PathBuf>,
         /// Hex-encoded 32-byte Ed25519 public key the verifier pinned out of band.
         #[arg(long)]
         anchor_key: Option<String>,
@@ -123,11 +157,17 @@ pub enum EvidenceCmd {
         /// independently of the database's `revoked_at` column.
         #[arg(long = "revoked-key-id")]
         revoked_key_ids: Vec<String>,
-        /// Local copy of a previously signed hub checkpoint file (repeatable).
-        /// Each supplied record must match `event_log`, exist as a signed row
-        /// in `evidence_checkpoint`, and pass signature verification.
+        /// Local copy of a previously signed checkpoint file (repeatable).
+        /// For `--checkpoint`: out-of-band hub checkpoints checked against the
+        /// database. For `--bundle`: pins the prior checkpoint head (`hub` or
+        /// `org`) for incremental completeness verification.
         #[arg(long = "prev-checkpoint")]
         prev_checkpoints: Vec<PathBuf>,
+        /// For `--bundle` (class `org` only): path to a signed `hub` bundle
+        /// directory used to cross-check `global_from_hash` and
+        /// `global_head_hash` against the global ledger chain.
+        #[arg(long)]
+        hub_bundle: Option<PathBuf>,
     },
 }
 
@@ -170,6 +210,12 @@ pub struct CheckpointArgs {
     /// Org class: the chained hash over the window's rows.
     #[arg(long)]
     pub chain: Option<String>,
+    /// Org class: derive `--global-from`, `--head`, `--row-count`, and
+    /// `--chain` directly from `event_log` for `--org` over
+    /// `[--window-from, --window-to]` (optionally continuing after
+    /// `--global-from`).
+    #[arg(long)]
+    pub derive: bool,
     /// Write the full checkpoint JSON file here for offline signing with
     /// `ua evidence sign --checkpoint-file`. Refuses to overwrite.
     #[arg(long)]
@@ -270,14 +316,20 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
         }
         EvidenceCmd::Checkpoint(args) => {
             let out = args.out.clone();
-            let checkpoint = build_checkpoint(args)?;
+            let checkpoint = build_checkpoint(hub, args)?;
             let now = ua_core::time::now();
             let previous_signed = hub
                 .db()
                 .read(|c| latest_signed_checkpoint(c, checkpoint.class, checkpoint.org_id.as_deref()))?
                 .as_ref()
                 .map(PreviousCheckpointHead::from_checkpoint);
-            let digest = hub.db().write(|tx| checkpoint_write(tx, &checkpoint, &now))?;
+            // The export snapshot (withheld counts, org ordinals) is frozen in
+            // the same transaction, so later deletes never change a re-export.
+            let digest = hub.db().write(|tx| {
+                let digest = checkpoint_write(tx, &checkpoint, &now)?;
+                snapshot_checkpoint(tx, &checkpoint.checkpoint_id, &now)?;
+                Ok(digest)
+            })?;
             let file_payload = CheckpointFile {
                 format: CHECKPOINT_FORMAT.to_string(),
                 checkpoint: checkpoint.clone(),
@@ -306,8 +358,44 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
             println!("{}", serde_json::to_string_pretty(&summary)?);
             Ok(ExitCode::SUCCESS)
         }
-        EvidenceCmd::Sign { key_file, checkpoint_file, prev_checkpoint, out } => {
-            run_sign(&key_file, &checkpoint_file, prev_checkpoint.as_deref(), out.as_deref())?;
+        EvidenceCmd::Export { checkpoint, out, from_seq, from_org_seq } => {
+            let opts = ExportBundleOptions {
+                checkpoint_id: checkpoint.trim().to_string(),
+                from_seq,
+                from_org_seq,
+                exported_at: ua_core::time::now(),
+                host: std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into()),
+                tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            // A checkpoint written before export snapshots existed freezes its
+            // snapshot on first export.
+            // Read first: the write transaction is taken only when the
+            // snapshot is missing.
+            let frozen = hub.db().read(|c| Ok(snapshot_load(c, &opts.checkpoint_id)?.is_some()))?;
+            if !frozen {
+                hub.db().write(|tx| snapshot_checkpoint(tx, &opts.checkpoint_id, &opts.exported_at))?;
+            }
+            let result = hub.db().read(|c| export_bundle(c, &out, &opts))?;
+            let summary = json!({
+                "format": result.manifest.format,
+                "class": result.manifest.class.as_str(),
+                "org_id": result.manifest.org_id,
+                "out": out.display().to_string(),
+                "digest": result.manifest.digest,
+                "counts": result.manifest.counts,
+                "withheld": result.withheld,
+            });
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        EvidenceCmd::Sign { key_file, checkpoint_file, bundle, prev_checkpoint, out } => {
+            run_sign_cmd(
+                &key_file,
+                checkpoint_file.as_deref(),
+                bundle.as_deref(),
+                prev_checkpoint.as_deref(),
+                out.as_deref(),
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         EvidenceCmd::Attach { checkpoint, signature } => {
@@ -318,12 +406,33 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
         }
         EvidenceCmd::Verify {
             checkpoint,
+            bundle,
             anchor_key,
             anchor_key_id,
             trust_file,
             revoked_key_ids,
             prev_checkpoints,
+            hub_bundle,
         } => {
+            if let Some(bundle_dir) = bundle {
+                return run_verify_bundle(
+                    &bundle_dir,
+                    anchor_key,
+                    anchor_key_id,
+                    trust_file.as_deref(),
+                    revoked_key_ids,
+                    prev_checkpoints,
+                    hub_bundle.as_deref(),
+                );
+            }
+            if hub_bundle.is_some() {
+                eprintln!("cannot verify: --hub-bundle is only valid with --bundle");
+                return Ok(ExitCode::from(2));
+            }
+            let Some(checkpoint) = checkpoint else {
+                eprintln!("cannot verify: either --checkpoint or --bundle is required");
+                return Ok(ExitCode::from(2));
+            };
             let trust = match build_verify_trust(
                 anchor_key,
                 anchor_key_id,
@@ -358,12 +467,296 @@ pub fn run(hub: &Hub, args: EvidenceArgs) -> anyhow::Result<ExitCode> {
     }
 }
 
+/// Verify an exported evidence bundle completely offline without opening or
+/// creating any hub database or reading `$UA_HOME`.
+pub fn run_verify_bundle(
+    bundle_dir: &Path,
+    anchor_key: Option<String>,
+    anchor_key_id: Option<String>,
+    trust_file: Option<&Path>,
+    revoked_key_ids: Vec<String>,
+    prev_checkpoints: Vec<PathBuf>,
+    hub_bundle: Option<&Path>,
+) -> anyhow::Result<ExitCode> {
+    let base_trust =
+        match build_verify_trust(anchor_key, anchor_key_id, trust_file, revoked_key_ids, Vec::new()) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("cannot verify: {e:#}");
+                return Ok(ExitCode::from(2));
+            }
+        };
+
+    let mut pinned_hub: Option<PinnedHubHead> = base_trust
+        .signed_checkpoints
+        .iter()
+        .max_by_key(|p| p.seq)
+        .map(|p| PinnedHubHead { seq: p.seq, hash: p.hash.clone() });
+    let mut pinned_org: Option<PinnedOrgHead> = None;
+
+    for path in prev_checkpoints {
+        let parsed = match load_checkpoint_file(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("cannot verify: {e:#}");
+                return Ok(ExitCode::from(2));
+            }
+        };
+        if let Err(e) = parsed.checkpoint.validate_fields() {
+            eprintln!("cannot verify: invalid --prev-checkpoint {}: {e}", path.display());
+            return Ok(ExitCode::from(2));
+        }
+        let recomputed = parsed.checkpoint.digest();
+        if let Some(claimed) = parsed.digest.as_deref()
+            && !claimed.trim().eq_ignore_ascii_case(&recomputed)
+        {
+            eprintln!(
+                "cannot verify: digest mismatch in --prev-checkpoint {} (claims {claimed}, recomputed {recomputed})",
+                path.display()
+            );
+            return Ok(ExitCode::from(2));
+        }
+        match parsed.checkpoint.class {
+            CheckpointClass::Hub => {
+                let seq = parsed.checkpoint.seq.expect("validated hub");
+                let hash = parsed.checkpoint.hash.expect("validated hub");
+                if pinned_hub.as_ref().is_none_or(|cur| seq > cur.seq) {
+                    pinned_hub = Some(PinnedHubHead { seq, hash });
+                }
+            }
+            CheckpointClass::Org => {
+                let org_id = parsed.checkpoint.org_id.expect("validated org");
+                let global_head_hash = parsed.checkpoint.global_head_hash.expect("validated org");
+                let org_row_count = parsed.checkpoint.org_row_count.expect("validated org");
+                let org_chain_hash = parsed.checkpoint.org_chain_hash.expect("validated org");
+                if pinned_org.as_ref().is_none_or(|cur| org_row_count > cur.org_row_count) {
+                    pinned_org =
+                        Some(PinnedOrgHead { org_id, global_head_hash, org_row_count, org_chain_hash });
+                }
+            }
+        }
+    }
+
+    let mut bundle_trust = BundleVerifyTrust {
+        anchor: base_trust.anchor,
+        trust_keys: base_trust.trust_keys,
+        revoked_key_ids: base_trust.revoked_key_ids,
+        pinned_hub,
+        pinned_org,
+        hub_cross_check: None,
+    };
+
+    if let Some(hub_dir) = hub_bundle {
+        match load_verified_hub_cross_check(hub_dir, &bundle_trust) {
+            Ok(Ok(cc)) => bundle_trust.hub_cross_check = Some(cc),
+            Ok(Err(failed_hub_verdict)) => {
+                println!("{}", serde_json::to_string_pretty(&failed_hub_verdict)?);
+                eprintln!(
+                    "cannot verify: --hub-bundle {} failed verification (exit {})",
+                    hub_dir.display(),
+                    failed_hub_verdict.exit_code
+                );
+                return Ok(ExitCode::from(failed_hub_verdict.exit_code));
+            }
+            Err(e) => {
+                eprintln!("cannot verify: loading --hub-bundle {}: {e}", hub_dir.display());
+                return Ok(ExitCode::from(2));
+            }
+        }
+    }
+
+    let verdict = match verify_bundle_dir(bundle_dir, &bundle_trust) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("cannot verify: {e}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&verdict)?);
+    for w in &verdict.warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok(ExitCode::from(verdict.exit_code))
+}
+
 /// Generate a key file without opening the hub. This command is offline: it
 /// must not create or migrate a hub database.
 pub fn run_key_generate(out: &Path) -> anyhow::Result<()> {
     let key = generate_key_file(out)?;
     println!("{}", json!({ "public_key": key, "key_file": out.display().to_string() }));
     Ok(())
+}
+
+/// Dispatch offline `ua evidence sign` for either `--checkpoint-file` or
+/// `--bundle`. Never opens or creates a hub database.
+pub fn run_sign_cmd(
+    key_file: &Path,
+    checkpoint_file: Option<&Path>,
+    bundle: Option<&Path>,
+    prev_checkpoint: Option<&Path>,
+    out: Option<&Path>,
+) -> anyhow::Result<()> {
+    match (checkpoint_file, bundle) {
+        (Some(cp), None) => run_sign(key_file, cp, prev_checkpoint, out),
+        (None, Some(dir)) => {
+            if prev_checkpoint.is_some() {
+                anyhow::bail!("--prev-checkpoint is only supported with --checkpoint-file");
+            }
+            run_sign_bundle(key_file, dir, out)
+        }
+        (Some(_), Some(_)) => anyhow::bail!("pass either --checkpoint-file or --bundle, not both"),
+        (None, None) => anyhow::bail!("either --checkpoint-file or --bundle is required"),
+    }
+}
+
+/// Sign an exported evidence bundle directory offline without opening any hub
+/// database. Recomputes `manifest.json`'s digest, refuses symlinks/path
+/// traversal/oversized files, verifies every hashed file listed in
+/// `manifest.files`, displays summary fields on stderr, and writes
+/// `manifest.sig` (or `--out`).
+pub fn run_sign_bundle(key_file: &Path, bundle_dir: &Path, out: Option<&Path>) -> anyhow::Result<()> {
+    let root_meta = std::fs::symlink_metadata(bundle_dir)
+        .with_context(|| format!("inspecting bundle directory {}", bundle_dir.display()))?;
+    if root_meta.file_type().is_symlink() {
+        anyhow::bail!("refusing bundle directory symlink {}", bundle_dir.display());
+    }
+    if !root_meta.file_type().is_dir() {
+        anyhow::bail!("bundle path {} is not a directory", bundle_dir.display());
+    }
+    let mut total_read = 0u64;
+    let manifest_bytes = read_bundle_file_for_sign(bundle_dir, "manifest.json", &mut total_read)?;
+    let manifest: BundleManifest = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("parsing bundle manifest {}", bundle_dir.join("manifest.json").display()))?;
+    if manifest.format != BUNDLE_FORMAT {
+        anyhow::bail!(
+            "unsupported bundle format {:?} in {} (expected {:?})",
+            manifest.format,
+            bundle_dir.join("manifest.json").display(),
+            BUNDLE_FORMAT
+        );
+    }
+    let recomputed =
+        manifest.recompute_digest().map_err(|e| anyhow::anyhow!("recomputing manifest digest: {e}"))?;
+    if !manifest.digest.trim().eq_ignore_ascii_case(&recomputed) {
+        anyhow::bail!(
+            "refusing to sign bundle: manifest claims digest {} but locally recomputed digest is {}",
+            manifest.digest.trim(),
+            recomputed
+        );
+    }
+    for (rel, expected_sha) in &manifest.files {
+        if rel.is_empty()
+            || rel.starts_with('/')
+            || rel.contains('\\')
+            || !rel.split('/').all(|s| !s.is_empty() && s != "." && s != "..")
+            || matches!(rel.as_str(), "manifest.json" | "manifest.sig" | "producer.json")
+        {
+            anyhow::bail!("refusing to sign bundle: illegal path {rel:?} in manifest.files");
+        }
+        let bytes = read_bundle_file_for_sign(bundle_dir, rel, &mut total_read)
+            .with_context(|| format!("refusing to sign bundle: reading hashed file {rel:?}"))?;
+        let actual_sha = sha256_hex(&bytes);
+        if !actual_sha.eq_ignore_ascii_case(expected_sha.trim()) {
+            anyhow::bail!(
+                "refusing to sign bundle: hashed file {rel:?} digest mismatch (manifest {}, actual {})",
+                expected_sha.trim(),
+                actual_sha
+            );
+        }
+    }
+
+    let cp_bytes = read_bundle_file_for_sign(bundle_dir, "ledger/checkpoint.json", &mut total_read)?;
+    let cp_file: BundleCheckpointFile = serde_json::from_slice(&cp_bytes).with_context(|| {
+        format!("parsing bundle checkpoint {}", bundle_dir.join("ledger/checkpoint.json").display())
+    })?;
+
+    // Run every verifier check except authorship before signing: the operator
+    // never attests a bundle the offline verifier would refuse. Without trust
+    // input the verifier stops at authorship (`unanchored`, `unsigned_bundle`
+    // or `unsigned_checkpoint`), having run every other check first.
+    let verdict = verify_bundle_dir(bundle_dir, &BundleVerifyTrust::default())
+        .map_err(|e| anyhow::anyhow!("verifying bundle before signing: {e}"))?;
+    let authorship_only = verdict.exit_code == 2
+        && matches!(
+            verdict.reason.as_deref(),
+            Some("unanchored" | "unsigned_bundle" | "unsigned_checkpoint")
+        );
+    if !verdict.ok && !authorship_only {
+        anyhow::bail!(
+            "refusing to sign bundle: the offline verifier refuses it ({}: {})",
+            verdict.reason.as_deref().unwrap_or("unknown"),
+            verdict.detail.as_deref().unwrap_or("")
+        );
+    }
+
+    let (sig, public_key) = sign_digest(key_file, &recomputed)?;
+
+    eprintln!("signing evidence bundle (manifest digest and file hashes verified locally):");
+    eprintln!("  format:            {}", manifest.format);
+    eprintln!("  class:             {}", manifest.class.as_str());
+    if let Some(org_id) = &manifest.org_id {
+        eprintln!("  org_id:            {org_id}");
+    }
+    eprintln!("  checkpoint_id:     {}", cp_file.checkpoint.checkpoint_id);
+    eprintln!("  key_id:            {}", cp_file.checkpoint.key_id);
+    eprintln!("  signing_pub_key:   {public_key}");
+    eprintln!("  window.start:      {}", manifest.window.start);
+    eprintln!("  window.end:        {}", manifest.window.end);
+    eprintln!("  events:            {}", manifest.counts.events);
+    eprintln!("  approvals:         {}", manifest.counts.approvals);
+    eprintln!("  artifacts:         {}", manifest.counts.artifacts);
+    eprintln!("  withheld_total:    {}", manifest.counts.withheld_total);
+    eprintln!("  digest (sha256):   {recomputed}");
+
+    let target = out.map(Path::to_path_buf).unwrap_or_else(|| bundle_dir.join("manifest.sig"));
+    reject_if_symlink(&target, "bundle signature file")?;
+    write_atomic_file(&target, sig.as_bytes(), false)?;
+    println!(
+        "{}",
+        json!({
+            "bundle": bundle_dir.display().to_string(),
+            "checkpoint_id": cp_file.checkpoint.checkpoint_id,
+            "digest": recomputed,
+            "signature": sig,
+            "out": target.display().to_string(),
+        })
+    );
+    Ok(())
+}
+
+fn read_bundle_file_for_sign(root: &Path, rel: &str, total_read: &mut u64) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut cur = root.to_path_buf();
+    for seg in rel.split('/') {
+        cur.push(seg);
+        let meta =
+            std::fs::symlink_metadata(&cur).with_context(|| format!("inspecting {}", cur.display()))?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("refusing symlink at {rel:?} inside bundle directory");
+        }
+    }
+    let meta = std::fs::symlink_metadata(&cur)?;
+    if !meta.file_type().is_file() {
+        anyhow::bail!("refusing non-regular file {rel:?} inside bundle directory");
+    }
+    if meta.len() > MAX_BUNDLE_FILE_BYTES {
+        anyhow::bail!("file {rel:?} exceeds limit {MAX_BUNDLE_FILE_BYTES} bytes");
+    }
+    if total_read.saturating_add(meta.len()) > MAX_BUNDLE_TOTAL_BYTES {
+        anyhow::bail!("bundle total size exceeds limit {MAX_BUNDLE_TOTAL_BYTES} bytes");
+    }
+    let file = std::fs::File::open(&cur)?;
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_BUNDLE_FILE_BYTES.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_BUNDLE_FILE_BYTES {
+        anyhow::bail!("file {rel:?} exceeds limit {MAX_BUNDLE_FILE_BYTES} bytes");
+    }
+    *total_read = total_read.saturating_add(buf.len() as u64);
+    if *total_read > MAX_BUNDLE_TOTAL_BYTES {
+        anyhow::bail!("bundle total size exceeds limit {MAX_BUNDLE_TOTAL_BYTES} bytes");
+    }
+    Ok(buf)
 }
 
 /// Sign a checkpoint file without opening the hub. This command is offline: it
@@ -739,7 +1132,7 @@ fn build_verify_trust(
     Ok(VerifyTrust { anchor, trust_keys, revoked_key_ids: all_revoked, signed_checkpoints })
 }
 
-fn build_checkpoint(args: CheckpointArgs) -> anyhow::Result<Checkpoint> {
+fn build_checkpoint(hub: &Hub, args: CheckpointArgs) -> anyhow::Result<Checkpoint> {
     let class = CheckpointClass::parse(&args.class).map_err(|e| anyhow::anyhow!("{e}"))?;
     let id = args.id.map(|s| s.trim().to_string()).unwrap_or_else(|| ulid::Ulid::generate().to_string());
     let key_id = args.key_id.trim().to_string();
@@ -748,6 +1141,9 @@ fn build_checkpoint(args: CheckpointArgs) -> anyhow::Result<Checkpoint> {
         CheckpointClass::Hub => {
             if args.org.is_some() {
                 anyhow::bail!("--org is only valid for an org checkpoint, not a hub checkpoint");
+            }
+            if args.derive {
+                anyhow::bail!("--derive is only valid for an org checkpoint, not a hub checkpoint");
             }
             let seq = args.seq.ok_or_else(|| anyhow::anyhow!("--seq is required for a hub checkpoint"))?;
             let hash = args
@@ -781,23 +1177,36 @@ fn build_checkpoint(args: CheckpointArgs) -> anyhow::Result<Checkpoint> {
                 .window_to
                 .map(|s| s.trim().to_string())
                 .ok_or_else(|| anyhow::anyhow!("--window-to is required for an org checkpoint"))?;
-            let global_from = args
-                .global_from
-                .map(|s| s.trim().to_string())
-                .ok_or_else(|| anyhow::anyhow!("--global-from is required for an org checkpoint"))?;
-            let head = args
-                .head
-                .map(|s| s.trim().to_string())
-                .ok_or_else(|| anyhow::anyhow!("--head is required for an org checkpoint"))?;
-            let row_count = args
-                .row_count
-                .ok_or_else(|| anyhow::anyhow!("--row-count is required for an org checkpoint"))?;
-            let chain = args
-                .chain
-                .map(|s| s.trim().to_string())
-                .ok_or_else(|| anyhow::anyhow!("--chain is required for an org checkpoint"))?;
             let org_id =
                 args.org.map(|s| s.trim().to_string()).unwrap_or_else(|| ua_core::DEFAULT_ORG.to_string());
+            let (global_from, head, row_count, chain) = if args.derive {
+                let prev_head = args.global_from.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                let summary =
+                    hub.db().read(|c| compute_org_window_checkpoint(c, &org_id, &from, &to, prev_head))?;
+                (
+                    summary.global_from_hash,
+                    summary.global_head_hash,
+                    summary.org_row_count,
+                    summary.org_chain_hash,
+                )
+            } else {
+                let global_from = args
+                    .global_from
+                    .map(|s| s.trim().to_string())
+                    .ok_or_else(|| anyhow::anyhow!("--global-from is required for an org checkpoint"))?;
+                let head = args
+                    .head
+                    .map(|s| s.trim().to_string())
+                    .ok_or_else(|| anyhow::anyhow!("--head is required for an org checkpoint"))?;
+                let row_count = args
+                    .row_count
+                    .ok_or_else(|| anyhow::anyhow!("--row-count is required for an org checkpoint"))?;
+                let chain = args
+                    .chain
+                    .map(|s| s.trim().to_string())
+                    .ok_or_else(|| anyhow::anyhow!("--chain is required for an org checkpoint"))?;
+                (global_from, head, row_count, chain)
+            };
             Ok(Checkpoint {
                 checkpoint_id: id,
                 class,

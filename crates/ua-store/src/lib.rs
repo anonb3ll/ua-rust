@@ -13,11 +13,13 @@
 pub mod backup;
 pub mod db;
 pub mod evidence;
+pub mod evidence_bundle;
 pub mod graph;
 pub mod ledger;
 pub mod lock;
 pub mod org;
 pub mod schema;
+pub mod task_comments;
 
 pub use db::{Db, Fence, WriteTx};
 pub use ledger::{Event, EventInput};

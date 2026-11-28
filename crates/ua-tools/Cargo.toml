@@ -132,6 +132,8 @@ rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Signs checkpoints and bundles in the evidence export corpus test.
+ed25519-dalek.workspace = true
 axum = "0.8.9"
 # The fake downstream MCP server in tests/mcp_gateway.rs.
 rmcp = { version = "=3.11.0", features = ["server", "transport-io", "transport-streamable-http-server"] }

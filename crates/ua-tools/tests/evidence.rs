@@ -795,3 +795,356 @@ async fn client_evidence_has_a_per_caller_hourly_budget_counted_from_the_ledger(
     assert_eq!(reason(&err), "rate_limited");
     call(&reg, &hub, &me, "evidence_append", json!({ "channel": "sdk.small", "payload": { "n": 1 } })).await;
 }
+
+// ---------------------------------------------------------------------------
+// Evidence bundle export over a corpus written by the real tool families
+// (#2716 S3b+S3c review A-B1)
+// ---------------------------------------------------------------------------
+
+mod bundle_corpus {
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::{Value, json};
+    use ua_core::{ActorKind, Caller, Config, Profile, UaError, identity::Transport};
+    use ua_graph::{
+        AssertedByKind, EnsureNodeRequest, NodeKind, PrincipalId, Provenance, SourceKind, Visibility,
+        graph_node_ensure,
+    };
+    use ua_store::evidence::{
+        Checkpoint, CheckpointClass, TrustAnchor, Window, checkpoint_attach, checkpoint_write, key_add,
+    };
+    use ua_store::evidence_bundle::{
+        BundleManifest, BundleVerifyTrust, ExportBundleOptions, compute_org_window_checkpoint, export_bundle,
+        snapshot_checkpoint, verify_bundle_dir,
+    };
+    use ua_tools::{Hub, Registry, builtin_registry};
+
+    const KEY_ID: &str = "k-corpus";
+
+    fn caller(label: &str, kind: ActorKind, profile: Profile) -> Caller {
+        Caller {
+            label: label.into(),
+            kind,
+            profile,
+            enforce_profile: kind != ActorKind::Human,
+            session_key: Some(format!("{label}-s")),
+            transport: Transport::Mcp,
+            org_id: ua_core::DEFAULT_ORG.into(),
+        }
+    }
+
+    fn human() -> Caller {
+        caller("operator", ActorKind::Human, Profile::Operator)
+    }
+
+    fn builder() -> Caller {
+        caller("builder-1", ActorKind::Agent, Profile::Developer)
+    }
+
+    async fn ok(reg: &Registry, hub: &Hub, who: &Caller, tool: &str, args: Value) -> Value {
+        reg.call(hub, who, tool, args.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{tool}({args}) failed: {e:?}"))
+    }
+
+    /// Park a gated call, approve it as the human, and retry it.
+    async fn gated(reg: &Registry, hub: &Hub, who: &Caller, tool: &str, args: Value) -> Value {
+        let parked = reg.call(hub, who, tool, args.clone()).await.unwrap_err();
+        let UaError::ApprovalRequired { approval_id, .. } = parked else {
+            panic!("expected approval: {parked:?}")
+        };
+        ok(reg, hub, &human(), "approval_resolve", json!({ "id": approval_id, "decision": "approve" })).await;
+        ok(reg, hub, who, tool, args).await
+    }
+
+    fn seed_grant(hub: &Hub, family: &str, subject: &str) {
+        hub.db()
+            .write(|tx| {
+                let now = ua_core::time::now();
+                tx.execute(
+                    "INSERT INTO oauth_grants (family_id, client_id, client_name, subject, approved_by, grant_type, \
+                     scope, resource, created_at) VALUES (?1, 'c1', 'Client', ?2, 'operator', 'authorization_code', \
+                     'mcp', 'https://hub.example.com/mcp', ?3)",
+                    rusqlite::params![family, subject, now],
+                )?;
+                tx.execute(
+                    "INSERT INTO oauth_tokens (token_hash, kind, family_id, client_id, subject, scope, resource, \
+                     issued_at, expires_at) VALUES (?1, 'refresh', ?2, 'c1', ?3, 'mcp', \
+                     'https://hub.example.com/mcp', ?4, '9999-01-01T00:00:00Z')",
+                    rusqlite::params![format!("{family}-hash"), family, subject, now],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn seed_graph_node(hub: &Hub, org: &str, ext: &str) -> String {
+        hub.db()
+            .write(|tx| {
+                let (row, _) = graph_node_ensure(
+                    tx,
+                    EnsureNodeRequest {
+                        org_id: org.into(),
+                        kind: NodeKind::MemoryNote,
+                        external_id: ext.into(),
+                        display_label: Some(format!("note {ext}")),
+                        visibility: Visibility::Org,
+                        team_id: None,
+                        owner_type: None,
+                        owner_id: None,
+                        provenance: Provenance {
+                            asserted_by: PrincipalId::system(),
+                            asserted_by_kind: AssertedByKind::System,
+                            source_kind: SourceKind::Import,
+                            source_ref: "import:corpus".into(),
+                        },
+                        meta_json: None,
+                        max_nodes_per_org: 0,
+                    },
+                )?;
+                Ok(row.id)
+            })
+            .unwrap()
+    }
+
+    fn sign(sk: &SigningKey, digest_hex: &str) -> String {
+        let bytes: [u8; 32] = hex::decode(digest_hex).unwrap().try_into().unwrap();
+        hex::encode(sk.sign(&bytes).to_bytes())
+    }
+
+    fn sign_bundle(dir: &std::path::Path, sk: &SigningKey) {
+        let m: BundleManifest =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        std::fs::write(dir.join("manifest.sig"), sign(sk, &m.digest)).unwrap();
+    }
+
+    /// Every real hub family that writes ledger metadata named like a secret
+    /// (`token_id`, `token_ids`, `revoked_tokens`, `session_id`,
+    /// `credential_id`) exports in both bundle classes and verifies.
+    #[tokio::test]
+    async fn bundles_export_and_verify_over_real_tool_families() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::for_home(dir.path().join("home"));
+        cfg.home = dir.path().to_path_buf();
+        cfg.db_path = Some(dir.path().join("ua.db"));
+        cfg.human_identities = vec!["operator".into()];
+        cfg.lifecycle_operators = Some(vec!["operator".into()]);
+        let policy_path = dir.path().join("conf/policy.yaml");
+        std::fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
+        std::fs::write(&policy_path, "version: 1\nrules: []\n").unwrap();
+        cfg.policy_file = Some(policy_path);
+        let hub = Hub::open(cfg).unwrap();
+        let reg = builtin_registry();
+        hub.db()
+            .write(|tx| {
+                tx.execute(
+                    "INSERT INTO orgs (id, slug, display_name, status, created_at) \
+                     VALUES ('org-b', 'org-b', 'Org B', 'active', ?1)",
+                    [ua_core::time::now()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Tasks, memory, graph.
+        ok(&reg, &hub, &builder(), "task_add", json!({ "title": "Corpus task" })).await;
+        ok(&reg, &hub, &builder(), "memory_save", json!({ "content": "Corpus note.", "title": "Note" }))
+            .await;
+        let n1 = seed_graph_node(&hub, ua_core::DEFAULT_ORG, "corpus-1");
+        let n2 = seed_graph_node(&hub, ua_core::DEFAULT_ORG, "corpus-2");
+        seed_graph_node(&hub, "org-b", "corpus-b");
+        ok(
+            &reg,
+            &hub,
+            &builder(),
+            "graph_edge_assert",
+            json!({ "src_id": n1, "dst_id": n2, "kind": "extends" }),
+        )
+        .await;
+
+        // Config revision.
+        ok(&reg, &hub, &human(), "config_revision_manage", json!({ "action": "capture", "kind": "policy" }))
+            .await;
+
+        // Agent token issue, rotate, and revoke (retire), plus OAuth sessions.
+        let v1 = "corpus-token-value-aaaaaaaaaaaaaaaaaaaaaa";
+        let v2 = "corpus-token-value-bbbbbbbbbbbbbbbbbbbbbb";
+        ok(&reg, &hub, &human(), "agent_token_issue", json!({ "agent_label": "builder-1", "value": v1 }))
+            .await;
+        ok(
+            &reg,
+            &hub,
+            &human(),
+            "agent_token_rotate",
+            json!({ "agent_label": "builder-1", "new_value": v2 }),
+        )
+        .await;
+        seed_grant(&hub, "fam-retire", "builder-1");
+        seed_grant(&hub, "fam-device", "remote-agent");
+        // OAuth device revoke goes through the approval gate (requested,
+        // resolved and consumed approval events).
+        gated(
+            &reg,
+            &hub,
+            &builder(),
+            "oauth_device_manage",
+            json!({ "action": "revoke", "session_id": "fam-device" }),
+        )
+        .await;
+        ok(
+            &reg,
+            &hub,
+            &human(),
+            "coordination_manage",
+            json!({ "action": "agent_retire", "params": {
+                "agent": "builder-1", "reason": "decommissioned", "owner": "operator" } }),
+        )
+        .await;
+
+        // Node session credentials sit behind `session_credentials_enabled`
+        // and an MCP revoke needs a registered server: write their exact
+        // payload shapes (`node_queue/credentials.rs`, `mcp/mod.rs`) so the
+        // bundle carries them (review A-NB1).
+        hub.db()
+            .write(|tx| {
+                for (ch, payload) in [
+                    (
+                        "hub.session_credential.minted",
+                        json!({ "credential_id": "a1b2c3d4e5f60718", "item_id": "item-1", "attempt": 1,
+                                "node": "node-a", "task_id": 1, "run_id": "run-1", "agent_label": "builder-1",
+                                "tools": ["fs_read"], "idle_expires_at": "2026-11-20T01:00:00Z",
+                                "expires_at": "2026-11-20T02:00:00Z", "superseded": [] }),
+                    ),
+                    (
+                        "hub.session_credential.revoked",
+                        json!({ "credential_id": "a1b2c3d4e5f60718", "reason": "expired", "actor": null }),
+                    ),
+                    (
+                        "hub.session_credential.refused",
+                        json!({ "check": "expired", "credential_id": "a1b2c3d4e5f60718" }),
+                    ),
+                    (
+                        "agent.mcp_server",
+                        json!({ "op": "revoked", "name": "srv", "spec_sha256": "ab12", "approval_id": 3,
+                                "orphaned_secrets": ["GITHUB_DEPLOY_NAME"] }),
+                    ),
+                ] {
+                    ua_store::ledger::append(
+                        tx,
+                        ua_store::EventInput::new(ua_core::DEFAULT_ORG, ch, payload),
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let channels: Vec<String> = hub
+            .db()
+            .read(|c| {
+                let mut stmt = c.prepare("SELECT DISTINCT channel FROM event_log")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        for ch in [
+            "agent.token.issued",
+            "agent.token.rotated",
+            "agent.token.revoked",
+            "agent.oauth.sessions_revoked",
+            "agent.approval.requested",
+            "agent.approval.resolved",
+            "agent.config.revision",
+        ] {
+            assert!(channels.iter().any(|c| c == ch), "corpus is missing {ch}: {channels:?}");
+        }
+
+        // Sign a hub checkpoint at the head and a default-org checkpoint.
+        let sk = SigningKey::from_bytes(&[0x24; 32]);
+        let pk = hex::encode(sk.verifying_key().to_bytes());
+        let (hub_cp, org_cp) = hub
+            .db()
+            .write(|tx| {
+                let now = ua_core::time::now();
+                key_add(tx, KEY_ID, &pk, &now, None)?;
+                let sum = compute_org_window_checkpoint(
+                    tx,
+                    ua_core::DEFAULT_ORG,
+                    "2000-01-01T00:00:00Z",
+                    "2999-12-31T23:59:59Z",
+                    None,
+                )?;
+                let org = Checkpoint {
+                    checkpoint_id: "cp-corpus-org".into(),
+                    class: CheckpointClass::Org,
+                    org_id: Some(ua_core::DEFAULT_ORG.into()),
+                    seq: None,
+                    hash: None,
+                    window: Some(Window { start: sum.window.start.clone(), end: sum.window.end.clone() }),
+                    global_from_hash: Some(sum.global_from_hash),
+                    global_head_hash: Some(sum.global_head_hash),
+                    org_row_count: Some(sum.org_row_count),
+                    org_chain_hash: Some(sum.org_chain_hash),
+                    key_id: KEY_ID.into(),
+                    signed_at: now.clone(),
+                };
+                let d = checkpoint_write(tx, &org, &now)?;
+                checkpoint_attach(tx, &org.checkpoint_id, &sign(&sk, &d))?;
+                snapshot_checkpoint(tx, &org.checkpoint_id, &now)?;
+                let (seq, hash): (i64, String) = tx.query_row(
+                    "SELECT seq, entry_hash FROM event_log ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let hub_cp = Checkpoint {
+                    checkpoint_id: "cp-corpus-hub".into(),
+                    class: CheckpointClass::Hub,
+                    org_id: None,
+                    seq: Some(seq),
+                    hash: Some(hash),
+                    window: None,
+                    global_from_hash: None,
+                    global_head_hash: None,
+                    org_row_count: None,
+                    org_chain_hash: None,
+                    key_id: KEY_ID.into(),
+                    signed_at: now.clone(),
+                };
+                let d = checkpoint_write(tx, &hub_cp, &now)?;
+                checkpoint_attach(tx, &hub_cp.checkpoint_id, &sign(&sk, &d))?;
+                snapshot_checkpoint(tx, &hub_cp.checkpoint_id, &now)?;
+                Ok((hub_cp.checkpoint_id, org.checkpoint_id))
+            })
+            .unwrap();
+
+        let trust = BundleVerifyTrust::from_anchor(TrustAnchor { key_id: KEY_ID.into(), public_key: pk });
+        for (name, cp) in [("hub", &hub_cp), ("org", &org_cp)] {
+            let out = dir.path().join(format!("bundle-{name}"));
+            let opts = ExportBundleOptions {
+                checkpoint_id: cp.clone(),
+                from_seq: None,
+                from_org_seq: None,
+                exported_at: ua_core::time::now(),
+                host: "corpus-host.example.com".into(),
+                tool_version: "corpus".into(),
+            };
+            hub.db()
+                .read(|c| export_bundle(c, &out, &opts))
+                .unwrap_or_else(|e| panic!("{name} bundle export refused on a real hub corpus: {e}"));
+            sign_bundle(&out, &sk);
+            let v = verify_bundle_dir(&out, &trust).unwrap();
+            assert!(v.ok, "{name} bundle over the real corpus failed to verify: {v:?}");
+            let events = std::fs::read_to_string(out.join("ledger/events.jsonl")).unwrap();
+            for secret in [v1, v2] {
+                assert!(!events.contains(secret), "{name} bundle carries a token value");
+            }
+            for ch in [
+                "agent.token.issued",
+                "agent.token.rotated",
+                "hub.session_credential.minted",
+                "agent.mcp_server",
+            ] {
+                let in_clear = events.lines().any(|l| l.contains(&format!("\"channel\":\"{ch}\"")));
+                assert!(in_clear, "{name} bundle does not carry {ch} in clear");
+            }
+        }
+    }
+}

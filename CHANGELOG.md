@@ -1333,10 +1333,13 @@ from its commit history.
   under `notify.webhook`: http or https to `notify_webhook_url`, any host
   and port, `OperatorConfigured` addresses (private networks and this host
   are still reached), no redirects, each attempt bounded by its timeout as
-  before. The configured secret header (also over plain http, as before),
-  retries on network errors, 429 and 5xx, the outbox and its error texts
-  are unchanged. Credentials in the URL are still sent as basic auth, now
-  as a header bound to the URL's origin. Stricter:
+  before. Retries on network errors, 429 and 5xx, the outbox and its error
+  texts are unchanged. Credentials in the URL are still sent as basic auth,
+  now as a header bound to the URL's origin. Stricter:
+  - notify over plain `http` to a non-loopback host carrying
+    `notify_webhook_secret` or URL credentials (Basic auth) is refused with
+    `invalid_argument` before the outbox write; operators should switch to
+    `https` (loopback `http` remains allowed);
   - a URL whose host is or resolves to a link-local (cloud metadata),
     unspecified, multicast, broadcast and reserved, documentation,
     benchmarking or IETF protocol address is refused (nothing was checked),

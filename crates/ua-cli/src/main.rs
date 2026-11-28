@@ -476,11 +476,38 @@ async fn run_cmd(cli: Cli, held: &mut Held) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Evidence(ops::evidence::EvidenceArgs {
-            cmd: ops::evidence::EvidenceCmd::Sign { key_file, checkpoint_file, prev_checkpoint, out },
+            cmd: ops::evidence::EvidenceCmd::Sign { key_file, checkpoint_file, bundle, prev_checkpoint, out },
         }) => {
-            ops::evidence::run_sign(&key_file, &checkpoint_file, prev_checkpoint.as_deref(), out.as_deref())?;
+            ops::evidence::run_sign_cmd(
+                &key_file,
+                checkpoint_file.as_deref(),
+                bundle.as_deref(),
+                prev_checkpoint.as_deref(),
+                out.as_deref(),
+            )?;
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Evidence(ops::evidence::EvidenceArgs {
+            cmd:
+                ops::evidence::EvidenceCmd::Verify {
+                    checkpoint: None,
+                    bundle: Some(bundle),
+                    anchor_key,
+                    anchor_key_id,
+                    trust_file,
+                    revoked_key_ids,
+                    prev_checkpoints,
+                    hub_bundle,
+                },
+        }) => ops::evidence::run_verify_bundle(
+            &bundle,
+            anchor_key,
+            anchor_key_id,
+            trust_file.as_deref(),
+            revoked_key_ids,
+            prev_checkpoints,
+            hub_bundle.as_deref(),
+        ),
         cmd => {
             let cfg = load_config(explicit_config.as_deref())?;
 

@@ -246,6 +246,11 @@ const HUB: &[&str] = &[
     // a tenant table and neither takes the tenant triggers.
     "evidence_key",
     "evidence_checkpoint",
+    // The append-only export snapshot (`evidence_bundle_snapshot.v1`): one row
+    // per checkpoint, keyed by `checkpoint_id`, holding that checkpoint's
+    // frozen withheld counts and org ordinals. Hub-scoped bookkeeping like the
+    // checkpoint row it belongs to.
+    "evidence_export_snapshot",
 ];
 
 /// The frozen baseline the missing list started from when the classification

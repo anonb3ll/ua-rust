@@ -5169,6 +5169,7 @@ dependencies = [
  "tracing",
  "ua-core",
  "ulid",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -5184,6 +5185,7 @@ dependencies = [
  "croner",
  "dom_query",
  "dom_smoothie",
+ "ed25519-dalek",
  "encoding_rs",
  "globset",
  "hex",
