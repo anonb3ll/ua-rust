@@ -289,11 +289,125 @@ async fn credentials_in_the_url_are_sent_as_basic_auth() {
 
 #[tokio::test]
 async fn a_link_local_webhook_is_refused_without_retry() {
-    let hub = hub_with(Some("http://169.254.169.254/hooks/path-secret".to_string()));
+    // Link-local over https with a secret, and over plain http without a
+    // secret, both pass notify's config check and are refused by ua-ingress
+    // without retry or leaking the path.
+    let hub = hub_with(Some("https://169.254.169.254/hooks/path-secret".to_string()));
     let res =
         call(&builtin_registry(), &hub, &staff(), "notify", json!({ "message": "x", "timeout_s": 2 })).await;
     assert_eq!(res["status"], "failed");
     assert_eq!(res["attempts"], 1, "a policy refusal is not retried: {res}");
     assert_eq!(res["error"], "webhook address refused (link-local (includes cloud metadata))");
     assert!(!res.to_string().contains("path-secret"), "{res}");
+
+    let mut cfg = Config::for_home(std::env::temp_dir());
+    cfg.notify_webhook_url = Some("http://169.254.169.254/hooks/path-secret".to_string());
+    cfg.notify_max_attempts = 3;
+    let hub_no_secret = Hub::in_memory(cfg).unwrap();
+    let res = call(
+        &builtin_registry(),
+        &hub_no_secret,
+        &staff(),
+        "notify",
+        json!({ "message": "x", "timeout_s": 2 }),
+    )
+    .await;
+    assert_eq!(res["status"], "failed");
+    assert_eq!(res["attempts"], 1, "a policy refusal is not retried: {res}");
+    assert_eq!(res["error"], "webhook address refused (link-local (includes cloud metadata))");
+    assert!(!res.to_string().contains("path-secret"), "{res}");
+}
+
+#[tokio::test]
+async fn cleartext_http_webhook_with_credentials_is_refused_early() {
+    let reg = builtin_registry();
+    let who = staff();
+
+    // 1. Secret header over plain http to a public IP, an RFC 1918 IP, and a
+    //    non-loopback hostname — each fails early before any resolution.
+    for url in [
+        "http://93.184.215.14/hooks/path-secret",
+        "http://10.20.30.40/hooks/path-secret",
+        "http://hooks.example.com/hooks/path-secret",
+    ] {
+        let hub = hub_with(Some(url.to_string()));
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reg.call(&hub, &who, "notify", json!({ "message": "hi", "timeout_s": 2 })),
+        )
+        .await
+        .expect("must refuse before resolving or connecting")
+        .unwrap_err();
+        assert_eq!(err.code(), "invalid_argument", "{url}: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("plain http") && msg.contains("https"), "{url}: {msg}");
+        assert!(
+            !msg.contains("path-secret") && !msg.contains(HEADER_SECRET),
+            "error must not leak URL path or secret: {msg}"
+        );
+    }
+
+    // 2. URL credentials (Basic auth) over plain http to non-loopback without
+    //    `notify_webhook_secret` — also fails early without leaking credentials.
+    for url in [
+        "http://hook-user:p%40ss@10.20.30.40/hooks/path-secret",
+        "http://hook-user:p%40ss@93.184.215.14/hooks/path-secret",
+        "http://hook-user:p%40ss@hooks.example.com/hooks/path-secret",
+    ] {
+        let mut cfg = Config::for_home(std::env::temp_dir());
+        cfg.notify_webhook_url = Some(url.to_string());
+        cfg.notify_max_attempts = 3;
+        let hub = Hub::in_memory(cfg).unwrap();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reg.call(&hub, &who, "notify", json!({ "message": "hi", "timeout_s": 2 })),
+        )
+        .await
+        .expect("must refuse before resolving or connecting")
+        .unwrap_err();
+        assert_eq!(err.code(), "invalid_argument", "{url}: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("plain http") && msg.contains("https"), "{url}: {msg}");
+        for secret in ["hook-user", "p@ss", "p%40ss", "path-secret"] {
+            assert!(!msg.contains(secret), "error leaked {secret}: {msg}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn https_webhook_with_secret_passes_config_check_and_starts_tls() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let saw_tls = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_tls_task = saw_tls.clone();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut b = [0u8; 1];
+            if sock.read_exact(&mut b).await.is_ok() && b[0] == 0x16 {
+                saw_tls_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    let mut cfg = Config::for_home(std::env::temp_dir());
+    cfg.notify_webhook_url = Some(format!("https://{addr}/hooks/path-secret"));
+    cfg.notify_webhook_secret = Some(SecretString::from(HEADER_SECRET));
+    cfg.notify_max_attempts = 1;
+    let hub = Hub::in_memory(cfg).unwrap();
+    let res =
+        call(&builtin_registry(), &hub, &staff(), "notify", json!({ "message": "hi", "timeout_s": 2 })).await;
+    assert_eq!(res["status"], "failed", "dummy listener closes after ClientHello: {res}");
+    assert_eq!(res["attempts"], 1);
+    assert!(saw_tls.load(std::sync::atomic::Ordering::SeqCst), "expected TLS ClientHello");
+}
+
+#[tokio::test]
+async fn plain_http_webhook_without_credentials_delivers_on_loopback() {
+    let (url, seen) = server(vec![200]).await;
+    let mut cfg = Config::for_home(std::env::temp_dir());
+    cfg.notify_webhook_url = Some(url);
+    cfg.notify_max_attempts = 1;
+    let hub = Hub::in_memory(cfg).unwrap();
+    let res = call(&builtin_registry(), &hub, &staff(), "notify", json!({ "message": "hi" })).await;
+    assert_eq!(res["delivered"], true, "{res}");
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }

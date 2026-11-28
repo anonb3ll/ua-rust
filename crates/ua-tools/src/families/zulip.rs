@@ -435,7 +435,8 @@ fn refusal(url: &Url, e: &OutboundError) -> Option<UaError> {
     match e {
         OutboundError::AddressRefused { .. }
         | OutboundError::Lookup { .. }
-        | OutboundError::UrlRefused { .. } => {
+        | OutboundError::UrlRefused { .. }
+        | OutboundError::CleartextSecret { .. } => {
             Some(outbound_error(url.host_str().unwrap_or_default(), e.clone()))
         }
         _ => None,

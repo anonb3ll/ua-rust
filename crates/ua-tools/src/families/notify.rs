@@ -34,8 +34,14 @@
 //! over http or https; link-local (cloud metadata), multicast and reserved
 //! addresses are refused. No redirect is followed (the secret header would
 //! go with it) and no proxy is used. The secret header, and credentials in
-//! the URL (sent as basic auth), are bound to the URL's origin.
+//! the URL (sent as basic auth), are bound to the URL's origin and are
+//! refused over plain `http` to any non-loopback address (enforced both
+//! early on configuration here and on the resolved address at connect time
+//! in `ua_ingress::Outbound`); loopback `http` with credentials, and plain
+//! `http` without credentials to an operator-configured destination, stay
+//! allowed.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use base64::Engine;
@@ -46,6 +52,7 @@ use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ua_core::{Config, UaError, UaResult};
+use ua_ingress::addr::is_loopback;
 use ua_ingress::{Outbound, OutboundError, Request, Url, policy};
 use ua_store::{EventInput, Procedure, SchemaPart, WriteTx, ledger};
 
@@ -171,6 +178,19 @@ fn webhook_for(cfg: &Config, org: &str) -> UaResult<Option<Webhook>> {
     webhook(cfg)
 }
 
+/// Whether `url`'s host is syntactically loopback (`localhost` or a loopback
+/// IP literal per `ua_ingress::addr::is_loopback`). Used only for early config
+/// validation before DNS resolution; `ua_ingress::Outbound` enforces the real
+/// guard on the resolved address at connect time.
+fn is_loopback_host(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(v4)) => is_loopback(IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => is_loopback(IpAddr::V6(v6)),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
 fn webhook(cfg: &Config) -> UaResult<Option<Webhook>> {
     let Some(raw) = cfg.notify_webhook_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -181,6 +201,12 @@ fn webhook(cfg: &Config) -> UaResult<Option<Webhook>> {
         return Err(UaError::invalid("notify_webhook_url must be http or https"));
     }
     let basic = take_basic_auth(&mut url)?;
+    let has_credentials = basic.is_some() || cfg.notify_webhook_secret.is_some();
+    if url.scheme() == "http" && has_credentials && !is_loopback_host(&url) {
+        return Err(UaError::invalid(
+            "refusing to send webhook credentials over plain http to a non-loopback host; use https",
+        ));
+    }
     let mut request = Request::post(url);
     if let Some(value) = basic {
         request = request.secret_header("authorization", &value).map_err(|_| {
@@ -225,6 +251,11 @@ fn failure(e: &OutboundError) -> (String, bool) {
             (format!("webhook address refused ({reason})"), false)
         }
         OutboundError::UrlRefused { why, .. } => (format!("webhook URL refused ({why})"), false),
+        OutboundError::CleartextSecret { .. } => (
+            "webhook refused: credentials cannot be sent over plain http to a non-loopback address; use https"
+                .into(),
+            false,
+        ),
         OutboundError::Unverified => ("webhook peer address could not be checked".into(), false),
         _ => ("webhook request failed".into(), true),
     }
@@ -748,4 +779,59 @@ pub fn register(r: &mut Registry) {
         .family("notify")
         .read_only(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use secrecy::SecretString;
+
+    use super::*;
+
+    fn cfg_with(url: &str, secret: Option<&str>) -> Config {
+        let mut cfg = Config::for_home(std::env::temp_dir());
+        cfg.notify_webhook_url = Some(url.to_string());
+        cfg.notify_webhook_secret = secret.map(SecretString::from);
+        cfg
+    }
+
+    #[test]
+    fn webhook_early_check_allows_https_loopback_and_unauthenticated_http() {
+        for (url, secret) in [
+            ("https://93.184.215.14/hooks/x", Some("Bearer s")),
+            ("https://10.20.30.40/hooks/x", Some("Bearer s")),
+            ("https://hooks.example.com/hooks/x", Some("Bearer s")),
+            ("https://hook-user:pass@10.20.30.40/hooks/x", None),
+            ("http://127.0.0.1:8080/hooks/x", Some("Bearer s")),
+            ("http://[::1]:8080/hooks/x", Some("Bearer s")),
+            ("http://[::ffff:127.0.0.1]:8080/hooks/x", Some("Bearer s")),
+            ("http://localhost:8080/hooks/x", Some("Bearer s")),
+            ("http://hook-user:pass@127.0.0.1:8080/hooks/x", None),
+            ("http://10.20.30.40/hooks/x", None),
+            ("http://93.184.215.14/hooks/x", None),
+            ("http://hooks.example.com/hooks/x", None),
+        ] {
+            assert!(webhook(&cfg_with(url, secret)).unwrap().is_some(), "{url} (secret={secret:?})");
+        }
+    }
+
+    #[test]
+    fn webhook_early_check_refuses_non_loopback_http_with_credentials() {
+        for (url, secret) in [
+            ("http://93.184.215.14/hooks/x", Some("Bearer s")),
+            ("http://10.20.30.40/hooks/x", Some("Bearer s")),
+            ("http://172.16.5.4/hooks/x", Some("Bearer s")),
+            ("http://192.168.1.10/hooks/x", Some("Bearer s")),
+            ("http://[fd00::7]/hooks/x", Some("Bearer s")),
+            ("http://[::ffff:10.20.30.40]/hooks/x", Some("Bearer s")),
+            ("http://hooks.example.com/hooks/x", Some("Bearer s")),
+            ("http://hook-user:pass@10.20.30.40/hooks/x", None),
+            ("http://hook-user:pass@93.184.215.14/hooks/x", None),
+            ("http://hook-user:pass@hooks.example.com/hooks/x", None),
+        ] {
+            let err =
+                webhook(&cfg_with(url, secret)).err().unwrap_or_else(|| panic!("expected err for {url}"));
+            assert_eq!(err.code(), "invalid_argument", "{url}: {err}");
+            assert!(err.to_string().contains("plain http"), "{url}: {err}");
+        }
+    }
 }

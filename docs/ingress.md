@@ -158,14 +158,20 @@ Each property is enforced in the crate and has a test there:
   `json()` (both fail past the cap, before reading when `Content-Length`
   already says so).
 - **A connect-time address check** (below).
-- **Headers stay with their origin.** `Request::secret_header` binds a
-  header to the origin (scheme, host, port) of the request URL; it is
-  attached only to a hop with that origin. Plain headers do the same,
-  except the short cross-origin list below. `Request::header` also refuses
-  names that look like credentials (`authorization`, `proxy-authorization`,
-  `cookie`, and any name containing `token`, `secret`, `api-key`, `apikey`
-  or `password`); that word list is an extra refusal, and cross-origin
-  safety does not depend on it.
+- **Headers stay with their origin, and credentials never leave loopback
+  over plain `http`.** `Request::secret_header` binds a header to the origin
+  (scheme, host, port) of the request URL; it is attached only to a hop with
+  that origin. Plain headers do the same, except the short cross-origin list
+  below. On any plain `http` hop carrying a secret header (or URL
+  credentials), every resolved address at connect time and the connection's
+  peer address must be loopback (`addr::is_loopback`); any non-loopback
+  address is refused with `OutboundError::CleartextSecret` on every hop,
+  redirects included, using a separate connection pool so an unauthenticated
+  `http` keep-alive connection is never reused. `Request::header` also
+  refuses names that look like credentials (`authorization`,
+  `proxy-authorization`, `cookie`, and any name containing `token`, `secret`,
+  `api-key`, `apikey` or `password`); that word list is an extra refusal, and
+  cross-origin safety does not depend on it.
 - **Timeouts.** Connect (which also bounds the DNS lookup), per request
   including the body, and a deadline for the whole call that also bounds
   body reads.
@@ -205,7 +211,8 @@ origin of the URL it was built for. On each redirect hop:
 
 Errors never include the request URL's path or query or any header value.
 `OutboundError` converts into `UaError` (`ssrf_blocked` for an address
-refusal, `outbound_refused` for a URL outside the policy).
+refusal, `outbound_refused` for a URL outside the policy or credentials
+refused over plain `http`).
 
 ### What the connect-time check guarantees
 
@@ -517,7 +524,7 @@ calls `ua_ingress::addr`, so it no longer counts.
 | GitHub REST (`github/client.rs`: CI checks, polling, merged pull requests), public API | `github.rest`: https to `api.github.com`, public addresses, no redirects, 8 MiB cap (refused past it), 10 s to connect, 20 s for the call; one client per API base, reused |
 | GitHub REST against a GHES root in `github_api_url` | `github.enterprise`: as `github.rest` for any host, with `OperatorConfigured` addresses |
 | The Obsidian Local REST API (`vault/obsidian.rs`: `obsidian_status`, `_open`, `_active_note`, `_search`, `_append`) | `obsidian.local_rest`: http or https to `obsidian_api_url` (which must name `localhost` or a loopback address), `LoopbackOnly` addresses, certificates not verified, no redirects, 16 MiB cap (refused past it), 20 s for everything |
-| Notification webhook (`notify.rs`: `notify`, `batch_notify`, `flush_digest`, hub events such as `review_ready`) | `notify.webhook`: http or https to `notify_webhook_url`, any host and port, `OperatorConfigured` addresses, no redirects, the body never read (64 KiB cap), 120 s, with each attempt bounded by the caller's timeout (1 to 120 s, default 60; 20 for hub events) |
+| Notification webhook (`notify.rs`: `notify`, `batch_notify`, `flush_digest`, hub events such as `review_ready`) | `notify.webhook`: http or https to `notify_webhook_url`, any host and port, `OperatorConfigured` addresses, no redirects, the body never read (64 KiB cap), 120 s, with each attempt bounded by the caller's timeout (1 to 120 s, default 60; 20 for hub events); credentials (`notify_webhook_secret` or URL credentials) require `https` for any non-loopback address (plain `http` with credentials is loopback-only; plain `http` without credentials stays allowed) |
 
 The loopback test hooks (`fetch_allow_loopback`, `slack_socket_test_api`,
 neither settable from TOML or the environment) apply

@@ -253,11 +253,17 @@ pub struct Config {
     #[serde(skip)]
     pub python_lint_timeout: Option<std::time::Duration>,
     /// Outbound notification webhook (`notify`, `flush_digest`). Unset keeps
-    /// notifications in the outbox with status `not_configured`.
+    /// notifications in the outbox with status `not_configured`. Must use
+    /// `https` for any non-loopback destination when `notify_webhook_secret`
+    /// or URL credentials are set; plain `http` with credentials is allowed
+    /// only on loopback, while unauthenticated plain `http` remains allowed
+    /// for operator-configured peers.
     pub notify_webhook_url: Option<String>,
     /// Header name that carries `notify_webhook_secret`.
     pub notify_webhook_header: String,
     /// Header value sent with every webhook delivery (e.g. `Bearer ...`).
+    /// Never sent over plain `http` to a non-loopback address (`https` is
+    /// required; loopback `http` is allowed).
     #[serde(skip_serializing)]
     pub notify_webhook_secret: Option<SecretString>,
     /// Delivery attempts per notification (1-10) before it is marked failed.

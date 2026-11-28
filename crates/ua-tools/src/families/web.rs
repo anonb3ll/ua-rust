@@ -321,6 +321,7 @@ pub(crate) fn outbound_error(host: &str, e: OutboundError) -> UaError {
         OutboundError::Redirect(why) | OutboundError::HeaderRefused(why) | OutboundError::Body(why) => {
             UaError::invalid(why)
         }
+        e @ OutboundError::CleartextSecret { .. } => UaError::denied("outbound_refused", e.to_string()),
         e @ OutboundError::TooLarge { .. } => UaError::invalid(e.to_string()),
         e @ (OutboundError::UnknownPolicy(_) | OutboundError::InvalidPolicy { .. }) => {
             UaError::internal(format!("cannot build the HTTP client: {e}"))
