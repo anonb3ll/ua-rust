@@ -21,9 +21,11 @@ pub mod egress;
 pub mod export;
 pub mod verify;
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use ua_core::{UaError, UaResult};
 
 use crate::evidence::{Checkpoint, CheckpointClass, Window};
@@ -31,13 +33,19 @@ use crate::evidence::{Checkpoint, CheckpointClass, Window};
 pub use canonical::{
     empty_org_chain_hash, org_chain_fold, sha256_hex, to_canonical_bytes, to_canonical_string,
 };
-pub use egress::{EgressFilter, WithheldReport, find_forbidden_in_ledger_event, find_forbidden_in_value};
+pub use egress::{
+    CLASS_AUTH_TOKENS, CLASS_CROSS_ORG_EVENTS, CLASS_MANAGED_SECRETS, CLASS_PASSKEYS, CLASS_PRIVATE_MESSAGES,
+    CLASS_PRIVATE_RECORDS, CLASS_PROVIDER_CREDENTIALS, CLASS_SESSION_CREDENTIALS, EgressFilter,
+    EgressViolation, WithheldReport, find_forbidden_in_ledger_event, find_forbidden_in_value,
+    is_restricted_channel, restricted_channel_class,
+};
 pub use export::{
     ExportBundleOptions, ExportBundleResult, OrgWindowSummary, compute_org_window_checkpoint, export_bundle,
 };
 pub use verify::{
     BundleVerdict, BundleVerifyTrust, ClaimReport, ClaimStatus, HubCrossCheck, LegacyPrefixReport,
-    PinnedHubHead, PinnedOrgHead, load_verified_hub_cross_check, verify_bundle_dir,
+    MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_TOTAL_BYTES, PinnedHubHead, PinnedOrgHead, RedactedEventsReport,
+    load_verified_hub_cross_check, verify_bundle_dir, verify_bundle_dir_with_limits,
 };
 
 /// Current bundle manifest format version.
@@ -45,6 +53,9 @@ pub const BUNDLE_FORMAT: &str = "ua.evidence.bundle.v1";
 
 /// Default artifact content mode (hash-only per Decision 2).
 pub const ARTIFACT_CONTENT_HASH_ONLY: &str = "hash_only";
+
+/// Placeholder channel written on hash-only redacted ledger stubs.
+pub const REDACTED_CHANNEL: &str = "[redacted]";
 
 /// Required hashed relative paths inside every bundle (in addition to any
 /// `approvals/<id>.json` files).
@@ -57,11 +68,87 @@ pub const REQUIRED_BUNDLE_FILES: &[&str] = &[
     "withheld.json",
 ];
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Normalize any RFC 3339 timestamp (`Z`, `+00:00`, or an arbitrary offset) to
+/// canonical RFC 3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`, preserving subseconds if
+/// non-zero). Returns `raw` unchanged if unparseable.
+pub fn normalize_ts_utc(raw: &str) -> String {
+    let Some(ts) = ua_core::time::parse_ts(raw.trim()) else {
+        return raw.to_string();
+    };
+    let nanos = ts.subsec_nanosecond();
+    if nanos == 0 {
+        ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+    } else {
+        let frac = format!("{nanos:09}");
+        let trimmed = frac.trim_end_matches('0');
+        format!("{}.{trimmed}Z", ts.strftime("%Y-%m-%dT%H:%M:%S"))
+    }
+}
+
+/// Compare two timestamps by instant when both parse as RFC 3339 (so `…Z` and
+/// `…+00:00` at the same instant compare `Equal`), falling back to lexical
+/// comparison only if either fails to parse.
+pub fn cmp_ts(a: &str, b: &str) -> Ordering {
+    match (ua_core::time::parse_ts(a.trim()), ua_core::time::parse_ts(b.trim())) {
+        (Some(ta), Some(tb)) => ta.cmp(&tb),
+        _ => a.cmp(b),
+    }
+}
+
+/// Extract the sorted list of tools requiring separation of duties from a
+/// parsed `config_revisions.document` JSON value.
+///
+/// Separation of duties is read strictly from the policy document rather than
+/// stamped by the exporter:
+/// - Explicit top-level `sod_tools` string array (if present).
+/// - Any rule in `rules` with `action == "require_approval"` and an explicit
+///   separation-of-duties clause (`separation_of_duties: true`,
+///   `require_distinct_approver: true`, or `different_approver: true`).
+pub fn extract_sod_tools_from_doc(doc: &Value) -> Vec<String> {
+    let mut tools = BTreeSet::new();
+    let Some(obj) = doc.as_object() else {
+        return Vec::new();
+    };
+    if let Some(arr) = obj.get("sod_tools").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(s) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                tools.insert(s.to_string());
+            }
+        }
+    }
+    if let Some(rules) = obj.get("rules").and_then(Value::as_array) {
+        for rule in rules {
+            let Some(r) = rule.as_object() else { continue };
+            if r.get("action").and_then(Value::as_str) != Some("require_approval") {
+                continue;
+            }
+            let explicit_sod = r
+                .get("separation_of_duties")
+                .and_then(Value::as_bool)
+                .or_else(|| r.get("require_distinct_approver").and_then(Value::as_bool))
+                .or_else(|| r.get("different_approver").and_then(Value::as_bool));
+            if explicit_sod == Some(true)
+                && let Some(tool) =
+                    r.get("tool").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+            {
+                tools.insert(tool.to_string());
+            }
+        }
+    }
+    tools.into_iter().collect()
+}
+
 /// Manifest counts for quick auditing and completeness cross-checks.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestCounts {
     pub events: u64,
+    #[serde(default)]
+    pub redacted_events: u64,
     pub unhashed_legacy_prefix: u64,
     pub approvals: u64,
     pub evidence_rows: u64,
@@ -129,8 +216,15 @@ pub struct ProducerInfo {
 ///
 /// - Class `hub` carries `seq` (global) and omits `org_seq`.
 /// - Class `org` carries `org_seq` (absolute from genesis) and omits `seq`.
-/// - `payload` stays the exact raw SQLite `event_log.payload` text so the
-///   verifier recomputes `entry_hash` byte-identically under `hash_v`.
+/// - For unredacted rows, `payload` stays the exact raw SQLite
+///   `event_log.payload` text so the verifier recomputes `entry_hash`
+///   byte-identically under `hash_v`.
+/// - For withheld/redacted private rows (`redacted: true`), `channel` is
+///   `"[redacted]"`, `payload` is `""`, `originator`/`episode_id`/
+///   `causal_parent_id`/`dedupe_key` are `None`, and only chain metadata
+///   (`prev_hash`, `entry_hash`, `hash_v`, `org_id`, `ulid`, `created_at`,
+///   `redacted_class`) is kept so chain continuity holds while the verifier
+///   reports per-row verification coverage explicitly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BundleLedgerEvent {
@@ -150,6 +244,10 @@ pub struct BundleLedgerEvent {
     pub entry_hash: Option<String>,
     pub org_id: String,
     pub hash_v: i64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redacted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_class: Option<String>,
 }
 
 /// `ledger/checkpoint.json`: the checkpoint record + digest + signature.
@@ -216,7 +314,7 @@ pub struct ApprovalReceipt {
     pub policy_digest: Option<String>,
     pub requester: ReceiptActor,
     pub resolver: ReceiptResolver,
-    /// `"approved"` or `"denied"`.
+    /// `"approved"`, `"denied"`, or `"revoked"`.
     pub decision: String,
     pub reason: Option<String>,
     pub decided_at: String,
@@ -296,17 +394,25 @@ pub struct EvidenceRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyRevisionRecord {
-    pub id: i64,
+    /// Hub-wide `config_revisions.id` (present in `hub` bundles, omitted in `org` bundles).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
     pub kind: String,
     pub revision: i64,
     pub action: String,
     pub actor: String,
+    /// Canonical policy document JSON string whose SHA-256 equals
+    /// `document_sha256` and from which `sod_tools` is independently derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
     pub document_sha256: String,
     pub raw_sha256: String,
     /// Tools under this policy revision whose approval rules require
-    /// separation of duties (`resolver != requester`).
+    /// separation of duties (`resolver != requester`), derived from `document`.
     pub sod_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ulid: Option<String>,
     pub created_at: String,
 }
@@ -325,6 +431,8 @@ pub struct ArtifactIndexEntry {
     pub attempt: Option<i64>,
     pub policy_revision: Option<i64>,
     pub approval_id: Option<i64>,
+    #[serde(default)]
+    pub released: bool,
     pub recorded_at: String,
 }
 

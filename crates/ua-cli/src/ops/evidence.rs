@@ -29,8 +29,9 @@ use ua_store::evidence::{
 };
 use ua_store::evidence_bundle::{
     BUNDLE_FORMAT, BundleCheckpointFile, BundleManifest, BundleVerifyTrust, ExportBundleOptions,
-    PinnedHubHead, PinnedOrgHead, compute_org_window_checkpoint, export_bundle,
-    load_verified_hub_cross_check, sha256_hex, verify_bundle_dir,
+    MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_TOTAL_BYTES, PinnedHubHead, PinnedOrgHead,
+    compute_org_window_checkpoint, export_bundle, load_verified_hub_cross_check, sha256_hex,
+    verify_bundle_dir,
 };
 use ua_tools::Hub;
 
@@ -595,20 +596,28 @@ pub fn run_sign_cmd(
 }
 
 /// Sign an exported evidence bundle directory offline without opening any hub
-/// database. Recomputes `manifest.json`'s digest, verifies every hashed file
-/// listed in `manifest.files`, displays summary fields on stderr, and writes
+/// database. Recomputes `manifest.json`'s digest, refuses symlinks/path
+/// traversal/oversized files, verifies every hashed file listed in
+/// `manifest.files`, displays summary fields on stderr, and writes
 /// `manifest.sig` (or `--out`).
 pub fn run_sign_bundle(key_file: &Path, bundle_dir: &Path, out: Option<&Path>) -> anyhow::Result<()> {
-    let manifest_path = bundle_dir.join("manifest.json");
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .with_context(|| format!("reading bundle manifest {}", manifest_path.display()))?;
+    let root_meta = std::fs::symlink_metadata(bundle_dir)
+        .with_context(|| format!("inspecting bundle directory {}", bundle_dir.display()))?;
+    if root_meta.file_type().is_symlink() {
+        anyhow::bail!("refusing bundle directory symlink {}", bundle_dir.display());
+    }
+    if !root_meta.file_type().is_dir() {
+        anyhow::bail!("bundle path {} is not a directory", bundle_dir.display());
+    }
+    let mut total_read = 0u64;
+    let manifest_bytes = read_bundle_file_for_sign(bundle_dir, "manifest.json", &mut total_read)?;
     let manifest: BundleManifest = serde_json::from_slice(&manifest_bytes)
-        .with_context(|| format!("parsing bundle manifest {}", manifest_path.display()))?;
+        .with_context(|| format!("parsing bundle manifest {}", bundle_dir.join("manifest.json").display()))?;
     if manifest.format != BUNDLE_FORMAT {
         anyhow::bail!(
             "unsupported bundle format {:?} in {} (expected {:?})",
             manifest.format,
-            manifest_path.display(),
+            bundle_dir.join("manifest.json").display(),
             BUNDLE_FORMAT
         );
     }
@@ -622,9 +631,16 @@ pub fn run_sign_bundle(key_file: &Path, bundle_dir: &Path, out: Option<&Path>) -
         );
     }
     for (rel, expected_sha) in &manifest.files {
-        let p = bundle_dir.join(rel);
-        let bytes = std::fs::read(&p)
-            .with_context(|| format!("refusing to sign bundle: missing hashed file {}", p.display()))?;
+        if rel.is_empty()
+            || rel.starts_with('/')
+            || rel.contains('\\')
+            || !rel.split('/').all(|s| !s.is_empty() && s != "." && s != "..")
+            || matches!(rel.as_str(), "manifest.json" | "manifest.sig" | "producer.json")
+        {
+            anyhow::bail!("refusing to sign bundle: illegal path {rel:?} in manifest.files");
+        }
+        let bytes = read_bundle_file_for_sign(bundle_dir, rel, &mut total_read)
+            .with_context(|| format!("refusing to sign bundle: reading hashed file {rel:?}"))?;
         let actual_sha = sha256_hex(&bytes);
         if !actual_sha.eq_ignore_ascii_case(expected_sha.trim()) {
             anyhow::bail!(
@@ -635,11 +651,10 @@ pub fn run_sign_bundle(key_file: &Path, bundle_dir: &Path, out: Option<&Path>) -
         }
     }
 
-    let cp_path = bundle_dir.join("ledger/checkpoint.json");
-    let cp_bytes = std::fs::read(&cp_path)
-        .with_context(|| format!("reading bundle checkpoint {}", cp_path.display()))?;
-    let cp_file: BundleCheckpointFile = serde_json::from_slice(&cp_bytes)
-        .with_context(|| format!("parsing bundle checkpoint {}", cp_path.display()))?;
+    let cp_bytes = read_bundle_file_for_sign(bundle_dir, "ledger/checkpoint.json", &mut total_read)?;
+    let cp_file: BundleCheckpointFile = serde_json::from_slice(&cp_bytes).with_context(|| {
+        format!("parsing bundle checkpoint {}", bundle_dir.join("ledger/checkpoint.json").display())
+    })?;
 
     let (sig, public_key) = sign_digest(key_file, &recomputed)?;
 
@@ -674,6 +689,41 @@ pub fn run_sign_bundle(key_file: &Path, bundle_dir: &Path, out: Option<&Path>) -
         })
     );
     Ok(())
+}
+
+fn read_bundle_file_for_sign(root: &Path, rel: &str, total_read: &mut u64) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut cur = root.to_path_buf();
+    for seg in rel.split('/') {
+        cur.push(seg);
+        let meta =
+            std::fs::symlink_metadata(&cur).with_context(|| format!("inspecting {}", cur.display()))?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("refusing symlink at {rel:?} inside bundle directory");
+        }
+    }
+    let meta = std::fs::symlink_metadata(&cur)?;
+    if !meta.file_type().is_file() {
+        anyhow::bail!("refusing non-regular file {rel:?} inside bundle directory");
+    }
+    if meta.len() > MAX_BUNDLE_FILE_BYTES {
+        anyhow::bail!("file {rel:?} exceeds limit {MAX_BUNDLE_FILE_BYTES} bytes");
+    }
+    if total_read.saturating_add(meta.len()) > MAX_BUNDLE_TOTAL_BYTES {
+        anyhow::bail!("bundle total size exceeds limit {MAX_BUNDLE_TOTAL_BYTES} bytes");
+    }
+    let file = std::fs::File::open(&cur)?;
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_BUNDLE_FILE_BYTES.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_BUNDLE_FILE_BYTES {
+        anyhow::bail!("file {rel:?} exceeds limit {MAX_BUNDLE_FILE_BYTES} bytes");
+    }
+    *total_read = total_read.saturating_add(buf.len() as u64);
+    if *total_read > MAX_BUNDLE_TOTAL_BYTES {
+        anyhow::bail!("bundle total size exceeds limit {MAX_BUNDLE_TOTAL_BYTES} bytes");
+    }
+    Ok(buf)
 }
 
 /// Sign a checkpoint file without opening the hub. This command is offline: it

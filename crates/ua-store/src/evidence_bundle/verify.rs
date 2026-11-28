@@ -8,16 +8,22 @@
 //!    chain cross-check.
 //! 3. Its own recomputation over the files in `bundle_dir`.
 //!
+//! Hardening: refuses symlinks anywhere in `bundle_dir`, refuses non-regular
+//! files, caps directory walk depth/entries, and caps per-file and total bytes
+//! read before allocating memory.
+//!
 //! Exit codes:
 //! - `0`: verified
-//! - `1`: refused (integrity, signature, chain, receipt, trace, downgrade, or
-//!   forbidden private/secret content violation — never downgraded to a warning)
+//! - `1`: refused (integrity, signature, chain, receipt, trace, downgrade,
+//!   symlink/size, or forbidden private/secret content violation — never
+//!   downgraded to a warning)
 //! - `2`: cannot verify (missing input, unsupported format, unanchored, unknown
 //!   or revoked key, unsigned bundle/checkpoint, or incremental bundle missing
 //!   its pinned checkpoint)
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -28,12 +34,24 @@ use crate::evidence::{CHECKPOINT_FORMAT, CheckpointClass, TrustAnchor, verify_ed
 use crate::ledger::{GENESIS_HASH, HASH_V1, HASH_V2, compute_entry_hash_for_version};
 
 use super::canonical::{empty_org_chain_hash, org_chain_fold, sha256_hex};
-use super::egress::{WithheldReport, find_forbidden_in_ledger_event, find_forbidden_in_value};
+use super::egress::{
+    CLASS_CROSS_ORG_EVENTS, CLASS_PRIVATE_MESSAGES, CLASS_PRIVATE_RECORDS, WithheldReport,
+    find_forbidden_in_ledger_event, find_forbidden_in_value,
+};
 use super::{
     ARTIFACT_CONTENT_HASH_ONLY, ApprovalReceipt, ArtifactIndexEntry, BUNDLE_FORMAT, BundleCheckpointFile,
-    BundleLedgerEvent, BundleManifest, EvidenceRow, PolicyRevisionRecord, ProducerInfo,
-    REQUIRED_BUNDLE_FILES, normalize_signature_hex,
+    BundleLedgerEvent, BundleManifest, EvidenceRow, PolicyRevisionRecord, ProducerInfo, REDACTED_CHANNEL,
+    REQUIRED_BUNDLE_FILES, extract_sod_tools_from_doc, normalize_signature_hex,
 };
+
+/// Default maximum size of any single file read from a bundle (64 MiB).
+pub const MAX_BUNDLE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Default maximum cumulative bytes read across an entire bundle (256 MiB).
+pub const MAX_BUNDLE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum directory depth walked inside a bundle directory.
+const MAX_WALK_DEPTH: usize = 16;
+/// Maximum directory entries inspected inside a bundle directory.
+const MAX_WALK_ENTRIES: usize = 100_000;
 
 /// Pinned prior `hub` checkpoint head held out of band by the verifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +142,15 @@ pub struct LegacyPrefixReport {
     pub last_seq: Option<i64>,
 }
 
+/// Redacted hash-only ledger rows reported explicitly (chain-linked only,
+/// payload omitted and therefore not row-hash-verified).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactedEventsReport {
+    pub count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seqs: Vec<i64>,
+}
+
 /// Complete machine-readable verdict from [`verify_bundle_dir`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundleVerdict {
@@ -146,6 +173,8 @@ pub struct BundleVerdict {
     pub completeness: ClaimReport,
     pub separation_of_duties: ClaimReport,
     pub unhashed_legacy_prefix: LegacyPrefixReport,
+    #[serde(default)]
+    pub redacted_events: RedactedEventsReport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withheld: Option<WithheldReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,6 +202,7 @@ impl BundleVerdict {
                 "no separation-of-duties-governed approvals checked",
             ),
             unhashed_legacy_prefix: LegacyPrefixReport::default(),
+            redacted_events: RedactedEventsReport::default(),
             withheld: None,
             producer: None,
             warnings: Vec::new(),
@@ -204,6 +234,72 @@ impl BundleVerdict {
 
 type DeferredCannotVerify = Option<(&'static str, String, Option<Value>)>;
 
+enum SafeReadError {
+    NotFound,
+    Symlink(String),
+    NonRegular(String),
+    TooLarge(String),
+    Io(String),
+}
+
+/// Safely read a relative file inside `root` without following any symlink at
+/// any path component, refusing non-regular files, and enforcing per-file and
+/// total byte limits before reading into memory.
+fn read_bundle_file_checked(
+    root: &Path,
+    rel: &str,
+    max_file_bytes: u64,
+    total_read: &mut u64,
+    max_total_bytes: u64,
+) -> Result<Vec<u8>, SafeReadError> {
+    let mut cur = PathBuf::from(root);
+    for seg in rel.split('/') {
+        cur.push(seg);
+        let meta = match std::fs::symlink_metadata(&cur) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(SafeReadError::NotFound),
+            Err(e) => return Err(SafeReadError::Io(format!("stat {rel:?}: {e}"))),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(SafeReadError::Symlink(format!("refusing symlink at {rel:?}")));
+        }
+    }
+    let meta =
+        std::fs::symlink_metadata(&cur).map_err(|e| SafeReadError::Io(format!("stat {rel:?}: {e}")))?;
+    if meta.file_type().is_symlink() {
+        return Err(SafeReadError::Symlink(format!("refusing symlink at {rel:?}")));
+    }
+    if !meta.file_type().is_file() {
+        return Err(SafeReadError::NonRegular(format!("refusing non-regular file {rel:?}")));
+    }
+    if meta.len() > max_file_bytes {
+        return Err(SafeReadError::TooLarge(format!(
+            "file {rel:?} size {} exceeds limit {max_file_bytes} bytes",
+            meta.len()
+        )));
+    }
+    if total_read.saturating_add(meta.len()) > max_total_bytes {
+        return Err(SafeReadError::TooLarge(format!(
+            "bundle total size exceeds limit {max_total_bytes} bytes at {rel:?}"
+        )));
+    }
+    let file = std::fs::File::open(&cur).map_err(|e| SafeReadError::Io(format!("opening {rel:?}: {e}")))?;
+    let mut buf = Vec::with_capacity(meta.len().min(max_file_bytes) as usize);
+    file.take(max_file_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| SafeReadError::Io(format!("reading {rel:?}: {e}")))?;
+    if buf.len() as u64 > max_file_bytes {
+        return Err(SafeReadError::TooLarge(format!("file {rel:?} exceeds limit {max_file_bytes} bytes")));
+    }
+    *total_read = total_read.saturating_add(buf.len() as u64);
+    if *total_read > max_total_bytes {
+        return Err(SafeReadError::TooLarge(format!(
+            "bundle total size exceeds limit {max_total_bytes} bytes at {rel:?}"
+        )));
+    }
+    Ok(buf)
+}
+
 /// Verify a `hub` bundle against `trust` and load its `ledger/events.jsonl`
 /// for use as [`HubCrossCheck`] when verifying an `org` bundle.
 pub fn load_verified_hub_cross_check(
@@ -229,8 +325,24 @@ pub fn load_verified_hub_cross_check(
             None,
         )));
     }
-    let bytes = std::fs::read(hub_bundle_dir.join("ledger/events.jsonl"))
-        .map_err(|e| ua_core::UaError::internal(format!("reading hub bundle events.jsonl: {e}")))?;
+    let mut total_read = 0u64;
+    let bytes = read_bundle_file_checked(
+        hub_bundle_dir,
+        "ledger/events.jsonl",
+        MAX_BUNDLE_FILE_BYTES,
+        &mut total_read,
+        MAX_BUNDLE_TOTAL_BYTES,
+    )
+    .map_err(|e| {
+        let msg = match e {
+            SafeReadError::NotFound => "missing ledger/events.jsonl".into(),
+            SafeReadError::Symlink(s)
+            | SafeReadError::NonRegular(s)
+            | SafeReadError::TooLarge(s)
+            | SafeReadError::Io(s) => s,
+        };
+        ua_core::UaError::internal(format!("reading hub bundle events.jsonl: {msg}"))
+    })?;
     let events = parse_jsonl::<BundleLedgerEvent>(&bytes)
         .map_err(|e| ua_core::UaError::internal(format!("parsing hub bundle events.jsonl: {e}")))?;
     Ok(Ok(HubCrossCheck { events }))
@@ -242,34 +354,116 @@ pub fn load_verified_hub_cross_check(
 /// [`BundleVerdict`] with exit code `0` (verified), `1` (refused), or `2`
 /// (cannot verify). Never touches any hub database or configuration.
 pub fn verify_bundle_dir(bundle_dir: &Path, trust: &BundleVerifyTrust) -> UaResult<BundleVerdict> {
+    verify_bundle_dir_with_limits(bundle_dir, trust, MAX_BUNDLE_FILE_BYTES, MAX_BUNDLE_TOTAL_BYTES)
+}
+
+/// Like [`verify_bundle_dir`], with caller-specified per-file and total byte
+/// limits (useful for testing size caps without writing tens of megabytes).
+pub fn verify_bundle_dir_with_limits(
+    bundle_dir: &Path,
+    trust: &BundleVerifyTrust,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> UaResult<BundleVerdict> {
     let mut verdict = BundleVerdict::base();
 
-    if !bundle_dir.exists() || !bundle_dir.is_dir() {
+    let root_meta = match std::fs::symlink_metadata(bundle_dir) {
+        Ok(m) => m,
+        Err(_) => {
+            return Ok(verdict.cannot_verify(
+                "missing_bundle_dir",
+                format!("bundle directory {} does not exist", bundle_dir.display()),
+                Some(json!({ "path": bundle_dir.display().to_string() })),
+            ));
+        }
+    };
+    if root_meta.file_type().is_symlink() {
+        verdict.integrity = ClaimReport::new(ClaimStatus::Refused, "bundle root is a symlink");
+        return Ok(verdict.refuse(
+            "symlink_not_allowed",
+            format!("refusing bundle directory symlink {}", bundle_dir.display()),
+            Some(json!({ "path": bundle_dir.display().to_string() })),
+        ));
+    }
+    if !root_meta.file_type().is_dir() {
         return Ok(verdict.cannot_verify(
             "missing_bundle_dir",
-            format!("bundle directory {} does not exist", bundle_dir.display()),
+            format!("bundle path {} is not a directory", bundle_dir.display()),
             Some(json!({ "path": bundle_dir.display().to_string() })),
         ));
     }
 
+    // Walk bundle_dir without following symlinks: refuse any symlink or
+    // runaway directory tree immediately before reading any file.
+    let mut disk_files = BTreeSet::new();
+    let mut walked_entries = 0usize;
+    if let Err((reason, detail, offending)) =
+        collect_relative_files_safe(bundle_dir, bundle_dir, 0, &mut walked_entries, &mut disk_files)
+    {
+        verdict.integrity = ClaimReport::new(ClaimStatus::Refused, detail.clone());
+        return Ok(verdict.refuse(reason, detail, offending));
+    }
+
+    let mut total_read = 0u64;
+
     // Read unhashed producer.json (reported, never hashed, never treated as evidence).
-    let producer_path = bundle_dir.join("producer.json");
-    if producer_path.exists() {
-        match std::fs::read(&producer_path).ok().and_then(|b| serde_json::from_slice::<ProducerInfo>(&b).ok())
-        {
-            Some(p) => verdict.producer = Some(p),
-            None => verdict.warnings.push("producer.json is present but unreadable (not hashed)".into()),
+    match read_bundle_file_checked(
+        bundle_dir,
+        "producer.json",
+        max_file_bytes,
+        &mut total_read,
+        max_total_bytes,
+    ) {
+        Ok(bytes) => match serde_json::from_slice::<ProducerInfo>(&bytes) {
+            Ok(p) => verdict.producer = Some(p),
+            Err(_) => verdict.warnings.push("producer.json is present but unreadable (not hashed)".into()),
+        },
+        Err(SafeReadError::NotFound) => {}
+        Err(SafeReadError::Symlink(msg)) => {
+            verdict.integrity = ClaimReport::new(ClaimStatus::Refused, msg.clone());
+            return Ok(verdict.refuse("symlink_not_allowed", msg, Some(json!({ "file": "producer.json" }))));
+        }
+        Err(SafeReadError::TooLarge(msg)) => {
+            verdict.integrity = ClaimReport::new(ClaimStatus::Refused, msg.clone());
+            return Ok(verdict.refuse("file_too_large", msg, Some(json!({ "file": "producer.json" }))));
+        }
+        Err(SafeReadError::NonRegular(msg)) | Err(SafeReadError::Io(msg)) => {
+            verdict.warnings.push(format!("producer.json unreadable ({msg})"));
         }
     }
 
     // Check 1: format & manifest parsing.
-    let manifest_path = bundle_dir.join("manifest.json");
-    let manifest_bytes = match std::fs::read(&manifest_path) {
+    let manifest_bytes = match read_bundle_file_checked(
+        bundle_dir,
+        "manifest.json",
+        max_file_bytes,
+        &mut total_read,
+        max_total_bytes,
+    ) {
         Ok(b) => b,
-        Err(e) => {
+        Err(SafeReadError::NotFound) => {
             return Ok(verdict.cannot_verify(
                 "missing_manifest",
-                format!("cannot read manifest.json: {e}"),
+                "cannot read manifest.json: file not found",
+                Some(json!({ "file": "manifest.json" })),
+            ));
+        }
+        Err(SafeReadError::Symlink(msg)) => {
+            verdict.integrity = ClaimReport::new(ClaimStatus::Refused, msg.clone());
+            return Ok(verdict.refuse("symlink_not_allowed", msg, Some(json!({ "file": "manifest.json" }))));
+        }
+        Err(SafeReadError::TooLarge(msg)) => {
+            verdict.integrity = ClaimReport::new(ClaimStatus::Refused, msg.clone());
+            return Ok(verdict.refuse("file_too_large", msg, Some(json!({ "file": "manifest.json" }))));
+        }
+        Err(SafeReadError::NonRegular(msg)) => {
+            verdict.integrity = ClaimReport::new(ClaimStatus::Refused, msg.clone());
+            return Ok(verdict.refuse("invalid_manifest", msg, Some(json!({ "file": "manifest.json" }))));
+        }
+        Err(SafeReadError::Io(msg)) => {
+            return Ok(verdict.cannot_verify(
+                "missing_manifest",
+                format!("cannot read manifest.json: {msg}"),
                 Some(json!({ "file": "manifest.json" })),
             ));
         }
@@ -333,9 +527,7 @@ pub fn verify_bundle_dir(bundle_dir: &Path, trust: &BundleVerifyTrust) -> UaResu
         }
     }
 
-    // Scan bundle_dir for extra unmanifested files (never counted as evidence, reported in warnings).
-    let mut disk_files = BTreeSet::new();
-    collect_relative_files(bundle_dir, bundle_dir, &mut disk_files);
+    // Report any extra unmanifested files (never counted as evidence).
     for rel in &disk_files {
         if !matches!(rel.as_str(), "manifest.json" | "manifest.sig" | "producer.json")
             && !manifest.files.contains_key(rel)
@@ -372,19 +564,32 @@ pub fn verify_bundle_dir(bundle_dir: &Path, trust: &BundleVerifyTrust) -> UaResu
 
     let mut file_bytes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for (rel, expected_sha) in &manifest.files {
-        let path = bundle_dir.join(rel);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => {
-                verdict.integrity =
-                    ClaimReport::new(ClaimStatus::Refused, format!("missing hashed file {rel:?}"));
-                return Ok(verdict.refuse(
-                    "missing_file",
-                    format!("hashed file {rel:?} listed in manifest.json is missing on disk"),
-                    Some(json!({ "file": rel })),
-                ));
-            }
-        };
+        let bytes =
+            match read_bundle_file_checked(bundle_dir, rel, max_file_bytes, &mut total_read, max_total_bytes)
+            {
+                Ok(b) => b,
+                Err(SafeReadError::Symlink(msg)) => {
+                    verdict.integrity = ClaimReport::new(ClaimStatus::Refused, msg.clone());
+                    return Ok(verdict.refuse("symlink_not_allowed", msg, Some(json!({ "file": rel }))));
+                }
+                Err(SafeReadError::TooLarge(msg)) => {
+                    verdict.integrity = ClaimReport::new(ClaimStatus::Refused, msg.clone());
+                    return Ok(verdict.refuse("file_too_large", msg, Some(json!({ "file": rel }))));
+                }
+                Err(SafeReadError::NonRegular(msg)) => {
+                    verdict.integrity = ClaimReport::new(ClaimStatus::Refused, msg.clone());
+                    return Ok(verdict.refuse("invalid_file_type", msg, Some(json!({ "file": rel }))));
+                }
+                Err(SafeReadError::NotFound) | Err(SafeReadError::Io(_)) => {
+                    verdict.integrity =
+                        ClaimReport::new(ClaimStatus::Refused, format!("missing hashed file {rel:?}"));
+                    return Ok(verdict.refuse(
+                        "missing_file",
+                        format!("hashed file {rel:?} listed in manifest.json is missing on disk"),
+                        Some(json!({ "file": rel })),
+                    ));
+                }
+            };
         let actual_sha = sha256_hex(&bytes);
         if !actual_sha.eq_ignore_ascii_case(expected_sha.trim()) {
             verdict.integrity =
@@ -452,12 +657,44 @@ pub fn verify_bundle_dir(bundle_dir: &Path, trust: &BundleVerifyTrust) -> UaResu
     }
 
     // Check 3: Checkpoint & manifest signatures against out-of-band pinned trust.
-    // Cryptographic failures exit 1 immediately; missing trust / unknown key /
-    // revoked key / unsigned are recorded as exit-2 pending checks 4-12 so a
-    // tampering refusal (exit 1) is never masked by an exit-2 trust issue.
     let mut deferred_cannot_verify: DeferredCannotVerify = None;
     let cp_key_id = cp_file.checkpoint.key_id.as_str();
-    let manifest_sig_raw = std::fs::read_to_string(bundle_dir.join("manifest.sig")).ok();
+    let manifest_sig_raw: Option<String> =
+        match read_bundle_file_checked(bundle_dir, "manifest.sig", 4096, &mut total_read, max_total_bytes) {
+            Ok(b) => match String::from_utf8(b) {
+                Ok(s) => Some(s),
+                Err(_) => {
+                    verdict.authorship =
+                        ClaimReport::new(ClaimStatus::Refused, "manifest.sig is not valid UTF-8");
+                    return Ok(verdict.refuse(
+                        "invalid_manifest_signature",
+                        "manifest.sig is not valid UTF-8",
+                        Some(json!({ "file": "manifest.sig" })),
+                    ));
+                }
+            },
+            Err(SafeReadError::NotFound) => None,
+            Err(SafeReadError::Symlink(msg)) => {
+                verdict.integrity = ClaimReport::new(ClaimStatus::Refused, msg.clone());
+                return Ok(verdict.refuse(
+                    "symlink_not_allowed",
+                    msg,
+                    Some(json!({ "file": "manifest.sig" })),
+                ));
+            }
+            Err(SafeReadError::TooLarge(msg)) => {
+                verdict.integrity = ClaimReport::new(ClaimStatus::Refused, msg.clone());
+                return Ok(verdict.refuse("file_too_large", msg, Some(json!({ "file": "manifest.sig" }))));
+            }
+            Err(SafeReadError::NonRegular(msg)) | Err(SafeReadError::Io(msg)) => {
+                verdict.authorship = ClaimReport::new(ClaimStatus::Refused, msg.clone());
+                return Ok(verdict.refuse(
+                    "invalid_manifest_signature",
+                    msg,
+                    Some(json!({ "file": "manifest.sig" })),
+                ));
+            }
+        };
 
     if trust.is_revoked(cp_key_id) {
         verdict.authorship = ClaimReport::new(
@@ -630,6 +867,12 @@ pub fn verify_bundle_dir(bundle_dir: &Path, trust: &BundleVerifyTrust) -> UaResu
         ));
     }
 
+    // Verify policy revision uniqueness on (kind, revision) and derive/check
+    // document SHA-256 and `sod_tools` independently from the hashed policy doc.
+    if verify_policy_revisions(&mut verdict, &policy_revisions).is_err() {
+        return Ok(verdict);
+    }
+
     let artifacts: Vec<ArtifactIndexEntry> = match serde_json::from_slice(&file_bytes["artifacts/index.json"])
     {
         Ok(a) => a,
@@ -765,6 +1008,9 @@ pub fn verify_bundle_dir(bundle_dir: &Path, trust: &BundleVerifyTrust) -> UaResu
 
     // Check 10: Private and secret content refusal across every bundle record.
     for ev in &events {
+        if ev.redacted {
+            continue;
+        }
         if let Some(v) = find_forbidden_in_ledger_event(&ev.channel, &ev.payload) {
             verdict.integrity =
                 ClaimReport::new(ClaimStatus::Refused, format!("forbidden content: {}", v.detail));
@@ -819,13 +1065,57 @@ pub fn verify_bundle_dir(bundle_dir: &Path, trust: &BundleVerifyTrust) -> UaResu
         }
     }
 
-    // Checks 4, 6, 11: Row hashes under hash_v, downgrade refusal, legacy unhashed prefix.
+    // Checks 4, 6, 11: Row hashes under hash_v, downgrade refusal, legacy
+    // unhashed prefix, and redacted hash-only row validation.
     let mut seen_hashed = false;
     let mut seen_v2 = false;
     let mut legacy_prefix = LegacyPrefixReport::default();
+    let mut redacted_report = RedactedEventsReport::default();
+    let mut payload_verified_rows = 0u64;
 
     for ev in &events {
         let pos = ev.seq.or(ev.org_seq);
+
+        if ev.redacted {
+            let valid_class = matches!(
+                ev.redacted_class.as_deref(),
+                Some(CLASS_PRIVATE_MESSAGES | CLASS_PRIVATE_RECORDS | CLASS_CROSS_ORG_EVENTS)
+            );
+            let stripped = ev.channel == REDACTED_CHANNEL
+                && ev.payload.is_empty()
+                && ev.originator.is_none()
+                && ev.episode_id.is_none()
+                && ev.causal_parent_id.is_none()
+                && ev.dedupe_key.is_none();
+            if !valid_class || !stripped {
+                verdict.integrity = ClaimReport::new(
+                    ClaimStatus::Refused,
+                    format!("malformed redacted ledger stub at {pos:?}"),
+                );
+                return Ok(verdict.refuse(
+                    "invalid_redacted_event",
+                    format!(
+                        "redacted event at {pos:?} must strip channel/payload/parties and carry a valid redacted_class"
+                    ),
+                    Some(json!({ "seq": ev.seq, "org_seq": ev.org_seq })),
+                ));
+            }
+            redacted_report.count += 1;
+            if let Some(p) = pos {
+                redacted_report.seqs.push(p);
+            }
+        } else if ev.redacted_class.is_some() {
+            verdict.integrity = ClaimReport::new(
+                ClaimStatus::Refused,
+                format!("unredacted ledger row at {pos:?} carries redacted_class"),
+            );
+            return Ok(verdict.refuse(
+                "invalid_redacted_event",
+                format!("unredacted event at {pos:?} must not set redacted_class"),
+                Some(json!({ "seq": ev.seq, "org_seq": ev.org_seq })),
+            ));
+        }
+
         let Some(entry_hash) = ev.entry_hash.as_deref() else {
             if seen_hashed {
                 verdict.integrity = ClaimReport::new(ClaimStatus::Refused, "unhashed row after hashed rows");
@@ -865,6 +1155,22 @@ pub fn verify_bundle_dir(bundle_dir: &Path, trust: &BundleVerifyTrust) -> UaResu
             ));
         }
 
+        if ev.redacted {
+            if entry_hash.len() != 64 || !entry_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                verdict.integrity = ClaimReport::new(
+                    ClaimStatus::Refused,
+                    format!("redacted ledger stub at {pos:?} has invalid entry_hash"),
+                );
+                return Ok(verdict.refuse(
+                    "invalid_redacted_event",
+                    format!("redacted event at {pos:?} entry_hash is not 64 hex chars"),
+                    Some(json!({ "seq": ev.seq, "org_seq": ev.org_seq })),
+                ));
+            }
+            // Payload is omitted; chain linkage to neighbors and checkpoint is verified in Check 5.
+            continue;
+        }
+
         let expected_hash = compute_entry_hash_for_version(
             ev.hash_v,
             ev.prev_hash.as_deref(),
@@ -888,6 +1194,7 @@ pub fn verify_bundle_dir(bundle_dir: &Path, trust: &BundleVerifyTrust) -> UaResu
                 Some(json!({ "seq": ev.seq, "org_seq": ev.org_seq, "hash_v": ev.hash_v })),
             ));
         }
+        payload_verified_rows += 1;
     }
 
     if legacy_prefix.count != manifest.counts.unhashed_legacy_prefix {
@@ -901,16 +1208,38 @@ pub fn verify_bundle_dir(bundle_dir: &Path, trust: &BundleVerifyTrust) -> UaResu
             Some(json!({ "field": "counts.unhashed_legacy_prefix" })),
         ));
     }
+    if redacted_report.count != manifest.counts.redacted_events {
+        verdict.integrity = ClaimReport::new(ClaimStatus::Refused, "redacted_events count mismatch");
+        return Ok(verdict.refuse(
+            "count_mismatch",
+            format!(
+                "manifest counts.redacted_events ({}) disagrees with events ({})",
+                manifest.counts.redacted_events, redacted_report.count
+            ),
+            Some(json!({ "field": "counts.redacted_events" })),
+        ));
+    }
     verdict.unhashed_legacy_prefix = legacy_prefix;
+    verdict.redacted_events = redacted_report;
 
     // Check 5: Sequence basis and class-specific chain continuity.
     let chain_ok = match manifest.class {
-        CheckpointClass::Hub => {
-            verify_hub_chain(&mut verdict, &cp_file, &events, trust, &mut deferred_cannot_verify)
-        }
-        CheckpointClass::Org => {
-            verify_org_chain(&mut verdict, &cp_file, &events, trust, &mut deferred_cannot_verify)
-        }
+        CheckpointClass::Hub => verify_hub_chain(
+            &mut verdict,
+            &cp_file,
+            &events,
+            payload_verified_rows,
+            trust,
+            &mut deferred_cannot_verify,
+        ),
+        CheckpointClass::Org => verify_org_chain(
+            &mut verdict,
+            &cp_file,
+            &events,
+            payload_verified_rows,
+            trust,
+            &mut deferred_cannot_verify,
+        ),
     };
     if chain_ok.is_err() {
         return Ok(verdict);
@@ -945,10 +1274,125 @@ pub fn verify_bundle_dir(bundle_dir: &Path, trust: &BundleVerifyTrust) -> UaResu
     Ok(verdict)
 }
 
+fn verify_policy_revisions(
+    verdict: &mut BundleVerdict,
+    policy_revisions: &[PolicyRevisionRecord],
+) -> Result<(), ()> {
+    let mut seen: BTreeSet<(&str, i64)> = BTreeSet::new();
+    for pol in policy_revisions {
+        if !seen.insert((pol.kind.as_str(), pol.revision)) {
+            verdict.integrity = ClaimReport::new(
+                ClaimStatus::Refused,
+                format!("duplicate policy revision ({:?}, rev {})", pol.kind, pol.revision),
+            );
+            verdict.set_refuse(
+                "duplicate_policy_revision",
+                format!(
+                    "policy/revisions.json contains duplicate entry for kind {:?} revision {}",
+                    pol.kind, pol.revision
+                ),
+                Some(json!({ "kind": pol.kind, "revision": pol.revision })),
+            );
+            return Err(());
+        }
+        if let Some(doc_str) = pol.document.as_deref() {
+            let parsed: Value = match serde_json::from_str(doc_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    verdict.integrity = ClaimReport::new(
+                        ClaimStatus::Refused,
+                        format!("invalid JSON in policy document ({:?}, rev {})", pol.kind, pol.revision),
+                    );
+                    verdict.set_refuse(
+                        "invalid_policy_document",
+                        format!(
+                            "policy/revisions.json ({:?}, rev {}) document is not valid JSON: {e}",
+                            pol.kind, pol.revision
+                        ),
+                        Some(json!({ "kind": pol.kind, "revision": pol.revision })),
+                    );
+                    return Err(());
+                }
+            };
+            let recomputed_sha = sha256_hex(ua_core::canonical::to_string(&parsed).as_bytes());
+            if !recomputed_sha.eq_ignore_ascii_case(&pol.document_sha256) {
+                verdict.integrity = ClaimReport::new(
+                    ClaimStatus::Refused,
+                    format!("policy document digest mismatch ({:?}, rev {})", pol.kind, pol.revision),
+                );
+                verdict.set_refuse(
+                    "policy_document_digest_mismatch",
+                    format!(
+                        "policy/revisions.json ({:?}, rev {}) document SHA-256 ({recomputed_sha}) disagrees with document_sha256 ({})",
+                        pol.kind, pol.revision, pol.document_sha256
+                    ),
+                    Some(json!({ "kind": pol.kind, "revision": pol.revision })),
+                );
+                return Err(());
+            }
+            let expected_sod = extract_sod_tools_from_doc(&parsed);
+            let mut claimed_sod = pol.sod_tools.clone();
+            claimed_sod.sort();
+            claimed_sod.dedup();
+            if claimed_sod != expected_sod {
+                verdict.integrity = ClaimReport::new(
+                    ClaimStatus::Refused,
+                    format!(
+                        "policy sod_tools disagrees with document ({:?}, rev {})",
+                        pol.kind, pol.revision
+                    ),
+                );
+                verdict.set_refuse(
+                    "policy_sod_mismatch",
+                    format!(
+                        "policy/revisions.json ({:?}, rev {}) sod_tools ({claimed_sod:?}) does not match policy document ({expected_sod:?})",
+                        pol.kind, pol.revision
+                    ),
+                    Some(json!({ "kind": pol.kind, "revision": pol.revision })),
+                );
+                return Err(());
+            }
+        } else if !pol.sod_tools.is_empty() {
+            verdict.integrity = ClaimReport::new(
+                ClaimStatus::Refused,
+                format!(
+                    "policy sod_tools claimed without backing document ({:?}, rev {})",
+                    pol.kind, pol.revision
+                ),
+            );
+            verdict.set_refuse(
+                "policy_sod_unverifiable",
+                format!(
+                    "policy/revisions.json ({:?}, rev {}) claims sod_tools without including its hashed document",
+                    pol.kind, pol.revision
+                ),
+                Some(json!({ "kind": pol.kind, "revision": pol.revision })),
+            );
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn integrity_basis(chain_desc: &str, payload_verified: u64, redacted: u64) -> String {
+    if redacted == 0 {
+        format!(
+            "manifest digest, all per-file SHA-256 digests, all {payload_verified} hashed row(s) payload-hash-verified under hash_v, and {chain_desc}"
+        )
+    } else {
+        let total = payload_verified + redacted;
+        format!(
+            "manifest digest, all per-file SHA-256 digests, {payload_verified} of {total} hashed row(s) payload-hash-verified under hash_v; \
+             {redacted} redacted hash-only row(s) chain-linked only (payload omitted and not row-hash-verified), and {chain_desc}"
+        )
+    }
+}
+
 fn verify_hub_chain(
     verdict: &mut BundleVerdict,
     cp_file: &BundleCheckpointFile,
     events: &[BundleLedgerEvent],
+    payload_verified_rows: u64,
     trust: &BundleVerifyTrust,
     deferred: &mut DeferredCannotVerify,
 ) -> Result<(), ()> {
@@ -1189,7 +1633,6 @@ fn verify_hub_chain(
                 ),
             );
         } else {
-            // pin.seq >= first_seq: check pinned row inside bundle, but start prior to pin is unanchored.
             let pinned_ev = events.iter().find(|e| e.seq == Some(pin.seq));
             if !pinned_ev
                 .and_then(|e| e.entry_hash.as_deref())
@@ -1243,7 +1686,11 @@ fn verify_hub_chain(
 
     verdict.integrity = ClaimReport::new(
         ClaimStatus::Verified,
-        "manifest digest, all per-file SHA-256 digests, per-row entry hashes under hash_v, and global chain continuity verified",
+        integrity_basis(
+            "global chain continuity verified",
+            payload_verified_rows,
+            verdict.redacted_events.count,
+        ),
     );
     Ok(())
 }
@@ -1252,6 +1699,7 @@ fn verify_org_chain(
     verdict: &mut BundleVerdict,
     cp_file: &BundleCheckpointFile,
     events: &[BundleLedgerEvent],
+    payload_verified_rows: u64,
     trust: &BundleVerifyTrust,
     deferred: &mut DeferredCannotVerify,
 ) -> Result<(), ()> {
@@ -1568,7 +2016,11 @@ fn verify_org_chain(
 
     verdict.integrity = ClaimReport::new(
         ClaimStatus::Verified,
-        "manifest digest, all per-file SHA-256 digests, per-row entry hashes under hash_v, org_seq ordering, and org_chain_hash verified",
+        integrity_basis(
+            "org_seq ordering and org_chain_hash verified",
+            payload_verified_rows,
+            verdict.redacted_events.count,
+        ),
     );
     verdict.completeness = if trust.hub_cross_check.is_some() {
         ClaimReport::new(
@@ -1609,10 +2061,14 @@ fn verify_receipts_and_cross_links(
     policy_revisions: &[PolicyRevisionRecord],
     artifacts: &[ArtifactIndexEntry],
 ) -> Result<(), ()> {
-    // Map latest agent.approval.resolved event per approval_id.
-    let mut resolved_events: BTreeMap<i64, (&BundleLedgerEvent, Value)> = BTreeMap::new();
+    // Collect unredacted agent.approval.resolved events.
+    // - For `hub` class: keyed by approval_id (latest per approval_id).
+    // - For `org` class: keyed by org_seq (receipts carry dense org-local
+    //   approval_ids and bind to the exact event via ledger.org_seq + hash).
+    let mut hub_resolved: BTreeMap<i64, (&BundleLedgerEvent, Value)> = BTreeMap::new();
+    let mut org_resolved_by_seq: BTreeMap<i64, (&BundleLedgerEvent, Value)> = BTreeMap::new();
     for ev in events {
-        if ev.channel != "agent.approval.resolved" {
+        if ev.redacted || ev.channel != "agent.approval.resolved" {
             continue;
         }
         let Ok(parsed) = serde_json::from_str::<Value>(&ev.payload) else {
@@ -1635,32 +2091,40 @@ fn verify_receipts_and_cross_links(
             );
             return Err(());
         };
-        resolved_events.insert(aid, (ev, parsed));
-    }
-
-    // Check 8a: every approval event must have a receipt.
-    for (&aid, (ev, _)) in &resolved_events {
-        if !receipts.contains_key(&aid) {
-            verdict.integrity = ClaimReport::new(
-                ClaimStatus::Refused,
-                format!("missing approval receipt for approval {aid}"),
-            );
-            verdict.set_refuse(
-                "cross_link_missing_receipt",
-                format!(
-                    "agent.approval.resolved event for approval {aid} has no approvals/{aid}.json receipt"
-                ),
-                Some(json!({ "approval_id": aid, "seq": ev.seq, "org_seq": ev.org_seq })),
-            );
-            return Err(());
+        match class {
+            CheckpointClass::Hub => {
+                hub_resolved.insert(aid, (ev, parsed));
+            }
+            CheckpointClass::Org => {
+                // Keep latest resolution per approval_id by replacing any earlier org_seq for same raw aid.
+                if let Some((prev_ev, _)) = hub_resolved.insert(aid, (ev, parsed.clone()))
+                    && let Some(prev_os) = prev_ev.org_seq
+                {
+                    org_resolved_by_seq.remove(&prev_os);
+                }
+                if let Some(os) = ev.org_seq {
+                    org_resolved_by_seq.insert(os, (ev, parsed));
+                }
+            }
         }
     }
 
+    let mut matched_org_seqs: BTreeSet<i64> = BTreeSet::new();
     let mut sod_verified_count = 0usize;
 
     // Check 7 & 8b: every receipt must resolve to an event and satisfy all bindings.
     for (&aid, receipt) in receipts {
-        let Some((ev, ev_payload)) = resolved_events.get(&aid) else {
+        let matched = match class {
+            CheckpointClass::Hub => hub_resolved.get(&aid),
+            CheckpointClass::Org => receipt.ledger.org_seq.and_then(|os| {
+                let res = org_resolved_by_seq.get(&os);
+                if res.is_some() {
+                    matched_org_seqs.insert(os);
+                }
+                res
+            }),
+        };
+        let Some((ev, ev_payload)) = matched else {
             verdict.integrity =
                 ClaimReport::new(ClaimStatus::Refused, format!("receipt {aid} has no matching ledger event"));
             verdict.set_refuse(
@@ -1784,16 +2248,19 @@ fn verify_receipts_and_cross_links(
             return Err(());
         }
 
-        // Policy revision and separation of duties (taken from policy/revisions.json).
+        // Policy revision and separation of duties (matched strictly on (kind="policy", revision)).
         if let Some(pol_rev) = receipt.policy_revision {
-            let Some(pol) = policy_revisions.iter().find(|p| p.revision == pol_rev) else {
+            let Some(pol) = policy_revisions.iter().find(|p| p.kind == "policy" && p.revision == pol_rev)
+            else {
                 verdict.integrity = ClaimReport::new(
                     ClaimStatus::Refused,
                     format!("receipt {aid} cites unknown policy revision {pol_rev}"),
                 );
                 verdict.set_refuse(
                     "receipt_policy_missing",
-                    format!("approvals/{aid}.json cites policy_revision {pol_rev}, absent from policy/revisions.json"),
+                    format!(
+                        "approvals/{aid}.json cites policy revision {pol_rev}, absent from policy/revisions.json (kind=\"policy\")"
+                    ),
                     Some(json!({ "approval_id": aid, "policy_revision": pol_rev })),
                 );
                 return Err(());
@@ -1838,7 +2305,11 @@ fn verify_receipts_and_cross_links(
         // Covered artifacts check against artifacts/index.json.
         for cov in &receipt.covers {
             let matched = artifacts.iter().any(|a| {
-                a.id == cov.id && a.revision == cov.revision && a.sha256.eq_ignore_ascii_case(&cov.sha256)
+                a.id == cov.id
+                    && a.revision == cov.revision
+                    && a.sha256.eq_ignore_ascii_case(&cov.sha256)
+                    && a.released
+                    && a.approval_id == Some(aid)
             });
             if !matched {
                 verdict.integrity = ClaimReport::new(
@@ -1848,12 +2319,52 @@ fn verify_receipts_and_cross_links(
                 verdict.set_refuse(
                     "receipt_covers_mismatch",
                     format!(
-                        "approvals/{aid}.json covers ({}, rev {}, sha256 {}), which does not match artifacts/index.json",
+                        "approvals/{aid}.json covers ({}, rev {}, sha256 {}), which does not match a released artifact in artifacts/index.json",
                         cov.id, cov.revision, cov.sha256
                     ),
                     Some(json!({ "approval_id": aid, "artifact_id": cov.id, "revision": cov.revision })),
                 );
                 return Err(());
+            }
+        }
+    }
+
+    // Check 8a: every unredacted approval event must have a receipt.
+    match class {
+        CheckpointClass::Hub => {
+            for (&aid, (ev, _)) in &hub_resolved {
+                if !receipts.contains_key(&aid) {
+                    verdict.integrity = ClaimReport::new(
+                        ClaimStatus::Refused,
+                        format!("missing approval receipt for approval {aid}"),
+                    );
+                    verdict.set_refuse(
+                        "cross_link_missing_receipt",
+                        format!(
+                            "agent.approval.resolved event for approval {aid} has no approvals/{aid}.json receipt"
+                        ),
+                        Some(json!({ "approval_id": aid, "seq": ev.seq, "org_seq": ev.org_seq })),
+                    );
+                    return Err(());
+                }
+            }
+        }
+        CheckpointClass::Org => {
+            for (&os, (ev, _)) in &org_resolved_by_seq {
+                if !matched_org_seqs.contains(&os) {
+                    verdict.integrity = ClaimReport::new(
+                        ClaimStatus::Refused,
+                        format!("missing approval receipt for org_seq {os}"),
+                    );
+                    verdict.set_refuse(
+                        "cross_link_missing_receipt",
+                        format!(
+                            "agent.approval.resolved event at org_seq {os} has no matching approval receipt"
+                        ),
+                        Some(json!({ "org_seq": ev.org_seq })),
+                    );
+                    return Err(());
+                }
             }
         }
     }
@@ -1892,43 +2403,9 @@ fn verify_artifact_traces(
             );
             return Err(());
         }
-        if art.run_id.as_deref().is_none_or(|s| s.trim().is_empty()) {
-            verdict.integrity = ClaimReport::new(
-                ClaimStatus::Refused,
-                format!("artifact {} missing run_id trace link", art.id),
-            );
-            verdict.set_refuse(
-                "broken_artifact_trace",
-                format!("artifact {} rev {} is missing run_id trace link", art.id, art.revision),
-                Some(json!({ "artifact_id": art.id, "revision": art.revision, "field": "run_id" })),
-            );
-            return Err(());
-        }
-        if art.attempt.is_none_or(|a| a <= 0) {
-            verdict.integrity = ClaimReport::new(
-                ClaimStatus::Refused,
-                format!("artifact {} missing attempt trace link", art.id),
-            );
-            verdict.set_refuse(
-                "broken_artifact_trace",
-                format!("artifact {} rev {} is missing valid attempt number", art.id, art.revision),
-                Some(json!({ "artifact_id": art.id, "revision": art.revision, "field": "attempt" })),
-            );
-            return Err(());
-        }
-        let Some(pol_rev) = art.policy_revision else {
-            verdict.integrity = ClaimReport::new(
-                ClaimStatus::Refused,
-                format!("artifact {} missing policy_revision trace link", art.id),
-            );
-            verdict.set_refuse(
-                "broken_artifact_trace",
-                format!("artifact {} rev {} is missing policy_revision trace link", art.id, art.revision),
-                Some(json!({ "artifact_id": art.id, "revision": art.revision, "field": "policy_revision" })),
-            );
-            return Err(());
-        };
-        if !policy_revisions.iter().any(|p| p.revision == pol_rev) {
+        if let Some(pol_rev) = art.policy_revision
+            && !policy_revisions.iter().any(|p| p.kind == "policy" && p.revision == pol_rev)
+        {
             verdict.integrity = ClaimReport::new(
                 ClaimStatus::Refused,
                 format!("artifact {} cites unknown policy_revision {pol_rev}", art.id),
@@ -1936,7 +2413,70 @@ fn verify_artifact_traces(
             verdict.set_refuse(
                 "broken_artifact_trace",
                 format!(
-                    "artifact {} rev {} cites policy_revision {pol_rev}, which is missing from policy/revisions.json",
+                    "artifact {} rev {} cites policy revision {pol_rev}, which is missing from policy/revisions.json (kind=\"policy\")",
+                    art.id, art.revision
+                ),
+                Some(json!({ "artifact_id": art.id, "revision": art.revision, "field": "policy_revision" })),
+            );
+            return Err(());
+        }
+        let has_run = art.run_id.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let has_attempt = art.attempt.is_some_and(|a| a > 0);
+        if has_run != has_attempt || art.attempt.is_some_and(|a| a <= 0) {
+            verdict.integrity = ClaimReport::new(
+                ClaimStatus::Refused,
+                format!("artifact {} has mismatched run_id/attempt trace link", art.id),
+            );
+            verdict.set_refuse(
+                "broken_artifact_trace",
+                format!("artifact {} rev {} must pair run_id with positive attempt", art.id, art.revision),
+                Some(json!({ "artifact_id": art.id, "revision": art.revision, "field": "run_id" })),
+            );
+            return Err(());
+        }
+
+        // Unreleased deliverables carry task linkage (and optional run/policy
+        // linkage when present) without requiring a release approval receipt.
+        if !art.released && art.approval_id.is_none() {
+            continue;
+        }
+
+        if !art.released {
+            verdict.integrity = ClaimReport::new(
+                ClaimStatus::Refused,
+                format!("unreleased artifact {} carries approval_id", art.id),
+            );
+            verdict.set_refuse(
+                "broken_artifact_trace",
+                format!("artifact {} rev {} carries approval_id but released=false", art.id, art.revision),
+                Some(json!({ "artifact_id": art.id, "revision": art.revision, "field": "released" })),
+            );
+            return Err(());
+        }
+
+        // Released artifacts must carry the complete trace:
+        // artifact -> task -> run/attempt -> policy revision -> approval -> receipt.covers.
+        if !has_run {
+            verdict.integrity = ClaimReport::new(
+                ClaimStatus::Refused,
+                format!("released artifact {} missing run_id trace link", art.id),
+            );
+            verdict.set_refuse(
+                "broken_artifact_trace",
+                format!("released artifact {} rev {} is missing run_id trace link", art.id, art.revision),
+                Some(json!({ "artifact_id": art.id, "revision": art.revision, "field": "run_id" })),
+            );
+            return Err(());
+        }
+        if art.policy_revision.is_none() {
+            verdict.integrity = ClaimReport::new(
+                ClaimStatus::Refused,
+                format!("released artifact {} missing policy_revision trace link", art.id),
+            );
+            verdict.set_refuse(
+                "broken_artifact_trace",
+                format!(
+                    "released artifact {} rev {} is missing policy_revision trace link",
                     art.id, art.revision
                 ),
                 Some(json!({ "artifact_id": art.id, "revision": art.revision, "field": "policy_revision" })),
@@ -1946,11 +2486,14 @@ fn verify_artifact_traces(
         let Some(aid) = art.approval_id else {
             verdict.integrity = ClaimReport::new(
                 ClaimStatus::Refused,
-                format!("artifact {} missing approval_id trace link", art.id),
+                format!("released artifact {} missing approval_id trace link", art.id),
             );
             verdict.set_refuse(
                 "broken_artifact_trace",
-                format!("artifact {} rev {} is missing approval_id trace link", art.id, art.revision),
+                format!(
+                    "released artifact {} rev {} is missing approval_id trace link",
+                    art.id, art.revision
+                ),
                 Some(json!({ "artifact_id": art.id, "revision": art.revision, "field": "approval_id" })),
             );
             return Err(());
@@ -2012,21 +2555,73 @@ fn is_safe_manifest_rel_path(rel: &str) -> bool {
     rel.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
-fn collect_relative_files(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+/// Walk `dir` under `root` without ever following symlinks, refusing any
+/// symlink or excessive depth/entry count.
+fn collect_relative_files_safe(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    entries_seen: &mut usize,
+    out: &mut BTreeSet<String>,
+) -> Result<(), (&'static str, String, Option<Value>)> {
+    if depth > MAX_WALK_DEPTH {
+        return Err((
+            "bundle_too_large",
+            format!("bundle directory depth exceeds maximum {MAX_WALK_DEPTH}"),
+            None,
+        ));
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
     for entry in entries.flatten() {
+        *entries_seen += 1;
+        if *entries_seen > MAX_WALK_ENTRIES {
+            return Err((
+                "bundle_too_large",
+                format!("bundle directory entry count exceeds maximum {MAX_WALK_ENTRIES}"),
+                None,
+            ));
+        }
         let path = entry.path();
-        if path.is_dir() {
-            collect_relative_files(root, &path, out);
-        } else if path.is_file()
-            && let Ok(rel) = path.strip_prefix(root)
-        {
-            let norm = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
+        let norm = path
+            .strip_prefix(root)
+            .ok()
+            .map(|rel| {
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_else(|| path.display().to_string());
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                return Err((
+                    "invalid_file_type",
+                    format!("cannot inspect entry {norm:?}: {e}"),
+                    Some(json!({ "file": norm })),
+                ));
+            }
+        };
+        if ft.is_symlink() {
+            return Err((
+                "symlink_not_allowed",
+                format!("refusing symlink {norm:?} inside bundle directory"),
+                Some(json!({ "file": norm })),
+            ));
+        }
+        if ft.is_dir() {
+            collect_relative_files_safe(root, &path, depth + 1, entries_seen, out)?;
+        } else if ft.is_file() {
             out.insert(norm);
+        } else {
+            return Err((
+                "invalid_file_type",
+                format!("refusing non-regular file {norm:?} inside bundle directory"),
+                Some(json!({ "file": norm })),
+            ));
         }
     }
+    Ok(())
 }

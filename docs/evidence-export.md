@@ -1,8 +1,11 @@
 # Evidence export and the independent verifier
 
-Status: design, not implemented. Scope: track G2 (#2716). The export replaces
-the `501` answers at `/api/evidence/*` and ships with a verifier so the format
-is testable by someone who does not trust the hub.
+Status: S2 (checkpoint signing and key store), S3 (`ua evidence export`,
+`hash_v = 2`, and offline `sign --bundle`), and S4 (standalone offline
+`ua evidence verify --bundle` and checked-in fixtures) are implemented. S5
+(persisted receipts at decision time), S6 (git anchor), and the
+`/api/evidence/*` HTTP endpoint remain later slices (HTTP routes still return
+`501`). Scope: track G2 (#2716).
 
 ## What this decides
 
@@ -106,7 +109,21 @@ a row omitted mid-window yields a bundle that is internally consistent.
 Detecting that omission needs the global chain — a `hub` bundle, or a verifier
 that can resolve the signed hashes against a later hub checkpoint.
 The verdict prints the class and this limitation, so a reader cannot mistake
-the narrower claim for the wider one.
+the narrower claim for the wider one. In particular, an unpinned `org` bundle
+starting at genesis (`global_from_hash = 0000…0000`) proves integrity and
+authorship and refolds `org_chain_hash` against the signed checkpoint, so it
+exits `0` with `completeness: "unverified"` until a `--hub-bundle` cross-check
+or `--prev-checkpoint` is supplied; an incremental `org` bundle starting after
+genesis without `--prev-checkpoint` cannot refold `org_chain_hash` at all and
+exits `2` (`missing_pinned_checkpoint`).
+
+To avoid leaking cross-organization volume through hub-wide autoincrement gaps,
+`org`-class bundles map entity IDs in `approvals/`, `artifacts/index.json`, and
+`evidence/rows.jsonl` to dense cumulative per-organization ordinals (`1, 2, …`),
+omit hub-global `config_revisions.id`/`approval_id`/`event_ulid` from
+`policy/revisions.json`, and include only the policy revisions actually cited by
+the bundle. (Existing unredacted ledger event payloads keep the raw JSON text
+recorded at write time so `entry_hash` remains verifiable.)
 
 ## Bundle layout
 
@@ -140,6 +157,46 @@ Rules that make the bundle verifiable:
   never treats it as evidence.
 - **No content by default.** Artifacts are referenced by hash and size.
   Including bytes is opt-in per export and changes the bundle class.
+
+### Redacted (hash-only) ledger entries
+
+Because `event_log` is one hash-chained ledger, dropping a private row outright
+would break chain continuity and sequence numbering, while exporting its payload
+would leak private messages or handoff notes. Yet a redacted row's `entry_hash`
+cannot be recomputed from an omitted payload.
+
+The bundle therefore separates **private/restricted ledger records** from
+**unexpected secret leaks**:
+
+- **Restricted channels and private records** (`agent.message.*`,
+  `agent.mailbox.*`, `agent.lifecycle.handoff`, `agent.lifecycle.handoff_hook`,
+  `agent.conversation.handoff`, `private.*`, `*.private.*`, explicit private
+  markers, and — in `org`-class exports — cross-organization `ORG-EVENT-DEFAULT`
+  approval rows) are exported in `ledger/events.jsonl` as **hash-only stubs**:
+  `redacted: true`, `redacted_class` set to the withheld class
+  (`private_message_bodies`, `private_records`, or `cross_org_events`),
+  `channel: "[redacted]"`, `payload: ""`, and `originator`, `episode_id`,
+  `causal_parent_id`, and `dedupe_key` set to `null`. Only the chain-linking
+  fields (`seq` or `org_seq`, `ulid`, `created_at`, `prev_hash`, `entry_hash`,
+  `org_id`, `hash_v`) remain, and each stub is counted in `withheld.json` and
+  `manifest.counts.redacted_events`.
+- **Verifier handling of hash-only stubs:** the verifier enforces that every
+  stripped field on a `redacted: true` row is empty/`null`, enforces `hash_v`
+  validity and the downgrade fence, and verifies chain linkage (`prev_hash` and
+  the following row's `prev_hash`, or `org_chain_hash` fold). It **never**
+  claims a redacted row was payload-hash-verified: `verdict.redacted_events`
+  lists the exact count and sequence numbers, and `verdict.integrity.basis`
+  reports per-row coverage explicitly (e.g., *"M of N hashed row(s)
+  payload-hash-verified under hash_v; K redacted hash-only row(s) chain-linked
+  only"*). An unredacted row on any restricted channel is refused outright
+  (`exit 1`, `forbidden_private_content`).
+- **Secret and credential leaks** (secret/token/password/authorization/API-key/
+  private-key fields regardless of casing or separators, string or non-string
+  values, JSON nested inside strings, `uas_…`, `ghp_…`/`github_pat_…`/provider
+  token prefixes, `Bearer …`, JWTs, and PEM private-key blocks) on non-private
+  records are **never** silently stubbed: export refuses outright without
+  writing bundle files, and the verifier refuses (`exit 1`) any bundle carrying
+  them.
 
 ## What is hashed, and under which version
 
@@ -207,43 +264,61 @@ Exit codes: `0` verified, `1` refused (with a machine-readable reason and the
 offending sequence or field), `2` cannot verify (missing input, unknown key,
 unsupported version). A refusal is never downgraded to a warning.
 
-1. **Format.** Version known; every file in the manifest present; no extra files
-   counted as evidence.
+1. **Format and filesystem safety.** Version known; every file in the manifest
+   present; no extra files counted as evidence; symlinks anywhere in the bundle
+   directory and non-regular files are refused (`exit 1`); per-file and total
+   read sizes are capped before loading into memory.
 2. **Manifest digest and per-file digests.**
 3. **Checkpoint signature** against the pinned anchor. An unknown key id is `2`,
    never a pass; a key read from the same database is reported as
    `valid_in_store_only` and is not authorship.
-4. **Row hashes and chain continuity.** Every row's `entry_hash` is recomputed
-   under its `hash_v`. For class `hub`, continuity is checked from the
-   checkpoint back to the pinned point or genesis. For class `org`, continuity
-   is the signed running hash (check 5).
+4. **Row hashes and chain continuity.** Every unredacted row's `entry_hash` is
+   recomputed under its `hash_v`; redacted hash-only stubs are checked for
+   stripped fields, `hash_v` rules, and chain linkage, with per-row coverage
+   reported in `integrity` and `redacted_events`. For class `hub`, continuity is
+   checked from the checkpoint back to the pinned point or genesis. For class
+   `org`, continuity is the signed running hash (check 5).
 5. **Sequence basis.** Class `hub`: every global `seq` in the window appears
    once, in order, with no gap or duplicate. Class `org`: `org_seq` runs from
    `pinned_count + 1` to `pinned_count + N` with no gap or duplicate, the
    refolded `org_chain_hash` and the cumulative `org_row_count` equal the signed
    values, and — when a later hub checkpoint is available — the signed
    `global_from_hash` and `global_head_hash` resolve in the global chain with
-   the bundle's rows between them. A mismatch is a refusal; an `org` bundle
-   with no pinned checkpoint or hub cross-check reports completeness as
-   `unverified`, never as a pass.
+   the bundle's rows between them. A mismatch is a refusal; an `org` bundle from
+   genesis with no pinned checkpoint or hub cross-check exits `0` while
+   reporting completeness as `unverified`, never as a pass; an incremental `org`
+   bundle without a pinned checkpoint exits `2`.
 6. **Downgrade refusal** — a `hash_v = 1` row after the first `hash_v = 2` row.
 7. **Receipts** — digest matches the manifest, `action_digest` matches the event
    payload, resolver is a verified human, separation of duties holds, `covers`
-   matches the artifact index. Separation of duties is taken from the action's
-   approval rule as captured in `policy/revisions.json` (today that is
-   `config_revision_manage`'s "a human other than the requester",
-   `docs/policy.md` → Config revisions). Where the rule has no such clause the
-   claim is reported as `not-applicable`, never as a pass.
-8. **Cross-links** — every approval event has a receipt and every receipt has an
-   event; `ledger.seq`/`ledger.org_seq` and `ledger.hash` in the receipt resolve.
-9. **Trace** — for each artifact: artifact → task → run/attempt → policy
-   revision → approval. A missing link is a refusal, not a blank field.
-10. **Private content** — a bundle containing a record marked private, a secret
-    value, or a message body marked private is refused.
+   matches the artifact index. Policy revisions are matched on `(kind, revision)`
+   (`kind = "policy"`), each revision's `document` is re-hashed against
+   `document_sha256`, and separation of duties is derived independently by the
+   verifier from that hashed policy document rather than trusted from an
+   exporter-stamped list. Where the policy document has no separation-of-duties
+   clause for the tool, the claim is reported as `not-applicable`, never as a
+   pass. In `hub` bundles, non-default organization approval receipts keep
+   `ledger_label` redaction (pseudonymized requester/resolver labels preserving
+   distinctness, and omitted free-text reason).
+8. **Cross-links** — every unredacted approval event has a receipt and every
+   receipt has an event; `ledger.seq`/`ledger.org_seq` and `ledger.hash` in the
+   receipt resolve.
+9. **Trace** — for each released artifact: artifact → task → run/attempt →
+   policy revision (`kind = "policy"`) → approval → `receipt.covers`. A missing
+   link on a released artifact is a refusal, not a blank field. Unreleased
+   deliverable revisions recorded inside the bundle window carry `released: false`
+   with task linkage (and optional run/policy linkage when present) without
+   requiring a release approval.
+10. **Private and secret content** — a bundle containing an unredacted
+    restricted channel, a record marked private, a secret/token/credential
+    key or value pattern (including non-string values and nested JSON strings),
+    or a PEM private key is refused (`exit 1`).
 11. **Unhashed or legacy rows** — reported explicitly with their count and
     sequence range; never silently accepted as verified.
-12. **Withheld classes** — `withheld.json` is reported as part of the verdict, so
-    a reader knows what the bundle deliberately does not contain.
+12. **Withheld classes** — `withheld.json` is scoped strictly to the
+    checkpoint's window and organization class (so re-exporting a checkpoint
+    after later writes stays deterministic) and is reported as part of the
+    verdict, so a reader knows what the bundle deliberately does not contain.
 
 The verifier also prints the three claims separately (`integrity`, `authorship`,
 `completeness`) with the basis for each, so a reader cannot mistake "hashes
