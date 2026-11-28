@@ -1038,6 +1038,18 @@ async fn loopback_http_with_secret_is_allowed() {
 }
 
 #[tokio::test]
+async fn ipv4_mapped_loopback_http_with_secret_is_allowed() {
+    let server = Server::start(|_| ok("mapped-delivered")).await;
+    let url = Url::parse(&format!("http://[::ffff:127.0.0.1]:{}/hooks/mapped", server.addr.port())).unwrap();
+    let out = Outbound::pinned(crate::policy::NOTIFY_WEBHOOK, &url).unwrap();
+    let req = Request::post(url).secret_header("Authorization", "Bearer mapped-local-secret").unwrap();
+    let resp = out.send(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(server.seen().len(), 1);
+    assert!(server.seen()[0].to_ascii_lowercase().contains("authorization: bearer mapped-local-secret"));
+}
+
+#[tokio::test]
 async fn https_with_secret_is_allowed() {
     // An https request with a secret reaches the TLS handshake on the dialed
     // peer (first byte 0x16 = TLS ClientHello) and is never refused as a
