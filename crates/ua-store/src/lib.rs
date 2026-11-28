@@ -13,6 +13,7 @@
 pub mod backup;
 pub mod db;
 pub mod evidence;
+pub mod evidence_bundle;
 pub mod graph;
 pub mod ledger;
 pub mod lock;

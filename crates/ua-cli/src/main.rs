@@ -476,9 +476,15 @@ async fn run_cmd(cli: Cli, held: &mut Held) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Evidence(ops::evidence::EvidenceArgs {
-            cmd: ops::evidence::EvidenceCmd::Sign { key_file, checkpoint_file, prev_checkpoint, out },
+            cmd: ops::evidence::EvidenceCmd::Sign { key_file, checkpoint_file, bundle, prev_checkpoint, out },
         }) => {
-            ops::evidence::run_sign(&key_file, &checkpoint_file, prev_checkpoint.as_deref(), out.as_deref())?;
+            ops::evidence::run_sign_cmd(
+                &key_file,
+                checkpoint_file.as_deref(),
+                bundle.as_deref(),
+                prev_checkpoint.as_deref(),
+                out.as_deref(),
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         cmd => {
